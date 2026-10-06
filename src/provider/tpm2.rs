@@ -52,7 +52,7 @@ use sha2::{Digest as ShaDigest, Sha256}; // hashing used to build the per-servic
 use std::path::PathBuf; // location of the derivation-secret file
 use std::str::FromStr; // brings `TctiNameConf::from_str` into scope
 use std::sync::{Arc, Mutex, OnceLock}; // shared, lock-protected TPM context; `OnceLock` for the per-process conformance verdict
-use zeroize::{Zeroize, Zeroizing}; // scrubs the derivation secret and its digest once they're no longer needed
+use zeroize::Zeroizing; // self-scrubbing buffers for the derivation secret, its digest, and the unique label
 
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder}; // TPM object-attribute and session-attribute bitfields
 use tss_esapi::constants::{PropertyTag, SessionType}; // TPM_PT_MANUFACTURER lookup, and the HMAC session type
@@ -125,6 +125,13 @@ fn derivation_secret_path() -> Result<PathBuf> {
 
 fn derivation_secret_is_missing() -> bool {
     matches!(derivation_secret_path().map(std::fs::symlink_metadata), Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether the policy names the derivation-secret file, rather than leaving
+/// [`DEFAULT_DERIVATION_SECRET_FILE`] -- i.e. whether an administrator said
+/// where the secret is. Mirrors [`tcti_is_explicit`].
+fn derivation_secret_is_explicit() -> bool {
+    matches!(crate::policy::tpm_derivation_secret_file(), Ok(Some(_)))
 }
 
 /// The TCTI used when the policy names none: the kernel's TPM resource
@@ -236,13 +243,48 @@ fn read_derivation_secret() -> Result<Option<Zeroizing<[u8; 32]>>> {
     let mut hasher = Sha256::new();
     hasher.update(DERIVATION_SECRET_DOMAIN);
     hasher.update(raw.as_slice());
-    let mut digest = hasher.finalize();
     raw.wipe();
+    // The digest is as sensitive as the file it came from: it goes straight
+    // into a zeroizing buffer, and the hasher's buffered copy of the file's
+    // tail is scrubbed (see `finalize_sha256_wiping`).
+    Ok(Some(crate::crypto::finalize_sha256_wiping(&mut hasher)))
+}
 
-    let mut out = Zeroizing::new([0u8; 32]);
-    out.copy_from_slice(&digest);
-    digest.as_mut_slice().zeroize(); // the digest is as sensitive as the file it came from
-    Ok(Some(out))
+/// Longest Owner-hierarchy authorization value accepted: the size of
+/// `TPM2B_AUTH` (a digest of the largest hash the TPM supports).
+const MAX_OWNER_AUTH_LEN: usize = 64;
+
+/// Reads the Owner-hierarchy authorization value from `path`
+/// (`tpm.owner_auth_file`). Held to the same standard as the derivation
+/// secret -- root-owned, `0400` or `root:<service-group> 0440`, not a
+/// symlink, in a root-controlled directory -- and used verbatim: no
+/// trimming, so it matches exactly what `tpm2_changeauth -c o file:<path>`
+/// set. Every failure, a missing file included, is an error: the policy
+/// says the owner has this password, so trying with none would fail anyway
+/// and hide why.
+fn read_owner_auth(path: &std::path::Path) -> Result<tss_esapi::structures::Auth> {
+    use crate::secure_file::{
+        check_location, config_owner, open_checked, FileRequirements, SecretBuffer, FORBID_GROUP_OTHER_ACCESS,
+    };
+    let requirements = FileRequirements {
+        owner: Some(config_owner()),
+        forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
+        follow_symlinks: false,
+        allow_group_read_if_root_owned: true,
+    };
+    let mut file = check_location(path, config_owner())
+        .and_then(|()| open_checked(path, &requirements))
+        .map_err(|e| Error::Provider(format!("TPM owner authorization file {}: {e}", path.display())))?;
+    let mut raw = SecretBuffer::read_from(&mut file, MAX_OWNER_AUTH_LEN)
+        .map_err(|e| Error::Provider(format!("TPM owner authorization file {}: {e}", path.display())))?;
+    if raw.as_slice().is_empty() {
+        return Err(Error::Provider(format!("TPM owner authorization file {} is empty", path.display())));
+    }
+    // `Auth` keeps its bytes in a `Zeroizing<Vec<u8>>`; `raw` wipes itself on drop.
+    let auth = tss_esapi::structures::Auth::try_from(raw.as_slice().to_vec())
+        .map_err(|e| Error::Provider(format!("TPM owner authorization value rejected: {e}")));
+    raw.wipe();
+    auth
 }
 
 
@@ -269,7 +311,7 @@ impl Tpm2Provider {
             Backend::Ready(ctx) => (Some(ctx), None),
             Backend::Absent => (None, None),
             Backend::Refused(reason) => {
-                log::error!("hkdfguard: TPM refused: {reason}");
+                crate::provider::log_once(log::Level::Error, format!("hkdfguard: TPM refused: {reason}"));
                 (None, Some(reason))
             }
         };
@@ -336,15 +378,42 @@ fn open_context() -> Backend<Context> {
     // Resolve the derivation secret before the self-test, purely so a
     // missing-but-required (or present-but-untrustworthy) secret reports
     // *that* rather than surfacing as an opaque "self-test could not run".
-    // A missing one means the TPM isn't set up for use on this host; its
-    // directory is root-controlled (see `read_derivation_secret`), so its
-    // absence can't be forced by anyone else.
+    //
+    // Missing at the *default* path means the TPM isn't set up for use on
+    // this host, and the chain may move on; its directory is
+    // root-controlled (see `read_derivation_secret`), so its absence can't
+    // be forced by anyone else. Missing at a path the *policy* names is
+    // different, exactly as for a configured TCTI that can't be opened: the
+    // administrator said the secret is there, so its absence (a typo, a
+    // file renamed during maintenance) is an outage to surface -- never a
+    // reason to quietly wrap under a weaker provider.
     if let Err(e) = read_derivation_secret() {
-        if derivation_secret_is_missing() {
+        if derivation_secret_is_missing() && !derivation_secret_is_explicit() {
             log::warn!("hkdfguard: TPM not used: {e}");
             return Backend::Absent;
         }
         return Backend::Refused(e.to_string());
+    }
+
+    // The Owner hierarchy's password, when policy says it has one. Set on
+    // the context once, before the self-test: every CreatePrimary here
+    // (self-test, salt key, service keys) is under the Owner hierarchy and
+    // authorizes through `execute_with_nullauth_session`, an HMAC session
+    // that keys its HMAC with whatever authValue the context holds for the
+    // handle -- so the password authorizes without ever crossing the bus.
+    // Not a derivation input: setting it changes no KEK.
+    match crate::policy::tpm_owner_auth_file() {
+        Ok(Some(path)) => {
+            let auth = match read_owner_auth(&path) {
+                Ok(auth) => auth,
+                Err(e) => return Backend::Refused(e.to_string()),
+            };
+            if let Err(e) = ctx.tr_set_auth(tss_esapi::handles::ObjectHandle::from(Hierarchy::Owner), auth) {
+                return Backend::Refused(format!("could not set the TPM owner authorization: {e}"));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => return Backend::Refused(e.to_string()),
     }
 
     // The conformance verdict is a fact about the TPM's *behavior*, not a
@@ -551,12 +620,56 @@ fn create_and_verify_primary_with(
         }
     };
 
-    if let Err(e) = verify_name(service, &public, &name) {
+    if let Err(e) = verify_matches_template(&template, &public).and_then(|()| verify_name(service, &public, &name)) {
         let _ = ctx.flush_context(key_handle.into());
         return Err(e);
     }
 
     Ok((key_handle, public, name))
+}
+
+/// Checks that the public area the TPM returned is the key that was asked
+/// for: the same type, attributes, name algorithm, auth policy, and
+/// parameters (curve, scheme, KDF, symmetric) as `template`. Only `unique`
+/// may differ -- for a primary key the TPM replaces the template's value
+/// with the generated public point.
+///
+/// With a pinned Name this adds nothing, since the Name commits to the
+/// whole public area. Without one, `verify_name` only proves the reported
+/// Name matches the reported area, which a non-conformant stack returning
+/// some other key would still pass; `PublicKey::from_sec1_bytes` would
+/// catch a wrong curve later, but not, say, a key the TPM would let be
+/// duplicated off the device.
+fn verify_matches_template(template: &Public, returned: &Public) -> Result<()> {
+    match (template, returned) {
+        (
+            Public::Ecc { object_attributes: ta, name_hashing_algorithm: tn, auth_policy: tp, parameters: tparams, .. },
+            Public::Ecc { object_attributes: ra, name_hashing_algorithm: rn, auth_policy: rp, parameters: rparams, .. },
+        ) => {
+            let mut differs = Vec::new();
+            if ta != ra {
+                differs.push("object attributes");
+            }
+            if tn != rn {
+                differs.push("name algorithm");
+            }
+            if tp != rp {
+                differs.push("auth policy");
+            }
+            if tparams != rparams {
+                differs.push("ECC parameters");
+            }
+            if differs.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::Provider(format!(
+                    "the TPM returned a key that does not match the requested template ({} differ)",
+                    differs.join(", ")
+                )))
+            }
+        }
+        _ => Err(Error::Provider("the TPM returned a key that is not an ECC key".into())),
+    }
 }
 
 // `create_and_verify_primary_with` for callers that only want the public
@@ -835,7 +948,7 @@ fn create_session_salt_key(ctx: &mut Context) -> Result<KeyHandle> {
             return Err(Error::Provider(format!("TPM2_ReadPublic (session salt key) failed: {e}")));
         }
     };
-    if let Err(e) = verify_salt_key_name(&public, &name) {
+    if let Err(e) = verify_matches_template(&template, &public).and_then(|()| verify_salt_key_name(&public, &name)) {
         let _ = ctx.flush_context(key_handle.into());
         return Err(e);
     }
@@ -898,7 +1011,27 @@ fn start_encrypted_session(ctx: &mut Context, salt_key: KeyHandle) -> Result<Aut
         let _ = ctx.flush_context(SessionHandle::from(session).into());
         return Err(Error::Provider(format!("failed to set TPM session attributes: {e}")));
     }
-    Ok(session)
+    // Read the attributes back and refuse a session that won't encrypt.
+    // Encryption is invisible to the caller -- an unencrypted session
+    // returns the very same Z -- so nothing downstream would notice a
+    // stack that accepted the attributes and then dropped them, and Z
+    // would cross the bus in the clear. A local ESAPI call: no TPM round
+    // trip.
+    let encrypts = ctx.tr_sess_get_attributes(session).map(|a| a.decrypt() && a.encrypt());
+    match encrypts {
+        Ok(true) => Ok(session),
+        Ok(false) => {
+            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            Err(Error::Provider(
+                "the TPM session did not keep its decrypt/encrypt attributes; refusing to send Z through it unencrypted"
+                    .into(),
+            ))
+        }
+        Err(e) => {
+            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            Err(Error::Provider(format!("failed to read back TPM session attributes: {e}")))
+        }
+    }
 }
 
 /// `TPM2_ECDH_ZGen` inside a salted, parameter-encrypted session, owning
@@ -974,15 +1107,15 @@ impl KekHandle for Tpm2Handle {
 
         let z = z_result?; // now propagate any ECDH failure
 
-        let mut secret = [0u8; 32];
         let x_bytes = z.x().value(); // the shared secret is conventionally just the X-coordinate of Z
         if x_bytes.len() != 32 {
             return Err(Error::Provider(
                 "TPM returned unexpected ECDH shared point size".into(), // defensive: should always be 32 for P-256
             ));
         }
+        let mut secret = SharedSecret::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
         secret.copy_from_slice(x_bytes);
-        Ok(SharedSecret::new(secret)) // wrap in the zeroizing alias before returning
+        Ok(secret)
     }
 
     // A standalone TPM2_CreatePrimary, independent of `ecdh`'s own --
@@ -1121,11 +1254,15 @@ fn unpinned_service_instructions(context: &Arc<Mutex<Option<Context>>>, service:
         let (_public, name) = create_and_read_primary(ctx, service, secret.as_ref())?;
         Ok(hex(name.value()))
     })();
+    // The service name itself stays out of the message: it is logged, and
+    // service names are kept out of the log (see the C ABI's "(redacted)"
+    // lines). The placeholder is the name the caller passed, which the
+    // caller -- `hkdfguard-v1-initialize provision`, say -- already knows.
     match name {
         Ok(name) => format!(
             "tpm.require_pinned_names is set and this service has no pinned TPM Name. To provision \
-             it, add this to the policy file and run provision again:\n  [tpm.pinned_names]\n  \
-             \"{service}\" = \"{name}\""
+             it, add this to the policy file, with <service> replaced by the service name, and run \
+             provision again:\n  [tpm.pinned_names]\n  \"<service>\" = \"{name}\""
         ),
         Err(e) => format!(
             "tpm.require_pinned_names is set and this service has no pinned TPM Name; deriving its \
@@ -1192,12 +1329,13 @@ fn service_public_template(
 // label; with one it also depends on the host secret, and is then as
 // sensitive as the secret itself.
 //
-// Caveat worth knowing: `EccParameter` (and the marshalled command buffer
-// tss-esapi builds from it) is not a zeroizing type, so with a secret
-// configured these 32-byte halves briefly live in heap memory this crate
-// can't scrub. They are one-way hashes rather than the secret itself, and
-// the secret file is already readable by the same uid, so this is a
-// known, bounded residue rather than a new exposure.
+// Caveat worth knowing: `EccParameter` itself zeroizes (in tss-esapi 7.x
+// it wraps a `Zeroizing<Vec<u8>>`), but the command buffer tpm2-tss
+// marshals it into does not, so with a secret configured these 32-byte
+// halves briefly live in library memory this crate can't scrub. They are
+// one-way hashes rather than the secret itself, and the secret file is
+// already readable by the same uid, so this is a known, bounded residue
+// rather than a new exposure.
 fn service_unique_point(
     service: &str,
     secret: Option<&Zeroizing<[u8; 32]>>,
@@ -1229,12 +1367,9 @@ fn unique_half(
         hasher.update(b":secret:"); // separates the secret from the service name it follows
         hasher.update(&secret[..]);
     }
-    let mut digest = hasher.finalize();
-
-    let mut out = Zeroizing::new([0u8; 32]);
-    out.copy_from_slice(&digest);
-    digest.as_mut_slice().zeroize();
-    out
+    // Same digest as a plain `finalize`, so every KEK is unchanged; the
+    // hasher's buffered copy of the secret's tail is scrubbed as well.
+    crate::crypto::finalize_sha256_wiping(&mut hasher)
 }
 
 // Converts the caller's ephemeral P-256 public key (a `p256::PublicKey`)
@@ -1755,10 +1890,22 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
-    fn a_missing_derivation_secret_leaves_the_tpm_absent() {
-        // Not set up for use on this host: the chain may move on.
-        let present = with_no_secret_file(|| Tpm2Provider::new().probe());
-        assert!(!present);
+    fn a_missing_policy_named_derivation_secret_refuses_the_tpm() {
+        // The policy names the secret's path and nothing is there: an
+        // outage, not "not set up here". The provider is present (so the
+        // chain stops at it) and every call fails, exactly like a
+        // configured TCTI that can't be opened. (Only a secret missing at
+        // the *default* path, with no policy naming one, leaves the TPM
+        // absent -- which cannot be tested without controlling
+        // /etc/hkdfguard.)
+        with_no_secret_file(|| {
+            let provider = Tpm2Provider::new();
+            assert!(provider.probe(), "a configured-but-missing secret must be refused, not absent");
+            match provider.load_kek("com.company.orders", false) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("refused"), "unexpected: {msg}"),
+                other => panic!("expected a Provider error, got {other:?}"),
+            }
+        });
     }
 
     #[test]
@@ -2113,6 +2260,31 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
+    fn encrypted_sessions_really_carry_the_encryption_attributes() {
+        // The test above cannot tell an encrypting session from one that
+        // silently isn't: Z is identical either way. This checks what
+        // decides it -- the session's own attributes, as ESAPI reports
+        // them for the session `ecdh_z_gen_encrypted` would use.
+        let attributes = with_tpm_context(|ctx| {
+            let salt_key = create_session_salt_key(ctx)?;
+            let session = start_encrypted_session(ctx, salt_key);
+            let attributes = session.as_ref().ok().map(|s| ctx.tr_sess_get_attributes(*s));
+            if let Ok(s) = session {
+                let _ = ctx.flush_context(SessionHandle::from(s).into());
+            }
+            let _ = ctx.flush_context(salt_key.into());
+            Ok(attributes)
+        })
+        .unwrap()
+        .expect("an encrypted session must start")
+        .expect("its attributes must be readable");
+        assert!(attributes.decrypt(), "the command's first parameter (inPoint) must be encrypted");
+        assert!(attributes.encrypt(), "the response's first parameter (Z) must be encrypted");
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
     fn session_salt_key_is_deterministic_and_pinnable() {
         let names = with_tpm_context(|ctx| {
             let mut names = Vec::new();
@@ -2290,9 +2462,10 @@ mod tests {
             })
             .unwrap();
             assert!(
-                message.contains(&format!("\"{service}\" = \"{actual}\"")),
+                message.contains(&format!("\"<service>\" = \"{actual}\"")),
                 "the refusal must carry a paste-ready pin for the real Name; got: {message}"
             );
+            assert!(!message.contains(service), "the refusal is logged, so it must not name the service: {message}");
 
             // Pinned (as the operator would, from that message): now it exists,
             // loads, and works end to end.

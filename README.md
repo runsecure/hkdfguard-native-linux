@@ -139,7 +139,10 @@ the first provider that already holds a KEK for `service`, and never
 creates one. `hkdfguard_unwrap_dek` always uses the exact provider that
 originally wrapped the payload (recorded -- and authenticated -- in the
 payload itself, never in `service`). Providers are constructed fresh on
-every call; nothing is cached or kept open between calls.
+every call; no session, login, or device connection is kept open between
+calls. (A PKCS#11 *module* stays loaded and initialized for the life of
+the process -- see "Nothing is cached between calls" under "Design
+decisions worth knowing".)
 
 The walk moves past a provider only when it is **absent** -- not on this
 host, or not set up for use here -- or has **no key for this service**.
@@ -155,8 +158,8 @@ caller isn't steered into creating a key somewhere weaker.
 
 | Provider | Absent (the walk moves on) | Present but failing (the call fails) |
 |---|---|---|
-| TPM2 | default device can't be opened (no TPM, or not in `tss`); no derivation secret | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; untrusted secret; failed or unrunnable self-test |
-| PKCS#11 | no module configured; no PIN file | untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure |
+| TPM2 | default device can't be opened (no TPM, or not in `tss`); no derivation secret at the default path | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a policy-named derivation secret that is missing; untrusted secret; a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
+| PKCS#11 | no module configured; no PIN file | untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
 | External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
 | (any) | -- | policy present but unusable |
 
@@ -207,7 +210,7 @@ once a process has made more than 10 setup calls.
 
 The floor is about load, not secrecy. It does not hide which services
 have a key: `hkdfguard_wrap_dek` is not rate-limited — it is the hot path
-— and answers `KEK_NOT_FOUND` (`-3`) at once for a service with none, so
+— and answers `KEK_NOT_FOUND` (`-9`) at once for a service with none, so
 anything that can call the library can find out quickly. Treat service
 names as public identifiers, never as secrets.
 
@@ -293,7 +296,11 @@ sensitive data fails with `TPM_RC_ATTRIBUTES` — confirmed against swtpm.)
 Because a TPM that ignored the extra input would leave the secret looking
 configured while protecting nothing, the provider verifies empirically —
 once per process — that the secret actually changes the derived key, and
-refuses to use the TPM at all if it doesn't.
+refuses to use the TPM at all if it doesn't. That proves the secret is
+*used*, not that all of it is: a TPM that kept only part of `unique` would
+still pass, while getting only that part's strength. No black-box test can
+rule that out; a conformant TPM hashes the whole public template into the
+derivation, and that conformance is what is relied on.
 
 **2. Pinned TPM Names.** Record the Name your TPM reports for a service
 and the provider will refuse any key whose Name differs. Unlike the
@@ -341,12 +348,16 @@ configured):
 ```text
 $ hkdfguard-v1-initialize provision -sn com.company.orders
 error: hkdfguard: create_kek failed for service (redacted): provider error: TPM2: tpm.require_pinned_names
-is set and this service has no pinned TPM Name. To provision it, add this to the policy file and run
-provision again:
+is set and this service has no pinned TPM Name. To provision it, add this to the policy file, with <service>
+replaced by the service name, and run provision again:
   [tpm.pinned_names]
-  "com.company.orders" = "000b..."
-error: hkdfguard_create_kek failed: the selected KEK provider failed (see the messages above for the provider's reason)
+  "<service>" = "000b..."
+error: hkdfguard_create_kek failed for service "com.company.orders": the selected KEK provider failed (see the
+messages above for the provider's reason; where they show <service>, use "com.company.orders")
 ```
+
+The library's own message uses a `<service>` placeholder because it keeps
+service names out of its log; `provision` fills it in on the line after.
 
 Add the entry as root and run `provision` again; it then reports
 "already provisioned". The same entry also gives you substitution
@@ -416,6 +427,69 @@ pinnable; it carries no derivation secret and protects nothing by itself.
 > against software attackers only. Closing that needs a persisted,
 > parent-encrypted key blob (`TPM2_Create` + `TPM2_Load`) instead of a
 > derived primary.
+
+**4. Protect the hierarchy the keys derive from.** Every TPM KEK is
+derived on demand from the Owner hierarchy's primary seed; nothing is
+persisted, and by default the provider authorizes with an empty owner
+password. Two TPM commands are therefore dangerous in the hands of anyone who can open
+the device -- the same `tss`-group adversary the derivation secret defends
+against -- and neither needs the derivation secret:
+
+- `TPM2_Clear` regenerates the seed. Every DEK ever wrapped on the host
+  becomes unrecoverable, and the only symptom is a fingerprint mismatch
+  (`-16`) at the next unwrap. With the default empty lockout password,
+  `tpm2_clear -c l` from any `tss`-group shell does it.
+- `TPM2_HierarchyChangeAuth` on the Owner hierarchy sets a password the
+  provider does not know. Every `CreatePrimary` then fails, the self-test
+  cannot run, and the TPM is refused on every call until the password is
+  cleared again.
+
+Set a lockout-hierarchy password and, where the platform allows, disable
+`TPM2_Clear`, so neither command is available to an unprivileged device
+user:
+
+```sh
+LOCKOUT_PW="$(head -c 32 /dev/urandom | base64)"   # keep it with the derivation secret's backup
+tpm2_changeauth -c lockout "$LOCKOUT_PW"
+tpm2_clearcontrol -C l -P "$LOCKOUT_PW" s          # disableClear; only platform authorization can re-enable it
+```
+
+Then, optionally, give the Owner hierarchy a password too, and name a
+file holding it in the policy. This is the stronger control: with an empty
+owner password, anyone who can open the TPM *and* read the derivation
+secret can issue the same `CreatePrimary` and use the service's key
+themselves; with a password, `CreatePrimary` under the Owner hierarchy
+needs it as well, and `TPM2_HierarchyChangeAuth` needs the current one.
+The password is not a derivation input, so setting it changes no KEK and
+needs no re-wrapping.
+
+```sh
+( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.owner-auth )
+# For a service that doesn't run as root, as for the derivation secret:
+chgrp <service-group> /etc/hkdfguard/tpm.owner-auth && chmod 0440 /etc/hkdfguard/tpm.owner-auth
+tpm2_changeauth -c o file:/etc/hkdfguard/tpm.owner-auth   # bytes used verbatim, as hkdfguard reads them
+```
+
+```toml
+[tpm]
+owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
+```
+
+Set the policy entry in the same change as the password: with a password
+and no entry (or the reverse), every TPM call is refused. Back the file up
+with the derivation secret. The owner password applies to the whole Owner
+hierarchy, so anything else on the host that creates keys under it with an
+empty password -- `systemd-cryptenroll --tpm2-device`, tpm2-tss FAPI,
+`tpm2_createprimary -C o` scripts -- stops working until it is given the
+password as well; check before setting it on a shared host. The provider
+presents it through an HMAC session, so it never crosses the bus in the
+clear.
+
+Note also that dictionary-attack lockout is TPM-wide: failed
+authorizations by any other local user of the TPM can put it in lockout,
+during which `TPM2_ECDH_ZGen` fails with `TPM_RC_LOCKOUT` until the lockout
+interval passes or the lockout password resets it. (Owner-hierarchy
+authorization failures are not counted towards it.)
 
 Callers never see which provider is active. Every provider implements the
 identical `ECDH -> HKDF-SHA512 -> AES-256-GCM` protocol
@@ -749,7 +823,10 @@ require_pinned_names = false        # true: only services in pinned_names exist 
 session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
 pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
 tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> | mssim:<conf> | swtpm:<conf>
+                                    # mssim/swtpm are for testing only: no resource manager, so another client of
+                                    # the same simulator can swap a key handle between its Name check and its use
 derivation_secret_file = "/etc/hkdfguard/tpm.derivation-secret"  # absolute path; root-owned, 0400 (or 0440 with the service's group)
+owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password. Absolute path, same rules; see "Protect the hierarchy"
 
 [tpm.pinned_names]                  # per-service expected TPM Name; refuse any other key
 "com.company.orders" = "000b<64 hex>"
@@ -826,8 +903,13 @@ its default.
   from disk each time. The only per-process state is a handful of facts
   about the *hardware* (the TPM conformance verdict, whether it honors the
   derivation secret, and its manufacturer) that cannot change underneath a
-  running process. This is deliberate: the most secret parts of the system
-  are re-authenticated on every use rather than held open.
+  running process, and the PKCS#11 module's library handle: `C_Initialize`
+  and `C_Finalize` act on the whole process, and finalizing while another
+  thread is mid-call is undefined behavior, so a module is initialized once
+  and never finalized. That handle is not authority -- every PKCS#11
+  session and login is still opened per call and closed with it. This is
+  deliberate: the most secret parts of the system are re-authenticated on
+  every use rather than held open.
 - **Unwrap always uses the provider recorded in the payload**, not
   whichever provider is currently strongest -- and that provider tag is
   authenticated, so it cannot be steered. If it differs from what policy
@@ -840,6 +922,10 @@ its default.
   the C ABI.** Only `int`/`uint8_t*`/`char*`.
 - **No panic ever unwinds across the ABI.** Every exported function is
   wrapped in `catch_unwind`; a caught panic returns `HKDFGUARD_ERR_INTERNAL_ERROR`.
+  That needs the panic strategy `unwind` (`Cargo.toml` sets it for release,
+  and every package is built that way). A Rust program linking the crate
+  into a binary built with `panic = "abort"` aborts on a panic instead --
+  never undefined behavior, but not a status code either.
 - **DEK plaintext is stack-only, never heap, during wrap/unwrap.**
   `crypto.rs` uses `AeadInPlace::{encrypt,decrypt}_in_place_detached` on a
   stack-allocated `[u8; 32]` instead of the more convenient

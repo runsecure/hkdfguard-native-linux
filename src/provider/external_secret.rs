@@ -84,7 +84,7 @@ impl ExternalSecretProvider {
             Backend::Ready(dir) => ExternalSecretProvider { dir: Some(dir), refused: None },
             Backend::Absent => ExternalSecretProvider { dir: None, refused: None },
             Backend::Refused(reason) => {
-                log::error!("hkdfguard: external-secret provider refused: {reason}");
+                crate::provider::log_once(log::Level::Error, format!("hkdfguard: external-secret provider refused: {reason}"));
                 ExternalSecretProvider { dir: None, refused: Some(reason) }
             }
         }
@@ -186,9 +186,9 @@ impl KekProvider for ExternalSecretProvider {
     fn load_kek(&self, service: &str, _create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
         self.check_not_refused()?;
         if !is_safe_file_name(service) {
-            return Err(Error::Provider(format!(
-                "service name {service:?} cannot be used as an external secret file name"
-            )));
+            return Err(Error::Provider(
+                "this service name cannot be used as an external secret file name".into(), // never the name itself: service names stay out of the log
+            ));
         }
         let dir = self
             .dir

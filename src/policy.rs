@@ -295,10 +295,26 @@ struct TpmPolicy {
     /// `mssim:...` or `swtpm:...`. Set here, by root, because it decides
     /// whose TPM derives the keys: a TCTI pointed at an attacker-run
     /// simulator hands them a TPM whose seed they know.
+    ///
+    /// `mssim` and `swtpm` are accepted for test harnesses only. They talk
+    /// to a simulator directly, with no resource manager in between, so
+    /// object handles are shared by every client of that simulator: another
+    /// client could flush and replace the key between the provider's
+    /// `TPM2_ReadPublic` (where its Name is checked) and its
+    /// `TPM2_ECDH_ZGen`. `device:/dev/tpmrm0` and `tabrmd` give each
+    /// connection its own handles, which closes that window.
     tcti: Option<String>,
     /// Absolute path of the derivation-secret file (default
     /// `/etc/hkdfguard/tpm.derivation-secret`).
     derivation_secret_file: Option<String>,
+    /// Absolute path of a file holding the Owner hierarchy's
+    /// authorization value, used verbatim. Unset (the default): the Owner
+    /// hierarchy is assumed to have an empty password. Setting an owner
+    /// password, and this file, stops anyone without it from deriving keys
+    /// under the Owner hierarchy at all -- including re-deriving this
+    /// crate's KEKs. It is not a derivation input, so adding it changes no
+    /// KEK.
+    owner_auth_file: Option<String>,
 }
 
 /// TCTI kinds tss-esapi can open; anything else is rejected at load time.
@@ -331,6 +347,7 @@ impl Default for TpmPolicy {
             pinned_session_salt_key_name: None,
             tcti: None,
             derivation_secret_file: None,
+            owner_auth_file: None,
         }
     }
 }
@@ -506,6 +523,7 @@ pub struct Policy {
     pinned_session_salt_key_name: Option<Vec<u8>>,
     tpm_tcti: Option<String>,
     tpm_derivation_secret_file: Option<PathBuf>,
+    tpm_owner_auth_file: Option<PathBuf>,
     external_secret_dir: Option<PathBuf>,
     pkcs11: Pkcs11Settings,
 }
@@ -655,6 +673,12 @@ impl Policy {
             .as_deref()
             .map(|f| absolute_path("tpm.derivation_secret_file", f))
             .transpose()?;
+        let tpm_owner_auth_file = raw
+            .tpm
+            .owner_auth_file
+            .as_deref()
+            .map(|f| absolute_path("tpm.owner_auth_file", f))
+            .transpose()?;
 
         let external_secret_dir = raw
             .external_secret
@@ -681,9 +705,15 @@ impl Policy {
             pinned_session_salt_key_name,
             tpm_tcti: raw.tpm.tcti,
             tpm_derivation_secret_file,
+            tpm_owner_auth_file,
             external_secret_dir,
             pkcs11,
         })
+    }
+
+    /// The Owner-hierarchy authorization file (`tpm.owner_auth_file`), if policy sets one.
+    pub fn tpm_owner_auth_file(&self) -> Option<&std::path::Path> {
+        self.tpm_owner_auth_file.as_deref()
     }
 
     /// TPM session parameter-encryption mode (`tpm.session_encryption`).
@@ -844,9 +874,75 @@ const POLICY_FILE_REQUIREMENTS: crate::secure_file::FileRequirements = crate::se
 ///   rather than falling back to the unrestricted default. Making the file
 ///   unreadable, or deleting it, must never be a way to switch policy off.
 ///
-/// Re-read from disk on every call (no caching), so an operator can update
-/// the policy without restarting the process.
+/// Re-read from disk on every C ABI call, so an operator can update the
+/// policy without restarting the process -- but only once per call: within
+/// a call, every reader gets the snapshot [`snapshot_for_call`] took (see
+/// there for why).
 pub fn load() -> Option<Result<Policy>> {
+    if let Some(snapshot) = SNAPSHOT.with(|s| s.borrow().clone()) {
+        return snapshot.map(|r| r.map_err(Error::Provider));
+    }
+    read_from_disk()
+}
+
+/// The policy as one C ABI call sees it: `None` for no file, else the
+/// parsed policy or the reason it was refused (every refusal is an
+/// `Error::Provider`, so its message is all there is to keep).
+type Snapshot = Option<std::result::Result<Policy, String>>;
+
+thread_local! {
+    /// The snapshot in force on this thread, while a C ABI call holds a
+    /// [`SnapshotGuard`]. Thread-local because a call runs entirely on the
+    /// caller's thread, and concurrent calls on other threads must each
+    /// get their own read.
+    static SNAPSHOT: std::cell::RefCell<Option<Snapshot>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps a policy snapshot in force on this thread until dropped.
+pub(crate) struct SnapshotGuard {
+    /// Whether this guard took the snapshot (and so clears it). A nested
+    /// guard -- `hkdfguard_generate_and_wrap_dek` running through the wrap
+    /// path -- leaves the outer one's snapshot alone.
+    owns: bool,
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        if self.owns {
+            SNAPSHOT.with(|s| *s.borrow_mut() = None);
+        }
+    }
+}
+
+/// Reads the policy file once and makes that reading the one every
+/// [`load`] on this thread returns until the guard drops.
+///
+/// Without this, a single call read the file several times -- the provider
+/// chain, each provider's settings, the TPM's pins and session mode, the
+/// setup floor -- and a root edit landing mid-call (or an editor that
+/// writes the file non-atomically) could give one operation two different
+/// policies: say, the chain from the old file and the TPM pins from the
+/// new one. A snapshot makes every decision in a call come from one
+/// version of the file.
+pub(crate) fn snapshot_for_call() -> SnapshotGuard {
+    SNAPSHOT.with(|s| {
+        if s.borrow().is_some() {
+            return SnapshotGuard { owns: false };
+        }
+        let snapshot: Snapshot = read_from_disk().map(|r| {
+            r.map_err(|e| match e {
+                Error::Provider(msg) => msg,
+                other => other.to_string(),
+            })
+        });
+        *s.borrow_mut() = Some(snapshot);
+        SnapshotGuard { owns: true }
+    })
+}
+
+/// Reads and validates the policy file itself; see [`load`] for what each
+/// outcome means.
+fn read_from_disk() -> Option<Result<Policy>> {
     let path = policy_file_path();
     let fail = |what: String| Some(Err(Error::Provider(format!("hkdfguard policy file {}: {what}", path.display()))));
 
@@ -982,6 +1078,19 @@ pub(crate) fn tpm_tcti() -> Result<Option<String>> {
 pub(crate) fn tpm_derivation_secret_file() -> Result<Option<PathBuf>> {
     match load() {
         Some(Ok(policy)) => Ok(policy.tpm_derivation_secret_file().map(std::path::Path::to_path_buf)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// The Owner-hierarchy authorization file policy names
+/// (`tpm.owner_auth_file`), if any. `Err` on a policy file that exists but
+/// can't be trusted: the TPM is then refused rather than tried with an
+/// empty owner password the administrator may have replaced.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_owner_auth_file() -> Result<Option<PathBuf>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.tpm_owner_auth_file().map(std::path::Path::to_path_buf)),
         Some(Err(e)) => Err(e),
         None => Ok(None),
     }
@@ -1663,6 +1772,54 @@ mod tests {
         for bad in ["", "libtss2-tcti-evil.so", "/tmp/evil.so", "cmd:sh", "devices:/dev/tpm0"] {
             let doc = format!("{base}[tpm]\ntcti = \"{bad}\"\n");
             assert!(Policy::from_toml_str(&doc).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn tpm_owner_auth_file_is_read_and_must_be_absolute() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        assert_eq!(Policy::from_toml_str(base).unwrap().tpm_owner_auth_file(), None);
+
+        let policy = Policy::from_toml_str(&format!("{base}[tpm]\nowner_auth_file = \"/etc/hkdfguard/tpm.owner-auth\"\n")).unwrap();
+        assert_eq!(policy.tpm_owner_auth_file(), Some(std::path::Path::new("/etc/hkdfguard/tpm.owner-auth")));
+
+        assert!(
+            Policy::from_toml_str(&format!("{base}[tpm]\nowner_auth_file = \"tpm.owner-auth\"\n")).is_err(),
+            "a relative owner_auth_file must be rejected"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_snapshot_pins_one_reading_of_the_policy_for_the_whole_call() {
+        let first = TestPolicy::write("[selection]\nmode = \"prefer\"\n[startup_behavior]\nsetup_min_delay_ms = 10\n");
+        let guard = snapshot_for_call();
+
+        // The file changes mid-call (a root edit, or a non-atomic write).
+        drop(first);
+        let _second = TestPolicy::write("[selection]\nmode = \"prefer\"\n[startup_behavior]\nsetup_min_delay_ms = 20\n");
+        assert_eq!(setup_min_delay(), Duration::from_millis(10), "every reader in the call must see the snapshot");
+
+        // A nested guard (generate_and_wrap running the wrap path) neither
+        // re-reads nor ends the outer snapshot.
+        drop(snapshot_for_call());
+        assert_eq!(setup_min_delay(), Duration::from_millis(10), "a nested guard must not clear the outer snapshot");
+
+        // The next call reads the file afresh.
+        drop(guard);
+        assert_eq!(setup_min_delay(), Duration::from_millis(20), "after the call, the policy is read from disk again");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_policy_stays_refused_through_the_snapshot() {
+        let _bad = TestPolicy::write("[selection]\nmode = \"no-such-mode\"\n");
+        let _guard = snapshot_for_call();
+        for _ in 0..2 {
+            match load() {
+                Some(Err(Error::Provider(msg))) => assert!(msg.contains("invalid hkdfguard policy"), "unexpected: {msg}"),
+                other => panic!("a malformed policy must stay refused within the call, got {other:?}"),
+            }
         }
     }
 

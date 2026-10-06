@@ -181,7 +181,7 @@ fn compiled_provider_types() -> Vec<ProviderType> {
 }
 
 /// Constructs exactly one provider, fresh. This is the expensive step --
-/// for TPM2 it opens a TCTI connection, for PKCS#11 it loads the module
+/// for TPM2 it opens a TCTI connection, for PKCS#11 it opens a session
 /// and logs in -- and it's deliberately done per call and torn down when
 /// the returned `Arc` drops: no session, login, or device connection is
 /// ever kept alive between calls. That's a deliberate posture, not an
@@ -193,6 +193,13 @@ fn compiled_provider_types() -> Vec<ProviderType> {
 /// *unwrapped DEK* for as long as they need it, not to call in here at
 /// high frequency. Returns `None` only for a type not compiled into this
 /// build.
+///
+/// The one thing that does outlive a call is the PKCS#11 *module*: it is
+/// loaded and `C_Initialize`d once per process and never finalized, because
+/// those two calls act on the whole process, and finalizing while another
+/// thread is inside the module is undefined behavior (see
+/// `pkcs11::MODULES`). That is a library handle, not authority -- every
+/// session and login is still per call.
 fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider>> {
     match provider_type {
         #[cfg(feature = "tpm2")]
@@ -254,9 +261,18 @@ static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new())
 /// carry a service name (see the C ABI's "(redacted)" lines), so this is
 /// bounded by the number of provider combinations, not of services.
 fn warn_once(message: String) {
+    log_once(log::Level::Warn, message);
+}
+
+/// [`warn_once`] at any level. Also used by the providers for a refusal
+/// reason, which they would otherwise log on every construction -- that
+/// is, on every C ABI call -- while the provider stays misconfigured. The
+/// C ABI's own per-call failure line still carries the reason each time,
+/// so logging it once more here adds nothing after the first.
+pub(crate) fn log_once(level: log::Level, message: String) {
     let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !warned.contains(&message) {
-        log::warn!("{message}");
+        log::log!(level, "{message}");
         warned.push(message);
     }
 }

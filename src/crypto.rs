@@ -136,12 +136,61 @@ pub(crate) fn payload_ecdh_point(salt: &[u8; SALT_LEN]) -> Result<PublicKey> {
 
 pub const DEK_LEN: usize = 32; // the mandated, fixed DEK size in bytes
 
+/// Longest `key_id` any provider may record in a payload. Every provider's
+/// tag is either a fixed-size hash (TPM2: 32 bytes) or a short prefix plus
+/// the service name (at most [`crate::MAX_SERVICE_LEN`] bytes); `wrap`
+/// refuses anything longer, so the payload size bound below always holds.
+pub const MAX_KEY_ID_LEN: usize = 16 + crate::MAX_SERVICE_LEN;
+
+/// Size of every wrapped payload apart from its `key_id`: version,
+/// provider tag, key_id length, salt, nonce, ciphertext length, the
+/// ciphertext with its tag, and the fingerprint.
+const FIXED_WRAPPED_LEN: usize = 1 + 1 + 2 + SALT_LEN + NONCE_LEN + 4 + DEK_LEN + TAG_LEN + FINGERPRINT_LEN;
+
+/// Smallest possible wrapped payload (an empty `key_id`). A caller capacity
+/// below this cannot hold any payload, so `hkdfguard_wrap_dek` answers it
+/// without touching a provider.
+pub const MIN_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN;
+
+/// Largest possible wrapped payload, for any provider and any valid service
+/// name. Mirrored as `HKDFGUARD_WRAPPED_MAX_LEN` in `include/hkdfguard.h`.
+pub const MAX_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN + MAX_KEY_ID_LEN;
+
+/// Finalizes a SHA-256 hash of secret input into a zeroizing buffer, then
+/// scrubs the hasher.
+///
+/// `sha2` 0.10 offers no zeroization of its own. A finalized hasher still
+/// holds the unprocessed tail of the input (up to 63 bytes, e.g. the end of
+/// a derivation secret) in its block buffer, and resetting only rewinds the
+/// cursor. So: finalize-and-reset (the chaining value goes back to the
+/// public IV), then feed 63 zero bytes, which overwrite every buffer
+/// position that can hold input -- padding has already overwritten the
+/// last one. `black_box` keeps the compiler from discarding those writes as
+/// dead stores. Best effort: the compression function's own stack
+/// temporaries are out of reach, as for every other stack copy here.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))] // the TPM provider is the caller that hashes secrets
+pub(crate) fn finalize_sha256_wiping(hasher: &mut Sha256) -> Zeroizing<[u8; 32]> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    Digest::finalize_into_reset(hasher, sha2::digest::generic_array::GenericArray::from_mut_slice(&mut out[..]));
+    hasher.update([0u8; 63]);
+    std::hint::black_box(hasher);
+    out
+}
+
 // Wraps `dek` under the persistent KEK for `service`, returning the
 // serialized wrapped payload ready to store/transmit. The KEK must already
 // exist (created via `provider::create_kek`, i.e. `hkdfguard_create_kek`);
 // this never creates one itself -- see `provider::select_existing`.
 pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     let (provider, handle) = provider::select_existing(service)?; // walk the priority chain for an already-created KEK
+    if handle.key_id().len() > MAX_KEY_ID_LEN {
+        // Keeps MAX_WRAPPED_LEN (which callers size buffers from) true.
+        return Err(Error::Provider(format!(
+            "{} key_id is {} bytes, over the {MAX_KEY_ID_LEN}-byte wire-format bound",
+            provider.provider_type().as_str(),
+            handle.key_id().len()
+        )));
+    }
 
     let fingerprint = kek_fingerprint(&handle.public_key()?); // identifies *which* KEK this payload is wrapped under, for `unwrap` to check before any ECDH/AES-GCM
 
@@ -179,12 +228,14 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
 
     // Copy the DEK onto the stack (a plain array-to-array copy, no heap
     // involved) and encrypt it in place: `ct_buf` starts as plaintext and
-    // ends as ciphertext, entirely within this stack frame.
-    let mut ct_buf: [u8; DEK_LEN] = *dek;
+    // ends as ciphertext, entirely within this stack frame. `Zeroizing`, so
+    // the plaintext is scrubbed even if something below panics before the
+    // encryption completes.
+    let mut ct_buf = Zeroizing::new(*dek);
     let tag_result = cipher.encrypt_in_place_detached(
         Nonce::from_slice(&nonce_bytes),
         &authenticated,
-        &mut ct_buf,
+        &mut ct_buf[..],
     );
     wrapping_key.zeroize(); // the derived AES key is no longer needed either way; scrub it immediately
     salt.zeroize(); // already copied into the payload; don't leave a second copy on the stack
@@ -202,7 +253,7 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     // `ct_buf` now holds ciphertext, not plaintext -- safe to copy into the
     // (necessarily heap-backed, since it's variable-length) wire payload.
     payload.ciphertext.clear();
-    payload.ciphertext.extend_from_slice(&ct_buf);
+    payload.ciphertext.extend_from_slice(&ct_buf[..]);
     payload.ciphertext.extend_from_slice(&tag);
     debug_assert_eq!(
         payload.authenticated_bytes(),
@@ -215,9 +266,10 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
 
 // Reverses `wrap`: parses the payload, re-derives the same wrapping key,
 // and decrypts+authenticates the original DEK back out. The recovered DEK
-// lives only in the stack-allocated `[u8; DEK_LEN]` returned to the
-// caller -- never in a heap buffer at any point.
-pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<[u8; DEK_LEN]> {
+// lives only in the stack-allocated, self-zeroizing array returned to the
+// caller -- never in a heap buffer at any point, and never in a buffer
+// that a panic could leave un-wiped.
+pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>> {
     let payload = Payload::from_bytes(wrapped)?; // parse and structurally validate the wire format (ciphertext stays a heap Vec, but it's ciphertext, not a secret)
 
     if payload.ciphertext.len() != DEK_LEN + TAG_LEN {
@@ -252,7 +304,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<[u8; DEK_LEN]> {
     // body onto the stack -- this is the *only* place the decrypted DEK
     // will ever live.
     let (ct_part, tag_part) = payload.ciphertext.split_at(DEK_LEN);
-    let mut dek = [0u8; DEK_LEN];
+    let mut dek = Zeroizing::new([0u8; DEK_LEN]);
     dek.copy_from_slice(ct_part); // still ciphertext at this point
     let tag = Tag::from_slice(tag_part);
 
@@ -260,7 +312,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<[u8; DEK_LEN]> {
     let auth_result = cipher.decrypt_in_place_detached(
         Nonce::from_slice(&payload.nonce),
         &authenticated,
-        &mut dek,
+        &mut dek[..],
         tag,
     ); // decrypts `dek` in place; on success it now holds the real plaintext DEK
     wrapping_key.zeroize(); // the AES key is no longer needed regardless of whether decryption succeeded
@@ -350,7 +402,7 @@ mod tests {
             let dek = [0x42u8; DEK_LEN]; // arbitrary fixed test DEK
             let wrapped = wrap("com.company.orders", &dek).unwrap();
             let recovered = unwrap("com.company.orders", &wrapped).unwrap();
-            assert_eq!(dek, recovered); // must get back exactly what was wrapped
+            assert_eq!(dek, *recovered); // must get back exactly what was wrapped
         });
     }
 
@@ -791,8 +843,58 @@ mod tests {
 
             // The genuine payload still works, so the test isn't passing
             // for an unrelated reason.
-            assert_eq!(unwrap(service, &genuine).unwrap(), [0x01u8; DEK_LEN]);
+            assert_eq!(*unwrap(service, &genuine).unwrap(), [0x01u8; DEK_LEN]);
         });
+    }
+
+    #[test]
+    fn wiping_finalize_matches_a_plain_finalize() {
+        // Any change to the digest would change every TPM KEK, so the
+        // wiping variant must agree with plain `finalize` byte for byte --
+        // across tails that end mid-block, exactly at a block boundary, and
+        // one byte short of one (where padding spills into a second block).
+        for len in [0usize, 1, 31, 32, 55, 56, 63, 64, 65, 127, 200] {
+            let input: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let expected = Sha256::digest(&input);
+
+            let mut hasher = Sha256::new();
+            hasher.update(&input);
+            let got = finalize_sha256_wiping(&mut hasher);
+            assert_eq!(&got[..], &expected[..], "input length {len}");
+
+            // And the scrubbed hasher holds nothing of the input: it is in
+            // the state of a fresh hasher that has absorbed 63 zero bytes.
+            let mut fresh = Sha256::new();
+            fresh.update([0u8; 63]);
+            assert_eq!(hasher.finalize(), fresh.finalize(), "input length {len}: hasher not reset to a public state");
+        }
+    }
+
+    #[test]
+    fn wrapped_length_bounds_hold_for_every_provider_tag_shape() {
+        // The bounds the C ABI sizes buffers from. Fixed part: version,
+        // provider, key_id length, salt, nonce, ciphertext length,
+        // ciphertext + tag, fingerprint.
+        assert_eq!(MIN_WRAPPED_LEN, 1 + 1 + 2 + 32 + 12 + 4 + 48 + 32);
+        assert_eq!(MAX_WRAPPED_LEN, MIN_WRAPPED_LEN + MAX_KEY_ID_LEN);
+        let longest_service = "s".repeat(crate::MAX_SERVICE_LEN);
+        for key_id in [
+            vec![0u8; 32],                                             // TPM2: SHA-256 of the service
+            format!("hkdfguard:{longest_service}").into_bytes(),        // PKCS#11
+            format!("external:{longest_service}").into_bytes(),         // external secret
+            format!("ephemeral:{longest_service}").into_bytes(),        // ephemeral
+        ] {
+            let payload = Payload { key_id, ..sample_payload() };
+            let len = payload.to_bytes().len();
+            assert!((MIN_WRAPPED_LEN..=MAX_WRAPPED_LEN).contains(&len), "payload of {len} bytes is outside the bounds");
+        }
+    }
+
+    #[test]
+    fn header_publishes_the_same_maximum_payload_size() {
+        let header = include_str!("../include/hkdfguard.h");
+        let expected = format!("#define HKDFGUARD_WRAPPED_MAX_LEN {MAX_WRAPPED_LEN}");
+        assert!(header.contains(&expected), "include/hkdfguard.h must contain `{expected}`");
     }
 
     #[test]
@@ -824,7 +926,7 @@ mod tests {
             for dek in patterns {
                 let wrapped = wrap("com.company.orders", &dek).unwrap();
                 let recovered = unwrap("com.company.orders", &wrapped).unwrap();
-                assert_eq!(dek, recovered);
+                assert_eq!(dek, *recovered);
             }
         });
     }
@@ -921,7 +1023,7 @@ mod tests {
             );
 
             // The untampered payload still works.
-            assert_eq!(unwrap("com.company.orders", &wrapped).unwrap(), dek);
+            assert_eq!(*unwrap("com.company.orders", &wrapped).unwrap(), dek);
         });
     }
 

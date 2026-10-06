@@ -33,7 +33,7 @@ use std::sync::Mutex; // serializes setup calls (see `gated_setup`)
 use std::time::{Duration, Instant}; // the setup-call latency floor
 use zeroize::Zeroize; // scrub sensitive stack buffers before returning
 
-const MAX_SERVICE_LEN: usize = 128; // spec-mandated maximum service-name length in bytes
+pub(crate) const MAX_SERVICE_LEN: usize = 128; // spec-mandated maximum service-name length in bytes
 
 /// Serializes every setup call (`hkdfguard_create_kek`,
 /// `hkdfguard_kek_exists`) so that, combined with the latency floor in
@@ -398,8 +398,8 @@ fn generate_and_wrap_impl(
     // the Linux analog of Windows' `BCryptGenRandom` / macOS's
     // `SecRandomCopyBytes` used for the equivalent purpose elsewhere in
     // this project.
-    let mut dek = [0u8; crypto::DEK_LEN];
-    OsRng.fill_bytes(&mut dek);
+    let mut dek = zeroize::Zeroizing::new([0u8; crypto::DEK_LEN]); // scrubbed on drop, panic included
+    OsRng.fill_bytes(&mut dek[..]);
 
     let code = wrap_impl(service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
     dek.zeroize(); // our local copy of the freshly generated DEK is no longer needed; scrub it now
@@ -483,6 +483,7 @@ fn create_kek_impl(service: *const c_char) -> c_int {
         Err(code) => return code,
     };
 
+    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     gated_setup(|| match provider::create_kek(&service_str) {
         Ok(_) => status::OK,
         Err(e) => {
@@ -504,6 +505,7 @@ fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
         Err(code) => return code,
     };
 
+    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     gated_setup(|| match provider::kek_exists(&service_str) {
         Ok(found) => {
             // SAFETY: exists is non-null per check above; caller contract
@@ -547,12 +549,27 @@ fn wrap_impl(
         Err(code) => return code, // bad service string: bail out with the specific reason
     };
 
+    // Buffer checks that need no provider, made before any provider work:
+    // a size probe, or a call that could never write its result, costs no
+    // TPM/HSM round trip.
+    if out.is_null() && capacity > 0 {
+        return status::INVALID_ARGUMENT; // a declared capacity with nowhere to write
+    }
+    if (capacity as usize) < crypto::MIN_WRAPPED_LEN {
+        // No payload fits, whatever the provider. Report a capacity that
+        // always suffices; the successful retry reports the exact length.
+        // SAFETY: out_len is non-null (checked above).
+        unsafe { *out_len = crypto::MAX_WRAPPED_LEN as c_int };
+        return status::BUFFER_TOO_SMALL;
+    }
+
     // SAFETY: dek is non-null and dek_len == DEK_LEN; caller contract
     // guarantees dek is readable for that many bytes.
     let dek_slice = unsafe { std::slice::from_raw_parts(dek, crypto::DEK_LEN) }; // borrow the caller's DEK bytes as a Rust slice
-    let mut dek_array = [0u8; crypto::DEK_LEN]; // owned, fixed-size copy (the crypto layer wants `&[u8; 32]`)
+    let mut dek_array = zeroize::Zeroizing::new([0u8; crypto::DEK_LEN]); // owned copy, scrubbed on drop (panic included)
     dek_array.copy_from_slice(dek_slice);
 
+    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     let result = crypto::wrap(&service_str, &dek_array); // do the actual ECDH -> HKDF -> AES-GCM work
     dek_array.zeroize(); // our local copy of the plaintext DEK is no longer needed; scrub it now
 
@@ -565,13 +582,12 @@ fn wrap_impl(
     };
 
     if (capacity as usize) < wrapped.len() {
-        // caller's buffer is too small: report the required size and write nothing
+        // Holds a payload of some size, just not this one (only possible
+        // for a capacity between MIN_WRAPPED_LEN and the actual length):
+        // report the exact size and write nothing.
         // SAFETY: out_len is non-null (checked above).
         unsafe { *out_len = wrapped.len() as c_int };
         return status::BUFFER_TOO_SMALL;
-    }
-    if out.is_null() {
-        return status::INVALID_ARGUMENT; // capacity was fine (possibly 0) but there's nowhere to actually write
     }
 
     // SAFETY: out is non-null and, per caller contract, writable for at
@@ -618,31 +634,32 @@ fn unwrap_impl(
         }
     };
 
-    // SAFETY: wrapped is non-null and wrapped_len >= 0; caller contract
-    // guarantees it is readable for that many bytes.
-    let wrapped_slice =
-        unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) }; // borrow the caller's wrapped-payload bytes
-
-    let mut dek = match crypto::unwrap(&service_str, wrapped_slice) {
-        Ok(dek) => dek, // recovered plaintext DEK, still only in this local variable
-        Err(e) => {
-            log::error!("hkdfguard: unwrap failed for service (redacted): {e}"); // log the reason, never the key material
-            zero_out_buffer();
-            return e.status_code();
-        }
-    };
-
+    // Buffer checks, before any provider work: the DEK is always exactly
+    // DEK_LEN bytes, so whether it fits is known without unwrapping.
     if (capacity as usize) < crypto::DEK_LEN {
-        dek.zeroize(); // don't leave the recovered DEK sitting in a local variable longer than necessary
         zero_out_buffer();
         // SAFETY: out_len is non-null (checked above).
         unsafe { *out_len = crypto::DEK_LEN as c_int }; // tell the caller exactly how big a buffer they need (always 32)
         return status::BUFFER_TOO_SMALL;
     }
     if out.is_null() {
-        dek.zeroize();
-        return status::INVALID_ARGUMENT;
+        return status::INVALID_ARGUMENT; // a declared capacity with nowhere to write
     }
+
+    // SAFETY: wrapped is non-null and wrapped_len >= 0; caller contract
+    // guarantees it is readable for that many bytes.
+    let wrapped_slice =
+        unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) }; // borrow the caller's wrapped-payload bytes
+
+    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
+    let mut dek = match crypto::unwrap(&service_str, wrapped_slice) {
+        Ok(dek) => dek, // recovered plaintext DEK, in a self-zeroizing local
+        Err(e) => {
+            log::error!("hkdfguard: unwrap failed for service (redacted): {e}"); // log the reason, never the key material
+            zero_out_buffer();
+            return e.status_code();
+        }
+    };
 
     // SAFETY: out is non-null and, per caller contract, writable for at
     // least `capacity` >= DEK_LEN bytes.
