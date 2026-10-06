@@ -1903,7 +1903,8 @@ mod tests {
             assert!(provider.probe(), "a configured-but-missing secret must be refused, not absent");
             match provider.load_kek("com.company.orders", false) {
                 Err(Error::Provider(msg)) => assert!(msg.contains("refused"), "unexpected: {msg}"),
-                other => panic!("expected a Provider error, got {other:?}"),
+                Err(other) => panic!("expected a Provider error, got {other:?}"),
+                Ok(_) => panic!("a configured-but-missing secret must fail the call"),
             }
         });
     }
