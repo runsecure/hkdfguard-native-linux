@@ -1,0 +1,80 @@
+[package]
+name = "hkdfguard"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, ephemeral)."
+repository = "https://github.com/torinblair/KeyProtectionCore-Linux"
+
+[lib]
+name = "hkdfguard_v1"
+# cdylib: shared object for dynamic linking.
+# staticlib: archive for static linking into a host binary.
+# rlib: lets this crate also be used directly from Rust (tests, examples).
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+p256 = { version = "0.13", features = ["ecdh", "pkcs8"] }
+elliptic-curve = { version = "0.13", features = ["pkcs8"] }
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+rand_core = { version = "0.6", features = ["std"] }
+zeroize = { version = "1", features = ["derive"] }
+log = "0.4"
+thiserror = "1"
+libc = "0.2"
+# Used only by the src/bin/hkdfguard-v1-initialize CLI tool, to decode its
+# --dek argument; already pulled in transitively by other dependencies, so
+# this adds no new compiled code to the dependency graph.
+base64 = "0.22"
+# Policy file (/etc/hkdfguard/policy.toml) parsing. Parse + deserialize
+# only: this crate never writes TOML.
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+
+# Optional hardware-backed provider dependencies. Not enabled by default
+# because they require system libraries (tpm2-tss / a PKCS#11 module) that
+# are not present on every build host. See README.md "Provider build matrix".
+tss-esapi = { version = "7", optional = true }
+cryptoki = { version = "0.6", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
+tempfile = "3"
+serial_test = "3"
+# Only to call `ExposeSecret` on cryptoki's `AuthPin` (a secrecy 0.8
+# `SecretString`) in the PKCS#11 PIN-file tests; same version cryptoki
+# itself already pulls in, so this adds no new crate to the build.
+secrecy = "0.8"
+# Test builds only: lets the policy test helper (`policy::test_support`)
+# write a complete policy file -- a test's own settings layered over the
+# harness's -- rather than a fragment. Cargo enables dev-dependency
+# features only for targets that need them, so the shipped library still
+# parses TOML and never writes it.
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde", "display"] }
+
+[features]
+# external-secret and ephemeral are pure-Rust / filesystem-only and always
+# buildable, so they ship in `default`. There is deliberately no
+# software-backed (locally-generated, filesystem-encrypted-at-rest) KEK
+# provider: deployments without TPM2/PKCS#11 hardware are expected to
+# provision a KEK via external-secret instead.
+default = ["external-secret", "ephemeral"]
+external-secret = []
+ephemeral = []
+# Hardware-backed providers: opt in per-deployment.
+tpm2 = ["dep:tss-esapi"]
+pkcs11 = ["dep:cryptoki"]
+
+[profile.release]
+panic = "unwind"   # required: hkdfguard_* catches unwinds at the FFI boundary
+strip = true
+lto = true
+
+[lints.rust]
+# `--cfg hkdfguard_test_paths` builds the library for the test harnesses:
+# it reads HKDFGUARD_POLICY_FILE and accepts configuration owned by the
+# invoking user. Nothing that ships is ever built with it; see
+# `policy::policy_file_path`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(hkdfguard_test_paths)"] }

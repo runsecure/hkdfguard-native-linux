@@ -1,0 +1,22 @@
+# Minimal swtpm-only image for docker-compose.yml's standalone `swtpm`
+# service. A lighter counterpart to docker/Dockerfile, which bundles the
+# full Rust + TPM2 + PKCS#11 toolchain into one image for the
+# single-container docker/run-tests.sh flow (where swtpm runs as a
+# background process inside that same container instead of its own).
+#
+# Splitting swtpm out into its own long-lived container is what makes
+# stopping/restarting it independently of the test runner possible --
+# see docker-compose.yml and scripts/tpm-reboot-test.sh, both of which
+# depend on swtpm's state directory surviving that restart.
+
+# Same pinned base as docker/Dockerfile, so both run the same swtpm.
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        swtpm \
+        swtpm-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["swtpm"]
