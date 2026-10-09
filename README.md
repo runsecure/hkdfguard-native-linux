@@ -508,15 +508,43 @@ same image, they need glibc 2.39 or newer: Ubuntu 24.04+, Debian 13, RHEL
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
 | `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.6.2 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against hashed per-payload points accepted |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs: **Intel PTT** and **AMD fTPM** |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs, **Intel PTT** and **AMD fTPM**, and against a virtual TPM, **Hyper-V's vTPM** (`MSFT`), in Ubuntu 24.04 (tpm2-tss 4.0.1) and AlmaLinux 10 (tpm2-tss 4.1.3, SELinux enforcing) guests |
 
-The TPM provider has been verified against `swtpm` and against two real
-firmware TPMs, Intel PTT and AMD fTPM. It has **not** been exercised
-against a discrete TPM chip (e.g. Infineon or Nuvoton) or against a
-hardware HSM/YubiHSM -- the PKCS#11 provider has only ever been run
-against SoftHSM2. `scripts/native-tpm-test.sh` (next section) exists
-precisely so you can run the same matrix on your own hardware, including
-a discrete chip, before depending on it.
+The TPM provider has been verified against `swtpm`, against two real
+firmware TPMs, Intel PTT and AMD fTPM, and against Hyper-V's virtual TPM.
+It has **not** been exercised against a discrete TPM chip (e.g. Infineon
+or Nuvoton), against other hypervisors' vTPMs (VMware, Google Cloud,
+AWS NitroTPM), or against a hardware HSM/YubiHSM -- the PKCS#11 provider
+has only ever been run against SoftHSM2. `scripts/native-tpm-test.sh`
+(next section) exists precisely so you can run the same matrix on your
+own hardware, including a discrete chip, before depending on it.
+
+On the Hyper-V vTPM the *packages* were verified too, not just the test
+builds: the Ubuntu 24.04 `.deb`s and the EL10 `.rpm`s from
+`packaging/build-packages.sh` (see "Packages"), installed and configured
+only through a root-owned `/etc/hkdfguard/policy.toml` that requires the
+TPM, with a `0440` derivation secret, and run as an unprivileged service
+account in the `tss` group. `hkdfguard-v1-initialize provision` and
+`wrap` followed by an unwrap through the installed library succeeded; a
+group-writable policy, a world-readable derivation secret, `TSS2_LOG` at
+`debug`, and the service losing access to `/dev/tpmrm0` were each refused
+(`-4`), with no fallback to another provider; an unwrap under the wrong
+service was refused (`-16`); and a DEK wrapped before a guest reboot
+unwrapped after it.
+
+> **Dictionary-attack lockout on Hyper-V vTPMs.** A new Hyper-V vTPM
+> allows only **3** failed authorizations, forgives one every **1000 s**,
+> and has no lockout password. One test guest came up already in lockout,
+> before any hkdfguard code had run -- most likely from forced resets
+> during installation, since a TPM counts an unclean restart as a failed
+> authorization -- and every `TPM2_ECDH_ZGen`, so every wrap and unwrap,
+> failed until it was cleared with `tpm2_dictionarylockout --clear-lockout`.
+> hkdfguard itself left the counter at 0 through the whole suite. On
+> Hyper-V guests, restart from inside the guest rather than with Reset or
+> Turn Off, raise the lockout parameters to suit the host
+> (`tpm2_dictionarylockout --setup-parameters`), and set a lockout
+> password as described under "Protect the hierarchy" -- without one, any
+> `tss`-group user can clear the lockout, as was done here.
 
 Run the ignored hardware/module tests yourself once you have the real backend:
 
@@ -529,7 +557,8 @@ cargo test --features pkcs11 -- --ignored   # needs SoftHSM2 or another PKCS#11 
 
 Docker proves the code against `swtpm`. This repo's maintainers have run
 the scripts below to completion, including reboot persistence, on real
-**Intel PTT** and **AMD fTPM** firmware TPMs. A **discrete** TPM (e.g.
+**Intel PTT** and **AMD fTPM** firmware TPMs, and on **Hyper-V's vTPM**
+in Ubuntu 24.04 and AlmaLinux 10 guests. A **discrete** TPM (e.g.
 Infineon, Nuvoton) has not yet been tested -- the code path exists (see
 the known limitation on parameter encryption below) but is unverified
 against real discrete hardware. To prove it against the hardware you
