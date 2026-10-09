@@ -591,25 +591,44 @@ to pass it. See [`docker/README.md`](docker/README.md).
 ## Packages (.deb / .rpm)
 
 ```sh
-packaging/build-packages.sh     # needs Docker; DISTROS=debian ARCHES=amd64 for a subset
+packaging/build-packages.sh     # needs Docker; DISTROS="debian sles16" ARCHES=amd64 for a subset
 ```
 
-Builds packages for **Debian 13** (`.deb`) and **EL10** -- RHEL 10,
-AlmaLinux 10, Rocky Linux 10 (`.rpm`) -- on amd64/x86_64 and
-arm64/aarch64, into `dist/packages/<distro>-<arch>/`. Each build runs on
-its own distribution (built against that distribution's glibc and
-tpm2-tss), runs the default and all-features test suites, and is then
-installed into a clean container of that distribution and exercised by
-[`packaging/smoke-test.sh`](packaging/smoke-test.sh). CI does the same in
-the `packages` job and attaches the packages to tagged releases. Debian 12
-and RHEL 9 are not targets: both ship tpm2-tss 3.x.
+Builds packages on amd64/x86_64 and arm64/aarch64 for:
 
-| Debian | RPM | Contents |
-|---|---|---|
-| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), README, third-party licenses |
-| `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
-| (in `libhkdfguard-dev`) | `hkdfguard-static` | `libhkdfguard.a` |
-| `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
+| `DISTROS` key | Distribution | Format | Built on |
+|---|---|---|---|
+| `debian` | Debian 13 | `.deb` | `debian:13` |
+| `ubuntu24.04` | Ubuntu 24.04 LTS | `.deb` | `ubuntu:24.04` |
+| `el10` | RHEL 10, AlmaLinux 10, Rocky Linux 10 | `.rpm` | `almalinux:10` |
+| `al2023` | Amazon Linux 2023 | `.rpm` | `amazonlinux:2023` |
+| `sles16` | SUSE Linux Enterprise Server 16, openSUSE Leap 16.0 | `.rpm` | SUSE's `bci/bci-base:16.0` |
+
+Packages land in `dist/packages/<distro>-<arch>/`. Each build runs on its
+own distribution, built against that distribution's glibc and tpm2-tss.
+It runs the default and all-features test suites, then installs into a
+clean container of that distribution, where
+[`packaging/smoke-test.sh`](packaging/smoke-test.sh) exercises it. The base
+images are pinned by digest in one table in `build-packages.sh`. CI does
+the same in the `packages` job and attaches the packages to tagged
+releases.
+
+Every target ships tpm2-tss 4.x. Debian 12, RHEL 9 and SLES 15 / Leap 15.6
+ship tpm2-tss 3.x and Amazon Linux 2 older still, so none of them is a
+target.
+
+One `debian/` directory serves both Debian-family targets. Built on
+Ubuntu, `packaging/build-deb.sh` adds the customary backport changelog
+entry, so the Ubuntu packages are versioned `0.1.0-1~ubuntu24.04.1` for
+release `noble`. One spec serves all three RPM targets. On SUSE it follows
+SUSE's naming policy and runs `ldconfig` from scriptlets:
+
+| Debian, Ubuntu | EL10, Amazon Linux | SUSE | Contents |
+|---|---|---|---|
+| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), README, third-party licenses |
+| `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
+| (in `libhkdfguard-dev`) | `hkdfguard-static` | `hkdfguard-devel-static` | `libhkdfguard.a` |
+| `hkdfguard` | `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
 
 All are built with every provider enabled, so the library depends on
 tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
@@ -1011,7 +1030,7 @@ build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1
 debian/                      Debian packaging (dpkg-buildpackage)
 packaging/
   build-packages.sh          Builds and smoke-tests the .deb and .rpm packages
-  Dockerfile.debian, .el10   Package build images (Debian 13, AlmaLinux 10)
+  Dockerfile.debian, .dnf, .suse   Package build images (apt, dnf, zypper targets)
   build-deb.sh, build-rpm.sh In-container package builds
   smoke-test.sh              Installs packages into a clean container and uses them
   check-version.sh           Cargo.toml / debian/changelog / spec version agreement

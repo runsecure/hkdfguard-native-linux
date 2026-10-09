@@ -147,8 +147,11 @@ use_base_policy() { use_policy $'[selection]\nmode = "prefer"'; }
 # Runs one #[ignore]d operator-helper test and extracts a KEY=value line.
 # `--exact` matches the *full* test path, so it is spelled out here.
 learn() { # learn <test-name> <KEY>
+    # awk reads to the end rather than exiting at the match: the test
+    # binary is still writing its summary, a closed pipe makes that write
+    # panic (exit 101), and pipefail turns that into a failed run.
     cargo test --features tpm2 --lib "provider::tpm2::tests::$1" -- --ignored --exact --nocapture 2>/dev/null \
-        | awk -F= -v k="$2" '$1==k {print $2; exit}'
+        | awk -F= -v k="$2" '$1==k && !found {print $2; found=1}'
 }
 
 # Builds a C example against the library.
@@ -196,6 +199,24 @@ if [ "$MODE" = "reboot" ]; then
         exit 0
     fi
 
+    # The derivation secret lives in $STATE, and the library refuses a
+    # secret under any directory another user could write to -- which
+    # surfaces only as "TPM context not available". Under a umask of 002
+    # (Ubuntu's default) `mkdir -p` would create such parents itself, so
+    # create them private, and name an existing open one instead of
+    # letting the run fail obscurely.
+    ( umask 077; mkdir -p "$STATE" )
+    d="$STATE"
+    while [ "$d" != / ]; do
+        perm=$(stat -Lc '%a' "$d")
+        if (( 8#$perm & 8#022 )) && ! (( 8#$perm & 8#1000 )); then
+            echo "$d is $(stat -Lc '%U:%G %a' "$d"): the library refuses a derivation secret under a group- or other-writable directory." >&2
+            echo "Run 'chmod go-w $d', or set HKDFGUARD_NATIVE_TEST_STATE to a private directory." >&2
+            exit 1
+        fi
+        d=$(dirname "$d")
+    done
+
     section "build (--features tpm2)"
     cargo build --features tpm2
     build_c examples/cli_unwrap_check.c "$WORK/cli_unwrap_check"
@@ -203,7 +224,7 @@ if [ "$MODE" = "reboot" ]; then
     case "$PHASE" in
         capture)
             section "reboot capture -> $STATE"
-            mkdir -p "$STATE"; chmod 700 "$STATE"
+            chmod 700 "$STATE"
             [ -f "$SECRET" ] || ( umask 077; head -c 32 /dev/urandom > "$SECRET" )
             ( umask 077; head -c 32 /dev/urandom > "$STATE/dek.bin" )
             HKDFGUARD_PIN_SERVICE="$SERVICE" learn print_service_key_name_for_pinning SERVICE_KEY_NAME > "$STATE/service-name.hex"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installs the built packages into a clean Debian 13 or EL10 container --
+# Installs the built packages into a clean container of their target
+# (Debian 13, Ubuntu 24.04, EL10, Amazon Linux 2023, SLES 16) --
 # the plain base image, not the build image, so a missing runtime
 # dependency can't be masked by build tools -- and uses them as a consumer
 # would: dynamic and static linking through pkg-config, dlopen by the
@@ -22,19 +23,33 @@ pkgs=$1
 examples=$2
 work=$(mktemp -d)
 
+# The RPMs to install, by glob rather than find: Amazon Linux's base image
+# has no findutils, and a failed $(find) would silently install nothing.
+rpms=()
+for f in "$pkgs"/*.rpm; do
+    case "$f" in *-debuginfo-*|*-debugsource-*) ;; *) if [ -f "$f" ]; then rpms+=("$f"); fi ;; esac
+done
+
 section "installing packages"
 if command -v apt-get >/dev/null; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends gcc libc6-dev pkgconf \
         "$pkgs"/hkdfguard_*.deb "$pkgs"/libhkdfguard1_*.deb "$pkgs"/libhkdfguard-dev_*.deb
+elif [ "${#rpms[@]}" -eq 0 ]; then
+    echo "no .rpm packages in $pkgs" >&2
+    exit 1
 elif command -v dnf >/dev/null; then
+    # EL10's tpm2-tss-devel is in CRB; Amazon Linux has no CRB.
     dnf -y install dnf-plugins-core
-    dnf config-manager --set-enabled crb
-    dnf -y install gcc pkgconf-pkg-config \
-        $(find "$pkgs" -name '*.rpm' ! -name '*-debuginfo-*' ! -name '*-debugsource-*')
+    if dnf repolist --all | grep -q '^crb[[:space:]]'; then dnf config-manager --set-enabled crb; fi
+    dnf -y install gcc pkgconf-pkg-config "${rpms[@]}"
+elif command -v zypper >/dev/null; then
+    # The packages are unsigned local files. SUSE's base image has no awk.
+    zypper --non-interactive install --no-recommends --allow-unsigned-rpm \
+        gcc glibc-devel pkgconf-pkg-config gawk "${rpms[@]}"
 else
-    echo "neither apt-get nor dnf found" >&2
+    echo "none of apt-get, dnf or zypper found" >&2
     exit 1
 fi
 

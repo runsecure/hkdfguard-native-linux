@@ -1,22 +1,25 @@
-# Builds the .deb packages for one Debian-family release -- Debian 13,
-# Ubuntu 24.04 -- from the same debian/ directory: see
+# Builds the .rpm packages for SUSE Linux Enterprise Server 16 and openSUSE
+# Leap 16.0 from the same spec as the dnf-based targets: see
 # packaging/build-packages.sh, which passes BASE_IMAGE, pinned by digest,
-# from its table of targets.
+# from its table of targets. SUSE's BCI base image stands in for SLES: its
+# repository needs no subscription and carries the SLES 16 libraries. SLES
+# 15 / Leap 15.6 are not targets: they ship tpm2-tss 3.1.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    CARGO_HOME=/usr/local/cargo \
+ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 
-# Build-Depends come from debian/control itself, so the two can't drift.
-COPY debian/control /tmp/deps/debian/control
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates curl lintian \
-    && apt-get build-dep -y --no-install-recommends /tmp/deps \
-    && rm -rf /var/lib/apt/lists/* /tmp/deps
+# BuildRequires come from the spec itself, so the two can't drift. zypper
+# has no builddep for a spec file, so rpmspec lists them; each is passed as
+# one capability ("pkgconfig(tss2-esys)>=4.0").
+COPY packaging/rpm/hkdfguard.spec /tmp/hkdfguard.spec
+RUN zypper --non-interactive install --no-recommends rpm-build util-linux tar gzip curl \
+    && zypper --non-interactive install --no-recommends \
+        $(rpmspec -q --buildrequires /tmp/hkdfguard.spec | tr -d ' ') \
+    && zypper clean --all \
+    && rm /tmp/hkdfguard.spec
 
 # The toolchain pinned in rust-toolchain.toml, installed exactly as in
 # docker/Dockerfile (see there for how to update the version and hashes;
@@ -38,8 +41,7 @@ RUN set -eu; \
     rm /tmp/rustup-init; \
     rustup component add clippy
 
-# Packages are built as `builder`, not root. dpkg-buildpackage writes its
-# output next to the source directory, so builder owns /build as well.
+# Packages are built as `builder`, not root.
 RUN useradd --create-home builder \
     && chown -R builder:builder "$CARGO_HOME" \
     && install -d -o builder -g builder /build /build/hkdfguard
@@ -47,4 +49,4 @@ RUN useradd --create-home builder \
 WORKDIR /build/hkdfguard
 COPY --chown=builder:builder . /build/hkdfguard
 
-ENTRYPOINT ["packaging/build-deb.sh"]
+ENTRYPOINT ["packaging/build-rpm.sh"]

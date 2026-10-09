@@ -1,7 +1,19 @@
-# Built by packaging/build-rpm.sh inside packaging/Dockerfile.el10, with
-# the rustup toolchain pinned in rust-toolchain.toml on PATH (EL10's own
-# rust is older) and dependency sources fetched beforehand with
-# `cargo fetch --locked`, so the build itself runs offline.
+# Built by packaging/build-rpm.sh inside packaging/Dockerfile.dnf (EL10,
+# Amazon Linux 2023) or packaging/Dockerfile.suse (SLES 16, Leap 16), with
+# the rustup toolchain pinned in rust-toolchain.toml on PATH (the
+# distributions' own rust is older) and dependency sources fetched
+# beforehand with `cargo fetch --locked`, so the build itself runs offline.
+
+# SUSE's shared-library policy names the library package after its SONAME
+# and the static archive's package -devel-static; Fedora-family
+# distributions use -libs and -static.
+%if 0%{?suse_version}
+%global libpkg libhkdfguard1
+%global staticpkg %{name}-devel-static
+%else
+%global libpkg %{name}-libs
+%global staticpkg %{name}-static
+%endif
 
 # The library and CLI link Rust crates statically. Their notices ship in
 # THIRD-PARTY-LICENSES.txt; `packaging/third-party-licenses.py --licenses`
@@ -28,7 +40,7 @@ BuildRequires:  pkgconfig(tss2-tctildr)
 
 # The CLI links the library code statically, but reads the same policy:
 # keep the two at the same version.
-Requires:       %{name}-libs%{?_isa} = %{version}-%{release}
+Requires:       %{libpkg}%{?_isa} = %{version}-%{release}
 
 %global common_description %{expand:
 HKDFGuard wraps 32-byte Data Encryption Keys (DEKs) under a persistent,
@@ -42,11 +54,11 @@ HKDF-SHA512 and AES-256-GCM.}
 This package contains hkdfguard-v1-initialize, which provisions a
 service's KEK and wraps DEKs under it at deployment time.
 
-%package libs
+%package -n %{libpkg}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK
 License:        MPL-2.0 AND %{linked_licenses}
 
-%description libs %{common_description}
+%description -n %{libpkg} %{common_description}
 
 Provider selection is controlled by the root-owned policy file
 /etc/hkdfguard/policy.toml, which this package does not create.
@@ -56,20 +68,25 @@ This package contains the shared library.
 %package devel
 Summary:        Development files for HKDFGuard
 License:        MPL-2.0
-Requires:       %{name}-libs%{?_isa} = %{version}-%{release}
-# hkdfguard.pc's Requires.private names the tss2 modules.
-Requires:       tpm2-tss-devel%{?_isa}
+Requires:       %{libpkg}%{?_isa} = %{version}-%{release}
+# hkdfguard.pc's Requires.private names the tss2 modules. Required by
+# module, not package name: tpm2-tss-devel on Fedora-family distributions,
+# tpm2-0-tss-devel on SUSE.
+Requires:       pkgconfig(tss2-esys)
+Requires:       pkgconfig(tss2-mu)
+Requires:       pkgconfig(tss2-sys)
+Requires:       pkgconfig(tss2-tctildr)
 
 %description devel %{common_description}
 
 This package contains the C header and the pkg-config file.
 
-%package static
+%package -n %{staticpkg}
 Summary:        Static library for HKDFGuard
 License:        MPL-2.0 AND %{linked_licenses}
 Requires:       %{name}-devel%{?_isa} = %{version}-%{release}
 
-%description static %{common_description}
+%description -n %{staticpkg} %{common_description}
 
 This package contains the static library.
 
@@ -104,12 +121,17 @@ install -d -m 0755 %{buildroot}%{_sysconfdir}/hkdfguard
 cargo test --locked --offline
 cargo test --locked --offline --all-features
 
+%if 0%{?suse_version}
+# SUSE policy; Fedora-family glibc runs ldconfig from a file trigger.
+%ldconfig_scriptlets -n %{libpkg}
+%endif
+
 %files
 %license LICENSE
 %{_bindir}/hkdfguard-v1-initialize
 %{_mandir}/man1/hkdfguard-v1-initialize.1*
 
-%files libs
+%files -n %{libpkg}
 %license LICENSE target/THIRD-PARTY-LICENSES.txt
 %doc README.md
 %{_libdir}/libhkdfguard.so.1
@@ -121,7 +143,7 @@ cargo test --locked --offline --all-features
 %{_libdir}/libhkdfguard.so
 %{_libdir}/pkgconfig/hkdfguard.pc
 
-%files static
+%files -n %{staticpkg}
 %{_libdir}/libhkdfguard.a
 
 %changelog
