@@ -1020,3 +1020,20 @@ packaging/
   hkdfguard-v1-initialize.1  Man page
   third-party-licenses.py    License notices of the statically linked crates
 ```
+
+## License
+
+HKDFGuard is licensed under the [Mozilla Public License 2.0](LICENSE)
+(`MPL-2.0`). Commits before this change were published under
+Apache-2.0, and copies already obtained under those terms keep them.
+
+MPL-2.0 is file-level copyleft: if you distribute modified versions of
+this project's source files, those files must stay under MPL-2.0 and
+their source must be made available. Programs that only link against
+`libhkdfguard` (dynamically or statically) may use any license for their
+own code; distributing a binary that includes this library only requires
+telling recipients where its source can be obtained (MPL-2.0 §3.2).
+
+The release binaries statically link Rust crates under Apache-2.0, MIT,
+BSD-3-Clause, ISC and Unlicense terms; their notices ship as
+`THIRD-PARTY-LICENSES.txt` (see `packaging/third-party-licenses.py`).
