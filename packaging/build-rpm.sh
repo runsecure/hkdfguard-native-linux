@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds the .rpm packages inside the image from packaging/Dockerfile.el10
-# and copies them into /dist -- bind-mount a host directory there (see
+# Builds the .rpm packages inside the image from packaging/Dockerfile.dnf or
+# packaging/Dockerfile.suse and copies them into /dist -- bind-mount a host
+# directory there (see
 # packaging/build-packages.sh, which does this).
 #
 # The container starts as root only to collect into /dist; fetching,

@@ -1,31 +1,30 @@
-# Builds the Enterprise Linux 10 (RHEL 10, AlmaLinux 10, Rocky Linux 10)
-# .rpm packages: see packaging/build-packages.sh. AlmaLinux stands in for
-# RHEL here because its repositories need no subscription; the packages
-# are built against the same EL10 libraries.
-#
-# Pinned by digest, like docker/Dockerfile. To take an update, re-resolve
-# deliberately:
-#   docker pull almalinux:10
-#   docker inspect --format='{{index .RepoDigests 0}}' almalinux:10
-FROM almalinux:10@sha256:957738702313e6ee452cdb17bc1431542c467be9a4e2f4da3b8e551b0ebb9677
+# Builds the .rpm packages for one dnf-based release -- EL10 (RHEL 10,
+# AlmaLinux 10, Rocky Linux 10), Amazon Linux 2023: see
+# packaging/build-packages.sh, which passes BASE_IMAGE, pinned by digest,
+# from its table of targets. AlmaLinux stands in for RHEL because its
+# repositories need no subscription; the packages are built against the
+# same EL10 libraries.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 
 # BuildRequires come from the spec itself, so the two can't drift. CRB
-# carries some EL10 -devel packages.
+# carries some EL10 -devel packages; Amazon Linux has no CRB. Amazon
+# Linux's base image also lacks useradd (shadow-utils).
 COPY packaging/rpm/hkdfguard.spec /tmp/hkdfguard.spec
 RUN dnf -y install dnf-plugins-core \
-    && dnf config-manager --set-enabled crb \
-    && dnf -y install rpm-build util-linux tar gzip \
+    && if dnf repolist --all | grep -q '^crb[[:space:]]'; then dnf config-manager --set-enabled crb; fi \
+    && dnf -y install rpm-build util-linux shadow-utils tar gzip \
     && dnf -y builddep /tmp/hkdfguard.spec \
     && dnf clean all \
     && rm /tmp/hkdfguard.spec
 
 # The toolchain pinned in rust-toolchain.toml, installed exactly as in
 # docker/Dockerfile (see there for how to update the version and hashes;
-# keep all three Dockerfiles in step). clippy is installed only because
+# keep all four Dockerfiles in step). clippy is installed only because
 # rust-toolchain.toml lists it: rustup would otherwise try to download it
 # during the offline package build.
 ARG RUSTUP_VERSION=1.29.1
