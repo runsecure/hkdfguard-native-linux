@@ -12,7 +12,7 @@ Name:           hkdfguard
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK (CLI)
-License:        %{linked_licenses}
+License:        MPL-2.0 AND %{linked_licenses}
 URL:            https://github.com/torinblair/KeyProtectionCore-Linux
 Source0:        %{name}-%{version}.tar.gz
 
@@ -44,7 +44,7 @@ service's KEK and wraps DEKs under it at deployment time.
 
 %package libs
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK
-License:        %{linked_licenses}
+License:        MPL-2.0 AND %{linked_licenses}
 
 %description libs %{common_description}
 
@@ -55,7 +55,7 @@ This package contains the shared library.
 
 %package devel
 Summary:        Development files for HKDFGuard
-License:        Apache-2.0
+License:        MPL-2.0
 Requires:       %{name}-libs%{?_isa} = %{version}-%{release}
 # hkdfguard.pc's Requires.private names the tss2 modules.
 Requires:       tpm2-tss-devel%{?_isa}
@@ -66,7 +66,7 @@ This package contains the C header and the pkg-config file.
 
 %package static
 Summary:        Static library for HKDFGuard
-License:        %{linked_licenses}
+License:        MPL-2.0 AND %{linked_licenses}
 Requires:       %{name}-devel%{?_isa} = %{version}-%{release}
 
 %description static %{common_description}
