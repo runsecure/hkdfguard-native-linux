@@ -535,13 +535,17 @@ unwrapped after it.
 > **Dictionary-attack lockout on Hyper-V vTPMs.** A new Hyper-V vTPM
 > allows only **3** failed authorizations, forgives one every **1000 s**,
 > and has no lockout password. One test guest came up already in lockout,
-> before any hkdfguard code had run -- most likely from forced resets
-> during installation, since a TPM counts an unclean restart as a failed
-> authorization -- and every `TPM2_ECDH_ZGen`, so every wrap and unwrap,
-> failed until it was cleared with `tpm2_dictionarylockout --clear-lockout`.
-> hkdfguard itself left the counter at 0 through the whole suite. On
-> Hyper-V guests, restart from inside the guest rather than with Reset or
-> Turn Off, raise the lockout parameters to suit the host
+> before any hkdfguard code had run, and every `TPM2_ECDH_ZGen`, so every
+> wrap and unwrap, failed until it was cleared with
+> `tpm2_dictionarylockout --clear-lockout`. The most likely cause is
+> Hyper-V's **Reset**, used several times on that guest during
+> installation: it restarts the vTPM without an orderly shutdown, which a
+> TPM counts as a failed authorization. (Not proven; a **Turn Off**, by
+> contrast, was tested and left the counter at 0, the vTPM reporting an
+> orderly shutdown.) hkdfguard itself left the counter at 0 through the
+> whole suite, including its deliberately failing cases. On Hyper-V
+> guests, restart from inside the guest rather than with Reset, raise the
+> lockout parameters to suit the host
 > (`tpm2_dictionarylockout --setup-parameters`), and set a lockout
 > password as described under "Protect the hierarchy" -- without one, any
 > `tss`-group user can clear the lockout, as was done here.
