@@ -14,20 +14,21 @@ name = "hkdfguard_v1"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-p256 = { version = "0.13", features = ["ecdh", "pkcs8"] }
-elliptic-curve = { version = "0.13", features = ["pkcs8"] }
-hkdf = "0.12"
-sha2 = "0.10"
-aes-gcm = "0.10"
-rand_core = { version = "0.6", features = ["std"] }
+p256 = { version = "0.14", features = ["ecdh", "pkcs8", "getrandom"] }
+elliptic-curve = { version = "0.14", features = ["pkcs8"] }
+hkdf = "0.13"
+# zeroize: the hasher wipes its state and buffered input when dropped.
+sha2 = { version = "0.11", features = ["zeroize"] }
+aes-gcm = "0.11"
+# The OS CSPRNG, getrandom(2): salts, nonces and generated DEKs.
+getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
-thiserror = "1"
 libc = "0.2"
 # Used only by the src/bin/hkdfguard-v1-initialize CLI tool, to decode its
 # --dek argument; already pulled in transitively by other dependencies, so
 # this adds no new compiled code to the dependency graph.
-base64 = "0.22"
+base64 = "0.23"
 # Policy file (/etc/hkdfguard/policy.toml) parsing. Parse + deserialize
 # only: this crate never writes TOML.
 serde = { version = "1", features = ["derive"] }
@@ -37,16 +38,16 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 # because they require system libraries (tpm2-tss / a PKCS#11 module) that
 # are not present on every build host. See README.md "Provider build matrix".
 tss-esapi = { version = "7", optional = true }
-cryptoki = { version = "0.6", optional = true }
+cryptoki = { version = "0.12.1", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
 tempfile = "3"
-serial_test = "3"
-# Only to call `ExposeSecret` on cryptoki's `AuthPin` (a secrecy 0.8
+serial_test = "4"
+# Only to call `ExposeSecret` on cryptoki's `AuthPin` (a secrecy 0.10
 # `SecretString`) in the PKCS#11 PIN-file tests; same version cryptoki
 # itself already pulls in, so this adds no new crate to the build.
-secrecy = "0.8"
+secrecy = "0.10"
 # Test builds only: lets the policy test helper (`policy::test_support`)
 # write a complete policy file -- a test's own settings layered over the
 # harness's -- rather than a fragment. Cargo enables dev-dependency

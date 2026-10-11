@@ -100,14 +100,14 @@
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
-use elliptic_curve::sec1::ToEncodedPoint; // encodes our ephemeral public key into the raw bytes the token expects
+use elliptic_curve::sec1::ToSec1Point; // encodes our ephemeral public key into the raw bytes the token expects
 use p256::PublicKey; // the caller's ephemeral public key type
 use sha2::{Digest as ShaDigest, Sha256}; // used for the CKA_ID tag (aliased to avoid clashing with cryptoki's own naming)
 use std::path::{Path, PathBuf}; // module-path validation and PIN-file location
 use std::sync::{Arc, Mutex, PoisonError}; // shared, lock-protected PKCS#11 session, and the process-wide module registry
 use zeroize::Zeroizing; // scrubs the shared secret read off the token as soon as it's no longer needed
 
-use cryptoki::context::{CInitializeArgs, Pkcs11}; // loads the PKCS#11 module and initializes the library
+use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11}; // loads the PKCS#11 module and initializes the library
 use cryptoki::error::{Error as CryptokiError, RvError}; // to recognize the two return codes that mean "already done" rather than failure
 use cryptoki::mechanism::elliptic_curve::{EcKdf, Ecdh1DeriveParams}; // parameters for the CKM_ECDH1_DERIVE mechanism
 use cryptoki::mechanism::Mechanism; // the mechanism enum (EccKeyPairGen, Ecdh1Derive, ...)
@@ -165,19 +165,18 @@ fn load_module(checked: &Path) -> std::result::Result<Pkcs11, String> {
         return Ok(pkcs11.clone()); // a clone shares the one underlying library handle
     }
     let pkcs11 = Pkcs11::new(checked).map_err(|e| format!("could not load module {}: {e}", checked.display()))?;
-    match pkcs11.initialize(CInitializeArgs::OsThreads) {
+    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
         // telling the module we may call it from multiple OS threads
         Ok(()) => {}
         // Something else in this process (the host application, another
         // library) initialized this module already. It is usable as it is,
         // and must never be finalized by code that did not initialize it --
         // which keeping it in the registry guarantees.
-        Err(CryptokiError::Pkcs11(RvError::CryptokiAlreadyInitialized)) => {
+        Err(CryptokiError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {
             log::debug!("hkdfguard: PKCS#11 module {} was already initialized in this process", checked.display());
         }
-        // `pkcs11` drops here. That runs C_Finalize on a module that was
-        // never initialized, which the module answers with
-        // CKR_CRYPTOKI_NOT_INITIALIZED: a no-op.
+        // `pkcs11` drops here, which unloads the module without calling
+        // C_Finalize (cryptoki finalizes only when asked to explicitly).
         Err(e) => return Err(format!("C_Initialize failed: {e}")),
     }
     modules.push((checked.to_path_buf(), pkcs11.clone()));
@@ -386,11 +385,14 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
     // Copy exactly the PIN bytes (no over-allocation, no growth) into the
     // String `AuthPin` takes ownership of, then wipe the file buffer
     // before anything can return -- including the error paths below.
+    // Exact capacity also matters to `AuthPin::from`: it turns the String
+    // into a `Box<str>`, which reallocates -- leaving an unwiped copy of
+    // the PIN behind -- only when there is spare capacity.
     let result = if pin.is_empty() {
         Err(IoError::new(ErrorKind::InvalidData, "PIN file is empty"))
     } else {
         String::from_utf8(pin.to_vec())
-            .map(AuthPin::new)
+            .map(AuthPin::from)
             .map_err(|e| {
                 let mut rejected = e.into_bytes();
                 zeroize::Zeroize::zeroize(&mut rejected); // the non-UTF-8 bytes are still PIN material
@@ -526,11 +528,11 @@ fn open_session() -> Backend<OpenSession> {
     // other call out mid-operation; closing the last session ends the
     // login instead.
     match session.login(UserType::User, Some(&pin)) {
-        Ok(()) | Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn)) => {}
+        Ok(()) | Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
         // The token rejected the configured PIN, or is now locked. One
         // attempt was spent finding that out; none more will be, from this
         // process, until the PIN file changes.
-        Err(CryptokiError::Pkcs11(rv @ (RvError::PinIncorrect | RvError::PinLocked))) => {
+        Err(CryptokiError::Pkcs11(rv @ (RvError::PinIncorrect | RvError::PinLocked), _)) => {
             let reason = format!("the token rejected the configured PIN ({rv:?})");
             latch_pin_login(&pin_path, pin_identity, reason.clone());
             return Backend::Refused(format!(
@@ -571,7 +573,7 @@ impl KekHandle for Pkcs11Handle {
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?; // session setup failed at construction time
 
-        let peer_point_bytes = ephemeral_public_key.to_encoded_point(false).as_bytes().to_vec(); // raw uncompressed point bytes the token expects as CKM_ECDH1_DERIVE's public data
+        let peer_point_bytes = ephemeral_public_key.to_sec1_point(false).as_bytes().to_vec(); // raw uncompressed point bytes the token expects as CKM_ECDH1_DERIVE's public data
 
         let params = Ecdh1DeriveParams::new(EcKdf::null(), &peer_point_bytes); // CKD_NULL: no extra KDF on-token, we do HKDF ourselves afterward
         let derive_template = [
@@ -1019,6 +1021,7 @@ fn parse_ec_point(bytes: &[u8]) -> Result<PublicKey> {
 #[cfg(test)]
 mod tests {
     use super::*; // bring `Pkcs11Provider` etc. into scope
+    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use secrecy::ExposeSecret;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1197,7 +1200,7 @@ mod tests {
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
 
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng); // stand-in "caller" ephemeral key for this test
+        let eph = p256::SecretKey::generate(); // stand-in "caller" ephemeral key for this test
         let eph_pub = eph.public_key();
 
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call: generates the key pair on the token
@@ -1237,7 +1240,7 @@ mod tests {
         let created = provider.load_kek(service, true).unwrap(); // hkdfguard_create_kek's path
         assert!(provider.kek_exists(service).unwrap(), "create must leave a key the token reports");
         let loaded = provider.load_kek(service, false).unwrap(); // hkdfguard_wrap_dek's path
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng).public_key();
+        let eph = p256::SecretKey::generate().public_key();
         assert_eq!(*created.ecdh(&eph).unwrap(), *loaded.ecdh(&eph).unwrap(), "both handles must drive the same key");
         assert_eq!(created.public_key().unwrap(), loaded.public_key().unwrap());
 
@@ -1253,7 +1256,7 @@ mod tests {
         // provider, so overlapping calls finalized the module under each
         // other's open sessions and failed (or crashed the module).
         let service = "com.company.orders";
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng).public_key();
+        let eph = p256::SecretKey::generate().public_key();
         let expected = {
             let setup = Pkcs11Provider::new();
             assert!(setup.probe(), "no PKCS#11 session available");
@@ -1398,7 +1401,7 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| destroy_all_for(open, service));
 
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng).public_key();
+        let eph = p256::SecretKey::generate().public_key();
         provider.load_kek(service, true).unwrap().ecdh(&eph).unwrap(); // generates the pair
 
         with_open(&provider, |open| {
@@ -1438,7 +1441,7 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| destroy_all_for(open, service));
 
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng).public_key();
+        let eph = p256::SecretKey::generate().public_key();
         provider.load_kek(service, true).unwrap().ecdh(&eph).unwrap();
         with_open(&provider, |open| plant_key_pair(open, service, key_id(service)));
 
