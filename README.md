@@ -658,7 +658,7 @@ SUSE's naming policy and runs `ldconfig` from scriptlets:
 
 | Debian, Ubuntu | EL10, Amazon Linux | SUSE | Contents |
 |---|---|---|---|
-| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), README, third-party licenses |
+| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), the example policy `/usr/share/hkdfguard/policy.toml.example`, README, third-party licenses |
 | `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
 | (in `libhkdfguard-dev`) | `hkdfguard-static` | `hkdfguard-devel-static` | `libhkdfguard.a` |
 | `hkdfguard` | `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
@@ -668,7 +668,18 @@ tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
 only ever loaded at run time, from the policy file. The packages install
 no policy file, derivation secret or PIN: those are per-host decisions
 (see "Configuration"), and with no policy file the library uses its
-defaults.
+defaults. To write one, start from the annotated example:
+
+```sh
+install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example \
+    /etc/hkdfguard/policy.toml
+```
+
+Copied unedited, it behaves exactly like no policy file: every setting in
+it is commented out at its default, and a unit test
+(`shipped_example_policy_behaves_like_no_policy`) keeps it that way. It is
+installed under `/usr/share`, not `/usr/share/doc`, so it survives
+container base images that drop documentation.
 
 The version lives in three places -- `Cargo.toml`, `debian/changelog` and
 `packaging/rpm/hkdfguard.spec` (`Version` and `%changelog`) -- and
@@ -1069,6 +1080,7 @@ packaging/
   check-version.sh           Cargo.toml / debian/changelog / spec version agreement
   rpm/hkdfguard.spec         RPM packaging
   hkdfguard.pc.in            pkg-config template
+  policy.toml.example        Annotated policy, installed to /usr/share/hkdfguard
   hkdfguard-v1-initialize.1  Man page
   third-party-licenses.py    License notices of the statically linked crates
 ```

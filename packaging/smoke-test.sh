@@ -57,6 +57,9 @@ section "installed layout"
 [ "$(stat -c '%U:%G %a' /etc/hkdfguard)" = "root:root 755" ] \
     || { echo "/etc/hkdfguard must be root:root 0755" >&2; exit 1; }
 [ ! -e /etc/hkdfguard/policy.toml ] || { echo "packages must not install a policy" >&2; exit 1; }
+example_policy=/usr/share/hkdfguard/policy.toml.example
+[ "$(stat -c '%U:%G %a' "$example_policy")" = "root:root 644" ] \
+    || { echo "$example_policy must be installed, root:root 0644" >&2; exit 1; }
 libdir=$(pkg-config --variable=libdir hkdfguard)
 ls -l "$libdir"/libhkdfguard* "$libdir"/HkdfGuard.Kms.Linux.v1.so
 hkdfguard-v1-initialize --help
@@ -116,5 +119,13 @@ hkdfguard-v1-initialize provision -sn com.company.cli
 # reaches an argument list.
 base64 -w0 < "$work/dek.bin" | hkdfguard-v1-initialize wrap -kf "$work/wrapped.key" -sn com.company.cli --dek-stdin
 "$work/cli_unwrap_check" "$work/wrapped.key" com.company.cli "$work/dek.bin"
+
+section "example policy, copied into place unedited"
+# The documented way to start a policy. Unedited, it must load (a policy
+# the library rejects would fail every call) and change nothing.
+install -m 0644 -o root -g root "$example_policy" /etc/hkdfguard/policy.toml
+"$work/wrap_unwrap"
+"$work/cli_unwrap_check" "$work/wrapped.key" com.company.cli "$work/dek.bin"
+rm /etc/hkdfguard/policy.toml
 
 section "SMOKE TEST PASSED"

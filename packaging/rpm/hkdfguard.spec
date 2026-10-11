@@ -61,7 +61,8 @@ License:        MPL-2.0 AND %{linked_licenses}
 %description -n %{libpkg} %{common_description}
 
 Provider selection is controlled by the root-owned policy file
-/etc/hkdfguard/policy.toml, which this package does not create.
+/etc/hkdfguard/policy.toml, which this package does not create; an
+annotated example is installed as /usr/share/hkdfguard/policy.toml.example.
 
 This package contains the shared library.
 
@@ -116,6 +117,7 @@ sed -e 's|@LIBDIR@|%{_libdir}|' -e 's|@VERSION@|%{version}|' \
 install -D -m 0755 target/release/hkdfguard-v1-initialize %{buildroot}%{_bindir}/hkdfguard-v1-initialize
 install -D -m 0644 packaging/hkdfguard-v1-initialize.1 %{buildroot}%{_mandir}/man1/hkdfguard-v1-initialize.1
 install -d -m 0755 %{buildroot}%{_sysconfdir}/hkdfguard
+install -D -m 0644 packaging/policy.toml.example %{buildroot}%{_datadir}/hkdfguard/policy.toml.example
 
 %check
 cargo test --locked --offline
@@ -137,6 +139,8 @@ cargo test --locked --offline --all-features
 %{_libdir}/libhkdfguard.so.1
 %{_libdir}/HkdfGuard.Kms.Linux.v1.so
 %dir %{_sysconfdir}/hkdfguard
+%dir %{_datadir}/hkdfguard
+%{_datadir}/hkdfguard/policy.toml.example
 
 %files devel
 %{_includedir}/hkdfguard.h

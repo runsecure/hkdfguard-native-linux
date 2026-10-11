@@ -87,6 +87,12 @@ Administrative policy: which providers may be used, and their
 configuration. Optional. When present it must be owned by root and not
 writable by group or others.
 .TP
+.I /usr/share/hkdfguard/policy.toml.example
+Annotated example policy, every setting commented out at its default.
+Copy it to
+.I /etc/hkdfguard/policy.toml
+to start one.
+.TP
 .I /etc/hkdfguard/tpm.derivation\-secret
 Per-host secret mixed into TPM-derived KEKs.
 .TP

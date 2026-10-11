@@ -26,7 +26,8 @@ Description: DEK wrapping under a TPM2, PKCS#11 or external-secret KEK
  HKDF-SHA512 and AES-256-GCM.
  .
  Provider selection is controlled by the root-owned policy file
- /etc/hkdfguard/policy.toml, which this package does not create.
+ /etc/hkdfguard/policy.toml, which this package does not create; an
+ annotated example is installed as /usr/share/hkdfguard/policy.toml.example.
  .
  This package contains the shared library.
 

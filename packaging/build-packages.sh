@@ -72,6 +72,11 @@ for distro in $DISTROS; do
 
         echo
         echo "=== Smoke-testing $distro packages for $platform in a clean $base_image ==="
+        # Docker's classic image store keeps one platform's image per
+        # multi-arch digest: with the other architecture's copy present,
+        # pulling this one fails with "cannot overwrite digest". Drop it so
+        # `docker run` pulls the right one.
+        docker image rm "$base_image" >/dev/null 2>&1 || true
         docker run --rm --platform "$platform" \
             -v "$(pwd)/$out_dir:/packages:ro" \
             -v "$(pwd)/examples:/examples:ro" \

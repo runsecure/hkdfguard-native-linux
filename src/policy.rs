@@ -2114,4 +2114,58 @@ mod tests {
         crate::secure_file::write_world_readable_for_tests(&path, vec![b'#'; MAX_POLICY_FILE_LEN + 1]);
         assert_load_fails_closed(&path, "an oversized policy must be rejected, not truncated");
     }
+
+    // ---- packaging/policy.toml.example ----
+
+    const EXAMPLE_POLICY: &str = include_str!("../packaging/policy.toml.example");
+
+    #[test]
+    fn shipped_example_policy_behaves_like_no_policy() {
+        // The packages install the example for administrators to copy to
+        // /etc/hkdfguard/policy.toml. Copied unedited, it must change
+        // nothing: the same chain as `provider::allowed_types` with no
+        // policy, and every knob at its default.
+        let policy = Policy::from_toml_str(EXAMPLE_POLICY).unwrap();
+        let all = [ProviderType::Tpm2, ProviderType::Pkcs11, ProviderType::ExternalSecret, ProviderType::Ephemeral];
+        assert_eq!(
+            policy.allowed_providers(&all).unwrap(),
+            vec![ProviderType::Tpm2, ProviderType::Pkcs11, ProviderType::ExternalSecret]
+        );
+        assert_eq!(policy.setup_min_delay(), Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
+        assert!(policy.require_tpm_derivation_secret());
+        assert!(!policy.require_tpm_pinned_names());
+        assert!(policy.pinned_tpm_name("com.company.orders").is_none());
+        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Auto);
+        assert!(policy.pinned_session_salt_key_name().is_none());
+        assert!(policy.tpm_tcti().is_none());
+        assert!(policy.tpm_derivation_secret_file().is_none());
+        assert!(policy.tpm_owner_auth_file().is_none());
+        assert!(policy.external_secret_dir().is_none());
+        assert_eq!(policy.pkcs11(), &Pkcs11Settings::default());
+    }
+
+    #[test]
+    fn every_commented_setting_in_the_example_is_a_real_one() {
+        // Uncommenting any one `#key = value` line must give a key the
+        // schema knows, in the table it sits under. Placeholders (TPM
+        // Names) and mode-specific keys (provider, level) may still fail
+        // validation; an unknown field is the one failure that means the
+        // example is wrong.
+        let lines: Vec<&str> = EXAMPLE_POLICY.lines().collect();
+        let mut checked = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let Some(setting) = line.strip_prefix('#') else { continue };
+            let starts_like_a_key = setting.starts_with(|c: char| c.is_ascii_lowercase() || c == '"');
+            if !starts_like_a_key || !setting.contains(" = ") {
+                continue;
+            }
+            let mut edited = lines.clone();
+            edited[i] = setting;
+            if let Err(e) = Policy::from_toml_str(&edited.join("\n")) {
+                assert!(!e.to_string().contains("unknown field"), "example line {}: `{setting}`: {e}", i + 1);
+            }
+            checked += 1;
+        }
+        assert!(checked >= 18, "only {checked} commented settings found; did the example's format change?");
+    }
 }

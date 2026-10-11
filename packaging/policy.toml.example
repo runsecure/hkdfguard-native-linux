@@ -1,0 +1,105 @@
+# Example HKDFGuard policy. Installed by the packages as
+# /usr/share/hkdfguard/policy.toml.example; nothing reads it there.
+#
+# To use it:
+#   install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example \
+#       /etc/hkdfguard/policy.toml
+# then edit /etc/hkdfguard/policy.toml.
+#
+# As shipped -- every setting below commented out -- this file behaves
+# exactly like having no policy file at all: providers are tried in the
+# order tpm2, pkcs11, external-secret, and ephemeral is never used. Each
+# commented line shows its default, or a placeholder where there is none;
+# uncomment and change only what you need. See "Policy file reference" in
+# the README (/usr/share/doc/libhkdfguard1/README.md on Debian and Ubuntu)
+# for every setting.
+#
+# The policy must be owned by root and not writable by group or others, and
+# so must /etc/hkdfguard and every directory above it. A file that exists
+# but is wrongly owned, too broadly writable or malformed makes every
+# operation fail closed; only a missing file means "no policy". Unknown
+# keys are rejected, so a typo fails loudly rather than being ignored.
+#
+# The library re-reads this file on every call: changes take effect
+# without restarting the service.
+
+# Which providers may be used, and in what order, under mode = "prefer".
+# A provider left out of the list is never used. This is also the only way
+# to allow ephemeral (keys held in process memory, lost on restart): name
+# it here. Must stay above the first [table] header, or the file is
+# rejected.
+#preferred_order = ["tpm2", "pkcs11", "external-secret"]
+
+[selection]
+# How a provider is chosen. The one required setting.
+#   "prefer"         try preferred_order (or the default order) in turn;
+#                    the first one available wins
+#   "require"        only `provider`, never a fallback
+#   "require-level"  any provider at `level` or above
+mode = "prefer"
+#provider = "tpm2"           # with "require": tpm2 | pkcs11 | external-secret | ephemeral
+#level = "hardware"          # with "require-level": ephemeral | software | external | hardware
+
+[key_requirements]
+# Exclude every provider below this tier, whatever the mode:
+#   ephemeral < software < external (secret files) < hardware (tpm2, pkcs11)
+#minimum_protection = "external"
+
+[startup_behavior]
+# Floor on the duration of hkdfguard_create_kek and hkdfguard_kek_exists,
+# in milliseconds, to limit how fast a caller can drive the TPM or HSM.
+# 0 disables it; at most 60000.
+#setup_min_delay_ms = 1000
+
+[tpm]
+# Which TPM: device:<path> | tabrmd:<conf>. mssim:<conf> and swtpm:<conf>
+# are for test harnesses only.
+#tcti = "device:/dev/tpmrm0"
+
+# Host secret mixed into every TPM-derived KEK. Without it, any process
+# that can open the TPM can re-derive every key. The TPM provider refuses
+# to run without the file unless require_derivation_secret = false.
+# Root-owned, mode 0400 (or 0440 with the service's group). Create it
+# before pinning any names below: it changes every derived Name.
+#   ( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )
+#require_derivation_secret = true
+#derivation_secret_file = "/etc/hkdfguard/tpm.derivation-secret"
+
+# File holding the Owner hierarchy's password, if you set one. Unset: an
+# empty password. Same ownership rules as the derivation secret.
+#owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
+
+# true: only services listed in [tpm.pinned_names] have a KEK on the TPM.
+# `hkdfguard-v1-initialize provision -sn <service>` then prints the exact
+# entry to add for a service that isn't listed yet.
+#require_pinned_names = false
+
+# Encrypt the ECDH shared secret on the TPM bus: "auto" | "required" | "off".
+# "auto" skips encryption only for TPMs known to have no external bus
+# (firmware TPMs). "required" needs pinned_session_salt_key_name.
+#session_encryption = "auto"
+#pinned_session_salt_key_name = "000b<64 hex chars>"
+
+[tpm.pinned_names]
+# The TPM Name each service's key must have; any other key is refused.
+# Quote the service names: unquoted dots would make nested tables.
+#"com.company.orders" = "000b<64 hex chars>"
+
+[external_secret]
+# Directory holding one KEK file per service, named after the service.
+# When set, the only place looked. Unset: the first of these that exists:
+#   /var/run/secrets/hkdfguard, /run/secrets/hkdfguard,
+#   /vault/secrets/hkdfguard, /mnt/secrets-store/hkdfguard
+#dir = "/run/secrets/hkdfguard"
+
+[pkcs11]
+# PKCS#11 is used only when `module` is set: there is no default module.
+# The module and every directory above it must be root-owned and not
+# writable by group or others.
+#module = "/usr/lib/vendor/libhsm-pkcs11.so"
+# User PIN file: root-owned, mode 0400 (or 0440 with the service's group).
+#pin_file = "/etc/hkdfguard/pkcs11.pin"
+# Choose the token by label and/or serial; exactly one token must match.
+# With neither, exactly one initialized token must be present.
+#token_label = "hkdfguard-prod"
+#token_serial = "0123456789abcdef"
