@@ -508,15 +508,47 @@ same image, they need glibc 2.39 or newer: Ubuntu 24.04+, Debian 13, RHEL
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
 | `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.6.2 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against hashed per-payload points accepted |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs: **Intel PTT** and **AMD fTPM** |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs, **Intel PTT** and **AMD fTPM**, and against a virtual TPM, **Hyper-V's vTPM** (`MSFT`), in Ubuntu 24.04 (tpm2-tss 4.0.1) and AlmaLinux 10 (tpm2-tss 4.1.3, SELinux enforcing) guests |
 
-The TPM provider has been verified against `swtpm` and against two real
-firmware TPMs, Intel PTT and AMD fTPM. It has **not** been exercised
-against a discrete TPM chip (e.g. Infineon or Nuvoton) or against a
-hardware HSM/YubiHSM -- the PKCS#11 provider has only ever been run
-against SoftHSM2. `scripts/native-tpm-test.sh` (next section) exists
-precisely so you can run the same matrix on your own hardware, including
-a discrete chip, before depending on it.
+The TPM provider has been verified against `swtpm`, against two real
+firmware TPMs, Intel PTT and AMD fTPM, and against Hyper-V's virtual TPM.
+It has **not** been exercised against a discrete TPM chip (e.g. Infineon
+or Nuvoton), against other hypervisors' vTPMs (VMware, Google Cloud,
+AWS NitroTPM), or against a hardware HSM/YubiHSM -- the PKCS#11 provider
+has only ever been run against SoftHSM2. `scripts/native-tpm-test.sh`
+(next section) exists precisely so you can run the same matrix on your
+own hardware, including a discrete chip, before depending on it.
+
+On the Hyper-V vTPM the *packages* were verified too, not just the test
+builds: the Ubuntu 24.04 `.deb`s and the EL10 `.rpm`s from
+`packaging/build-packages.sh` (see "Packages"), installed and configured
+only through a root-owned `/etc/hkdfguard/policy.toml` that requires the
+TPM, with a `0440` derivation secret, and run as an unprivileged service
+account in the `tss` group. `hkdfguard-v1-initialize provision` and
+`wrap` followed by an unwrap through the installed library succeeded; a
+group-writable policy, a world-readable derivation secret, `TSS2_LOG` at
+`debug`, and the service losing access to `/dev/tpmrm0` were each refused
+(`-4`), with no fallback to another provider; an unwrap under the wrong
+service was refused (`-16`); and a DEK wrapped before a guest reboot
+unwrapped after it.
+
+> **Dictionary-attack lockout on Hyper-V vTPMs.** A new Hyper-V vTPM
+> allows only **3** failed authorizations, forgives one every **1000 s**,
+> and has no lockout password. One test guest came up already in lockout,
+> before any hkdfguard code had run, and every `TPM2_ECDH_ZGen`, so every
+> wrap and unwrap, failed until it was cleared with
+> `tpm2_dictionarylockout --clear-lockout`. The most likely cause is
+> Hyper-V's **Reset**, used several times on that guest during
+> installation: it restarts the vTPM without an orderly shutdown, which a
+> TPM counts as a failed authorization. (Not proven; a **Turn Off**, by
+> contrast, was tested and left the counter at 0, the vTPM reporting an
+> orderly shutdown.) hkdfguard itself left the counter at 0 through the
+> whole suite, including its deliberately failing cases. On Hyper-V
+> guests, restart from inside the guest rather than with Reset, raise the
+> lockout parameters to suit the host
+> (`tpm2_dictionarylockout --setup-parameters`), and set a lockout
+> password as described under "Protect the hierarchy" -- without one, any
+> `tss`-group user can clear the lockout, as was done here.
 
 Run the ignored hardware/module tests yourself once you have the real backend:
 
@@ -529,7 +561,8 @@ cargo test --features pkcs11 -- --ignored   # needs SoftHSM2 or another PKCS#11 
 
 Docker proves the code against `swtpm`. This repo's maintainers have run
 the scripts below to completion, including reboot persistence, on real
-**Intel PTT** and **AMD fTPM** firmware TPMs. A **discrete** TPM (e.g.
+**Intel PTT** and **AMD fTPM** firmware TPMs, and on **Hyper-V's vTPM**
+in Ubuntu 24.04 and AlmaLinux 10 guests. A **discrete** TPM (e.g.
 Infineon, Nuvoton) has not yet been tested -- the code path exists (see
 the known limitation on parameter encryption below) but is unverified
 against real discrete hardware. To prove it against the hardware you
@@ -610,8 +643,10 @@ It runs the default and all-features test suites, then installs into a
 clean container of that distribution, where
 [`packaging/smoke-test.sh`](packaging/smoke-test.sh) exercises it. The base
 images are pinned by digest in one table in `build-packages.sh`. CI does
-the same in the `packages` job and attaches the packages to tagged
-releases.
+the same in the `packages` job of
+[`.github/workflows/build.yml`](.github/workflows/build.yml), one job per
+distribution and architecture, each on a native runner; tagged releases
+publish what it builds (see "Releases and verifying downloads").
 
 Every target ships tpm2-tss 4.x. Debian 12, RHEL 9 and SLES 15 / Leap 15.6
 ship tpm2-tss 3.x and Amazon Linux 2 older still, so none of them is a
@@ -625,7 +660,7 @@ SUSE's naming policy and runs `ldconfig` from scriptlets:
 
 | Debian, Ubuntu | EL10, Amazon Linux | SUSE | Contents |
 |---|---|---|---|
-| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), README, third-party licenses |
+| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), the example policy `/usr/share/hkdfguard/policy.toml.example`, README, third-party licenses |
 | `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
 | (in `libhkdfguard-dev`) | `hkdfguard-static` | `hkdfguard-devel-static` | `libhkdfguard.a` |
 | `hkdfguard` | `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
@@ -635,7 +670,18 @@ tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
 only ever loaded at run time, from the policy file. The packages install
 no policy file, derivation secret or PIN: those are per-host decisions
 (see "Configuration"), and with no policy file the library uses its
-defaults.
+defaults. To write one, start from the annotated example:
+
+```sh
+install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example \
+    /etc/hkdfguard/policy.toml
+```
+
+Copied unedited, it behaves exactly like no policy file: every setting in
+it is commented out at its default, and a unit test
+(`shipped_example_policy_behaves_like_no_policy`) keeps it that way. It is
+installed under `/usr/share`, not `/usr/share/doc`, so it survives
+container base images that drop documentation.
 
 The version lives in three places -- `Cargo.toml`, `debian/changelog` and
 `packaging/rpm/hkdfguard.spec` (`Version` and `%changelog`) -- and
@@ -644,6 +690,75 @@ package build, and any release tag, where they disagree. The library's
 SONAME major (`.1`, in `build.rs`) is separate: it changes only with an
 incompatible C ABI change, together with the Debian package name
 `libhkdfguard1`.
+
+## Continuous integration
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on every
+push to `main` and `develop` and on every pull request:
+
+| Job | What it runs |
+|---|---|
+| `lint` | `packaging/check-version.sh`; `cargo clippy --all-targets --all-features -- -D warnings` |
+| `deny` | `cargo deny check advisories bans sources` ([`deny.toml`](deny.toml)) |
+| `test` | `docker/run-tests.sh` -- the full matrix against swtpm and SoftHSM2 -- on amd64 and arm64 |
+| `packages` | `packaging/build-packages.sh` for each distribution and architecture: build, both test suites, lintian, clean-container smoke test |
+| `binaries` | `docker/build-dist.sh` for each architecture |
+
+Each architecture runs on its own native runner (`ubuntu-24.04`,
+`ubuntu-24.04-arm`), not under QEMU. Every third-party action is pinned
+to a commit SHA, and Dependabot ([`.github/dependabot.yml`](.github/dependabot.yml))
+proposes updates to those pins weekly.
+
+## Releases and verifying downloads
+
+Pushing a tag `v<version>` runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml): the
+whole build workflow above, then a `publish` job that
+
+1. fails unless the tag names the version in `Cargo.toml`,
+   `debian/changelog` and the RPM spec (`packaging/check-version.sh`);
+2. assembles the release assets
+   ([`packaging/release-assets.sh`](packaging/release-assets.sh)):
+   - `hkdfguard-<version>-<distro>-<arch>.tar.gz` -- one target's `.deb`
+     or `.rpm` packages;
+   - `hkdfguard-<version>-linux-<arch>.tar.gz` -- the standalone library
+     (`lib/`, with the `libhkdfguard.so.1` and `HkdfGuard.Kms.Linux.v1.so`
+     names), CLI (`bin/`), header (`include/`), `LICENSE` and
+     `THIRD-PARTY-LICENSES.txt`;
+   - `SHA256SUMS`;
+3. signs a [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance)
+   attestation for every asset, **and for every package and binary inside
+   the tarballs**, with a short-lived Sigstore certificate issued to this
+   repository's release workflow (the public-good Sigstore instance; the
+   signature is recorded in its public transparency log, Rekor);
+4. opens a **draft** GitHub release with the assets and the attestation's
+   Sigstore bundle (`hkdfguard-<version>.sigstore.json`). A maintainer
+   reviews and publishes it.
+
+The `publish` job runs in a GitHub environment named `release`. Before
+the first release, create it under Settings -> Environments with required
+reviewers and a deployment rule allowing only `v*` tags, and protect `v*`
+tags with a tag ruleset so only maintainers can create them.
+
+To verify a download -- a release tarball, or a `.deb`, `.rpm` or binary
+taken out of one -- with the [GitHub CLI](https://cli.github.com/):
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify hkdfguard_0.1.0-1_amd64.deb \
+    --repo runsecure/hkdfguard-native-linux \
+    --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
+```
+
+Without network access to GitHub, pass the bundle from the release:
+`--bundle hkdfguard-<version>.sigstore.json`. A successful verification
+proves the file was built by this repository's release workflow, from the
+commit and tag the attestation names; it says nothing about whether that
+code is correct.
+
+The attestations prove provenance; they do not make the packages
+installable from a signed apt, dnf or zypper repository. Those check GPG
+signatures on repository metadata, which these releases do not provide.
 
 ## External-secret file requirements
 
@@ -1028,14 +1143,20 @@ docker/                      Dockerfile + entrypoint running the full matrix
                               against swtpm and SoftHSM2 (run-tests.sh)
 build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1)
 debian/                      Debian packaging (dpkg-buildpackage)
+.github/
+  workflows/build.yml        CI: lint, cargo deny, test matrix, packages, binaries
+  workflows/release.yml      v* tags: build, attest (Sigstore), draft release
+  dependabot.yml             Weekly updates to the pinned action SHAs
 packaging/
   build-packages.sh          Builds and smoke-tests the .deb and .rpm packages
   Dockerfile.debian, .dnf, .suse   Package build images (apt, dnf, zypper targets)
   build-deb.sh, build-rpm.sh In-container package builds
   smoke-test.sh              Installs packages into a clean container and uses them
+  release-assets.sh          Release tarballs, SHA256SUMS and attestation subjects from CI artifacts
   check-version.sh           Cargo.toml / debian/changelog / spec version agreement
   rpm/hkdfguard.spec         RPM packaging
   hkdfguard.pc.in            pkg-config template
+  policy.toml.example        Annotated policy, installed to /usr/share/hkdfguard
   hkdfguard-v1-initialize.1  Man page
   third-party-licenses.py    License notices of the statically linked crates
 ```

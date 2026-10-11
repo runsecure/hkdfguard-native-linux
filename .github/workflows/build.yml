@@ -1,0 +1,114 @@
+# Continuous integration: lint and supply-chain checks, the full Docker test
+# matrix (swtpm, SoftHSM2) on both architectures, and every package and
+# standalone binary build. release.yml runs this same workflow for a tag and
+# publishes what it builds.
+#
+# Each architecture builds on its own native runner, not under QEMU.
+# Third-party actions are pinned to commit SHAs (Dependabot keeps them
+# current: .github/dependabot.yml).
+name: build
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: clippy + version check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install tpm2-tss headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libtss2-dev
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - run: packaging/check-version.sh
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # deny.toml: advisories, yanked crates, duplicate versions and
+      # non-crates.io sources. Licenses are not checked yet.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          command-arguments: advisories bans sources
+
+  test:
+    name: test matrix (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker/run-tests.sh
+
+  packages:
+    name: packages (${{ matrix.distro }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in step with the target table in packaging/build-packages.sh.
+        distro: [debian, ubuntu24.04, el10, al2023, sles16]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build, test and smoke-test the packages
+        run: packaging/build-packages.sh
+        env:
+          DISTROS: ${{ matrix.distro }}
+          ARCHES: ${{ matrix.arch }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages-${{ matrix.distro }}-${{ matrix.arch }}
+          path: dist/packages/${{ matrix.distro }}-${{ matrix.arch }}/
+          if-no-files-found: error
+
+  binaries:
+    name: standalone binaries (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker/build-dist.sh
+        env:
+          PLATFORMS: linux/${{ matrix.arch }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: dist/linux-${{ matrix.arch }}/
+          if-no-files-found: error
