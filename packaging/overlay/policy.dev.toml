@@ -1,0 +1,25 @@
+# HKDFGuard DEVELOPMENT policy, installed by the overlay-dev image. Not for
+# production: it allows EPHEMERAL keys, which live only in process memory --
+# every DEK wrapped under one is lost when the process exits.
+#
+# Order of use:
+#   1. SoftHSM2 (PKCS#11), when /etc/hkdfguard/pkcs11.pin exists. Install
+#      softhsm2, initialize a token labelled "hkdfguard", and write its user
+#      PIN to that file (root-owned, mode 0400; or 0440 with the service's
+#      group). Once the PIN file exists, a problem with the module or token
+#      fails every call instead of falling back to ephemeral.
+#   2. Ephemeral, when there is no PIN file.
+#
+# SoftHSM2 is a software token: its keys are files in its token directory
+# (/var/lib/softhsm/tokens by default), so mount that directory on a volume
+# for them to survive the container.
+
+preferred_order = ["pkcs11", "ephemeral"]
+
+[selection]
+mode = "prefer"
+
+[pkcs11]
+module = "/usr/lib/softhsm/libsofthsm2.so"   # Debian/Ubuntu softhsm2 package
+pin_file = "/etc/hkdfguard/pkcs11.pin"
+token_label = "hkdfguard"

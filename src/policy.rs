@@ -2145,6 +2145,19 @@ mod tests {
     }
 
     #[test]
+    fn overlay_dev_policy_prefers_softhsm_then_ephemeral() {
+        // packaging/overlay/policy.dev.toml, which the overlay-dev image
+        // installs as /etc/hkdfguard/policy.toml.
+        let policy = Policy::from_toml_str(include_str!("../packaging/overlay/policy.dev.toml")).unwrap();
+        let all = [ProviderType::Tpm2, ProviderType::Pkcs11, ProviderType::ExternalSecret, ProviderType::Ephemeral];
+        assert_eq!(policy.allowed_providers(&all).unwrap(), vec![ProviderType::Pkcs11, ProviderType::Ephemeral]);
+        let pkcs11 = policy.pkcs11();
+        assert_eq!(pkcs11.module.as_deref(), Some(std::path::Path::new("/usr/lib/softhsm/libsofthsm2.so")));
+        assert_eq!(pkcs11.pin_file.as_deref(), Some(std::path::Path::new("/etc/hkdfguard/pkcs11.pin")));
+        assert_eq!(pkcs11.token_label.as_deref(), Some("hkdfguard"));
+    }
+
+    #[test]
     fn every_commented_setting_in_the_example_is_a_real_one() {
         // Uncommenting any one `#key = value` line must give a key the
         // schema knows, in the table it sits under. Placeholders (TPM
