@@ -37,16 +37,16 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 # because they require system libraries (tpm2-tss / a PKCS#11 module) that
 # are not present on every build host. See README.md "Provider build matrix".
 tss-esapi = { version = "7", optional = true }
-cryptoki = { version = "0.6", optional = true }
+cryptoki = { version = "0.12.1", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
 tempfile = "3"
 serial_test = "3"
-# Only to call `ExposeSecret` on cryptoki's `AuthPin` (a secrecy 0.8
+# Only to call `ExposeSecret` on cryptoki's `AuthPin` (a secrecy 0.10
 # `SecretString`) in the PKCS#11 PIN-file tests; same version cryptoki
 # itself already pulls in, so this adds no new crate to the build.
-secrecy = "0.8"
+secrecy = "0.10"
 # Test builds only: lets the policy test helper (`policy::test_support`)
 # write a complete policy file -- a test's own settings layered over the
 # harness's -- rather than a fragment. Cargo enables dev-dependency
