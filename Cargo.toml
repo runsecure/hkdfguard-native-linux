@@ -24,7 +24,6 @@ aes-gcm = "0.11"
 getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
-thiserror = "1"
 libc = "0.2"
 # Used only by the src/bin/hkdfguard-v1-initialize CLI tool, to decode its
 # --dek argument; already pulled in transitively by other dependencies, so
@@ -44,7 +43,7 @@ cryptoki = { version = "0.12.1", optional = true }
 [dev-dependencies]
 env_logger = "0.11"
 tempfile = "3"
-serial_test = "3"
+serial_test = "4"
 # Only to call `ExposeSecret` on cryptoki's `AuthPin` (a secrecy 0.10
 # `SecretString`) in the PKCS#11 PIN-file tests; same version cryptoki
 # itself already pulls in, so this adds no new crate to the build.
