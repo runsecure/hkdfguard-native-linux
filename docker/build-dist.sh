@@ -17,10 +17,12 @@
 # failure -- so nothing is left behind on the host beyond this run.
 #
 # Usage: docker/build-dist.sh
+#   PLATFORMS=linux/arm64 docker/build-dist.sh   (one platform; CI builds
+#                                                each on a native runner)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PLATFORMS=(linux/amd64 linux/arm64)
+read -r -a PLATFORMS <<< "${PLATFORMS:-linux/amd64 linux/arm64}"
 
 BUILT_TAGS=()
 cleanup() {

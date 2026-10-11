@@ -643,8 +643,10 @@ It runs the default and all-features test suites, then installs into a
 clean container of that distribution, where
 [`packaging/smoke-test.sh`](packaging/smoke-test.sh) exercises it. The base
 images are pinned by digest in one table in `build-packages.sh`. CI does
-the same in the `packages` job and attaches the packages to tagged
-releases.
+the same in the `packages` job of
+[`.github/workflows/build.yml`](.github/workflows/build.yml), one job per
+distribution and architecture, each on a native runner; tagged releases
+publish what it builds (see "Releases and verifying downloads").
 
 Every target ships tpm2-tss 4.x. Debian 12, RHEL 9 and SLES 15 / Leap 15.6
 ship tpm2-tss 3.x and Amazon Linux 2 older still, so none of them is a
@@ -688,6 +690,75 @@ package build, and any release tag, where they disagree. The library's
 SONAME major (`.1`, in `build.rs`) is separate: it changes only with an
 incompatible C ABI change, together with the Debian package name
 `libhkdfguard1`.
+
+## Continuous integration
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on every
+push to `main` and `develop` and on every pull request:
+
+| Job | What it runs |
+|---|---|
+| `lint` | `packaging/check-version.sh`; `cargo clippy --all-targets --all-features -- -D warnings` |
+| `deny` | `cargo deny check advisories bans sources` ([`deny.toml`](deny.toml)) |
+| `test` | `docker/run-tests.sh` -- the full matrix against swtpm and SoftHSM2 -- on amd64 and arm64 |
+| `packages` | `packaging/build-packages.sh` for each distribution and architecture: build, both test suites, lintian, clean-container smoke test |
+| `binaries` | `docker/build-dist.sh` for each architecture |
+
+Each architecture runs on its own native runner (`ubuntu-24.04`,
+`ubuntu-24.04-arm`), not under QEMU. Every third-party action is pinned
+to a commit SHA, and Dependabot ([`.github/dependabot.yml`](.github/dependabot.yml))
+proposes updates to those pins weekly.
+
+## Releases and verifying downloads
+
+Pushing a tag `v<version>` runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml): the
+whole build workflow above, then a `publish` job that
+
+1. fails unless the tag names the version in `Cargo.toml`,
+   `debian/changelog` and the RPM spec (`packaging/check-version.sh`);
+2. assembles the release assets
+   ([`packaging/release-assets.sh`](packaging/release-assets.sh)):
+   - `hkdfguard-<version>-<distro>-<arch>.tar.gz` -- one target's `.deb`
+     or `.rpm` packages;
+   - `hkdfguard-<version>-linux-<arch>.tar.gz` -- the standalone library
+     (`lib/`, with the `libhkdfguard.so.1` and `HkdfGuard.Kms.Linux.v1.so`
+     names), CLI (`bin/`), header (`include/`), `LICENSE` and
+     `THIRD-PARTY-LICENSES.txt`;
+   - `SHA256SUMS`;
+3. signs a [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance)
+   attestation for every asset, **and for every package and binary inside
+   the tarballs**, with a short-lived Sigstore certificate issued to this
+   repository's release workflow (the public-good Sigstore instance; the
+   signature is recorded in its public transparency log, Rekor);
+4. opens a **draft** GitHub release with the assets and the attestation's
+   Sigstore bundle (`hkdfguard-<version>.sigstore.json`). A maintainer
+   reviews and publishes it.
+
+The `publish` job runs in a GitHub environment named `release`. Before
+the first release, create it under Settings -> Environments with required
+reviewers and a deployment rule allowing only `v*` tags, and protect `v*`
+tags with a tag ruleset so only maintainers can create them.
+
+To verify a download -- a release tarball, or a `.deb`, `.rpm` or binary
+taken out of one -- with the [GitHub CLI](https://cli.github.com/):
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify hkdfguard_0.1.0-1_amd64.deb \
+    --repo runsecure/hkdfguard-native-linux \
+    --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
+```
+
+Without network access to GitHub, pass the bundle from the release:
+`--bundle hkdfguard-<version>.sigstore.json`. A successful verification
+proves the file was built by this repository's release workflow, from the
+commit and tag the attestation names; it says nothing about whether that
+code is correct.
+
+The attestations prove provenance; they do not make the packages
+installable from a signed apt, dnf or zypper repository. Those check GPG
+signatures on repository metadata, which these releases do not provide.
 
 ## External-secret file requirements
 
@@ -1072,11 +1143,16 @@ docker/                      Dockerfile + entrypoint running the full matrix
                               against swtpm and SoftHSM2 (run-tests.sh)
 build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1)
 debian/                      Debian packaging (dpkg-buildpackage)
+.github/
+  workflows/build.yml        CI: lint, cargo deny, test matrix, packages, binaries
+  workflows/release.yml      v* tags: build, attest (Sigstore), draft release
+  dependabot.yml             Weekly updates to the pinned action SHAs
 packaging/
   build-packages.sh          Builds and smoke-tests the .deb and .rpm packages
   Dockerfile.debian, .dnf, .suse   Package build images (apt, dnf, zypper targets)
   build-deb.sh, build-rpm.sh In-container package builds
   smoke-test.sh              Installs packages into a clean container and uses them
+  release-assets.sh          Release tarballs, SHA256SUMS and attestation subjects from CI artifacts
   check-version.sh           Cargo.toml / debian/changelog / spec version agreement
   rpm/hkdfguard.spec         RPM packaging
   hkdfguard.pc.in            pkg-config template

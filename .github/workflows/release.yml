@@ -1,0 +1,74 @@
+# Release: for a v* tag, runs the whole build workflow, assembles its
+# artifacts into release assets (packaging/release-assets.sh), attests
+# their build provenance with Sigstore, and opens a draft GitHub release
+# holding them. Publishing the draft is a maintainer's decision.
+#
+# Attestations are signed through the public-good Sigstore instance (this
+# repository is public) and recorded in its transparency log. Verify a
+# download with:
+#   gh attestation verify <file> --repo runsecure/hkdfguard-native-linux
+#
+# The publish job runs in the `release` environment: give it required
+# reviewers and restrict it to v* tags in the repository settings.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write     # create the draft release
+      id-token: write     # OIDC token for the Sigstore signing certificate
+      attestations: write # store the attestation with the repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag matches Cargo.toml, debian/changelog and the RPM spec
+        run: packaging/check-version.sh "$GITHUB_REF_NAME"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release/artifacts
+
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+
+      - name: Assemble release assets
+        run: |
+          cargo fetch --locked
+          packaging/release-assets.sh release/artifacts release/assets
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release/attestation-subjects.txt
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          # The Sigstore bundle, for verifying without the GitHub API:
+          #   gh attestation verify <file> --bundle hkdfguard-<version>.sigstore.json --repo <owner>/<repo>
+          cp "$BUNDLE" "release/assets/hkdfguard-$version.sigstore.json"
+          prerelease=()
+          case "$version" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" release/assets/* \
+            --draft --verify-tag "${prerelease[@]}" \
+            --title "HKDFGuard $version" --generate-notes
