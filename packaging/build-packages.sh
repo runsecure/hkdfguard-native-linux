@@ -26,9 +26,9 @@ cd "$(dirname "$0")/.."
 # Ubuntu pin is the one docker/Dockerfile builds the release binaries on.
 target() {
     case "$1" in
-        debian)      echo "packaging/Dockerfile.debian debian:13@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c" ;;
-        ubuntu24.04) echo "packaging/Dockerfile.debian ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3" ;;
-        el10)        echo "packaging/Dockerfile.dnf almalinux:10@sha256:957738702313e6ee452cdb17bc1431542c467be9a4e2f4da3b8e551b0ebb9677" ;;
+        debian)      echo "packaging/Dockerfile.debian debian:13@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5" ;;
+        ubuntu24.04) echo "packaging/Dockerfile.debian ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55" ;;
+        el10)        echo "packaging/Dockerfile.dnf almalinux:10@sha256:838c2fafefb1a8a0d7f8cdbc3b0551c2a2b1eb0cd87aad6d62aecadb18311f1b" ;;
         al2023)      echo "packaging/Dockerfile.dnf amazonlinux:2023@sha256:8ed3c0a996841537f75607e7d1de2114d8150391f75792e8da9268738547e73f" ;;
         sles16)      echo "packaging/Dockerfile.suse registry.suse.com/bci/bci-base:16.0@sha256:23e3d679d07fe982d1e306bb2536ef7279aa82f7d296ed3f990f5c55c53f1878" ;;
         *) return 1 ;;

@@ -2,6 +2,6 @@
 # whatever "stable" is on the day. Bump deliberately, together with
 # --default-toolchain in docker/Dockerfile and packaging/Dockerfile.*.
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.0"
 profile = "minimal"
 components = ["clippy"]

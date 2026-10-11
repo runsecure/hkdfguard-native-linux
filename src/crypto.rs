@@ -60,7 +60,7 @@
 //!
 //! Memory note: the DEK plaintext is kept in stack-allocated `[u8; DEK_LEN]`
 //! buffers for the *entire* wrap/unwrap operation -- we deliberately use
-//! `AeadInPlace::{encrypt,decrypt}_in_place_detached` instead of the more
+//! `AeadInOut::{encrypt,decrypt}_inout_detached` (in place) instead of the more
 //! convenient `Aead::{encrypt,decrypt}`, because the latter allocates a
 //! heap `Vec<u8>` internally and, on the decrypt side, that `Vec` would
 //! momentarily hold the *decrypted plaintext DEK* on the heap before we
@@ -70,11 +70,10 @@
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::payload::{Payload, FINGERPRINT_LEN, NONCE_LEN, SALT_LEN}; // wire-format struct + its fixed field sizes
 use crate::provider; // provider selection functions (`select_existing`, `get_by_type`)
-use aes_gcm::{AeadInPlace, Aes256Gcm, Key, KeyInit, Nonce, Tag}; // in-place AEAD trait, concrete cipher, and its key/nonce/tag types (all fixed-size, stack-resident)
-use elliptic_curve::sec1::ToEncodedPoint; // lets us serialize the ephemeral public key to SEC1 bytes
+use aes_gcm::{AeadInOut, Aes256Gcm, Key, KeyInit, Nonce, Tag}; // in-place AEAD trait, concrete cipher, and its key/nonce/tag types (all fixed-size, stack-resident)
+use elliptic_curve::sec1::ToSec1Point; // lets us serialize the KEK public key to SEC1 bytes
 use hkdf::Hkdf; // HKDF-SHA512 key derivation
 use p256::PublicKey; // P-256 public key type
-use rand_core::{OsRng, RngCore}; // OS RNG + the trait providing `fill_bytes`
 use sha2::{Digest, Sha256, Sha512}; // `Sha256` for the KEK fingerprint, `Sha512` for HKDF, `Digest` for `Sha256::digest`
 use zeroize::{Zeroize, Zeroizing}; // `Zeroize` for explicit scrubbing of stack arrays, `Zeroizing` for auto-scrubbing owned buffers
 
@@ -156,24 +155,21 @@ pub const MIN_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN;
 /// name. Mirrored as `HKDFGUARD_WRAPPED_MAX_LEN` in `include/hkdfguard.h`.
 pub const MAX_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN + MAX_KEY_ID_LEN;
 
-/// Finalizes a SHA-256 hash of secret input into a zeroizing buffer, then
-/// scrubs the hasher.
+/// Finalizes a SHA-256 hash of secret input into a zeroizing buffer, and
+/// consumes the hasher so it is wiped at once.
 ///
-/// `sha2` 0.10 offers no zeroization of its own. A finalized hasher still
-/// holds the unprocessed tail of the input (up to 63 bytes, e.g. the end of
-/// a derivation secret) in its block buffer, and resetting only rewinds the
-/// cursor. So: finalize-and-reset (the chaining value goes back to the
-/// public IV), then feed 63 zero bytes, which overwrite every buffer
-/// position that can hold input -- padding has already overwritten the
-/// last one. `black_box` keeps the compiler from discarding those writes as
-/// dead stores. Best effort: the compression function's own stack
-/// temporaries are out of reach, as for every other stack copy here.
+/// A hasher holds the unprocessed tail of its input (up to 63 bytes, e.g.
+/// the end of a derivation secret) in its block buffer, plus the chaining
+/// state. With `sha2`'s `zeroize` feature (Cargo.toml) both are wiped when
+/// the hasher drops, which here is the end of this function; the digest is
+/// written straight into the zeroizing output, with no other copy. Best
+/// effort: the compression function's own stack temporaries are out of
+/// reach, as for every other stack copy here.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))] // the TPM provider is the caller that hashes secrets
-pub(crate) fn finalize_sha256_wiping(hasher: &mut Sha256) -> Zeroizing<[u8; 32]> {
+pub(crate) fn finalize_sha256_wiping(hasher: Sha256) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
-    Digest::finalize_into_reset(hasher, sha2::digest::generic_array::GenericArray::from_mut_slice(&mut out[..]));
-    hasher.update([0u8; 63]);
-    std::hint::black_box(hasher);
+    let digest: &mut sha2::digest::Output<Sha256> = (&mut out[..]).try_into().expect("SHA-256 output is 32 bytes");
+    Digest::finalize_into(hasher, digest);
     out
 }
 
@@ -195,10 +191,10 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     let fingerprint = kek_fingerprint(&handle.public_key()?); // identifies *which* KEK this payload is wrapped under, for `unwrap` to check before any ECDH/AES-GCM
 
     let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt); // per-payload salt: selects this payload's ECDH point and salts its HKDF
+    getrandom::fill(&mut salt).map_err(|_| Error::Crypto("the OS random number generator failed"))?; // per-payload salt: selects this payload's ECDH point and salts its HKDF
     let point = payload_ecdh_point(&salt)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes); // fresh random nonce for this one AES-GCM encryption
+    getrandom::fill(&mut nonce_bytes).map_err(|_| Error::Crypto("the OS random number generator failed"))?; // fresh random nonce for this one AES-GCM encryption
 
     // Build the payload up front, with the ciphertext buffer already at
     // its final size, so `authenticated_bytes` below covers the real
@@ -224,7 +220,7 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     let mut wrapping_key = derive_wrapping_key(&shared_secret, service, &salt, &authenticated)?; // HKDF-SHA512 turns the shared secret into a 32-byte AES key (also stack-only)
     shared_secret.zeroize(); // the raw ECDH shared secret is no longer needed; scrub it now rather than waiting for scope exit
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*wrapping_key)); // set up AES-256-GCM with the derived key
+    let cipher = Aes256Gcm::new(aes_key(&wrapping_key)); // set up AES-256-GCM with the derived key
 
     // Copy the DEK onto the stack (a plain array-to-array copy, no heap
     // involved) and encrypt it in place: `ct_buf` starts as plaintext and
@@ -232,11 +228,7 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     // the plaintext is scrubbed even if something below panics before the
     // encryption completes.
     let mut ct_buf = Zeroizing::new(*dek);
-    let tag_result = cipher.encrypt_in_place_detached(
-        Nonce::from_slice(&nonce_bytes),
-        &authenticated,
-        &mut ct_buf[..],
-    );
+    let tag_result = cipher.encrypt_inout_detached(&Nonce::from(nonce_bytes), &authenticated, (&mut ct_buf[..]).into());
     wrapping_key.zeroize(); // the derived AES key is no longer needed either way; scrub it immediately
     salt.zeroize(); // already copied into the payload; don't leave a second copy on the stack
 
@@ -306,15 +298,11 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     let (ct_part, tag_part) = payload.ciphertext.split_at(DEK_LEN);
     let mut dek = Zeroizing::new([0u8; DEK_LEN]);
     dek.copy_from_slice(ct_part); // still ciphertext at this point
-    let tag = Tag::from_slice(tag_part);
+    let tag = Tag::try_from(tag_part).map_err(|_| Error::Crypto("wrapped ciphertext has unexpected length"))?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*wrapping_key));
-    let auth_result = cipher.decrypt_in_place_detached(
-        Nonce::from_slice(&payload.nonce),
-        &authenticated,
-        &mut dek[..],
-        tag,
-    ); // decrypts `dek` in place; on success it now holds the real plaintext DEK
+    let cipher = Aes256Gcm::new(aes_key(&wrapping_key));
+    let auth_result =
+        cipher.decrypt_inout_detached(&Nonce::from(payload.nonce), &authenticated, (&mut dek[..]).into(), &tag); // decrypts `dek` in place; on success it now holds the real plaintext DEK
     wrapping_key.zeroize(); // the AES key is no longer needed regardless of whether decryption succeeded
 
     if auth_result.is_err() {
@@ -364,6 +352,12 @@ fn derive_wrapping_key(
     Ok(out)
 }
 
+// The derived key as the cipher's key type, by reference: no unwiped copy
+// of the key is made on the way in.
+fn aes_key(key: &Zeroizing<[u8; 32]>) -> &Key<Aes256Gcm> {
+    (&key[..]).try_into().expect("an AES-256 key is 32 bytes")
+}
+
 /// Computes the "fingerprint" appended to every wrapped payload (see
 /// [`crate::payload::Payload::fingerprint`]): a SHA-256 hash of the
 /// persistent KEK's public key, SEC1-uncompressed-encoded. Not a secret
@@ -372,7 +366,7 @@ fn derive_wrapping_key(
 /// cheaply on "this payload wasn't wrapped under the KEK `service`
 /// currently resolves to," before spending any effort on ECDH/AES-GCM.
 fn kek_fingerprint(public_key: &PublicKey) -> [u8; FINGERPRINT_LEN] {
-    let encoded = public_key.to_encoded_point(false); // uncompressed SEC1 point: 0x04 || X || Y
+    let encoded = public_key.to_sec1_point(false); // uncompressed SEC1 point: 0x04 || X || Y
     let digest = Sha256::digest(encoded.as_bytes());
     let mut out = [0u8; FINGERPRINT_LEN];
     out.copy_from_slice(&digest);
@@ -382,6 +376,7 @@ fn kek_fingerprint(public_key: &PublicKey) -> [u8; FINGERPRINT_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*; // bring `wrap`, `unwrap`, `DEK_LEN`, etc. into scope
+    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use p256::SecretKey; // test-only: stands in for an attacker scalar and for fingerprint fixtures
     use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
 
@@ -519,16 +514,16 @@ mod tests {
         let mut salts: Vec<[u8; SALT_LEN]> = vec![[0u8; SALT_LEN], [0xffu8; SALT_LEN]];
         for _ in 0..64 {
             let mut s = [0u8; SALT_LEN];
-            OsRng.fill_bytes(&mut s);
+            getrandom::fill(&mut s).unwrap();
             salts.push(s);
         }
 
-        let k = SecretKey::random(&mut OsRng);
-        let other = SecretKey::random(&mut OsRng);
+        let k = SecretKey::generate();
+        let other = SecretKey::generate();
         for salt in salts {
             let h = payload_ecdh_point(&salt).unwrap();
 
-            let encoded = h.to_encoded_point(false);
+            let encoded = h.to_sec1_point(false);
             assert_eq!(encoded.as_bytes().len(), UNCOMPRESSED_POINT_LEN);
             assert_eq!(encoded.as_bytes()[0], 0x04);
             assert_eq!(PublicKey::from_sec1_bytes(encoded.as_bytes()).unwrap(), h);
@@ -600,12 +595,12 @@ mod tests {
             let open = |z: &[u8; 32], p: &Payload| -> std::result::Result<[u8; DEK_LEN], ()> {
                 let aad = p.authenticated_bytes();
                 let key = derive_wrapping_key(z, service, &p.salt, &aad).unwrap();
-                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
+                let cipher = Aes256Gcm::new_from_slice(&*key).unwrap();
                 let (ct, tag) = p.ciphertext.split_at(DEK_LEN);
                 let mut buf = [0u8; DEK_LEN];
                 buf.copy_from_slice(ct);
                 cipher
-                    .decrypt_in_place_detached(Nonce::from_slice(&p.nonce), &aad, &mut buf, Tag::from_slice(tag))
+                    .decrypt_inout_detached(&Nonce::try_from(&p.nonce[..]).unwrap(), &aad, (&mut buf[..]).into(), &Tag::try_from(tag).unwrap())
                     .map(|_| buf)
                     .map_err(|_| ())
             };
@@ -724,14 +719,14 @@ mod tests {
             shared_secret.zeroize();
 
             let (ct_part, tag_part) = payload.ciphertext.split_at(DEK_LEN);
-            let tag = Tag::from_slice(tag_part);
-            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*wrapping_key));
+            let tag = &Tag::try_from(tag_part).unwrap();
+            let cipher = Aes256Gcm::new_from_slice(&*wrapping_key).unwrap();
 
             // Decrypting with the exact original AAD must succeed --
             // establishes this is a faithful re-derivation, not a setup bug.
             let mut buf = [0u8; DEK_LEN];
             buf.copy_from_slice(ct_part);
-            assert!(cipher.decrypt_in_place_detached(Nonce::from_slice(&payload.nonce), &correct_aad, &mut buf, tag).is_ok());
+            assert!(cipher.decrypt_inout_detached(&Nonce::try_from(&payload.nonce[..]).unwrap(), &correct_aad, (&mut buf[..]).into(), tag).is_ok());
             assert_eq!(buf, dek);
 
             // A single bit flipped in *only* the fingerprint half of the
@@ -742,7 +737,7 @@ mod tests {
             let mut buf = [0u8; DEK_LEN];
             buf.copy_from_slice(ct_part);
             assert!(
-                cipher.decrypt_in_place_detached(Nonce::from_slice(&payload.nonce), &tampered_fingerprint_aad, &mut buf, tag).is_err(),
+                cipher.decrypt_inout_detached(&Nonce::try_from(&payload.nonce[..]).unwrap(), &tampered_fingerprint_aad, (&mut buf[..]).into(), tag).is_err(),
                 "AES-GCM must reject a payload whose fingerprint-half AAD bytes were altered"
             );
 
@@ -755,7 +750,7 @@ mod tests {
             let mut buf = [0u8; DEK_LEN];
             buf.copy_from_slice(ct_part);
             assert!(
-                cipher.decrypt_in_place_detached(Nonce::from_slice(&payload.nonce), &tampered_provider_aad, &mut buf, tag).is_err(),
+                cipher.decrypt_inout_detached(&Nonce::try_from(&payload.nonce[..]).unwrap(), &tampered_provider_aad, (&mut buf[..]).into(), tag).is_err(),
                 "AES-GCM must reject a payload whose provider_type byte was altered"
             );
         });
@@ -791,7 +786,7 @@ mod tests {
             // The old attack, attempted: pick an ephemeral scalar, do ECDH
             // against the KEK's public key, and try to derive the wrapping
             // key from it.
-            let attacker_scalar = SecretKey::random(&mut OsRng);
+            let attacker_scalar = SecretKey::generate();
             let attacker_z = p256::ecdh::diffie_hellman(
                 attacker_scalar.to_nonzero_scalar(),
                 kek_public.as_affine(),
@@ -819,9 +814,9 @@ mod tests {
             // well-formed and the fingerprint is correct.
             let attacker_dek = [0xEEu8; DEK_LEN];
             let mut ct_buf = attacker_dek;
-            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*forged_key));
+            let cipher = Aes256Gcm::new_from_slice(&*forged_key).unwrap();
             let tag = cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&payload.nonce), &authenticated, &mut ct_buf)
+                .encrypt_inout_detached(&Nonce::try_from(&payload.nonce[..]).unwrap(), &authenticated, (&mut ct_buf[..]).into())
                 .unwrap();
 
             let mut forged = Payload {
@@ -859,15 +854,17 @@ mod tests {
 
             let mut hasher = Sha256::new();
             hasher.update(&input);
-            let got = finalize_sha256_wiping(&mut hasher);
+            let got = finalize_sha256_wiping(hasher);
             assert_eq!(&got[..], &expected[..], "input length {len}");
-
-            // And the scrubbed hasher holds nothing of the input: it is in
-            // the state of a fresh hasher that has absorbed 63 zero bytes.
-            let mut fresh = Sha256::new();
-            fresh.update([0u8; 63]);
-            assert_eq!(hasher.finalize(), fresh.finalize(), "input length {len}: hasher not reset to a public state");
         }
+    }
+
+    #[test]
+    fn sha256_wipes_itself_on_drop() {
+        // What makes the hasher `finalize_sha256_wiping` consumes safe to
+        // drop: sha2's `zeroize` feature. Without it this stops compiling.
+        fn wipes_on_drop<T: sha2::digest::zeroize::ZeroizeOnDrop>() {}
+        wipes_on_drop::<Sha256>();
     }
 
     #[test]
@@ -899,8 +896,8 @@ mod tests {
 
     #[test]
     fn kek_fingerprint_properties() {
-        let key1 = SecretKey::random(&mut OsRng).public_key();
-        let key2 = SecretKey::random(&mut OsRng).public_key();
+        let key1 = SecretKey::generate().public_key();
+        let key2 = SecretKey::generate().public_key();
 
         let f1 = kek_fingerprint(&key1);
         let f1_repeat = kek_fingerprint(&key1);
@@ -949,7 +946,7 @@ mod tests {
             let service = "com.company.rotated";
             let secret_path = ext_dir.path().join(service);
 
-            let key_a = SecretKey::random(&mut OsRng);
+            let key_a = SecretKey::generate();
             std::fs::write(&secret_path, key_a.to_bytes()).unwrap();
             // Owner-only, as the provider requires of a KEK file. The rotation
             // rewrite below preserves this mode, so it's set once.
@@ -963,7 +960,7 @@ mod tests {
             // the mounted secret file with a brand new, unrelated key
             // under the exact same service name -- the scenario this
             // whole feature exists to catch.
-            let key_b = SecretKey::random(&mut OsRng);
+            let key_b = SecretKey::generate();
             std::fs::write(&secret_path, key_b.to_bytes()).unwrap();
 
             let err = unwrap(service, &wrapped).unwrap_err();
@@ -1041,5 +1038,134 @@ mod tests {
             let err = unwrap("com.company.orders", &tampered_bytes).unwrap_err();
             assert!(matches!(err, Error::Crypto(_)));
         });
+    }
+}
+
+/// Known-answer tests: every step of the protocol, and a whole wrapped
+/// payload, checked against values frozen from a known-good build. Each
+/// step is pure, standardized math (SHA-256, SEC1, ECDH, HKDF-SHA512,
+/// AES-256-GCM, PKCS#8), so a dependency upgrade must not change any of
+/// them; if one does, the upgrade changed what this library computes.
+#[cfg(test)]
+mod known_answer {
+    use super::*;
+    use p256::SecretKey;
+    use serial_test::serial;
+
+    const SERVICE: &str = "com.hkdfguard.kat";
+    const KEK_SCALAR: [u8; 32] = [0x2a; 32];
+    const SALT: [u8; SALT_LEN] = [0x11; SALT_LEN];
+    const NONCE: [u8; NONCE_LEN] = [0x22; NONCE_LEN];
+    const DEK: [u8; DEK_LEN] = [0x5a; DEK_LEN];
+    const HEADER: &[u8] = b"hkdfguard known-answer header";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn kek() -> SecretKey {
+        SecretKey::from_slice(&KEK_SCALAR).unwrap()
+    }
+
+    // Each step, from the fixed inputs above.
+    struct Steps {
+        point: String,
+        shared_secret: String,
+        fingerprint: String,
+        wrapping_key: String,
+        ciphertext_and_tag: String,
+        kek_pkcs8_der: String,
+    }
+
+    fn compute() -> Steps {
+        use elliptic_curve::pkcs8::EncodePrivateKey;
+        let point = payload_ecdh_point(&SALT).unwrap();
+        let shared = p256::ecdh::diffie_hellman(kek().to_nonzero_scalar(), point.as_affine());
+        let mut z = [0u8; 32];
+        z.copy_from_slice(shared.raw_secret_bytes());
+        let key = derive_wrapping_key(&z, SERVICE, &SALT, HEADER).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&*key).unwrap();
+        let mut buf = DEK;
+        let tag = cipher.encrypt_inout_detached(&Nonce::try_from(&NONCE[..]).unwrap(), HEADER, (&mut buf[..]).into()).unwrap();
+        Steps {
+            point: hex(point.to_sec1_point(true).as_bytes()),
+            shared_secret: hex(&z),
+            fingerprint: hex(&kek_fingerprint(&kek().public_key())),
+            wrapping_key: hex(&*key),
+            ciphertext_and_tag: hex(&[&buf[..], &tag[..]].concat()),
+            kek_pkcs8_der: hex(kek().to_pkcs8_der().unwrap().as_bytes()),
+        }
+    }
+
+    // Prints the values to freeze. Run when deliberately changing the
+    // protocol: cargo test --lib crypto::known_answer::print -- --ignored --nocapture
+    #[test]
+    #[ignore = "prints the known-answer values; not a check"]
+    #[serial]
+    fn print() {
+        let s = compute();
+        println!("POINT={}\nSHARED_SECRET={}\nFINGERPRINT={}\nWRAPPING_KEY={}\nCIPHERTEXT_AND_TAG={}\nKEK_PKCS8_DER={}",
+            s.point, s.shared_secret, s.fingerprint, s.wrapping_key, s.ciphertext_and_tag, s.kek_pkcs8_der);
+        let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
+        let dir = crate::secure_file::private_tempdir();
+        let _mount = crate::policy::test_support::secret_mount(dir.path());
+        write_kek(dir.path());
+        println!("WRAPPED={}", hex(&wrap(SERVICE, &DEK).unwrap()));
+    }
+
+    // Frozen from a known-good build, and reproduced independently with
+    // pyca/cryptography (OpenSSL), which shares no code with this crate.
+    const POINT: &str = "028b28b65f7985dc4744ce179dcdcf2c463b469d8c032cadaf26f415e52e79aada";
+    const SHARED_SECRET: &str = "89dc5c245004699ed3c2c5c72f456cf3d83807512d511a8db546f32ea4df92b2";
+    const FINGERPRINT: &str = "550baec2e009d8c4ba938306605e9c55657d613e13ee25e208736c90567b6d88";
+    const WRAPPING_KEY: &str = "ce57db74b0f45cce92c7a74a05ae974439f7e3cf5849a6d0e960fb9efbe89ee9";
+    const CIPHERTEXT_AND_TAG: &str =
+        "760b828e0b85d18b97a9ab592c0c54eed5fbc07f35282f838bf09b2efd2e09fc76257eb112fdfba067cd4e61247a0d36";
+    const KEK_PKCS8_DER: &str = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2aa144034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569e";
+    /// A whole payload `wrap` produced for DEK under the external-secret
+    /// KEK_SCALAR (random salt and nonce, so it can only be frozen, not
+    /// recomputed).
+    const WRAPPED: &str = "01031a0065787465726e616c3a636f6d2e686b646667756172642e6b6174f19e14b88861e505a308026e42c673fddf3bb2ea2f9fc1772b3c35ea96095c923f25b66ea046a30b599e904230000000cf94fb647987ec9d62a7a992cbd39978cf011ac1b655ba632b72ae681fe043a7d4172237ab3564493ea98bb20b4be323550baec2e009d8c4ba938306605e9c55657d613e13ee25e208736c90567b6d88";
+
+    #[test]
+    fn every_protocol_step_matches_its_known_answer() {
+        let s = compute();
+        assert_eq!(s.point, POINT, "salt-to-point hash");
+        assert_eq!(s.shared_secret, SHARED_SECRET, "ECDH");
+        assert_eq!(s.fingerprint, FINGERPRINT, "KEK fingerprint");
+        assert_eq!(s.wrapping_key, WRAPPING_KEY, "HKDF-SHA512 wrapping key");
+        assert_eq!(s.ciphertext_and_tag, CIPHERTEXT_AND_TAG, "AES-256-GCM");
+        assert_eq!(s.kek_pkcs8_der, KEK_PKCS8_DER, "PKCS#8 encoding");
+    }
+
+    #[test]
+    fn a_frozen_pkcs8_kek_parses_to_the_same_key() {
+        // The external-secret provider accepts PKCS#8 DER as well as a raw
+        // scalar; both forms of KEK_SCALAR must be the same key.
+        use elliptic_curve::pkcs8::DecodePrivateKey;
+        let parsed = SecretKey::from_pkcs8_der(&unhex(KEK_PKCS8_DER)).unwrap();
+        assert_eq!(parsed.to_bytes().as_slice(), &KEK_SCALAR[..]);
+    }
+
+    #[test]
+    #[serial]
+    fn a_frozen_payload_unwraps_through_the_external_secret_provider() {
+        let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
+        let dir = crate::secure_file::private_tempdir();
+        let _mount = crate::policy::test_support::secret_mount(dir.path());
+        write_kek(dir.path());
+        let dek = unwrap(SERVICE, &unhex(WRAPPED)).unwrap();
+        assert_eq!(*dek, DEK);
+    }
+
+    fn write_kek(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(SERVICE);
+        std::fs::write(&path, KEK_SCALAR).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 }

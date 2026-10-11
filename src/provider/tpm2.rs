@@ -46,7 +46,7 @@
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
-use elliptic_curve::sec1::ToEncodedPoint; // lets us split the caller's ephemeral public key into X/Y coordinates
+use elliptic_curve::sec1::ToSec1Point; // lets us split the caller's ephemeral public key into X/Y coordinates
 use p256::PublicKey; // the caller's ephemeral public key type
 use sha2::{Digest as ShaDigest, Sha256}; // hashing used to build the per-service `unique` label (aliased to avoid clashing with tss-esapi's own `Digest`)
 use std::path::PathBuf; // location of the derivation-secret file
@@ -247,7 +247,7 @@ fn read_derivation_secret() -> Result<Option<Zeroizing<[u8; 32]>>> {
     // The digest is as sensitive as the file it came from: it goes straight
     // into a zeroizing buffer, and the hasher's buffered copy of the file's
     // tail is scrubbed (see `finalize_sha256_wiping`).
-    Ok(Some(crate::crypto::finalize_sha256_wiping(&mut hasher)))
+    Ok(Some(crate::crypto::finalize_sha256_wiping(hasher)))
 }
 
 /// Longest Owner-hierarchy authorization value accepted: the size of
@@ -1369,14 +1369,14 @@ fn unique_half(
     }
     // Same digest as a plain `finalize`, so every KEK is unchanged; the
     // hasher's buffered copy of the secret's tail is scrubbed as well.
-    crate::crypto::finalize_sha256_wiping(&mut hasher)
+    crate::crypto::finalize_sha256_wiping(hasher)
 }
 
 // Converts the caller's ephemeral P-256 public key (a `p256::PublicKey`)
 // into the TPM crate's `EccPoint` representation, as required by
 // `ecdh_z_gen`.
 fn encode_peer_point(peer_public: &PublicKey) -> Result<EccPoint> {
-    let encoded = peer_public.to_encoded_point(false); // uncompressed SEC1 encoding, so X and Y are both directly available
+    let encoded = peer_public.to_sec1_point(false); // uncompressed SEC1 encoding, so X and Y are both directly available
     let x = encoded
         .x()
         .ok_or(Error::Provider("ephemeral public key missing X".into()))?; // should never actually be missing for a valid point
@@ -1395,6 +1395,7 @@ fn encode_peer_point(peer_public: &PublicKey) -> Result<EccPoint> {
 #[cfg(test)]
 mod tests {
     use super::*; // bring `Tpm2Provider` etc. into scope
+    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use crate::policy::test_support::TestPolicy;
     use serial_test::serial; // the tests below set process-wide env vars
 
@@ -1686,7 +1687,7 @@ mod tests {
         let provider = Tpm2Provider::new();
         assert!(provider.probe(), "no TPM available");
 
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng); // stand-in "caller" ephemeral key for this test
+        let eph = p256::SecretKey::generate(); // stand-in "caller" ephemeral key for this test
         let eph_pub = eph.public_key();
 
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first CreatePrimary for this service
@@ -1813,7 +1814,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     fn different_services_produce_different_ecdh_secrets() {
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng); // one peer keypair, reused for every call below
+        let eph = p256::SecretKey::generate(); // one peer keypair, reused for every call below
         let peer = eph.public_key();
 
         let z_orders = create_ecdh_secret("orders", &peer).unwrap();
@@ -1828,7 +1829,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     fn ecdh_repeatability_for_same_service() {
-        let eph = p256::SecretKey::random(&mut rand_core::OsRng);
+        let eph = p256::SecretKey::generate();
         let peer = eph.public_key();
 
         let z1 = create_ecdh_secret("orders", &peer).unwrap();

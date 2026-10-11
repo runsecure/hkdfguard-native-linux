@@ -12,7 +12,7 @@
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // the traits/types this module implements
 use p256::{PublicKey, SecretKey}; // P-256 key types from RustCrypto's `p256` crate
-use rand_core::OsRng; // OS-backed cryptographically secure RNG, used to generate new keys
+use p256::elliptic_curve::Generate; // `SecretKey::try_generate`, from the OS CSPRNG
 use std::collections::HashMap; // in-memory service -> key table
 use std::sync::{Arc, Mutex, OnceLock}; // guards the table so concurrent calls don't race
 
@@ -100,7 +100,8 @@ impl KekProvider for EphemeralProvider {
                     "no ephemeral KEK created yet for this service",
                 ));
             }
-            let fresh = SecretKey::random(&mut OsRng); // generate a brand-new random key only since none exists yet
+            let fresh = SecretKey::try_generate() // a brand-new random key, only since none exists yet
+                .map_err(|_| Error::Provider("the OS random number generator failed".into()))?;
             keys.insert(service.to_string(), fresh.clone());
             fresh
         }; // lock released once this block ends, before returning
@@ -159,7 +160,7 @@ mod tests {
         let handle = provider.load_kek("com.company.pubkey-test", true).unwrap();
         let reported_public = handle.public_key().unwrap();
 
-        let eph = SecretKey::random(&mut OsRng);
+        let eph = SecretKey::generate();
         let eph_pub = eph.public_key();
 
         let via_handle = handle.ecdh(&eph_pub).unwrap();
@@ -181,7 +182,7 @@ mod tests {
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call creates the key
         let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second call must reuse it
 
-        let eph = SecretKey::random(&mut OsRng); // a throwaway "caller" ephemeral key for this test
+        let eph = SecretKey::generate(); // a throwaway "caller" ephemeral key for this test
         let eph_pub = eph.public_key();
 
         let s1 = h1.ecdh(&eph_pub).unwrap();
@@ -195,7 +196,7 @@ mod tests {
         let h1 = provider.load_kek("com.company.orders", true).unwrap();
         let h2 = provider.load_kek("com.company.billing", true).unwrap(); // a different service name
 
-        let eph = SecretKey::random(&mut OsRng);
+        let eph = SecretKey::generate();
         let eph_pub = eph.public_key();
 
         let s1 = h1.ecdh(&eph_pub).unwrap();
@@ -213,7 +214,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let service = if i % 2 == 0 { "service.a" } else { "service.b" };
                 let h = p.load_kek(service, true).unwrap();
-                let eph = SecretKey::random(&mut OsRng);
+                let eph = SecretKey::generate();
                 h.ecdh(&eph.public_key()).unwrap()
             }));
         }
@@ -225,7 +226,7 @@ mod tests {
         // Verify that keys for service.a and service.b are stable
         let ha = provider.load_kek("service.a", true).unwrap();
         let hb = provider.load_kek("service.b", true).unwrap();
-        let eph = SecretKey::random(&mut OsRng);
+        let eph = SecretKey::generate();
         assert_ne!(
             *ha.ecdh(&eph.public_key()).unwrap(),
             *hb.ecdh(&eph.public_key()).unwrap()

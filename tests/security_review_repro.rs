@@ -25,6 +25,7 @@ use std::fs;
 use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
 fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir().unwrap()
@@ -240,7 +241,7 @@ fn tpm_missing_policy_named_derivation_secret_fails_the_call() {
     // An external-secret mount holding a KEK for the service.
     let mount = tempdir();
     let service_name = "com.review.tpm.fallthrough";
-    let key = p256::SecretKey::random(&mut rand_core::OsRng);
+    let key = p256::SecretKey::generate();
     let key_path = mount.path().join(service_name);
     fs::write(&key_path, key.to_bytes()).unwrap();
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
