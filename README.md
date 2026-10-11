@@ -40,19 +40,17 @@ scripts/build-release.sh
 ```
 
 Runs `cargo build --release`, which produces
-`target/release/libhkdfguard_v1.{so,dylib}` (dynamic) and
+`target/release/libhkdfguard_v1.so` (dynamic) and
 `libhkdfguard_v1.a` (static) -- the `[lib] name` in
 `Cargo.toml` controls that output name directly, and Cargo has no way to
-produce a name containing dots. The script's one additional step copies the
-dynamic library to `target/release/HkdfGuard.Kms.Linux.v1.{so,dylib}` --
-this project's actual release artifact name, matching the
-`HkdfGuard.Kms.<platform>.v1` convention its Windows (CMake `OUTPUT_NAME`)
-and macOS (Xcode `PRODUCT_NAME`) builds apply natively. A plain
-`cargo build --release` still works for local iteration; just link against
-`libhkdfguard_v1` directly in that case. On Linux the
-library's SONAME is `libhkdfguard.so.1` ([`build.rs`](build.rs)), so a
-program linked that way looks for that name at run time: the script also
-creates it as a symlink in `target/release`. Installed from the packages
+produce a name containing dots. The library's name on a running system is
+its SONAME, `libhkdfguard.so.1` ([`build.rs`](build.rs)): a program linked
+against it records that name and looks for it at run time, and it is what
+the packages, the release tarballs and the container overlay install. The
+script's one additional step creates `target/release/libhkdfguard.so.1` as
+a symlink to Cargo's output. A plain `cargo build --release` still works
+for local iteration; link against `libhkdfguard_v1` directly and add the
+same symlink (or set `LD_LIBRARY_PATH`) to run. Installed from the packages
 (see "Packages"), the library is simply `-lhkdfguard`, via
 `pkg-config --cflags --libs hkdfguard`. The C header
 (`include/hkdfguard.h`) and exported C symbols (`hkdfguard_create_kek`,
@@ -660,7 +658,7 @@ SUSE's naming policy and runs `ldconfig` from scriptlets:
 
 | Debian, Ubuntu | EL10, Amazon Linux | SUSE | Contents |
 |---|---|---|---|
-| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), the example policy `/usr/share/hkdfguard/policy.toml.example`, README, third-party licenses |
+| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, an empty `/etc/hkdfguard` (root, `0755`), the example policy `/usr/share/hkdfguard/policy.toml.example`, README, third-party licenses |
 | `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
 | (in `libhkdfguard-dev`) | `hkdfguard-static` | `hkdfguard-devel-static` | `libhkdfguard.a` |
 | `hkdfguard` | `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
@@ -703,6 +701,7 @@ push to `main` and `develop` and on every pull request:
 | `test` | `docker/run-tests.sh` -- the full matrix against swtpm and SoftHSM2 -- on amd64 and arm64 |
 | `packages` | `packaging/build-packages.sh` for each distribution and architecture: build, both test suites, lintian, clean-container smoke test |
 | `binaries` | `docker/build-dist.sh` for each architecture |
+| `overlay` | `packaging/build-overlay.sh` for each architecture: both container overlay targets, each tested in a consumer image (see "Container overlay image") |
 
 Each architecture runs on its own native runner (`ubuntu-24.04`,
 `ubuntu-24.04-arm`), not under QEMU. Every third-party action is pinned
@@ -722,9 +721,9 @@ whole build workflow above, then a `publish` job that
    - `hkdfguard-<version>-<distro>-<arch>.tar.gz` -- one target's `.deb`
      or `.rpm` packages;
    - `hkdfguard-<version>-linux-<arch>.tar.gz` -- the standalone library
-     (`lib/`, with the `libhkdfguard.so.1` and `HkdfGuard.Kms.Linux.v1.so`
-     names), CLI (`bin/`), header (`include/`), `LICENSE` and
-     `THIRD-PARTY-LICENSES.txt`;
+     (`lib/libhkdfguard.so.1`, with the `libhkdfguard.so` link for
+     `-lhkdfguard`, and the static `lib/libhkdfguard.a`), CLI (`bin/`),
+     header (`include/`), `LICENSE` and `THIRD-PARTY-LICENSES.txt`;
    - `SHA256SUMS`;
 3. signs a [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance)
    attestation for every asset, **and for every package and binary inside
@@ -759,6 +758,75 @@ code is correct.
 The attestations prove provenance; they do not make the packages
 installable from a signed apt, dnf or zypper repository. Those check GPG
 signatures on repository metadata, which these releases do not provide.
+
+## Container overlay image
+
+For containers, each release also publishes a `FROM scratch` image that
+holds only HKDFGuard's binaries, at the paths the Ubuntu 24.04 packages
+install them to, for copying into another image
+([`packaging/overlay/Dockerfile`](packaging/overlay/Dockerfile)):
+
+```
+/usr/lib/<multiarch>/libhkdfguard.so.1
+/usr/bin/hkdfguard-v1-initialize
+```
+
+They are taken from the tested `libhkdfguard1` and `hkdfguard` packages,
+not rebuilt; nothing else from the packages is copied.
+`packaging/build-overlay.sh` fails if the image holds anything more. About
+6 MB, for `linux/amd64` and `linux/arm64`.
+
+| Tag | Policy |
+|---|---|
+| `ghcr.io/runsecure/hkdfguard-overlay:<version>` | None: the library's defaults (TPM2, PKCS#11 if configured, external secret; never ephemeral). Add your own `/etc/hkdfguard/policy.toml`. |
+| `ghcr.io/runsecure/hkdfguard-overlay:<version>-dev` | Adds `/etc/hkdfguard/policy.toml` from [`packaging/overlay/policy.dev.toml`](packaging/overlay/policy.dev.toml): SoftHSM2 when `/etc/hkdfguard/pkcs11.pin` exists, otherwise **ephemeral** keys that are lost when the process exits. Development and tests only. |
+
+```dockerfile
+FROM ubuntu:24.04
+# The library's runtime dependencies (libhkdfguard1's Depends).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-tctildr0t64 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.1.0 / /
+```
+
+- **Debian-family images only**, with glibc 2.39 or newer: Ubuntu 24.04+
+  or Debian 13. The library sits in Debian's multiarch directory, which
+  their dynamic loader searches without `ldconfig`. RPM-family images
+  (`/usr/lib64`) and musl-based ones (Alpine) need the packages instead.
+- **License notices aren't in the image.** The binaries statically link
+  crates under Apache-2.0, MIT, BSD-3-Clause, ISC and Unlicense terms,
+  which require their notices to accompany the binaries. An image you
+  distribute with the overlay in it should carry `LICENSE` and
+  `THIRD-PARTY-LICENSES.txt` from the release's `linux-<arch>` tarball.
+- **dpkg doesn't know about these files.** `apt` won't upgrade them, and
+  installing the `libhkdfguard1` package later in the same image conflicts
+  with them; update by changing the overlay tag.
+- **To use SoftHSM2 with the `-dev` tag**, install `softhsm2`, initialize
+  a token labelled `hkdfguard`
+  (`softhsm2-util --init-token --free --label hkdfguard ...`), and write
+  its user PIN to `/etc/hkdfguard/pkcs11.pin` (root-owned, `0400`, or
+  `0440` with the service's group). From then on a problem with the module
+  or token fails every call rather than falling back to ephemeral. Keep
+  the token directory (`/var/lib/softhsm/tokens`) on a volume so its keys
+  outlive the container.
+
+The release workflow's `overlay` job builds both architectures from the
+packages the build workflow tested, pushes them, and attests each image
+with Sigstore. To verify one:
+
+```sh
+gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.1.0 \
+    --repo runsecure/hkdfguard-native-linux
+```
+
+To build and test locally, from `dist/packages/ubuntu24.04-<arch>/`
+(`DISTROS=ubuntu24.04 packaging/build-packages.sh`):
+
+```sh
+packaging/build-overlay.sh    # hkdfguard-overlay:local and :local-dev for this architecture
+```
 
 ## External-secret file requirements
 
@@ -1134,8 +1202,8 @@ tests/
   cli_initialize_round_trip.rs   Drives the CLI as a real subprocess
   harden_process.rs              hkdfguard_harden_process, in its own process
 scripts/
-  build-release.sh           cargo build --release, then renames the output
-                              to HkdfGuard.Kms.Linux.v1.{so,dylib}
+  build-release.sh           cargo build --release, then links libhkdfguard.so.1
+                              (the SONAME) to Cargo's libhkdfguard_v1.so
   native-tpm-preflight.sh    Read-only check of a real Linux TPM host
   native-tpm-test.sh         Full matrix on a real TPM; `reboot capture|verify`
   tpm-reboot-test.sh         swtpm-restart approximation of reboot persistence
@@ -1145,7 +1213,7 @@ build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1
 debian/                      Debian packaging (dpkg-buildpackage)
 .github/
   workflows/build.yml        CI: lint, cargo deny, test matrix, packages, binaries
-  workflows/release.yml      v* tags: build, attest (Sigstore), draft release
+  workflows/release.yml      v* tags: build, attest (Sigstore), draft release, overlay images
   dependabot.yml             Weekly updates to the pinned action SHAs
 packaging/
   build-packages.sh          Builds and smoke-tests the .deb and .rpm packages
@@ -1153,6 +1221,10 @@ packaging/
   build-deb.sh, build-rpm.sh In-container package builds
   smoke-test.sh              Installs packages into a clean container and uses them
   release-assets.sh          Release tarballs, SHA256SUMS and attestation subjects from CI artifacts
+  build-overlay.sh           Builds the scratch overlay images and tests them in consumer images
+  overlay/Dockerfile         FROM scratch overlay: the library and CLI from the packages
+  overlay/policy.dev.toml    The -dev overlay's policy: SoftHSM2, else ephemeral
+  overlay/consumer-test.sh   Uses the overlay from a consumer image
   check-version.sh           Cargo.toml / debian/changelog / spec version agreement
   rpm/hkdfguard.spec         RPM packaging
   hkdfguard.pc.in            pkg-config template
