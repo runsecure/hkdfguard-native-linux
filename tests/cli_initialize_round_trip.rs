@@ -113,12 +113,15 @@ fn run_wrap_stdin(key_path: &Path, service: &str, dek: &[u8; 32], extra_args: &[
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn hkdfguard-v1-initialize wrap");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin was piped")
-        .write_all(dek_b64.as_bytes())
-        .expect("failed to write the DEK to the CLI's stdin");
+    // A CLI that refuses before reading stdin (e.g. an existing key file
+    // without --force) may already have exited, closing the pipe: that is
+    // a BrokenPipe here, not a test failure. The caller judges the outcome
+    // from the exit status and output; any other write error is a failure.
+    match child.stdin.as_mut().expect("stdin was piped").write_all(dek_b64.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("failed to write the DEK to the CLI's stdin: {e}"),
+    }
     drop(child.stdin.take()); // close stdin so the child sees EOF
     child.wait_with_output().expect("failed to run hkdfguard-v1-initialize wrap")
 }
