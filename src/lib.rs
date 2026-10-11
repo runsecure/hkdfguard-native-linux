@@ -8,14 +8,6 @@
 //! unwind across it -- see [`hkdfguard_wrap_dek`], [`hkdfguard_unwrap_dek`],
 //! and [`hkdfguard_generate_and_wrap_dek`].
 
-// `aes-gcm` 0.10 / `elliptic-curve` 0.13 (the latest versions compatible
-// with each other at the time of writing) still depend on `generic-array`
-// 0.14, whose `GenericArray::from_slice`/`as_slice` are deprecated in
-// favor of APIs only available via a `generic-array` 1.x upgrade that
-// those crates haven't taken yet. Not actionable from this crate without
-// pinning to pre-release dependency versions.
-#![allow(deprecated)] // crate-wide, silences that specific transitive-dependency warning everywhere
-
 mod crypto; // ECDH -> HKDF -> AES-GCM protocol
 mod error; // internal error type + public status codes
 mod payload; // wrapped-payload wire format
@@ -25,7 +17,6 @@ mod secure_file; // hardened, check-then-read-safe file access + self-wiping Sec
 
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
-use rand_core::{OsRng, RngCore}; // the OS CSPRNG, used by hkdfguard_generate_and_wrap_dek below
 use std::os::raw::{c_char, c_int}; // C-ABI-compatible integer/char types
 use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
 use std::sync::atomic::{AtomicU32, Ordering}; // per-process count of setup calls, for the misuse warning
@@ -392,14 +383,15 @@ fn generate_and_wrap_impl(
     out: *mut u8,
     out_len: *mut c_int,
 ) -> c_int {
-    // Cryptographically random 32-byte DEK, sourced from the OS CSPRNG --
-    // the same `OsRng` this crate's own CLI tool
-    // (`hkdfguard-v1-initialize`) uses for its secure-overwrite passes, and
-    // the Linux analog of Windows' `BCryptGenRandom` / macOS's
-    // `SecRandomCopyBytes` used for the equivalent purpose elsewhere in
-    // this project.
+    // Cryptographically random 32-byte DEK, from the OS CSPRNG
+    // (getrandom(2)) -- the Linux analog of Windows' `BCryptGenRandom` /
+    // macOS's `SecRandomCopyBytes` used for the equivalent purpose
+    // elsewhere in this project.
     let mut dek = zeroize::Zeroizing::new([0u8; crypto::DEK_LEN]); // scrubbed on drop, panic included
-    OsRng.fill_bytes(&mut dek[..]);
+    if getrandom::fill(&mut dek[..]).is_err() {
+        log::error!("hkdfguard: the OS random number generator failed; no DEK generated");
+        return status::INTERNAL_ERROR;
+    }
 
     let code = wrap_impl(service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
     dek.zeroize(); // our local copy of the freshly generated DEK is no longer needed; scrub it now
@@ -674,6 +666,7 @@ fn unwrap_impl(
 #[cfg(test)]
 mod ffi_tests {
     use super::*; // bring the exported functions + `status` into scope
+    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
     use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
     // Disables the external-secret provider so tests deterministically
@@ -1579,7 +1572,7 @@ mod ffi_tests {
         let secret_path = ext_dir.path().join(service_str);
         let service = CString::new(service_str).unwrap();
 
-        let key_a = p256::SecretKey::random(&mut rand_core::OsRng);
+        let key_a = p256::SecretKey::generate();
         std::fs::write(&secret_path, key_a.to_bytes()).unwrap();
         // Owner-only, as the provider requires of a KEK file. The rotation
         // rewrite below preserves this mode, so it's set once.
@@ -1597,7 +1590,7 @@ mod ffi_tests {
         // Simulate an out-of-band KEK rotation: the deployment platform
         // rewrites the mounted secret file with a brand new, unrelated
         // key under the exact same service name.
-        let key_b = p256::SecretKey::random(&mut rand_core::OsRng);
+        let key_b = p256::SecretKey::generate();
         std::fs::write(&secret_path, key_b.to_bytes()).unwrap();
 
         let mut out = [0xAAu8; 32]; // recognizable non-zero pattern

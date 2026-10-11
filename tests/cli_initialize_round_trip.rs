@@ -27,7 +27,6 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use p256::SecretKey;
-use rand_core::OsRng;
 use serial_test::serial;
 use std::ffi::CString;
 use std::fs;
@@ -43,6 +42,7 @@ fn tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir()
 }
 use hkdfguard_v1::{hkdfguard_unwrap_dek, status};
+use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
 // through the inherited environment, by every CLI process it spawns --
@@ -77,7 +77,7 @@ fn external_secret_policy(mount: &Path) -> String {
 // would otherwise serve the service and this would test the wrong thing.
 fn with_provisioned_external_secret<F: FnOnce()>(service: &str, f: F) {
     let dir = tempdir().unwrap();
-    let secret_key = SecretKey::random(&mut OsRng);
+    let secret_key = SecretKey::generate();
     let secret_path = dir.path().join(service);
     fs::write(&secret_path, secret_key.to_bytes()).unwrap();
     fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap(); // owner-only, as the provider requires of a KEK file

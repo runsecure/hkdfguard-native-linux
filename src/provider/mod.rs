@@ -457,6 +457,7 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
 #[cfg(test)]
 mod tests {
     use super::*; // bring `ProviderType` etc. into scope
+    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use serial_test::serial;
 
     // Points HKDFGUARD_POLICY_FILE somewhere guaranteed not to exist, so
@@ -556,7 +557,6 @@ mod tests {
         #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
         {
             use p256::SecretKey;
-            use rand_core::OsRng;
 
             let _policy = crate::policy::allow_ephemeral_policy_for_tests(); // the billing fall-through below needs Ephemeral opted in
 
@@ -565,7 +565,7 @@ mod tests {
 
             // Write an external secret for "com.company.orders", owner-only
             // as the provider requires of a KEK file.
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             let secret_path = ext_dir.path().join("com.company.orders");
             std::fs::write(&secret_path, secret_key.to_bytes()).unwrap();
             std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
@@ -623,7 +623,6 @@ mod tests {
         #[cfg(feature = "external-secret")]
         {
             use p256::SecretKey;
-            use rand_core::OsRng;
 
             // This test is about external-secret specifically (that a
             // fresh instance of it is constructed per call), so pin the
@@ -636,8 +635,8 @@ mod tests {
 
             // external-secret never creates a key itself, so both
             // services need to be pre-provisioned.
-            let key_a = SecretKey::random(&mut OsRng);
-            let key_b = SecretKey::random(&mut OsRng);
+            let key_a = SecretKey::generate();
+            let key_b = SecretKey::generate();
             for (name, key) in [("com.company.a", &key_a), ("com.company.b", &key_b)] {
                 let path = ext_dir.path().join(name);
                 std::fs::write(&path, key.to_bytes()).unwrap();
@@ -745,7 +744,7 @@ mod tests {
             // Pre-provision the external secret so it's actually usable
             // once the chain reaches it (this provider never creates one
             // itself).
-            let secret_key = p256::SecretKey::random(&mut rand_core::OsRng);
+            let secret_key = p256::SecretKey::generate();
             let secret_path = ext_dir.path().join("com.company.orders");
             std::fs::write(&secret_path, secret_key.to_bytes()).unwrap();
             std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap(); // owner-only, as the provider requires
@@ -849,7 +848,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join(service);
-        std::fs::write(&path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
+        std::fs::write(&path, p256::SecretKey::generate().to_bytes()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let mount = crate::policy::test_support::secret_mount(dir.path());
         (dir, mount)

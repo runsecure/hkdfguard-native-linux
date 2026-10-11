@@ -73,7 +73,6 @@
 //! remaps, where the original blocks may still exist elsewhere.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rand_core::{OsRng, RngCore};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -620,7 +619,7 @@ fn secure_delete(path: &Path) -> Result<(), String> {
         buf.iter_mut().for_each(|b| *b = 0); // pass: overwrite with bit 0 throughout
         overwrite_pass(&mut file, path, &buf)?;
 
-        OsRng.fill_bytes(&mut buf); // pass: overwrite with a fresh random bit pattern
+        getrandom::fill(&mut buf).map_err(|e| format!("random overwrite of {} failed: {e}", path.display()))?; // pass: overwrite with a fresh random bit pattern
         overwrite_pass(&mut file, path, &buf)?;
     }
 

@@ -386,8 +386,8 @@ fn resolve_dir() -> Backend<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*; // bring `ExternalSecretProvider` etc. into scope
+    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use elliptic_curve::pkcs8::EncodePrivateKey; // lets the test encode a key to PKCS#8 DER for the "provisioned" fixture
-    use rand_core::OsRng; // used to generate test keys
     use serial_test::serial; // these tests mutate a shared env var, so they must not run concurrently
     use std::os::unix::fs::PermissionsExt;
 
@@ -435,7 +435,7 @@ mod tests {
                 Err(Error::KeyNotProvisioned(_))
             ));
 
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             provision(dir, "com.company.orders", secret_key.to_bytes()); // simulate an operator provisioning it externally
 
             assert!(provider.kek_exists("com.company.orders").unwrap());
@@ -450,7 +450,7 @@ mod tests {
             // A real, valid key sitting at a hidden-file name in the
             // mount: reachable as a path, but the provider must still
             // refuse the name rather than load it.
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             provision(dir, ".hidden", secret_key.to_bytes());
 
             for bad in [".hidden", ".", "..", "...", "com..orders", ""] {
@@ -478,7 +478,7 @@ mod tests {
             let versioned = dir.join("..2026_09_28_00_00_00.000000000");
             std::fs::create_dir(&versioned).unwrap();
             std::fs::set_permissions(&versioned, std::fs::Permissions::from_mode(0o755)).unwrap(); // as kubelet makes it, whatever the umask
-            let key = SecretKey::random(&mut OsRng);
+            let key = SecretKey::generate();
             provision(&versioned, "com.company.orders", key.to_bytes());
             std::os::unix::fs::symlink(&versioned, dir.join("..data")).unwrap();
             std::os::unix::fs::symlink(
@@ -502,7 +502,7 @@ mod tests {
             // containment rule is the only thing standing between a
             // planted link and an attacker-chosen KEK.
             let outside = crate::secure_file::private_tempdir();
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             let real_path = provision(outside.path(), "real-secret", secret_key.to_bytes());
             std::os::unix::fs::symlink(&real_path, dir.join("com.company.orders")).unwrap();
 
@@ -520,7 +520,7 @@ mod tests {
     #[serial]
     fn refuses_group_or_world_accessible_files_as_errors_not_absence() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             let path = provision(dir, "com.company.orders", secret_key.to_bytes());
 
             for mode in [0o644u32, 0o640, 0o604, 0o660, 0o444] {
@@ -575,7 +575,7 @@ mod tests {
             // writable by others: they could swap the key underneath.
             let inner = dir.join("..2026_10_01");
             std::fs::create_dir(&inner).unwrap();
-            provision(&inner, "com.company.orders", SecretKey::random(&mut OsRng).to_bytes());
+            provision(&inner, "com.company.orders", SecretKey::generate().to_bytes());
             std::os::unix::fs::symlink("..2026_10_01/com.company.orders", dir.join("com.company.orders")).unwrap();
 
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -592,7 +592,7 @@ mod tests {
     #[serial]
     fn refuses_a_mount_others_can_write_to() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             provision(dir, "com.company.orders", secret_key.to_bytes());
             provider.load_kek("com.company.orders", false).unwrap();
 
@@ -623,8 +623,8 @@ mod tests {
     #[serial]
     fn different_provisioned_keys_produce_different_public_keys() {
         with_dir(|provider, dir| {
-            let key_a = SecretKey::random(&mut OsRng);
-            let key_b = SecretKey::random(&mut OsRng);
+            let key_a = SecretKey::generate();
+            let key_b = SecretKey::generate();
             provision(dir, "com.company.orders", key_a.to_bytes());
             provision(dir, "com.company.billing", key_b.to_bytes());
 
@@ -648,12 +648,12 @@ mod tests {
     #[serial]
     fn loads_provisioned_pkcs8_secret() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::random(&mut OsRng); // simulate an operator-provisioned key
+            let secret_key = SecretKey::generate(); // simulate an operator-provisioned key
             let der = secret_key.to_pkcs8_der().unwrap();
             provision(dir, "com.company.orders", der.as_bytes()); // "provision" it as a mounted file
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let eph = SecretKey::random(&mut OsRng); // stand-in peer key
+            let eph = SecretKey::generate(); // stand-in peer key
             let expected = p256::ecdh::diffie_hellman(
                 secret_key.to_nonzero_scalar(),
                 eph.public_key().as_affine(),
@@ -667,11 +667,11 @@ mod tests {
     #[serial]
     fn loads_provisioned_raw_scalar_secret() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             provision(dir, "com.company.orders", secret_key.to_bytes()); // provision as raw 32-byte scalar this time
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let eph = SecretKey::random(&mut OsRng);
+            let eph = SecretKey::generate();
             let expected = p256::ecdh::diffie_hellman(
                 secret_key.to_nonzero_scalar(),
                 eph.public_key().as_affine(),
@@ -733,7 +733,7 @@ mod tests {
     #[serial]
     fn key_id_format() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::random(&mut OsRng);
+            let secret_key = SecretKey::generate();
             provision(dir, "com.company.orders", secret_key.to_bytes());
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();

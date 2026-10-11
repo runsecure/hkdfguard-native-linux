@@ -25,9 +25,6 @@ ignore = []
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
-    # p256 0.13's RustCrypto stack (rand_core 0.6) uses getrandom 0.2;
-    # tss-esapi 7.7 uses 0.4. Both are thin wrappers over getrandom(2).
-    { crate = "getrandom@0.2.17", reason = "rand_core 0.6 (p256 0.13) needs 0.2; tss-esapi 7.7 needs 0.4" },
     # Proc-macro only: compile-time code, nothing linked into the library.
     { crate = "syn@2.0.119", reason = "proc-macro deps of tss-esapi (enumflags2, num-derive) and thiserror 1 are on syn 2" },
 ]

@@ -38,6 +38,7 @@ fn hardening_takes_effect_and_the_library_still_works_afterwards() {
         use std::os::raw::c_int;
         use std::os::unix::fs::PermissionsExt;
         use hkdfguard_v1::{hkdfguard_unwrap_dek, hkdfguard_wrap_dek};
+        use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
         // A non-dumpable process loses some /proc/<pid> access. The
         // external-secret provider re-checks an opened descriptor through
@@ -45,7 +46,7 @@ fn hardening_takes_effect_and_the_library_still_works_afterwards() {
         let mount = private_tempdir();
         let service = "com.company.hardened";
         let key_path = mount.path().join(service);
-        std::fs::write(&key_path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
+        std::fs::write(&key_path, p256::SecretKey::generate().to_bytes()).unwrap();
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let policy_dir = private_tempdir();
