@@ -4,7 +4,7 @@
 # the plain base image, not the build image, so a missing runtime
 # dependency can't be masked by build tools -- and uses them as a consumer
 # would: dynamic and static linking through pkg-config, dlopen by the
-# HkdfGuard.Kms.Linux.v1 name, and the CLI's provision/wrap output
+# SONAME, libhkdfguard.so.1, and the CLI's provision/wrap output
 # unwrapped through the installed library.
 #
 # There is no TPM or PKCS#11 module in the container, so with no policy
@@ -61,7 +61,7 @@ example_policy=/usr/share/hkdfguard/policy.toml.example
 [ "$(stat -c '%U:%G %a' "$example_policy")" = "root:root 644" ] \
     || { echo "$example_policy must be installed, root:root 0644" >&2; exit 1; }
 libdir=$(pkg-config --variable=libdir hkdfguard)
-ls -l "$libdir"/libhkdfguard* "$libdir"/HkdfGuard.Kms.Linux.v1.so
+ls -l "$libdir"/libhkdfguard*
 hkdfguard-v1-initialize --help
 
 section "external secrets for the test services (root's mount, as a platform's would be)"
@@ -94,15 +94,15 @@ if ldd "$work/wrap_unwrap_static" | grep -F libhkdfguard; then
 fi
 "$work/wrap_unwrap_static"
 
-section "dlopen(\"HkdfGuard.Kms.Linux.v1.so\")"
+section "dlopen(\"libhkdfguard.so.1\")"
 cat > "$work/dlopen_check.c" <<'C'
 #include <dlfcn.h>
 #include <stdio.h>
 int main(void) {
-    void* lib = dlopen("HkdfGuard.Kms.Linux.v1.so", RTLD_NOW);
+    void* lib = dlopen("libhkdfguard.so.1", RTLD_NOW);
     if (!lib) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
     if (!dlsym(lib, "hkdfguard_wrap_dek")) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
-    puts("HkdfGuard.Kms.Linux.v1.so loads and exports hkdfguard_wrap_dek");
+    puts("libhkdfguard.so.1 loads and exports hkdfguard_wrap_dek");
     return 0;
 }
 C

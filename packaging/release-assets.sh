@@ -6,9 +6,10 @@
 #
 # Writes to <out-dir>:
 #   hkdfguard-<version>-<distro>-<arch>.tar.gz  one target's .deb or .rpm packages
-#   hkdfguard-<version>-linux-<arch>.tar.gz     the standalone library, CLI and
-#                                               header, with LICENSE and
-#                                               THIRD-PARTY-LICENSES.txt
+#   hkdfguard-<version>-linux-<arch>.tar.gz     the standalone library
+#                                               (libhkdfguard.so.1, .so, .a),
+#                                               CLI and header, with LICENSE
+#                                               and THIRD-PARTY-LICENSES.txt
 #   SHA256SUMS                                  every file above
 # and <out-dir>/../attestation-subjects.txt: SHA256SUMS plus the files
 # inside each tarball, so a package or binary that has been extracted can
@@ -67,11 +68,11 @@ for dir in "$artifacts"/binaries-*/; do
     arch=$(basename "$dir"); arch=${arch#binaries-}
     bin="$stage/bin-$arch"
     mkdir -p "$bin/lib" "$bin/bin" "$bin/include"
-    install -m 0644 "$dir/libhkdfguard_v1.so" "$dir/libhkdfguard_v1.a" "$bin/lib/"
-    # The SONAME (build.rs), and the name the other platforms' builds use
-    # (see scripts/build-release.sh).
-    ln -s libhkdfguard_v1.so "$bin/lib/libhkdfguard.so.1"
-    ln -s libhkdfguard_v1.so "$bin/lib/HkdfGuard.Kms.Linux.v1.so"
+    # Named as the packages install them: the library under its SONAME
+    # (build.rs), not Cargo's libhkdfguard_v1.
+    install -m 0644 "$dir/libhkdfguard_v1.so" "$bin/lib/libhkdfguard.so.1"
+    ln -s libhkdfguard.so.1 "$bin/lib/libhkdfguard.so"
+    install -m 0644 "$dir/libhkdfguard_v1.a" "$bin/lib/libhkdfguard.a"
     install -m 0755 "$dir/hkdfguard-v1-initialize" "$bin/bin/"
     install -m 0644 "$dir/hkdfguard.h" "$bin/include/"
     install -m 0644 LICENSE "$stage/THIRD-PARTY-LICENSES.txt" "$bin/"
