@@ -46,6 +46,98 @@ skip if they ever run as root. The script:
 
 Exits non-zero (and stops at the failing section) if anything fails.
 
+## Test across distributions (SoftHSM2 + Ephemeral)
+
+```sh
+docker/run-distro-tests.sh                        # every distribution
+docker/run-distro-tests.sh alpine-3.24 sles-16.0  # a subset
+docker/run-distro-tests.sh --list                 # the names
+JOBS=3 docker/run-distro-tests.sh                 # three at a time
+docker/distros/test-sles-16.0.sh                  # one, output streamed
+```
+
+Every distribution has its own `docker/distros/test-<name>.sh`.
+`docker/run-all-tests.sh` runs `run-tests.sh` and then this whole matrix:
+the fleet [CONTRIBUTING.md](../CONTRIBUTING.md) asks every change to pass.
+
+Proves the PKCS#11 (SoftHSM2) and Ephemeral providers on each
+distribution's own libc, toolchain and SoftHSM2 build, one container
+each:
+
+| Name | Base image | SoftHSM2 from |
+|---|---|---|
+| `almalinux-9`, `almalinux-10` | `almalinux` | AppStream |
+| `debian-12`, `debian-13` | `debian` | main |
+| `ubuntu-24.04`, `ubuntu-26.04` | `ubuntu` | universe |
+| `sles-15.7` | `registry.suse.com/bci/bci-base:15.7` | built from pinned upstream source |
+| `sles-16.0` | `registry.suse.com/bci/bci-base:16.0` | openSUSE Backports (SUSE Package Hub's packages), signing key pinned |
+| `ubi9-micro`, `ubi10-micro` | `registry.access.redhat.com/ubi{9,10}/ubi-micro` | built from pinned upstream source |
+| `amazonlinux-2023` | `amazonlinux` | core repository |
+| `alpine-3.24` | `alpine` (musl) | community |
+
+SLES runs on SUSE's freely redistributable BCI images, which are real
+SLES binaries without a subscription, but carry only part of SLES's
+package set; softhsm is not in it (see
+[`distros/Dockerfile.zypper`](distros/Dockerfile.zypper)). Alpine builds
+with `-C target-feature=-crt-static`: a static musl binary cannot
+`dlopen()` a PKCS#11 module, and rustc will not build the cdylib at all.
+
+UBI Micro has no package manager, compiler, `find` or `useradd`, so
+[`distros/Dockerfile.ubi-micro`](distros/Dockerfile.ubi-micro) assembles
+it the way Red Hat documents: a full UBI image of the same release
+installs packages into a copy of Micro's root filesystem
+(`dnf --installroot`) and, in the same builder stage, compiles the
+release library, the C consumers and every test executable
+([`distros/build-artifacts.sh`](distros/build-artifacts.sh)). The final
+image runs those prebuilt (`HKDFGUARD_PREBUILT=1`): the same tests, minus
+cargo. It adds to stock Micro only SoftHSM2 and its libraries
+(`openssl-libs`, `libstdc++`), plus `util-linux` and `grep` for the
+harness. An extra check asserts that the release library and CLI link
+nothing beyond glibc and `libgcc_s`, so they run on unmodified Micro.
+
+Each base image is pinned by digest in the script's matrix, as is every
+download (rustup-init, the SoftHSM2 source, the Backports key). The
+images come from one Dockerfile per package-manager family
+([`distros/`](distros/)), which installs the distribution's packages and
+then runs the shared
+[`distros/prepare-image.sh`](distros/prepare-image.sh) (pinned Rust
+toolchain, the unprivileged `ci` user).
+[`distros/entrypoint-distro-test.sh`](distros/entrypoint-distro-test.sh)
+then, as `ci`:
+
+1. Builds with `--features pkcs11` and runs the default-feature tests,
+   including the ephemeral provider's unit tests.
+2. Initializes a SoftHSM2 token and runs the test build
+   (`--cfg hkdfguard_test_paths`) suite, then the `#[ignore]`d PKCS#11
+   tests against the token.
+3. Builds the release library and CLI, then checks them against a
+   root-owned `/etc/hkdfguard/policy.toml`, as a deployment installs it:
+   - with no policy, no provider is available: ephemeral is never a
+     silent fallback;
+   - with `provider = "ephemeral"`, `examples/wrap_unwrap.c` round-trips,
+     and [`distros/ephemeral_cross_process.c`](distros/ephemeral_cross_process.c)
+     shows a payload wrapped by one process cannot be unwrapped by the
+     next (the KEK dies with the process);
+   - with `provider = "pkcs11"` and a `root:ci 0440` PIN file, the CLI
+     provisions and wraps, a separate process unwraps through the `.so`,
+     and a world-readable PIN file is refused.
+
+Nothing is left in Docker afterwards. Each distribution's image is
+removed as soon as its run ends, pass or fail. On exit, including Ctrl-C,
+running builds and containers are stopped and removed, along with any
+pinned base image the run itself pulled; images that were already
+present are never touched. `docker/run-tests.sh` cleans up the same way.
+Set `KEEP_IMAGES=1` to keep the images for debugging. BuildKit's build
+cache is kept so reruns are fast; `docker builder prune` reclaims it,
+for every project on the machine, not only this one.
+
+The TPM2 provider is not part of this matrix: it needs tpm2-tss 4.x and
+has the swtpm suite above. All distributions run even when one fails;
+the summary lists each result and its log under `target/distro-tests/`.
+The images run on the Docker host's native architecture; set
+`PLATFORM=linux/amd64` (or `linux/arm64`) to test the other one under
+QEMU emulation, which is much slower.
+
 ## Build a distributable release
 
 ```sh

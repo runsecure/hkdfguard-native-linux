@@ -630,6 +630,19 @@ retired `--dek` and an unprovisioned `wrap` both asserted to be refused)
 unwrapped by a separate C consumer. Every change in this repo is expected
 to pass it. See [`docker/README.md`](docker/README.md).
 
+```sh
+docker/run-distro-tests.sh
+```
+
+Runs the PKCS#11 (SoftHSM2) and Ephemeral provider tests, plus release
+builds of the library and CLI configured through a root-owned policy, on
+AlmaLinux 9 and 10, Debian 12 and 13, Ubuntu 24.04 and 26.04, SLES 15 SP7
+and 16.0, Red Hat UBI 9 and 10 Micro, Amazon Linux 2023 and Alpine 3.24
+(musl), each in its own container. See "Test across distributions" in
+[`docker/README.md`](docker/README.md). `docker/run-all-tests.sh` runs both
+suites, which every change is expected to pass before it is merged; see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Packages (.deb / .rpm)
 
 ```sh
@@ -1220,6 +1233,10 @@ scripts/
   tpm-reboot-test.sh         swtpm-restart approximation of reboot persistence
 docker/                      Dockerfile + entrypoint running the full matrix
                               against swtpm and SoftHSM2 (run-tests.sh)
+  distros/                   Per-distribution SoftHSM2 + Ephemeral test images:
+                              AlmaLinux, Debian, Ubuntu, SLES, UBI Micro,
+                              Amazon Linux, Alpine (run-distro-tests.sh)
+  run-all-tests.sh           Every containerized suite (see CONTRIBUTING.md)
 build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1)
 debian/                      Debian packaging (dpkg-buildpackage)
 .github/
