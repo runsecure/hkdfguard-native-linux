@@ -33,6 +33,17 @@ bound into both the AEAD's associated data and the HKDF `info`, so the
 `provider_type` tag and the KEK fingerprint are authenticated rather
 than merely present.
 
+## Documentation
+
+For installing, configuring and using HKDFGuard on a host:
+
+- [Installation](docs/installation.md): packages, standalone tarball, container overlay, verifying downloads
+- [Configuration](docs/configuration.md): `/etc/hkdfguard/policy.toml`, setting up each provider, example policies, permissions
+- [Usage](docs/usage.md): the deployment workflow, the CLI, the C API, linking, running as a service
+- [Troubleshooting](docs/troubleshooting.md): finding out why a call fails, and what each error means
+
+The rest of this README covers the design and building from source.
+
 ## Quick start
 
 ```sh
