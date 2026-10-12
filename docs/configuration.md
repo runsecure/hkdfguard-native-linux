@@ -248,19 +248,22 @@ Otherwise the first of these that exists:
 Each service's KEK is the file `<dir>/<service-name>`, e.g.
 `/run/secrets/hkdfguard/com.company.orders`.
 
-**The key file** holds a P-256 private key, in one of two forms:
+**The key file** holds a P-256 private key, as 32 raw bytes, or in DER
+form (PKCS#8 or SEC1):
 
 ```sh
 # A raw 32-byte private scalar:
 ( umask 077; head -c 32 /dev/urandom > com.company.orders )
 
-# Or PKCS#8 DER:
+# Or DER, straight from OpenSSL (this writes SEC1; PKCS#8 works too):
 ( umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-    | openssl pkcs8 -topk8 -nocrypt -outform DER -out com.company.orders )
+    -outform DER -out com.company.orders )
 ```
 
-`openssl genpkey -outform DER` on its own writes the SEC1 format, which is
-**not** accepted: convert it with `openssl pkcs8 -topk8` as above.
+PEM (text starting `-----BEGIN`) isn't accepted: convert it to DER first,
+with `openssl pkey -in key.pem -outform DER -out key.der`. A key for any
+curve other than P-256 is refused. `provision` reads and checks the key, so
+a wrong format is reported when you provision, not later.
 
 **File rules.** The file must:
 - be owned by root or by the service's user, with no group or other access

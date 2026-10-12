@@ -113,7 +113,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `permissions too broad (mode ...)` | The key file must be `0400` or `0600` with no group or other access. On Kubernetes, check `defaultMode`, and leave `fsGroup` unset for the secret volume. |
 | `owned by uid ..., which is not an allowed owner` | The key file must be owned by root or by the service's user |
 | `resolves to ..., outside the secret mount` | A symlink points out of the mount. Deliver the file inside it. |
-| `external secret is not a valid P-256 key: PKCS#8 ASN.1 error: ... expected SEQUENCE, got OCTET STRING` | The key is in SEC1 format (what `openssl genpkey -outform DER` writes). Convert it: `openssl pkcs8 -topk8 -nocrypt -inform DER -in key.sec1 -outform DER -out key.pkcs8`, or use a raw 32-byte scalar. |
+| `external secret is not a valid P-256 key (expected 32 raw bytes, PKCS#8 DER or SEC1 DER; PEM must be converted to DER)` | The file isn't one of the accepted forms. Most often it's PEM (text starting `-----BEGIN`): convert it with `openssl pkey -in key.pem -outform DER -out key.der`. Or the key is for another curve: only P-256 is accepted. |
 | A configured `external_secret.dir` is missing | The mount isn't there yet (a volume not attached, a sidecar not ready). Fix the mount; the library won't use another provider in the meantime. |
 
 ## No KEK for the service (-9)
@@ -165,13 +165,11 @@ HKDFGuard can't tell these apart, by design.
 
 ## Other problems
 
-**`provision` says "already provisioned", but `wrap` fails.** Two common causes:
-- **External secret:** `provision` only checks that the key file exists.
-  If its contents are invalid (the wrong format, for example), the error
-  appears at `wrap`.
-- **TPM without `require_pinned_names`:** the TPM derives a key for any
-  name, so `provision` always reports a key. Enable pinned names to make
-  provisioning explicit.
+**`provision` says "already provisioned" for a service you never set up.**
+On a TPM without `require_pinned_names`, the TPM derives a key for any name,
+so `provision` always reports a key; a typo in a service name then quietly
+gets its own key. Enable pinned names to make provisioning explicit
+([configuration.md](configuration.md#tpm-20), step 3).
 
 **Startup takes about a second per service.** By design:
 `hkdfguard_create_kek` and `hkdfguard_kek_exists` take at least

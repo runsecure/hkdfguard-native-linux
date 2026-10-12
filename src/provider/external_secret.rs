@@ -10,11 +10,14 @@
 //! the root-owned policy when set; otherwise the first of a list of
 //! conventional secret mount points that exists.
 //!
-//! The secret file's contents must be either a PKCS#8 DER-encoded P-256
-//! private key, or exactly 32 raw big-endian scalar bytes.
+//! The secret file's contents must be a P-256 private key, as exactly 32
+//! raw big-endian scalar bytes, PKCS#8 DER, or SEC1 DER (`ECPrivateKey`,
+//! what `openssl genpkey -outform DER` writes).
 //!
 //! This provider never creates or writes a secret: if no file exists for a
-//! given service it declines with [`Error::KeyNotProvisioned`].
+//! given service it declines with [`Error::KeyNotProvisioned`]. A file that
+//! exists is only reported as a provisioned KEK once it has been read and
+//! parsed, so a malformed secret fails at provisioning, not at first use.
 //!
 //! ## What the file must satisfy
 //!
@@ -54,7 +57,7 @@
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
 use crate::secure_file::{open_checked, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_ACCESS}; // descriptor-based trust checks and a self-wiping read buffer
-use elliptic_curve::pkcs8::DecodePrivateKey; // lets `SecretKey` parse from PKCS#8 DER
+use elliptic_curve::pkcs8::DecodePrivateKey; // lets `SecretKey` parse from PKCS#8 DER (SEC1 DER is an inherent method)
 use p256::{PublicKey, SecretKey}; // P-256 key types
 use std::fs::File;
 use std::path::{Path, PathBuf}; // filesystem path types
@@ -156,11 +159,13 @@ impl KekProvider for ExternalSecretProvider {
         self.dir.is_some() || self.refused.is_some()
     }
 
-    // Reads nothing: resolves and opens the file exactly as `load_kek`
-    // would, so "exists" means "exists *and* would be accepted". A file
-    // that is present but fails a trust check is an error here, not
-    // `false` -- reporting it as absent would let the chain move on to a
-    // weaker provider and hide the misconfiguration.
+    // Loads the key exactly as `load_kek` would -- open, trust checks, read,
+    // parse -- so "exists" means "exists *and* is a usable key", and a
+    // malformed secret is reported when it is provisioned rather than at
+    // the first wrap. A file that is present but fails a trust check, or
+    // doesn't parse, is an error here, not `false`: reporting it as absent
+    // would let the chain move on to a weaker provider and hide the
+    // misconfiguration.
     fn kek_exists(&self, service: &str) -> Result<bool> {
         self.check_not_refused()?;
         if !is_safe_file_name(service) {
@@ -169,13 +174,7 @@ impl KekProvider for ExternalSecretProvider {
         let Some(dir) = self.dir.as_ref() else {
             return Ok(false); // no mount at all
         };
-        match open_secret_within_mount(dir, service) {
-            Ok(_file) => Ok(true), // opened and passed every check; the descriptor is dropped unread
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(Error::Provider(format!(
-                "external secret for this service is present but not trusted: {e}"
-            ))),
-        }
+        Ok(read_key(dir, service)?.is_some()) // the parsed key drops (and zeroizes) here
     }
 
     // `create_if_missing` is deliberately ignored: this provider never
@@ -195,33 +194,9 @@ impl KekProvider for ExternalSecretProvider {
             .as_ref()
             .ok_or(Error::KeyNotProvisioned("no external secret mount found"))?; // no mount at all -> decline immediately
 
-        let mut file = match open_secret_within_mount(dir, service) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // mount exists, but nothing has been provisioned for this specific service yet
-                return Err(Error::KeyNotProvisioned(
-                    "no secret file provisioned for this service",
-                ));
-            }
-            Err(e) => {
-                // present but untrusted (escapes the mount, wrong owner, too
-                // broad a mode, not a regular file) or unreadable: a real
-                // failure, never "not provisioned"
-                return Err(Error::Provider(format!(
-                    "external secret for this service rejected: {e}"
-                )));
-            }
-        };
-
-        // Raw KEK private-key material (a PKCS#8 DER key or a raw scalar)
-        // read straight off disk into a `SecretBuffer`: one fixed
-        // allocation, never grown, zeroed on every exit path below.
-        let mut bytes = SecretBuffer::read_from(&mut file, MAX_SECRET_FILE_LEN)
-            .map_err(|e| Error::Provider(format!("failed to read external secret: {e}")))?;
-
-        let parsed = parse_secret_key(bytes.as_slice()); // accept either raw-scalar or PKCS#8 DER
-        bytes.wipe(); // the raw bytes have served their only purpose -- clear them now, on success *and* failure, before propagating anything
-        let secret_key = parsed?;
+        let secret_key = read_key(dir, service)?.ok_or(Error::KeyNotProvisioned(
+            "no secret file provisioned for this service", // mount exists, but nothing provisioned for this service yet
+        ))?;
         let key_id = format!("external:{service}").into_bytes();
 
         Ok(Box::new(ExternalSecretHandle {
@@ -229,6 +204,28 @@ impl KekProvider for ExternalSecretProvider {
             secret_key,
         }))
     }
+}
+
+/// Opens, checks, reads and parses `<mount>/<service>`. `Ok(None)` only when
+/// no such file exists (nothing provisioned); a file that is untrusted
+/// (escapes the mount, wrong owner, too broad a mode, not a regular file),
+/// unreadable, or not a valid P-256 key is an error, never "not
+/// provisioned".
+fn read_key(mount: &Path, service: &str) -> Result<Option<SecretKey>> {
+    let mut file = match open_secret_within_mount(mount, service) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Provider(format!("external secret for this service rejected: {e}"))),
+    };
+
+    // Raw KEK private-key material read straight off disk into a
+    // `SecretBuffer`: one fixed allocation, never grown, zeroed on every
+    // exit path below.
+    let mut bytes = SecretBuffer::read_from(&mut file, MAX_SECRET_FILE_LEN)
+        .map_err(|e| Error::Provider(format!("failed to read external secret: {e}")))?;
+    let parsed = parse_secret_key(bytes.as_slice());
+    bytes.wipe(); // the raw bytes have served their only purpose -- clear them now, on success *and* failure, before propagating anything
+    parsed.map(Some)
 }
 
 // Largest secret file accepted. A PKCS#8 DER P-256 key is ~138 bytes and
@@ -348,17 +345,29 @@ fn verify_opened(file: &File, target_real: &Path, mount_real: &Path, proc_root: 
     Ok(())
 }
 
-// Accepts either a 32-byte raw scalar or a PKCS#8 DER-encoded key, since
-// different provisioning tools produce different formats.
+// Accepts a 32-byte raw scalar, a PKCS#8 DER key, or a SEC1 DER
+// (`ECPrivateKey`) key, since different provisioning tools produce
+// different formats -- `openssl genpkey -outform DER` writes SEC1. Both DER
+// forms must name the P-256 curve when they name one at all; a key for
+// any other curve is refused.
 fn parse_secret_key(bytes: &[u8]) -> Result<SecretKey> {
     if bytes.len() == 32 {
         // exactly 32 bytes: treat as a raw big-endian P-256 private scalar
         return SecretKey::from_slice(bytes)
             .map_err(|e| Error::Provider(format!("invalid raw external KEK scalar: {e}")));
     }
-    // anything else: try to parse it as a standard PKCS#8 DER private key
+    // A DER key: PKCS#8 (a PrivateKeyInfo, whose second field is the
+    // algorithm SEQUENCE) or SEC1 (an ECPrivateKey, whose second field is
+    // the key OCTET STRING). Errors are reported for the format that was
+    // tried last, with the accepted formats named, since a PEM file or a
+    // key for the wrong curve is the usual cause.
     SecretKey::from_pkcs8_der(bytes)
-        .map_err(|e| Error::Provider(format!("external secret is not a valid P-256 key: {e}")))
+        .or_else(|_| SecretKey::from_sec1_der(bytes))
+        .map_err(|e| {
+            Error::Provider(format!(
+                "external secret is not a valid P-256 key (expected 32 raw bytes, PKCS#8 DER or SEC1 DER; PEM must be converted to DER): {e}"
+            ))
+        })
 }
 
 // Picks the secret mount directory: `external_secret.dir` from the policy,
@@ -641,6 +650,59 @@ mod tests {
             assert_eq!(public_a, key_a.public_key());
             assert_eq!(public_b, key_b.public_key());
             assert_ne!(public_a, public_b, "different provisioned keys must produce different public keys");
+        });
+    }
+
+    // An ECPrivateKey (SEC1 DER) exactly as `openssl genpkey -algorithm EC
+    // -pkeyopt ec_paramgen_curve:P-256 -outform DER` writes it: version 1,
+    // the 32-byte key, the prime256v1 OID, and the public point, which is
+    // the last 65 bytes. A throwaway test key.
+    const OPENSSL_P256_SEC1_DER: &str = "30770201010420ea598655faab80ea2ed2b41d232b0e2ed6291ec86ee54ea2da6fb704ff2d77f9a00a06082a8648ce3d030107a1440342000418d2afa00d9d7ffb1f6514ff3b303b6c4b2b95f5b150b03e56a086f9f5d021f02d0fc482189427a10597d3a4e0b673d364d9a95915c0c3d05b389adc3ea0ffae";
+    // The same, for P-384 (secp384r1). A throwaway test key.
+    const OPENSSL_P384_SEC1_DER: &str = "3081a402010104301b8239a974c78597128424d8e0704b918c2191efe564110956c8f536b337de8c3255811434aaee8eed4d1b0cbf1dc1c9a00706052b81040022a16403620004e32b45d36c8cf4ac83aa5d3386fca1291f5892e079c687ac3c00a3b91d399057d308d7272f4eaf709412526ca7a131944e32bcb119dad9b4ca0effd743845860b040018c325b9e4ecda3fca57c502d702115507c25d577c03198e8d0c8c719b3";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    #[serial]
+    fn loads_an_openssl_sec1_secret() {
+        use elliptic_curve::sec1::ToSec1Point;
+        with_dir(|provider, dir| {
+            let der = unhex(OPENSSL_P256_SEC1_DER);
+            provision(dir, "com.company.orders", &der);
+
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+            let handle = provider.load_kek("com.company.orders", false).unwrap();
+            // The key loaded is the one in the file: its public point is the
+            // one OpenSSL embedded alongside it.
+            let public = handle.public_key().unwrap().to_sec1_point(false);
+            assert_eq!(public.as_bytes(), &der[der.len() - 65..]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_a_sec1_key_for_another_curve() {
+        with_dir(|provider, dir| {
+            provision(dir, "com.company.orders", unhex(OPENSSL_P384_SEC1_DER));
+            let err = provider.kek_exists("com.company.orders").unwrap_err();
+            assert!(err.to_string().contains("not a valid P-256 key"), "{err}");
+            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Provider(_))));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_unparseable_secret_is_an_error_at_provisioning_not_a_kek() {
+        // kek_exists is what `provision` asks; it must not report a key
+        // the first wrap would then reject.
+        with_dir(|provider, dir| {
+            provision(dir, "com.company.orders", b"-----BEGIN EC PRIVATE KEY-----\nnot DER\n");
+            let err = provider.kek_exists("com.company.orders").unwrap_err();
+            assert!(err.to_string().contains("PEM must be converted to DER"), "{err}");
+            assert!(matches!(provider.load_kek("com.company.orders", true), Err(Error::Provider(_))));
         });
     }
 
