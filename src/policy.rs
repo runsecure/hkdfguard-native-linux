@@ -2158,6 +2158,45 @@ mod tests {
     }
 
     #[test]
+    fn the_policies_in_docs_configuration_md_are_valid() {
+        // docs/configuration.md is what operators copy from. Every complete
+        // example policy there must validate as written (placeholder TPM
+        // Names swapped for well-formed ones); every other block with a
+        // [selection] -- the reference, which lists every key at once --
+        // must at least be valid TOML using only known keys.
+        let doc = include_str!("../docs/configuration.md");
+        let examples_start = doc.find("## Example policies").expect("docs: no \"Example policies\" section");
+        let examples_end = doc[examples_start..].find("\n## ").map_or(doc.len(), |i| examples_start + i + 1);
+        let dummy_name = format!("000b{}", "00".repeat(32));
+        let mut examples = 0;
+        let mut pos = 0;
+        while let Some(start) = doc[pos..].find("```toml\n") {
+            let body_start = pos + start + "```toml\n".len();
+            let body_end = body_start + doc[body_start..].find("```").expect("docs: unterminated toml block");
+            pos = body_end + 3;
+            let body = &doc[body_start..body_end];
+            if !body.contains("[selection]") {
+                continue; // a fragment, not a policy
+            }
+            let line = doc[..body_start].lines().count();
+            if (examples_start..examples_end).contains(&body_start) {
+                let policy = body.replace("000b<64 hex chars>", &dummy_name);
+                if let Err(e) = Policy::from_toml_str(&policy) {
+                    panic!("docs/configuration.md line {line}: example policy is invalid: {e}");
+                }
+                examples += 1;
+            } else if let Err(e) = Policy::from_toml_str(body) {
+                let e = e.to_string();
+                assert!(
+                    !e.contains("TOML parse error") && !e.contains("unknown field"),
+                    "docs/configuration.md line {line}: {e}"
+                );
+            }
+        }
+        assert!(examples >= 4, "found {examples} example policies in docs/configuration.md");
+    }
+
+    #[test]
     fn every_commented_setting_in_the_example_is_a_real_one() {
         // Uncommenting any one `#key = value` line must give a key the
         // schema knows, in the table it sits under. Placeholders (TPM
