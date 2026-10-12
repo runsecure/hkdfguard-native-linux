@@ -60,7 +60,7 @@ What `provision` does depends on the provider:
 |---|---|
 | TPM | Derives the key on demand, so it reports "already provisioned". With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
 | PKCS#11 | Generates the key pair on the token, once. |
-| External secret | Checks for the delivered file: the file itself is the provisioning. |
+| External secret | Checks the delivered file and that it holds a valid key: the file itself is the provisioning. |
 | Ephemeral | Creates a key that lives only in that one process (so `provision` from the CLI is pointless for it). |
 
 ## The CLI: `hkdfguard-v1-initialize`
