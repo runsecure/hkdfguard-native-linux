@@ -1,0 +1,61 @@
+# SUSE Linux Enterprise Server test image, on SUSE's freely redistributable
+# BCI base (registry.suse.com/bci/bci-base), which carries real SLES
+# binaries but only a subset of SLES's packages. One of the per-distro
+# images docker/run-distro-tests.sh builds; see docker/README.md.
+#
+# softhsm is not in that subset. On SLES it comes from SUSE Package Hub,
+# whose packages the openSUSE Backports repositories publish:
+#   - BACKPORTS_REPO set (SLES 16): add that repository and install its
+#     softhsm, as a registered SLES host with Package Hub enabled would.
+#     The repository's signing key is pinned by SHA-256
+#     (BACKPORTS_KEY_SHA256), so a changed key fails the build instead of
+#     being trusted on first use.
+#   - BACKPORTS_REPO empty (SLES 15 SP7, whose Backports repository no
+#     longer carries softhsm): build it from pinned upstream source
+#     (build-softhsm.sh).
+#
+# BASE_IMAGE is always passed by run-distro-tests.sh, pinned by digest
+# there; the default only keeps a bare `docker build` working.
+ARG BASE_IMAGE=registry.suse.com/bci/bci-base:16.0@sha256:23e3d679d07fe982d1e306bb2536ef7279aa82f7d296ed3f990f5c55c53f1878
+FROM ${BASE_IMAGE}
+ARG BACKPORTS_REPO=
+ARG BACKPORTS_KEY_SHA256=
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN zypper --non-interactive install --no-recommends \
+        curl \
+        findutils \
+        gawk \
+        gcc \
+        shadow \
+        util-linux \
+    && zypper clean --all
+
+COPY docker/distros/build-softhsm.sh /tmp/build-softhsm.sh
+RUN set -eu; \
+    if [ -n "$BACKPORTS_REPO" ]; then \
+        curl --proto '=https' --tlsv1.2 -sSfLo /tmp/backports.key "${BACKPORTS_REPO}repodata/repomd.xml.key"; \
+        echo "${BACKPORTS_KEY_SHA256}  /tmp/backports.key" | sha256sum -c -; \
+        rpm --import /tmp/backports.key; \
+        rm /tmp/backports.key; \
+        zypper --non-interactive addrepo --refresh "$BACKPORTS_REPO" backports; \
+        zypper --non-interactive install --no-recommends softhsm; \
+    else \
+        zypper --non-interactive install --no-recommends \
+            autoconf automake gcc-c++ gzip libopenssl-3-devel libtool make pkg-config tar; \
+        sh /tmp/build-softhsm.sh; \
+    fi; \
+    rm /tmp/build-softhsm.sh; \
+    zypper clean --all
+
+COPY docker/distros/prepare-image.sh /tmp/prepare-image.sh
+RUN sh /tmp/prepare-image.sh && rm /tmp/prepare-image.sh
+ENV SOFTHSM2_CONF=/etc/softhsm2-ci.conf \
+    HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1
+
+WORKDIR /work
+COPY --chown=ci:ci . /work
+ENTRYPOINT ["bash", "docker/distros/entrypoint-distro-test.sh"]

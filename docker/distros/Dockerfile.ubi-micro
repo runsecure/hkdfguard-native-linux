@@ -1,0 +1,73 @@
+# Red Hat UBI Micro test image. One of the per-distro images
+# docker/run-distro-tests.sh builds; see docker/README.md.
+#
+# UBI Micro is a runtime base: glibc, libgcc and a few coreutils, but no
+# package manager, compiler, find, grep or useradd. It is assembled the way
+# Red Hat documents for it: a full UBI image of the same release
+# (BUILDER_IMAGE) installs packages into a copy of Micro's root filesystem
+# with `dnf --installroot`, and the result is copied over Micro. That
+# builder stage also compiles everything the tests run
+# (build-artifacts.sh), so the final image runs prebuilt binaries
+# (HKDFGUARD_PREBUILT=1) on Micro's own libraries.
+#
+# What the final image adds to stock Micro, and why:
+#   openssl-libs, libstdc++  SoftHSM2's dependencies. HKDFGuard's release
+#                            library and CLI need neither: the entrypoint
+#                            checks they link only what Micro ships.
+#   softhsm                  built from pinned source (build-softhsm.sh);
+#                            the UBI repositories do not carry it
+#   util-linux, grep         test-harness tools only (setpriv, grep)
+#
+# BASE_IMAGE, BUILDER_IMAGE and RELEASEVER are always passed by
+# run-distro-tests.sh, pinned by digest there; the defaults only keep a
+# bare `docker build` working.
+ARG BASE_IMAGE=registry.access.redhat.com/ubi10/ubi-micro@sha256:5b13e670e107509be71c066180032017ff5dddff2b6cd60d16311a5cea309953
+ARG BUILDER_IMAGE=registry.access.redhat.com/ubi10/ubi@sha256:ad0d8e4fcd4c83cf4a2d025de402f010fd068e43f253d0a57b5681d1ad45f044
+
+FROM ${BASE_IMAGE} AS micro
+
+FROM ${BUILDER_IMAGE} AS builder
+ARG RELEASEVER=10
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        autoconf \
+        automake \
+        gcc \
+        gcc-c++ \
+        libtool \
+        make \
+        openssl-devel \
+        pkgconf \
+    && dnf clean all
+
+COPY --from=micro / /mnt/rootfs
+RUN dnf install -y --installroot /mnt/rootfs --releasever "$RELEASEVER" \
+        --setopt=install_weak_deps=False --nodocs \
+        grep \
+        libstdc++ \
+        openssl-libs \
+        util-linux \
+    && dnf --installroot /mnt/rootfs clean all
+
+COPY docker/distros/build-softhsm.sh docker/distros/prepare-image.sh /tmp/
+RUN DESTDIR=/mnt/rootfs sh /tmp/build-softhsm.sh \
+    && sh /tmp/prepare-image.sh rust \
+    && sh /tmp/prepare-image.sh user /mnt/rootfs
+
+WORKDIR /work
+COPY . /work
+RUN sh docker/distros/build-artifacts.sh
+
+FROM ${BASE_IMAGE}
+COPY --from=builder /mnt/rootfs/ /
+COPY --from=builder --chown=ci:ci /work /work
+ENV SOFTHSM2_CONF=/etc/softhsm2-ci.conf \
+    SOFTHSM_MODULE=/usr/lib64/softhsm/libsofthsm2.so \
+    HKDFGUARD_PREBUILT=1 \
+    HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1
+
+WORKDIR /work
+ENTRYPOINT ["bash", "docker/distros/entrypoint-distro-test.sh"]
