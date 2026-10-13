@@ -45,10 +45,13 @@ int main(int argc, char** argv) {
     const char* service = argv[2];
     const char* expected_dek_path = argv[3];
 
-    uint8_t wrapped[1024];
-    long wrapped_len = read_file(wrapped_path, wrapped, (long)sizeof(wrapped));
-    if (wrapped_len <= 0) {
-        fprintf(stderr, "failed to read wrapped file %s\n", wrapped_path);
+    /* Read the key file the way an application should: the library checks
+     * it is a complete, well-formed wrapped DEK before handing it over. */
+    uint8_t wrapped[HKDFGUARD_WRAPPED_MAX_LEN];
+    int wrapped_len = (int)sizeof(wrapped);
+    int rc = hkdfguard_open_file(wrapped_path, wrapped, &wrapped_len);
+    if (rc != HKDFGUARD_OK) {
+        fprintf(stderr, "hkdfguard_open_file(%s) failed: %d\n", wrapped_path, rc);
         return 1;
     }
 
@@ -59,9 +62,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* The expected-DEK file is a plaintext key: hkdfguard_open_file must
+     * refuse it as one, and leave nothing of it in the buffer. */
+    uint8_t probe[HKDFGUARD_WRAPPED_MAX_LEN];
+    int probe_len = (int)sizeof(probe);
+    rc = hkdfguard_open_file(expected_dek_path, probe, &probe_len);
+    if (rc != HKDFGUARD_ERR_FILE_PLAINTEXT_KEY || probe_len != 0) {
+        fprintf(stderr, "hkdfguard_open_file on a raw DEK returned %d (len %d), expected %d\n",
+                rc, probe_len, HKDFGUARD_ERR_FILE_PLAINTEXT_KEY);
+        return 1;
+    }
+
     uint8_t recovered[HKDFGUARD_DEK_LEN];
     int recovered_len = sizeof(recovered);
-    int rc = hkdfguard_unwrap_dek(service, wrapped, (int)wrapped_len, recovered, &recovered_len);
+    rc = hkdfguard_unwrap_dek(service, wrapped, wrapped_len, recovered, &recovered_len);
     if (rc != HKDFGUARD_OK) {
         fprintf(stderr, "hkdfguard_unwrap_dek failed: %d\n", rc);
         return 1;

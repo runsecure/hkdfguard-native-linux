@@ -10,6 +10,7 @@
 
 mod crypto; // ECDH -> HKDF -> AES-GCM protocol
 mod error; // internal error type + public status codes
+mod key_file; // reading and checking a wrapped-DEK key file (hkdfguard_open_file)
 mod payload; // wrapped-payload wire format
 mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.toml)
 mod provider; // provider trait + selection chain
@@ -660,6 +661,128 @@ fn unwrap_impl(
         *out_len = crypto::DEK_LEN as c_int; // always exactly 32 on success
     }
     dek.zeroize(); // our local copy has served its purpose; scrub it now rather than waiting for scope exit
+    status::OK
+}
+
+/// Reads a wrapped-key file into `out`, exactly as stored, after checking
+/// it is a complete, well-formed wrapped DEK -- see [`key_file`] for the
+/// checks. Never unwraps and never reaches a provider.
+///
+/// # Parameters
+/// - `path`: NUL-terminated path, at most `PATH_MAX` bytes including the
+///   terminator. Need not be UTF-8 (Linux paths are bytes).
+/// - `out` / `out_len`: on input, `*out_len` is the capacity of `out`. On
+///   success, the file's bytes are in `out` and `*out_len` is their count.
+///   On [`status::BUFFER_TOO_SMALL`], `*out_len` is a capacity to retry
+///   with. On every other failure `*out_len` is 0. On any failure, every
+///   byte of the declared capacity is zeroed -- unless `out_len` is NULL.
+///
+/// # Returns
+/// One of the status codes in [`status`]. Never throws/unwinds.
+///
+/// # Safety
+/// `path` must be a readable C string pointer. `out_len` must be a valid,
+/// readable and writable pointer to an `int`. `out` must be writable for
+/// at least `*out_len` bytes, unless null (in which case `*out_len` must be
+/// 0).
+#[no_mangle]
+pub extern "C" fn hkdfguard_open_file(path: *const c_char, out: *mut u8, out_len: *mut c_int) -> c_int {
+    let capacity = declared_capacity(out_len);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_file_impl(path, out, out_len, capacity))) {
+        Ok(code) => code,
+        Err(_) => {
+            log::error!("hkdfguard: internal panic caught at hkdfguard_open_file boundary");
+            zero_caller_buffer(out, capacity);
+            if !out_len.is_null() {
+                // SAFETY: non-null; caller contract guarantees it is writable.
+                unsafe { *out_len = 0 };
+            }
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+// Longest `path` hkdfguard_open_file accepts, terminator included: Linux's
+// PATH_MAX, which no path the kernel would open can exceed.
+const MAX_PATH_BYTES: usize = libc::PATH_MAX as usize;
+
+// Reads a NUL-terminated path from `ptr`, scanning at most MAX_PATH_BYTES
+// bytes for the terminator -- the same bounded scan as `cstr_to_service`,
+// so an unterminated buffer is refused instead of over-read.
+fn cstr_to_path(ptr: *const c_char) -> Result<std::path::PathBuf, c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    if ptr.is_null() {
+        return Err(status::INVALID_ARGUMENT);
+    }
+    let mut len = 0usize;
+    loop {
+        if len >= MAX_PATH_BYTES {
+            return Err(status::INVALID_ARGUMENT); // no NUL within PATH_MAX bytes
+        }
+        // SAFETY: caller contract guarantees a readable, NUL-terminated
+        // string; the loop stops at the first NUL and never reads past
+        // MAX_PATH_BYTES bytes.
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 {
+        return Err(status::INVALID_ARGUMENT);
+    }
+    // SAFETY: the loop above established that `len` bytes at `ptr` are readable.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+// The actual logic behind `hkdfguard_open_file`, running inside the
+// `catch_unwind` wrapper above.
+fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capacity: c_int) -> c_int {
+    if out_len.is_null() {
+        return status::INVALID_ARGUMENT; // no declared capacity, so nothing can be safely zeroed
+    }
+    // Every failure zeroes the declared buffer; `reported` is what *out_len says afterwards.
+    let fail = |code: c_int, reported: c_int| {
+        zero_caller_buffer(out, capacity);
+        // SAFETY: out_len is non-null (checked above).
+        unsafe { *out_len = reported };
+        code
+    };
+
+    if capacity < 0 {
+        return fail(status::INVALID_ARGUMENT, 0);
+    }
+    let path = match cstr_to_path(path) {
+        Ok(p) => p,
+        Err(code) => return fail(code, 0),
+    };
+    // Too small for any payload (including the 0 of a size probe):
+    // answered without opening the file, as hkdfguard_wrap_dek does.
+    if (capacity as usize) < crypto::MIN_WRAPPED_LEN {
+        return fail(status::BUFFER_TOO_SMALL, crypto::MAX_WRAPPED_LEN as c_int);
+    }
+    if out.is_null() {
+        return fail(status::INVALID_ARGUMENT, 0); // a declared capacity with nowhere to write
+    }
+
+    let wrapped = match key_file::read(&path) {
+        Ok(contents) => contents, // wiped when it drops at the end of this function
+        Err(e) => {
+            // The path is left out, as service names are: it often contains one.
+            log::error!("hkdfguard: hkdfguard_open_file refused a key file: {}", e.describe());
+            return fail(e.status_code(), 0);
+        }
+    };
+    let len = wrapped.as_slice().len(); // at most MAX_WRAPPED_LEN, so it fits a c_int
+    if len > capacity as usize {
+        return fail(status::BUFFER_TOO_SMALL, len as c_int);
+    }
+    // SAFETY: out is non-null and, per caller contract, writable for
+    // `capacity` >= len bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(wrapped.as_slice().as_ptr(), out, len);
+        *out_len = len as c_int;
+    }
     status::OK
 }
 
@@ -1655,5 +1778,214 @@ mod ffi_tests {
             hkdfguard_kek_exists(service.as_ptr(), std::ptr::null_mut()),
             status::INVALID_ARGUMENT
         );
+    }
+
+    // ---- hkdfguard_open_file ----
+
+    // Writes `contents` owner-only into a fresh private directory, as the
+    // CLI writes a key file; the directory is returned to keep it alive.
+    fn key_file_with(contents: &[u8]) -> (tempfile::TempDir, CString) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = secure_file::private_tempdir();
+        let path = dir.path().join("wrapped.key");
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, CString::new(path.into_os_string().into_encoded_bytes()).unwrap())
+    }
+
+    // A real payload, from the real wrap entry point.
+    fn wrapped_for_test(service: &CString, dek: &[u8; 32]) -> Vec<u8> {
+        create_kek_for_test(service);
+        let mut buf = [0u8; crypto::MAX_WRAPPED_LEN];
+        let mut len = buf.len() as c_int;
+        assert_eq!(hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, buf.as_mut_ptr(), &mut len), status::OK);
+        buf[..len as usize].to_vec()
+    }
+
+    // Calls hkdfguard_open_file with a buffer of `capacity` bytes, prefilled
+    // with 0xAA so a failure's zeroing is visible.
+    fn open_file(path: &CString, capacity: usize) -> (c_int, Vec<u8>, c_int) {
+        let mut out = vec![0xAAu8; capacity];
+        let mut out_len = capacity as c_int;
+        let rc = hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), &mut out_len);
+        (rc, out, out_len)
+    }
+
+    fn sample_wrapped_bytes() -> Vec<u8> {
+        payload::Payload {
+            provider_type: provider::ProviderType::Ephemeral,
+            key_id: b"ephemeral:com.company.orders".to_vec(),
+            salt: [1; payload::SALT_LEN],
+            nonce: [2; payload::NONCE_LEN],
+            ciphertext: vec![3; crypto::DEK_LEN + crypto::TAG_LEN],
+            fingerprint: [4; payload::FINGERPRINT_LEN],
+        }
+        .to_bytes()
+    }
+
+    #[test]
+    #[serial]
+    fn open_file_then_unwrap_recovers_the_dek() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders.openfile").unwrap();
+            let dek = [0x5Cu8; 32];
+            let wrapped = wrapped_for_test(&service, &dek);
+            let (_dir, path) = key_file_with(&wrapped);
+
+            let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+            assert_eq!(rc, status::OK);
+            assert_eq!(out_len as usize, wrapped.len(), "out_len is the number of bytes read");
+            assert_eq!(&out[..wrapped.len()], &wrapped[..], "the file's bytes, exactly as stored");
+            assert!(out[wrapped.len()..].iter().all(|&b| b == 0xAA), "nothing written past the payload");
+
+            let mut recovered = [0u8; 32];
+            let mut recovered_len: c_int = 32;
+            let rc = hkdfguard_unwrap_dek(service.as_ptr(), out.as_ptr(), out_len, recovered.as_mut_ptr(), &mut recovered_len);
+            assert_eq!(rc, status::OK);
+            assert_eq!(recovered, dek);
+        });
+    }
+
+    #[test]
+    fn open_file_accepts_an_exact_size_buffer() {
+        let bytes = sample_wrapped_bytes();
+        let (_dir, path) = key_file_with(&bytes);
+        let (rc, out, out_len) = open_file(&path, bytes.len());
+        assert_eq!(rc, status::OK);
+        assert_eq!(out_len as usize, bytes.len());
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn open_file_reports_each_refusal_and_zeroes_the_buffer() {
+        let valid = sample_wrapped_bytes();
+        let mut long = valid.clone();
+        long.push(0);
+        let mut bad_version = valid.clone();
+        bad_version[0] = 2;
+        let b64_dek = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([9u8; 32]) + "\n"
+        };
+        let cases: [(&str, Vec<u8>, c_int); 8] = [
+            ("empty", vec![], status::FILE_TOO_SHORT),
+            ("truncated", valid[..valid.len() - 1].to_vec(), status::FILE_TOO_SHORT),
+            ("appended", long, status::FILE_TOO_LONG),
+            ("oversized", vec![0u8; crypto::MAX_WRAPPED_LEN + 1], status::FILE_TOO_LONG),
+            ("bad version", bad_version, status::FILE_MALFORMED),
+            ("raw DEK", vec![9u8; 32], status::FILE_PLAINTEXT_KEY),
+            ("base64 DEK", b64_dek.into_bytes(), status::FILE_PLAINTEXT_KEY),
+            ("garbage", vec![0xEEu8; 200], status::FILE_MALFORMED),
+        ];
+        for (name, contents, expected) in cases {
+            let (_dir, path) = key_file_with(&contents);
+            let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+            assert_eq!(rc, expected, "{name}");
+            assert_eq!(out_len, 0, "{name}: no bytes reported read");
+            assert!(out.iter().all(|&b| b == 0), "{name}: the whole buffer is zeroed");
+        }
+    }
+
+    #[test]
+    fn open_file_reports_why_a_file_could_not_be_opened() {
+        let dir = secure_file::private_tempdir();
+        let missing = CString::new(dir.path().join("absent.key").into_os_string().into_encoded_bytes()).unwrap();
+        let (rc, out, out_len) = open_file(&missing, crypto::MAX_WRAPPED_LEN);
+        assert_eq!((rc, out_len), (status::FILE_NOT_FOUND, 0));
+        assert!(out.iter().all(|&b| b == 0));
+
+        let directory = CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(open_file(&directory, crypto::MAX_WRAPPED_LEN).0, status::FILE_IO);
+
+        if !secure_file::skip_as_root() {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, path) = key_file_with(&sample_wrapped_bytes());
+            std::fs::set_permissions(dir.path().join("wrapped.key"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(open_file(&path, crypto::MAX_WRAPPED_LEN).0, status::FILE_ACCESS_DENIED);
+        }
+    }
+
+    #[test]
+    fn open_file_too_small_for_any_payload_answers_without_opening_the_file() {
+        // A nonexistent path, so reaching the file would be FILE_NOT_FOUND.
+        let missing = CString::new("/nonexistent-hkdfguard-open-file-test/wrapped.key").unwrap();
+        for capacity in [0usize, 1, crypto::MIN_WRAPPED_LEN - 1] {
+            let (rc, out, out_len) = open_file(&missing, capacity);
+            assert_eq!(rc, status::BUFFER_TOO_SMALL, "capacity {capacity}");
+            assert_eq!(out_len as usize, crypto::MAX_WRAPPED_LEN, "a size that always fits");
+            assert!(out.iter().all(|&b| b == 0));
+        }
+        // The size probe: NULL out with a capacity of 0.
+        let mut out_len: c_int = 0;
+        assert_eq!(hkdfguard_open_file(missing.as_ptr(), ptr::null_mut(), &mut out_len), status::BUFFER_TOO_SMALL);
+        assert_eq!(out_len as usize, crypto::MAX_WRAPPED_LEN);
+    }
+
+    #[test]
+    fn open_file_buffer_shorter_than_the_file_reports_its_exact_length() {
+        let bytes = sample_wrapped_bytes();
+        let (_dir, path) = key_file_with(&bytes);
+        let (rc, out, out_len) = open_file(&path, bytes.len() - 1);
+        assert_eq!(rc, status::BUFFER_TOO_SMALL);
+        assert_eq!(out_len as usize, bytes.len());
+        assert!(out.iter().all(|&b| b == 0), "nothing of the file is left in a too-small buffer");
+    }
+
+    #[test]
+    fn open_file_invalid_arguments() {
+        let bytes = sample_wrapped_bytes();
+        let (_dir, path) = key_file_with(&bytes);
+        let mut out = [0xAAu8; crypto::MAX_WRAPPED_LEN];
+
+        // NULL out_len: nothing to report through, nothing written.
+        assert_eq!(hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), ptr::null_mut()), status::INVALID_ARGUMENT);
+        assert!(out.iter().all(|&b| b == 0xAA), "no declared capacity, so `out` is untouched");
+
+        // NULL path, empty path.
+        let empty = CString::new("").unwrap();
+        for p in [ptr::null(), empty.as_ptr()] {
+            let mut out_len = out.len() as c_int;
+            assert_eq!(hkdfguard_open_file(p, out.as_mut_ptr(), &mut out_len), status::INVALID_ARGUMENT);
+            assert_eq!(out_len, 0);
+        }
+
+        // Negative capacity.
+        let mut out_len: c_int = -1;
+        assert_eq!(hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), &mut out_len), status::INVALID_ARGUMENT);
+
+        // NULL out with a positive capacity.
+        let mut out_len = out.len() as c_int;
+        assert_eq!(hkdfguard_open_file(path.as_ptr(), ptr::null_mut(), &mut out_len), status::INVALID_ARGUMENT);
+        assert_eq!(out_len, 0);
+    }
+
+    #[test]
+    fn open_file_unterminated_path_is_rejected_without_over_reading() {
+        // Exactly MAX_PATH_BYTES non-NUL bytes and no terminator: the scan
+        // must stop at the end of this buffer rather than run past it.
+        let unterminated = vec![b'a'; MAX_PATH_BYTES];
+        let mut out = [0u8; crypto::MAX_WRAPPED_LEN];
+        let mut out_len = out.len() as c_int;
+        let rc = hkdfguard_open_file(unterminated.as_ptr() as *const c_char, out.as_mut_ptr(), &mut out_len);
+        assert_eq!(rc, status::INVALID_ARGUMENT);
+
+        // One byte shorter, terminated, is a path (here, a missing one).
+        let mut at_limit = vec![b'a'; MAX_PATH_BYTES];
+        at_limit[MAX_PATH_BYTES - 1] = 0;
+        assert!(cstr_to_path(at_limit.as_ptr() as *const c_char).is_ok());
+    }
+
+    #[test]
+    fn open_file_accepts_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = sample_wrapped_bytes();
+        let dir = secure_file::private_tempdir();
+        let name = std::ffi::OsStr::from_bytes(b"wrapped-\xFF.key");
+        let file = dir.path().join(name);
+        std::fs::write(&file, &bytes).unwrap();
+        let path = CString::new(file.into_os_string().into_encoded_bytes()).unwrap();
+        let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!(rc, status::OK);
+        assert_eq!(&out[..out_len as usize], &bytes[..]);
     }
 }

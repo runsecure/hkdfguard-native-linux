@@ -45,6 +45,16 @@ pub mod status {
     // cross-platform notion, unlike the gap above it.
     pub const FINGERPRINT_MISMATCH: i32 = -16; // wrapped payload's embedded KEK fingerprint doesn't match the current KEK's public key
     pub const PROCESS_HARDENING_FAILED: i32 = -17; // hkdfguard_harden_process could not disable core dumps or ptrace access
+    // hkdfguard_open_file's refusals. -18..-20 are the numbers Windows uses
+    // for the same three conditions; the rest follow on, since Windows's
+    // -15..-17 are already taken here.
+    pub const FILE_TOO_SHORT: i32 = -18; // key file is shorter than a wrapped DEK, or than its own header declares
+    pub const FILE_TOO_LONG: i32 = -19; // key file is longer than a wrapped DEK, or than its own header declares
+    pub const FILE_PLAINTEXT_KEY: i32 = -20; // key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64) -- a likely key exposure
+    pub const FILE_MALFORMED: i32 = -21; // key file is the right length but not a payload a wrap could have produced
+    pub const FILE_NOT_FOUND: i32 = -22; // key file, or a directory in its path, does not exist
+    pub const FILE_ACCESS_DENIED: i32 = -23; // this process may not open the key file
+    pub const FILE_IO: i32 = -24; // key file is not a regular file, or reading it failed
 }
 
 #[derive(Debug)] // lets `Error` be formatted with `{:?}` in tests/logs
@@ -148,6 +158,34 @@ mod tests {
             status::FINGERPRINT_MISMATCH
         );
         assert_eq!(status::FINGERPRINT_MISMATCH, -16); // pinned to match macOS's HKDFGuardStatus.fingerprintMismatch
+    }
+
+    #[test]
+    fn header_defines_every_key_file_status_code() {
+        // The header is what C callers compile against; a code defined
+        // only here would be a number they can't name.
+        let header = include_str!("../include/hkdfguard.h");
+        for (name, value) in [
+            ("FILE_TOO_SHORT", status::FILE_TOO_SHORT),
+            ("FILE_TOO_LONG", status::FILE_TOO_LONG),
+            ("FILE_PLAINTEXT_KEY", status::FILE_PLAINTEXT_KEY),
+            ("FILE_MALFORMED", status::FILE_MALFORMED),
+            ("FILE_NOT_FOUND", status::FILE_NOT_FOUND),
+            ("FILE_ACCESS_DENIED", status::FILE_ACCESS_DENIED),
+            ("FILE_IO", status::FILE_IO),
+        ] {
+            let define = format!("#define HKDFGUARD_ERR_{name} ");
+            let line = header
+                .lines()
+                .find(|l| l.starts_with(&define))
+                .unwrap_or_else(|| panic!("include/hkdfguard.h must define HKDFGUARD_ERR_{name}"));
+            assert!(line.contains(&format!("({value})")), "HKDFGUARD_ERR_{name} must be ({value}): {line}");
+        }
+        // Same numbers as Windows for the conditions both platforms share.
+        assert_eq!(
+            (status::FILE_TOO_SHORT, status::FILE_TOO_LONG, status::FILE_PLAINTEXT_KEY),
+            (-18, -19, -20)
+        );
     }
 
     #[test]

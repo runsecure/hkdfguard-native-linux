@@ -25,9 +25,10 @@ getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
 libc = "0.2"
-# Used only by the src/bin/hkdfguard-v1-initialize CLI tool, to decode its
-# --dek argument; already pulled in transitively by other dependencies, so
-# this adds no new compiled code to the dependency graph.
+# Decodes the CLI's base64 DEK input (src/bin/hkdfguard-v1-initialize), and
+# lets hkdfguard_open_file recognise that same text as a plaintext key;
+# already pulled in transitively by other dependencies, so this adds no new
+# compiled code to the dependency graph.
 base64 = "0.23"
 # Policy file (/etc/hkdfguard/policy.toml) parsing. Parse + deserialize
 # only: this crate never writes TOML.

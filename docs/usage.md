@@ -114,6 +114,7 @@ warning (`memory not locked as a whole`).
 | `int hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int dek_len, uint8_t* out, int* out_len)` | Wrap a 32-byte DEK |
 | `int hkdfguard_unwrap_dek(const char* service, const uint8_t* wrapped, int wrapped_len, uint8_t* out, int* out_len)` | Recover the DEK from a wrapped payload |
 | `int hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int* out_len)` | Generate a random DEK and return only its wrapped form |
+| `int hkdfguard_open_file(const char* path, uint8_t* out, int* out_len)` | Read a wrapped-key file, checking its length and form; `*out_len` is the number of bytes read. Doesn't unwrap |
 | `int hkdfguard_harden_process(void)` | Opt in to process hardening: no core dumps, no same-user debugging |
 
 **Rules that matter.**
@@ -147,6 +148,13 @@ warning (`memory not locked as a whole`).
 | -9 | `HKDFGUARD_ERR_KEK_NOT_FOUND` | The service has no KEK yet: provision it first |
 | -16 | `HKDFGUARD_ERR_FINGERPRINT_MISMATCH` | The payload was wrapped under a different KEK than the service has now |
 | -17 | `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` | `hkdfguard_harden_process` couldn't apply its settings |
+| -18 | `HKDFGUARD_ERR_FILE_TOO_SHORT` | `hkdfguard_open_file`: the file is shorter than a wrapped DEK, or than its header says (a truncated copy) |
+| -19 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
+| -20 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64). Treat it as a key exposure: delete the file and rotate the DEK |
+| -21 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
+| -22 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
+| -23 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: this process may not read the file |
+| -24 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
 
 The library doesn't print its reasons for a failure. To see why a call
 fails, run the CLI as the same user; see [troubleshooting.md](troubleshooting.md).
@@ -168,17 +176,25 @@ int main(void) {
         return 1;
     }
 
-    /* Read the wrapped DEK. It is ciphertext: safe to hold in normal memory. */
+    /* Read the wrapped DEK. It is ciphertext: safe to hold in normal memory.
+     * hkdfguard_open_file checks it is a complete wrapped DEK, and refuses a
+     * file that holds a plaintext key instead. */
     uint8_t wrapped[HKDFGUARD_WRAPPED_MAX_LEN];
-    FILE* f = fopen("/var/lib/orders/dek.wrapped", "rb");
-    if (!f) { perror("open key file"); return 1; }
-    int wrapped_len = (int)fread(wrapped, 1, sizeof(wrapped), f);
-    fclose(f);
+    int wrapped_len = sizeof(wrapped);
+    int rc = hkdfguard_open_file("/var/lib/orders/dek.wrapped", wrapped, &wrapped_len);
+    if (rc == HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) {
+        fprintf(stderr, "the key file holds an UNWRAPPED key: delete it and rotate the DEK\n");
+        return 1;
+    }
+    if (rc != HKDFGUARD_OK) {
+        fprintf(stderr, "reading the key file failed: %d\n", rc);
+        return 1;
+    }
 
     /* Recover the DEK. */
     uint8_t dek[HKDFGUARD_DEK_LEN];
     int dek_len = sizeof(dek);
-    int rc = hkdfguard_unwrap_dek(service, wrapped, wrapped_len, dek, &dek_len);
+    rc = hkdfguard_unwrap_dek(service, wrapped, wrapped_len, dek, &dek_len);
     if (rc != HKDFGUARD_OK) {
         fprintf(stderr, "unwrap failed: %d\n", rc);
         return 1;
