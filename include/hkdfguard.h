@@ -59,7 +59,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-21)     /* key file is the right length but not a well-formed wrapped DEK */
 #define HKDFGUARD_ERR_FILE_NOT_FOUND (-22)     /* key file, or a directory in its path, does not exist */
-#define HKDFGUARD_ERR_FILE_ACCESS_DENIED (-23) /* this process may not open the key file */
+#define HKDFGUARD_ERR_FILE_ACCESS_DENIED (-23) /* this process may not open the key file; or it is owned by another user, or writable by group/others */
 #define HKDFGUARD_ERR_FILE_IO (-24)            /* key file is not a regular file, or reading it failed */
 
 /*
@@ -251,7 +251,13 @@ int hkdfguard_generate_and_wrap_dek(
  * path:     NUL-terminated path, at most PATH_MAX (4096) bytes including the
  *           terminator. Symlinks are followed. Must name a regular file:
  *           directories, FIFOs and devices are refused before anything is
- *           read (a FIFO never blocks the call).
+ *           read (a FIFO never blocks the call). The file must be owned by
+ *           root or by the calling user, and must not be writable by group
+ *           or others (HKDFGUARD_ERR_FILE_ACCESS_DENIED otherwise): a
+ *           wrapped DEK is ciphertext, but someone who can replace the file
+ *           and can wrap under the service's KEK could plant a DEK they
+ *           know. The CLI writes key files 0600; a root-owned read-only
+ *           secret mount also passes.
  * out:      buffer to receive the wrapped payload. May be NULL only if
  *           *out_len is 0 (to probe the size).
  * out_len:  in: capacity of `out` in bytes.
@@ -270,7 +276,8 @@ int hkdfguard_generate_and_wrap_dek(
  *       UNWRAPPED DEK), or is base64 of 32 bytes with at most one trailing
  *       newline (the CLI's DEK input format). Most likely the plaintext key
  *       saved where its wrapped form belongs: treat it as a key exposure. A
- *       32-byte file is refused from its size alone, never read.
+ *       32-byte file is refused from its size alone, normally without being
+ *       read (one rewritten mid-call is read, then refused on its contents).
  *   HKDFGUARD_ERR_FILE_TOO_SHORT - shorter than the smallest wrapped DEK, or
  *       than its header declares (e.g. a truncated copy). Includes empty.
  *   HKDFGUARD_ERR_FILE_TOO_LONG - longer than HKDFGUARD_WRAPPED_MAX_LEN, or

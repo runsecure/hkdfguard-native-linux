@@ -388,5 +388,12 @@ fn cli_key_file_opens_through_the_library_and_its_dek_input_is_refused() {
         assert_eq!(open_via_library(&copy).0, status::FILE_TOO_SHORT);
         fs::write(&copy, [&full[..], b"\n".as_slice()].concat()).unwrap();
         assert_eq!(open_via_library(&copy).0, status::FILE_TOO_LONG);
+
+        // The CLI's 0600 key file, loosened so another group member could
+        // replace it: refused, until the mode is restored.
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(open_via_library(&key_path).0, status::FILE_ACCESS_DENIED);
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(open_via_library(&key_path).0, status::OK);
     });
 }

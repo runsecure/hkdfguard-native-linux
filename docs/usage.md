@@ -153,7 +153,7 @@ warning (`memory not locked as a whole`).
 | -20 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64). Treat it as a key exposure: delete the file and rotate the DEK |
 | -21 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
 | -22 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
-| -23 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: this process may not read the file |
+| -23 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: this process may not read the file; or the file is owned by another user, or is writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root |
 | -24 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
 
 The library doesn't print its reasons for a failure. To see why a call

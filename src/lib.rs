@@ -1906,6 +1906,25 @@ mod ffi_tests {
     }
 
     #[test]
+    fn open_file_refuses_a_key_file_someone_else_could_have_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let bytes = sample_wrapped_bytes();
+        let (dir, path) = key_file_with(&bytes);
+        let file = dir.path().join("wrapped.key");
+        for mode in [0o660, 0o606] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+            assert_eq!((rc, out_len), (status::FILE_ACCESS_DENIED, 0), "mode {mode:o}");
+            assert!(out.iter().all(|&b| b == 0), "mode {mode:o}: nothing of the file is handed over");
+        }
+        // Read-only for others is fine: the contents are ciphertext.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!(rc, status::OK);
+        assert_eq!(&out[..out_len as usize], &bytes[..]);
+    }
+
+    #[test]
     fn open_file_too_small_for_any_payload_answers_without_opening_the_file() {
         // A nonexistent path, so reaching the file would be FILE_NOT_FOUND.
         let missing = CString::new("/nonexistent-hkdfguard-open-file-test/wrapped.key").unwrap();

@@ -18,15 +18,24 @@
 //!   DEK -- 32 raw bytes, or the base64 text the CLI takes as its DEK input
 //!   -- is [`KeyFileError::PlaintextKey`]: most likely the DEK itself saved
 //!   where its wrapped form belongs. A 32-byte file is refused from its size
-//!   alone, without its contents ever being read into this process. Neither
+//!   alone, normally without its contents being read into this process. Neither
 //!   form can be mistaken for a payload: both are shorter than the smallest
 //!   one.
+//! - **Integrity.** The file must be owned by root or by this process's
+//!   user, and must not be writable by group or others; otherwise
+//!   [`KeyFileError::AccessDenied`]. A wrapped DEK is ciphertext, so reading
+//!   it gains nothing -- but *replacing* it does: anyone who can write the
+//!   file and can also wrap under the service's KEK (on TPM2, any process
+//!   in the `tss` group with the derivation secret) could plant a DEK they
+//!   know, and `unwrap` would accept it as genuine. The CLI writes key
+//!   files `0600` for the same reason. Symlinks are followed, and the
+//!   checks apply to the file they resolve to.
 
 use crate::crypto::{DEK_LEN, MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN, TAG_LEN};
 use crate::error::status;
 use crate::payload::{Payload, NONCE_LEN, SALT_LEN, VERSION};
 use crate::provider::ProviderType;
-use crate::secure_file::{self, FileRequirements, SecretBuffer};
+use crate::secure_file::{self, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_WRITE};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::io;
 use std::path::Path;
@@ -37,7 +46,9 @@ use zeroize::Zeroizing;
 pub enum KeyFileError {
     /// The file, or a directory in its path, does not exist.
     NotFound,
-    /// The calling process may not open the file.
+    /// The calling process may not open the file; or the file is owned by
+    /// another user, or is writable by group or others, so someone else
+    /// could have replaced its contents.
     AccessDenied,
     /// Not a regular file (a directory, FIFO, device...), or the read failed.
     Io,
@@ -68,7 +79,9 @@ impl KeyFileError {
     pub fn describe(self) -> &'static str {
         match self {
             KeyFileError::NotFound => "the file, or a directory in its path, does not exist",
-            KeyFileError::AccessDenied => "this process may not open the file",
+            KeyFileError::AccessDenied => {
+                "this process may not open the file, or the file is owned by another user or writable by group/others"
+            }
             KeyFileError::Io => "not a regular file, or reading it failed",
             KeyFileError::TooShort => "the file is shorter than a wrapped DEK, or than its header declares",
             KeyFileError::TooLong => "the file is longer than a wrapped DEK, or than its header declares",
@@ -83,17 +96,20 @@ impl KeyFileError {
 /// Opens `path` and returns its contents once they pass [`check`].
 ///
 /// Opened read-only, following symlinks, with `O_NONBLOCK` so a FIFO can't
-/// hang the call; anything but a regular file is refused before a byte is
-/// read. A file whose size alone says it is too long, or is a raw DEK, is
-/// refused without being read. The bytes come back in a [`SecretBuffer`]:
-/// a payload is ciphertext, but a refused file may have held a plaintext
-/// key, and either way the buffer is wiped when dropped.
+/// hang the call; anything but a regular file, and any file someone other
+/// than root or this user could have written (see the module docs), is
+/// refused before a byte is read, on the opened descriptor's own metadata.
+/// A file whose size alone says it is too long, or is a raw DEK, is normally
+/// refused without being read (a file rewritten between the size check and
+/// the read is read, then refused on its contents). The bytes come back in
+/// a [`SecretBuffer`]: a payload is ciphertext, but a refused file may have
+/// held a plaintext key, and either way the buffer is wiped when dropped.
 pub fn read(path: &Path) -> Result<SecretBuffer, KeyFileError> {
     let req = FileRequirements {
-        owner: None,
-        forbidden_mode_bits: 0,
+        owner: Some(Owner::RootOrCurrentUser),
+        forbidden_mode_bits: FORBID_GROUP_OTHER_WRITE,
         follow_symlinks: true,
-        allow_group_read_if_root_owned: false,
+        allow_group_read_if_root_owned: false, // group read isn't forbidden here anyway: the file is ciphertext
     };
     let mut file = secure_file::open_checked(path, &req).map_err(open_error)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
@@ -414,6 +430,45 @@ mod tests {
         let dir = secure_file::private_tempdir();
         let path = write(dir.path(), "wrapped.key", &valid());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied));
+    }
+
+    #[test]
+    fn group_or_other_writable_file_is_refused_and_read_only_modes_are_accepted() {
+        let dir = secure_file::private_tempdir();
+        let path = write(dir.path(), "wrapped.key", &valid());
+        for mode in [0o600, 0o400, 0o640, 0o644, 0o444] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(read(&path).is_ok(), "mode {mode:o} lets nobody else write; it must be accepted");
+        }
+        for mode in [0o620, 0o660, 0o602, 0o606, 0o666, 0o622] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied), "mode {mode:o} lets someone else replace the key");
+        }
+    }
+
+    #[test]
+    fn symlink_to_a_writable_file_is_refused_on_the_target() {
+        let dir = secure_file::private_tempdir();
+        let target = write(dir.path(), "wrapped.key", &valid());
+        let link = dir.path().join("current.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(read(&link).err(), Some(KeyFileError::AccessDenied));
+    }
+
+    #[test]
+    fn file_owned_by_another_user_is_refused() {
+        // Only root can create a file owned by someone else, so this proves
+        // the owner rule only when the suite runs as root; non-root runs
+        // cover the same rule through secure_file's own tests.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = secure_file::private_tempdir();
+        let path = write(dir.path(), "wrapped.key", &valid());
+        std::os::unix::fs::chown(&path, Some(65534), Some(65534)).unwrap(); // nobody
         assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied));
     }
 
