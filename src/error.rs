@@ -41,8 +41,10 @@ pub mod status {
     // Linux equivalent (kekCorrupted, accessControlCreationFailed,
     // keyGenerationFailed, keychainWriteFailed, kekVerificationFailed).
     // FINGERPRINT_MISMATCH is deliberately given the *same* code macOS
-    // (and now Windows) use for the same concept, since it's a
-    // cross-platform notion, unlike the gap above it.
+    // uses for the same concept, since it's a cross-platform notion,
+    // unlike the gap above it. (Windows numbers its codes independently:
+    // there the same condition is HKDFGUARD_ERR_KEK_MISMATCH, -11, and -16
+    // is a file-access error.)
     pub const FINGERPRINT_MISMATCH: i32 = -16; // wrapped payload's embedded KEK fingerprint doesn't match the current KEK's public key
     pub const PROCESS_HARDENING_FAILED: i32 = -17; // hkdfguard_harden_process could not disable core dumps or ptrace access
     // hkdfguard_open_file's refusals. -18..-20 are the numbers Windows uses

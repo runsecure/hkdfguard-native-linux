@@ -693,12 +693,18 @@ pub extern "C" fn hkdfguard_open_file(path: *const c_char, out: *mut u8, out_len
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_open_file boundary");
             zero_caller_buffer(out, capacity);
-            if !out_len.is_null() {
-                // SAFETY: non-null; caller contract guarantees it is writable.
-                unsafe { *out_len = 0 };
-            }
+            clear_out_len(out_len);
             status::INTERNAL_ERROR
         }
+    }
+}
+
+// Reports "no bytes read" through `out_len`, for hkdfguard_open_file's
+// caught-panic path. A no-op when `out_len` is NULL.
+fn clear_out_len(out_len: *mut c_int) {
+    if !out_len.is_null() {
+        // SAFETY: non-null; caller contract guarantees it is writable.
+        unsafe { *out_len = 0 };
     }
 }
 
@@ -1922,6 +1928,15 @@ mod ffi_tests {
         let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
         assert_eq!(rc, status::OK);
         assert_eq!(&out[..out_len as usize], &bytes[..]);
+
+        // A 0600 file in a directory others can write: they could rename
+        // their own file over it.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!((rc, out_len), (status::FILE_ACCESS_DENIED, 0), "writable directory");
+        assert!(out.iter().all(|&b| b == 0));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

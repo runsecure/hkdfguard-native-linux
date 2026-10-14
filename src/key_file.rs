@@ -15,8 +15,9 @@
 //!   length must be ones a wrap can produce, and the whole must parse;
 //!   otherwise [`KeyFileError::Malformed`].
 //! - **An unprotected key.** A file holding what looks like an *unwrapped*
-//!   DEK -- 32 raw bytes, or the base64 text the CLI takes as its DEK input
-//!   -- is [`KeyFileError::PlaintextKey`]: most likely the DEK itself saved
+//!   DEK -- 32 raw bytes, or 32 bytes as text: base64 (standard or URL-safe,
+//!   padded or not; the CLI's DEK input is standard base64) or hex, with any
+//!   surrounding whitespace -- is [`KeyFileError::PlaintextKey`]: most likely the DEK itself saved
 //!   where its wrapped form belongs. A 32-byte file is refused from its size
 //!   alone, normally without its contents being read into this process. Neither
 //!   form can be mistaken for a payload: both are shorter than the smallest
@@ -29,7 +30,12 @@
 //!   in the `tss` group with the derivation secret) could plant a DEK they
 //!   know, and `unwrap` would accept it as genuine. The CLI writes key
 //!   files `0600` for the same reason. Symlinks are followed, and the
-//!   checks apply to the file they resolve to.
+//!   checks apply to the file they resolve to. The same holds for the
+//!   directories that decide what the path names -- the opened file's own
+//!   and the one the path names it in, each up to `/`: owned by root or
+//!   this user, and not writable by group or others unless sticky
+//!   (`/tmp`-style). Otherwise someone else could rename a file of their
+//!   choosing over the key, or retarget a symlink to one.
 
 use crate::crypto::{DEK_LEN, MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN, TAG_LEN};
 use crate::error::status;
@@ -80,14 +86,15 @@ impl KeyFileError {
         match self {
             KeyFileError::NotFound => "the file, or a directory in its path, does not exist",
             KeyFileError::AccessDenied => {
-                "this process may not open the file, or the file is owned by another user or writable by group/others"
+                "this process may not open the file, or the file or a directory deciding what its path names \
+                 is owned by another user or writable by group/others"
             }
             KeyFileError::Io => "not a regular file, or reading it failed",
             KeyFileError::TooShort => "the file is shorter than a wrapped DEK, or than its header declares",
             KeyFileError::TooLong => "the file is longer than a wrapped DEK, or than its header declares",
             KeyFileError::Malformed => "the file is not a well-formed wrapped DEK",
             KeyFileError::PlaintextKey => {
-                "the file looks like an UNWRAPPED DEK (32 raw bytes, or its base64); treat it as a key exposure"
+                "the file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex); treat it as a key exposure"
             }
         }
     }
@@ -95,23 +102,50 @@ impl KeyFileError {
 
 /// Opens `path` and returns its contents once they pass [`check`].
 ///
-/// Opened read-only, following symlinks, with `O_NONBLOCK` so a FIFO can't
-/// hang the call; anything but a regular file, and any file someone other
-/// than root or this user could have written (see the module docs), is
-/// refused before a byte is read, on the opened descriptor's own metadata.
-/// A file whose size alone says it is too long, or is a raw DEK, is normally
-/// refused without being read (a file rewritten between the size check and
-/// the read is read, then refused on its contents). The bytes come back in
-/// a [`SecretBuffer`]: a payload is ciphertext, but a refused file may have
-/// held a plaintext key, and either way the buffer is wiped when dropped.
+/// The same sequence the external-secret provider uses for its secret
+/// files (`open_secret_within_mount`):
+///
+/// 1. `path` is resolved once, symlinks and all, to the real file.
+/// 2. The directories that decide what `path` names are checked (see the
+///    module docs): the resolved file's, and the one `path` names it in,
+///    where a symlink lives if `path` is one -- each up to `/`.
+/// 3. The *resolved* path is opened read-only with `O_NOFOLLOW`, so a
+///    symlink swapped in after step 1 fails the open instead of being
+///    followed, and with `O_NONBLOCK` so a FIFO can't hang the call.
+///    Anything but a regular file, and any file someone other than root or
+///    this user could have written, is refused on the opened descriptor's
+///    own metadata, before a byte is read.
+/// 4. The descriptor is confirmed to be the file resolved and checked in
+///    steps 1-2 ([`secure_file::verify_opened`]): through `/proc` where it
+///    is mounted, and by device and inode where it isn't -- equally
+///    conclusive, so a sandbox without `/proc` loses nothing.
+///
+/// A file whose size alone says it is too long, or is a raw DEK, is then
+/// normally refused without being read (one rewritten between the size
+/// check and the read is read, then refused on its contents). The bytes
+/// come back in a [`SecretBuffer`]: a payload is ciphertext, but a refused
+/// file may have held a plaintext key, and either way the buffer is wiped
+/// when dropped.
 pub fn read(path: &Path) -> Result<SecretBuffer, KeyFileError> {
+    read_with_proc_root(path, Path::new("/proc"))
+}
+
+// `read`, with where `/proc` is mounted made a parameter so tests can run
+// it as though `/proc` were missing.
+fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
     let req = FileRequirements {
         owner: Some(Owner::RootOrCurrentUser),
         forbidden_mode_bits: FORBID_GROUP_OTHER_WRITE,
-        follow_symlinks: true,
+        follow_symlinks: false,
         allow_group_read_if_root_owned: false, // group read isn't forbidden here anyway: the file is ciphertext
     };
-    let mut file = secure_file::open_checked(path, &req).map_err(open_error)?;
+    let target_real = std::fs::canonicalize(path).map_err(open_error)?;
+    check_location(path, &target_real)?;
+    let mut file = secure_file::open_checked(&target_real, &req).map_err(|e| match e.raw_os_error() {
+        Some(libc::ELOOP) => KeyFileError::AccessDenied, // became a symlink after it was resolved
+        _ => open_error(e),
+    })?;
+    secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::AccessDenied)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
     if size == DEK_LEN as u64 {
         return Err(KeyFileError::PlaintextKey);
@@ -128,6 +162,36 @@ pub fn read(path: &Path) -> Result<SecretBuffer, KeyFileError> {
     })?;
     check(contents.as_slice())?;
     Ok(contents)
+}
+
+// The directories that decide what `path` names must be as trustworthy as
+// the file: owned by root or this user, and not writable by group or others
+// (sticky, `/tmp`-style, is fine -- see
+// `secure_file::check_dir_chain_for_existing_file`). Otherwise someone else
+// could rename a file of their choosing over the key, or retarget a symlink
+// to one, and the file checks alone would pass on whatever they put there.
+//
+// Two directories are checked, each up to `/`: the resolved file's own --
+// where the file actually read sits, which `read` confirms after the open --
+// and the one `path` names it in, which holds the symlink if `path` is one.
+// Directories that intermediate symlinks *within* the path live in are not
+// walked; someone able to retarget one could at most redirect `path` to a
+// different file that itself passes every check here (owned by root or
+// this user, in trusted directories) -- never to one they wrote.
+fn check_location(path: &Path, target_real: &Path) -> Result<(), KeyFileError> {
+    let check = |dir: &Path| {
+        secure_file::check_dir_chain_for_existing_file(dir, Owner::RootOrCurrentUser)
+            .map_err(|_| KeyFileError::AccessDenied)
+    };
+    let target_dir = target_real.parent().ok_or(KeyFileError::AccessDenied)?;
+    check(target_dir)?;
+
+    let named_in = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let named_in = std::fs::canonicalize(named_in).map_err(|_| KeyFileError::AccessDenied)?;
+    if named_in != target_dir {
+        check(&named_in)?;
+    }
+    Ok(())
 }
 
 fn open_error(e: io::Error) -> KeyFileError {
@@ -182,22 +246,38 @@ pub fn check(bytes: &[u8]) -> Result<(), KeyFileError> {
 
 /// Base64 of a 32-byte DEK, with its one `=` of padding.
 const BASE64_DEK_LEN: usize = 44;
+/// Hex of a 32-byte DEK.
+const HEX_DEK_LEN: usize = 2 * DEK_LEN;
+/// Longest text form recognised, surrounding whitespace included. Every
+/// length up to this is far below [`MIN_WRAPPED_LEN`], so no payload can
+/// ever be mistaken for a plaintext key, however it is padded.
+const MAX_PLAINTEXT_TEXT_LEN: usize = 96;
 
-// 32 raw bytes, or the CLI's DEK input format: standard base64 of exactly
-// 32 bytes, optionally followed by one "\n" or "\r\n".
+// 32 raw bytes, or 32 bytes written as text: base64 (standard or URL-safe,
+// with or without its `=` padding -- the CLI's own DEK input format is
+// standard, padded) or hex (either case), with any leading or trailing
+// whitespace an editor or `echo` adds. Every one of these is refused as
+// TooShort anyway; recognising them is what turns "wrong file" into "this
+// key is exposed".
 fn looks_like_plaintext_dek(bytes: &[u8]) -> bool {
     if bytes.len() == DEK_LEN {
         return true;
     }
-    let text = match bytes.strip_suffix(b"\n") {
-        Some(t) => t.strip_suffix(b"\r").unwrap_or(t),
-        None => bytes,
-    };
-    if text.len() != BASE64_DEK_LEN {
+    if bytes.len() > MAX_PLAINTEXT_TEXT_LEN {
         return false;
     }
-    let mut decoded = Zeroizing::new([0u8; BASE64_DEK_LEN]); // a decoded DEK is wiped as soon as it's been measured
-    matches!(STANDARD.decode_slice(text, &mut decoded[..]), Ok(n) if n == DEK_LEN)
+    let text = bytes.trim_ascii();
+    match text.len() {
+        HEX_DEK_LEN => text.iter().all(u8::is_ascii_hexdigit),
+        43 | BASE64_DEK_LEN => {
+            use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+            let mut decoded = Zeroizing::new([0u8; BASE64_DEK_LEN]); // a decoded DEK is wiped as soon as it's been measured
+            [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD]
+                .iter()
+                .any(|engine| matches!(engine.decode_slice(text, &mut decoded[..]), Ok(n) if n == DEK_LEN))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -341,22 +421,45 @@ mod tests {
         assert_eq!(check(&[0xFFu8; DEK_LEN]), Err(KeyFileError::PlaintextKey));
     }
 
+    // Every text form of one DEK whose bytes need '+' and '/' in standard
+    // base64 (so '-' and '_' in URL-safe): the encodings really differ.
+    fn text_forms_of_a_dek() -> Vec<(&'static str, String)> {
+        use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+        let dek = [0xFBu8; DEK_LEN];
+        let hex: String = dek.iter().map(|b| format!("{b:02x}")).collect();
+        vec![
+            ("base64", STANDARD.encode(dek)),
+            ("base64, no padding", STANDARD_NO_PAD.encode(dek)),
+            ("URL-safe base64", URL_SAFE.encode(dek)),
+            ("URL-safe base64, no padding", URL_SAFE_NO_PAD.encode(dek)),
+            ("hex", hex.clone()),
+            ("HEX", hex.to_ascii_uppercase()),
+        ]
+    }
+
     #[test]
-    fn base64_dek_is_a_plaintext_key_with_or_without_a_newline() {
-        let b64 = base64_dek();
-        for text in [b64.clone(), format!("{b64}\n"), format!("{b64}\r\n")] {
-            assert_eq!(check(text.as_bytes()), Err(KeyFileError::PlaintextKey), "{text:?}");
+    fn every_text_form_of_a_dek_is_a_plaintext_key_whatever_the_whitespace() {
+        let forms = text_forms_of_a_dek();
+        assert!(forms[0].1.contains('+') && forms[2].1.contains('-'), "the fixture must exercise both alphabets");
+        for (name, text) in forms {
+            for wrapped in [text.clone(), format!("{text}\n"), format!("{text}\r\n"), format!("{text}\n\n"), format!("  {text}\t\n")] {
+                assert_eq!(check(wrapped.as_bytes()), Err(KeyFileError::PlaintextKey), "{name}: {wrapped:?}");
+            }
         }
+        // And the CLI's own DEK input, exactly as the docs show writing it.
+        assert_eq!(check(format!("{}\n", base64_dek()).as_bytes()), Err(KeyFileError::PlaintextKey));
     }
 
     #[test]
     fn near_misses_of_a_plaintext_key_are_just_too_short() {
-        let b64 = base64_dek();
+        let hex = "ab".repeat(DEK_LEN);
         for text in [
             STANDARD.encode([0x5Au8; DEK_LEN - 1]), // base64, but of 31 bytes
+            STANDARD.encode([0x5Au8; DEK_LEN + 1]), // base64, but of 33 bytes
             "!".repeat(BASE64_DEK_LEN),             // 44 bytes, not base64
-            format!("{b64}\n\n"),                   // more than one newline
-            format!(" {b64}"),                      // leading space
+            hex[1..].to_string(),                   // 63 hex digits
+            format!("{}g", &hex[1..]),              // 64 characters, one not hex
+            format!("{}\n{}", &hex[..32], &hex[32..]), // hex split by a newline inside
         ] {
             assert_eq!(check(text.as_bytes()), Err(KeyFileError::TooShort), "{text:?}");
         }
@@ -367,8 +470,11 @@ mod tests {
 
     #[test]
     fn no_valid_payload_can_be_mistaken_for_a_plaintext_key() {
-        // Both plaintext forms are far shorter than the smallest payload.
-        assert!(BASE64_DEK_LEN + 2 < MIN_WRAPPED_LEN && DEK_LEN < MIN_WRAPPED_LEN);
+        // Every plaintext form, padding included, is far shorter than the
+        // smallest payload, so detection can never refuse a real one.
+        assert!(MAX_PLAINTEXT_TEXT_LEN < MIN_WRAPPED_LEN && DEK_LEN < MIN_WRAPPED_LEN);
+        // The smallest real payload is accepted as one.
+        assert_eq!(check(&payload_with_key_id(0)), Ok(()));
     }
 
     // ---- read(): the file itself ----
@@ -455,6 +561,107 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(read(&link).err(), Some(KeyFileError::AccessDenied));
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn writable_directory_holding_the_key_is_refused_but_sticky_is_fine() {
+        let base = secure_file::private_tempdir();
+        let dir = base.path().join("keys");
+        std::fs::create_dir(&dir).unwrap();
+        let path = write(&dir, "wrapped.key", &valid());
+
+        chmod(&dir, 0o700);
+        assert!(read(&path).is_ok());
+        for mode in [0o770, 0o707, 0o777] {
+            chmod(&dir, mode);
+            assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied), "dir mode {mode:o}: the key could be renamed over");
+        }
+        // Sticky: only the file's owner (checked) can rename or replace it.
+        chmod(&dir, 0o1777);
+        assert!(read(&path).is_ok(), "a sticky /tmp-style directory protects an existing, owner-checked file");
+        chmod(&dir, 0o700);
+    }
+
+    #[test]
+    fn writable_ancestor_directory_is_refused() {
+        let base = secure_file::private_tempdir();
+        let inner = base.path().join("a").join("b");
+        std::fs::create_dir_all(&inner).unwrap();
+        chmod(&base.path().join("a"), 0o700);
+        chmod(&inner, 0o700);
+        let path = write(&inner, "wrapped.key", &valid());
+        assert!(read(&path).is_ok());
+
+        chmod(&base.path().join("a"), 0o777);
+        assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied), "`b` itself could be swapped out");
+        chmod(&base.path().join("a"), 0o700);
+    }
+
+    #[test]
+    fn symlink_into_a_writable_directory_is_refused() {
+        let trusted = secure_file::private_tempdir();
+        let shared = secure_file::private_tempdir();
+        let target = write(shared.path(), "wrapped.key", &valid());
+        let link = trusted.path().join("current.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read(&link).is_ok());
+
+        chmod(shared.path(), 0o777);
+        assert_eq!(read(&link).err(), Some(KeyFileError::AccessDenied), "the file actually read sits where others can replace it");
+        chmod(shared.path(), 0o700);
+    }
+
+    #[test]
+    fn symlink_in_a_writable_directory_is_refused_even_to_a_safe_target() {
+        let trusted = secure_file::private_tempdir();
+        let shared = secure_file::private_tempdir();
+        let target = write(trusted.path(), "wrapped.key", &valid());
+        let link = shared.path().join("current.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read(&link).is_ok());
+
+        chmod(shared.path(), 0o777);
+        assert_eq!(read(&link).err(), Some(KeyFileError::AccessDenied), "others could retarget the link");
+        chmod(shared.path(), 0o700);
+    }
+
+    #[test]
+    fn without_proc_every_check_still_applies() {
+        // A sandbox with /proc missing: the opened file is confirmed by
+        // device and inode instead, and nothing else changes.
+        let no_proc = Path::new("/nonexistent-hkdfguard-proc");
+        let trusted = secure_file::private_tempdir();
+        let shared = secure_file::private_tempdir();
+        let bytes = valid();
+        let path = write(trusted.path(), "wrapped.key", &bytes);
+        assert_eq!(read_with_proc_root(&path, no_proc).unwrap().as_slice(), &bytes[..]);
+
+        let link = trusted.path().join("current.key");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read_with_proc_root(&link, no_proc).unwrap().as_slice(), &bytes[..], "symlinks still resolve");
+
+        chmod(&path, 0o666);
+        assert_eq!(read_with_proc_root(&path, no_proc).err(), Some(KeyFileError::AccessDenied), "file checks");
+        chmod(&path, 0o600);
+
+        let elsewhere = write(shared.path(), "wrapped.key", &bytes);
+        chmod(shared.path(), 0o777);
+        assert_eq!(read_with_proc_root(&elsewhere, no_proc).err(), Some(KeyFileError::AccessDenied), "directory checks");
+        chmod(shared.path(), 0o700);
+    }
+
+    #[test]
+    fn a_path_that_resolves_to_a_symlink_loop_is_refused() {
+        let dir = secure_file::private_tempdir();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(read(&a).is_err());
     }
 
     #[test]

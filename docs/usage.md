@@ -150,10 +150,10 @@ warning (`memory not locked as a whole`).
 | -17 | `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` | `hkdfguard_harden_process` couldn't apply its settings |
 | -18 | `HKDFGUARD_ERR_FILE_TOO_SHORT` | `hkdfguard_open_file`: the file is shorter than a wrapped DEK, or than its header says (a truncated copy) |
 | -19 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
-| -20 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64). Treat it as a key exposure: delete the file and rotate the DEK |
+| -20 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
 | -21 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
 | -22 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
-| -23 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: this process may not read the file; or the file is owned by another user, or is writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root |
+| -23 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: this process may not read the file; or the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write; a sticky directory such as `/tmp` is fine |
 | -24 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
 
 The library doesn't print its reasons for a failure. To see why a call

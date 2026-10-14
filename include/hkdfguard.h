@@ -56,10 +56,10 @@ extern "C" {
 /* hkdfguard_open_file's refusals. -18..-20 match the Windows library's codes for the same conditions. */
 #define HKDFGUARD_ERR_FILE_TOO_SHORT (-18)     /* key file is shorter than a wrapped DEK, or than its own header declares */
 #define HKDFGUARD_ERR_FILE_TOO_LONG (-19)      /* key file is longer than a wrapped DEK, or than its own header declares */
-#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64): treat as a key exposure */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-21)     /* key file is the right length but not a well-formed wrapped DEK */
 #define HKDFGUARD_ERR_FILE_NOT_FOUND (-22)     /* key file, or a directory in its path, does not exist */
-#define HKDFGUARD_ERR_FILE_ACCESS_DENIED (-23) /* this process may not open the key file; or it is owned by another user, or writable by group/others */
+#define HKDFGUARD_ERR_FILE_ACCESS_DENIED (-23) /* this process may not open the key file; or it, or a directory deciding what its path names, is owned by another user or writable by group/others */
 #define HKDFGUARD_ERR_FILE_IO (-24)            /* key file is not a regular file, or reading it failed */
 
 /*
@@ -256,8 +256,12 @@ int hkdfguard_generate_and_wrap_dek(
  *           or others (HKDFGUARD_ERR_FILE_ACCESS_DENIED otherwise): a
  *           wrapped DEK is ciphertext, but someone who can replace the file
  *           and can wrap under the service's KEK could plant a DEK they
- *           know. The CLI writes key files 0600; a root-owned read-only
- *           secret mount also passes.
+ *           know. The same goes for the directories that decide what `path`
+ *           names -- the one holding the opened file and the one `path`
+ *           names it in (where a symlink lives), each up to `/`: owned by
+ *           root or the calling user, and not writable by group or others
+ *           unless sticky (like /tmp). The CLI writes key files 0600; a
+ *           root-owned read-only secret mount also passes.
  * out:      buffer to receive the wrapped payload. May be NULL only if
  *           *out_len is 0 (to probe the size).
  * out_len:  in: capacity of `out` in bytes.
@@ -273,8 +277,9 @@ int hkdfguard_generate_and_wrap_dek(
  * The file's length is checked against the payload's own header (the
  * header declares the payload's exact length):
  *   HKDFGUARD_ERR_FILE_PLAINTEXT_KEY - the file is 32 bytes (the size of an
- *       UNWRAPPED DEK), or is base64 of 32 bytes with at most one trailing
- *       newline (the CLI's DEK input format). Most likely the plaintext key
+ *       UNWRAPPED DEK), or is 32 bytes written as text -- base64 (standard
+ *       or URL-safe, padded or not; the CLI's DEK input is standard base64)
+ *       or hex -- with any surrounding whitespace. Most likely the plaintext key
  *       saved where its wrapped form belongs: treat it as a key exposure. A
  *       32-byte file is refused from its size alone, normally without being
  *       read (one rewritten mid-call is read, then refused on its contents).
