@@ -66,7 +66,7 @@ same symlink (or set `LD_LIBRARY_PATH`) to run. Installed from the packages
 `pkg-config --cflags --libs hkdfguard`. The C header
 (`include/hkdfguard.h`) and exported C symbols (`hkdfguard_create_kek`,
 `hkdfguard_kek_exists`, `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`,
-`hkdfguard_generate_and_wrap_dek`) are unaffected either way and keep
+`hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) are unaffected either way and keep
 their existing names.
 
 ```c

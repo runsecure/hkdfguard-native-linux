@@ -41,7 +41,7 @@ use std::process::{Command, Output, Stdio};
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir()
 }
-use hkdfguard_v1::{hkdfguard_unwrap_dek, status};
+use hkdfguard_v1::{hkdfguard_open_file, hkdfguard_unwrap_dek, status};
 use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
@@ -340,5 +340,60 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .expect("failed to run hkdfguard-v1-initialize");
         assert!(!output.status.success());
         assert!(stderr_of(&output).contains("--key-file-path"), "must point at the new flag");
+    });
+}
+
+// Reads `path` through the library's own key-file reader, as an
+// application would at startup.
+fn open_via_library(path: &Path) -> (c_int, Vec<u8>) {
+    let path = CString::new(path.to_str().unwrap()).unwrap();
+    let mut out = vec![0u8; 276]; // HKDFGUARD_WRAPPED_MAX_LEN
+    let mut out_len = out.len() as c_int;
+    let rc = hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), &mut out_len);
+    out.truncate(out_len.max(0) as usize);
+    (rc, out)
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_key_file_opens_through_the_library_and_its_dek_input_is_refused() {
+    with_provisioned_external_secret("com.example.openfile", || {
+        let original_dek = [0x3Cu8; 32];
+        let out_dir = tempdir().unwrap();
+        let key_path = out_dir.path().join("wrapped.key");
+        let output = run_wrap_stdin(&key_path, "com.example.openfile", &original_dek, &[]);
+        assert!(output.status.success(), "wrap failed: {}", stderr_of(&output));
+
+        // The file the CLI wrote, read by hkdfguard_open_file: byte for
+        // byte what is on disk, and it unwraps to the original DEK.
+        let (rc, wrapped) = open_via_library(&key_path);
+        assert_eq!(rc, status::OK, "hkdfguard_open_file failed with status {rc}");
+        assert_eq!(wrapped, fs::read(&key_path).unwrap());
+        let (rc, recovered) = unwrap_via_library("com.example.openfile", &wrapped);
+        assert_eq!(rc, status::OK);
+        assert_eq!(recovered, original_dek);
+
+        // The likeliest mix-up: pointing the application at the CLI's DEK
+        // *input* file instead of its output. That is the plaintext key.
+        let dek_path = out_dir.path().join("dek.b64");
+        fs::write(&dek_path, format!("{}\n", STANDARD.encode(original_dek))).unwrap();
+        fs::set_permissions(&dek_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(open_via_library(&dek_path).0, status::FILE_PLAINTEXT_KEY);
+
+        // A truncated or extended copy of the key file.
+        let full = fs::read(&key_path).unwrap();
+        let copy = out_dir.path().join("copy.key");
+        fs::write(&copy, &full[..full.len() - 1]).unwrap();
+        assert_eq!(open_via_library(&copy).0, status::FILE_TOO_SHORT);
+        fs::write(&copy, [&full[..], b"\n".as_slice()].concat()).unwrap();
+        assert_eq!(open_via_library(&copy).0, status::FILE_TOO_LONG);
+
+        // The CLI's 0600 key file, loosened so another group member could
+        // replace it: refused, until the mode is restored.
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(open_via_library(&key_path).0, status::FILE_ACCESS_DENIED);
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(open_via_library(&key_path).0, status::OK);
     });
 }

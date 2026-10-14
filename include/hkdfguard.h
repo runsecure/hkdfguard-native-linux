@@ -53,6 +53,14 @@ extern "C" {
 /* -10..-15 intentionally unassigned here -- see hkdfguard's error.rs. */
 #define HKDFGUARD_ERR_FINGERPRINT_MISMATCH (-16)
 #define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED (-17) /* hkdfguard_harden_process could not disable core dumps or ptrace access */
+/* hkdfguard_open_file's refusals. -18..-20 match the Windows library's codes for the same conditions. */
+#define HKDFGUARD_ERR_FILE_TOO_SHORT (-18)     /* key file is shorter than a wrapped DEK, or than its own header declares */
+#define HKDFGUARD_ERR_FILE_TOO_LONG (-19)      /* key file is longer than a wrapped DEK, or than its own header declares */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex): treat as a key exposure */
+#define HKDFGUARD_ERR_FILE_MALFORMED (-21)     /* key file is the right length but not a well-formed wrapped DEK */
+#define HKDFGUARD_ERR_FILE_NOT_FOUND (-22)     /* key file, or a directory in its path, does not exist */
+#define HKDFGUARD_ERR_FILE_ACCESS_DENIED (-23) /* this process may not open the key file; or it, or a directory deciding what its path names, is owned by another user or writable by group/others */
+#define HKDFGUARD_ERR_FILE_IO (-24)            /* key file is not a regular file, or reading it failed */
 
 /*
  * Opt-in hardening of the *calling process* against memory disclosure:
@@ -229,6 +237,71 @@ int hkdfguard_unwrap_dek(
  */
 int hkdfguard_generate_and_wrap_dek(
     const char* service,
+    uint8_t* out,
+    int* out_len);
+
+/*
+ * Reads a wrapped-key file -- one written by `hkdfguard-v1-initialize wrap`,
+ * or the output of hkdfguard_wrap_dek saved as-is -- into `out`, exactly as
+ * stored, after checking that it is a complete, well-formed wrapped DEK.
+ * Never unwraps: nothing is decrypted, no provider is reached and no KEK is
+ * opened, so this needs only read access to the file. Pass the result to
+ * hkdfguard_unwrap_dek.
+ *
+ * path:     NUL-terminated path, at most PATH_MAX (4096) bytes including the
+ *           terminator. Symlinks are followed. Must name a regular file:
+ *           directories, FIFOs and devices are refused before anything is
+ *           read (a FIFO never blocks the call). The file must be owned by
+ *           root or by the calling user, and must not be writable by group
+ *           or others (HKDFGUARD_ERR_FILE_ACCESS_DENIED otherwise): a
+ *           wrapped DEK is ciphertext, but someone who can replace the file
+ *           and can wrap under the service's KEK could plant a DEK they
+ *           know. The same goes for the directories that decide what `path`
+ *           names -- the one holding the opened file and the one `path`
+ *           names it in (where a symlink lives), each up to `/`: owned by
+ *           root or the calling user, and not writable by group or others
+ *           unless sticky (like /tmp). The CLI writes key files 0600; a
+ *           root-owned read-only secret mount also passes.
+ * out:      buffer to receive the wrapped payload. May be NULL only if
+ *           *out_len is 0 (to probe the size).
+ * out_len:  in: capacity of `out` in bytes.
+ *           out: on HKDFGUARD_OK, the number of bytes read (the file's
+ *                length, 132..=HKDFGUARD_WRAPPED_MAX_LEN).
+ *                on HKDFGUARD_ERR_BUFFER_TOO_SMALL, a capacity to retry
+ *                with: HKDFGUARD_WRAPPED_MAX_LEN for a capacity too small
+ *                for any payload (answered without opening the file),
+ *                otherwise the file's exact length.
+ *                0 on every other failure.
+ *           A buffer of HKDFGUARD_WRAPPED_MAX_LEN bytes always fits.
+ *
+ * The file's length is checked against the payload's own header (the
+ * header declares the payload's exact length):
+ *   HKDFGUARD_ERR_FILE_PLAINTEXT_KEY - the file is 32 bytes (the size of an
+ *       UNWRAPPED DEK), or is 32 bytes written as text -- base64 (standard
+ *       or URL-safe, padded or not; the CLI's DEK input is standard base64)
+ *       or hex -- with any surrounding whitespace. Most likely the plaintext key
+ *       saved where its wrapped form belongs: treat it as a key exposure. A
+ *       32-byte file is refused from its size alone, normally without being
+ *       read (one rewritten mid-call is read, then refused on its contents).
+ *   HKDFGUARD_ERR_FILE_TOO_SHORT - shorter than the smallest wrapped DEK, or
+ *       than its header declares (e.g. a truncated copy). Includes empty.
+ *   HKDFGUARD_ERR_FILE_TOO_LONG - longer than HKDFGUARD_WRAPPED_MAX_LEN, or
+ *       than its header declares (e.g. data appended).
+ *   HKDFGUARD_ERR_FILE_MALFORMED - an unknown version or provider, or a
+ *       key-id or ciphertext length no wrap produces.
+ * HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED and
+ * HKDFGUARD_ERR_FILE_IO report why the file couldn't be opened or read.
+ *
+ * On any failure, every byte of the caller's declared `out` capacity is
+ * zeroed (unless `out_len` is NULL: then nothing is written).
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code --
+ * HKDFGUARD_ERR_INVALID_ARGUMENT for a NULL or empty `path`, a `path` with
+ * no terminator within PATH_MAX bytes, a NULL `out_len`, a negative
+ * capacity, or a NULL `out` with a positive capacity.
+ */
+int hkdfguard_open_file(
+    const char* path,
     uint8_t* out,
     int* out_len);
 

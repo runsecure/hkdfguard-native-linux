@@ -78,7 +78,7 @@ use sha2::{Digest, Sha256, Sha512}; // `Sha256` for the KEK fingerprint, `Sha512
 use zeroize::{Zeroize, Zeroizing}; // `Zeroize` for explicit scrubbing of stack arrays, `Zeroizing` for auto-scrubbing owned buffers
 
 const HKDF_INFO_PREFIX: &[u8] = b"hkdfguard-wrap-v1:"; // domain-separation prefix; concatenated with the service name as HKDF's "info"
-const TAG_LEN: usize = 16; // AES-GCM's standard 128-bit authentication tag size
+pub(crate) const TAG_LEN: usize = 16; // AES-GCM's standard 128-bit authentication tag size
 #[cfg(test)]
 const UNCOMPRESSED_POINT_LEN: usize = 65; // SEC1 uncompressed P-256 point: 1 tag byte (0x04) + 32-byte X + 32-byte Y
 
