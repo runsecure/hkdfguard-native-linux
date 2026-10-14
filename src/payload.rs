@@ -119,12 +119,12 @@ impl Payload {
 
         let version = cursor.take(1)?[0]; // read 1 byte and unwrap it from the returned slice
         if version != VERSION {
-            return Err(Error::Crypto("unsupported wrapped payload version")); // reject anything but the version we know how to parse
+            return Err(Error::Unsupported("unsupported wrapped payload version")); // reject anything but the version we know how to parse
         }
 
         let provider_byte = cursor.take(1)?[0]; // read the raw provider-tag byte
         let provider_type = ProviderType::from_u8(provider_byte) // convert the raw byte into the enum
-            .ok_or(Error::Crypto("unknown provider type in wrapped payload"))?; // reject any value outside 1..=5
+            .ok_or(Error::Malformed("unknown provider type in wrapped payload"))?; // reject any value outside 1..=5
 
         let key_id_len = u16::from_le_bytes(cursor.take(2)?.try_into().unwrap()) as usize; // read the 2-byte length prefix, then widen to usize for indexing
         let key_id = cursor.take(key_id_len)?.to_vec(); // read exactly that many bytes and copy them into an owned Vec
@@ -142,7 +142,7 @@ impl Payload {
             // anything left over after consuming every declared field means the
             // input was longer than a valid payload -- reject it rather than
             // silently ignoring trailing garbage.
-            return Err(Error::Crypto("trailing bytes after wrapped payload"));
+            return Err(Error::Malformed("trailing bytes after wrapped payload"));
         }
 
         Ok(Payload {
@@ -170,9 +170,9 @@ impl<'a> Cursor<'a> {
         let end = self
             .pos
             .checked_add(n) // guard against `pos + n` overflowing usize on a hostile length field
-            .ok_or(Error::Crypto("wrapped payload field length overflow"))?;
+            .ok_or(Error::Malformed("wrapped payload field length overflow"))?;
         if end > self.buf.len() {
-            return Err(Error::Crypto("wrapped payload is truncated")); // requested more bytes than remain
+            return Err(Error::Malformed("wrapped payload is truncated")); // requested more bytes than remain
         }
         let slice = &self.buf[self.pos..end]; // the requested slice, borrowed from the original buffer
         self.pos = end; // advance the cursor past what we just returned
@@ -268,7 +268,7 @@ mod tests {
             bytes[0] = other;
             let err = Payload::from_bytes(&bytes).unwrap_err();
             assert!(
-                matches!(err, Error::Crypto("unsupported wrapped payload version")),
+                matches!(err, Error::Unsupported("unsupported wrapped payload version")),
                 "version byte {other} must be rejected"
             );
         }
@@ -287,15 +287,15 @@ mod tests {
         let mut bytes = payload.to_bytes();
         bytes[1] = 0; // invalid provider 0
         let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("unknown provider type in wrapped payload")));
+        assert!(matches!(err, Error::Malformed("unknown provider type in wrapped payload")));
 
         bytes[1] = 6; // invalid provider 6
         let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("unknown provider type in wrapped payload")));
+        assert!(matches!(err, Error::Malformed("unknown provider type in wrapped payload")));
 
         bytes[1] = 0xFF; // invalid provider 255
         let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("unknown provider type in wrapped payload")));
+        assert!(matches!(err, Error::Malformed("unknown provider type in wrapped payload")));
     }
 
     #[test]
@@ -313,8 +313,8 @@ mod tests {
         for len in 0..bytes.len() {
             let truncated = &bytes[..len];
             assert!(
-                Payload::from_bytes(truncated).is_err(),
-                "should reject payload truncated at length {len}"
+                matches!(Payload::from_bytes(truncated), Err(Error::Malformed(_))),
+                "should reject payload truncated at length {len} as malformed"
             );
         }
     }
@@ -332,7 +332,7 @@ mod tests {
         let mut bytes = payload.to_bytes();
         bytes.push(0xFF); // append one stray byte after a complete, valid payload
         let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("trailing bytes after wrapped payload")));
+        assert!(matches!(err, Error::Malformed("trailing bytes after wrapped payload")));
     }
 
     #[test]

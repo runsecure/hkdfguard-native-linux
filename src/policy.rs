@@ -234,7 +234,7 @@ pub struct Pkcs11Settings {
 fn absolute_path(field: &str, value: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value);
     if !path.is_absolute() {
-        return Err(Error::Provider(format!("hkdfguard policy: {field} \"{value}\" must be an absolute path")));
+        return Err(Error::Policy(format!("hkdfguard policy: {field} \"{value}\" must be an absolute path")));
     }
     Ok(path)
 }
@@ -243,7 +243,7 @@ fn absolute_path(field: &str, value: &str) -> Result<PathBuf> {
 // serial 16. A longer value can never match, so reject it as a typo.
 fn token_field(field: &str, value: &str, max: usize) -> Result<String> {
     if value.is_empty() || value.len() > max {
-        return Err(Error::Provider(format!(
+        return Err(Error::Policy(format!(
             "hkdfguard policy: {field} must be 1..={max} bytes, got {}",
             value.len()
         )));
@@ -328,7 +328,7 @@ fn validate_tcti(tcti: &str) -> Result<()> {
     if TCTI_KINDS.contains(&kind) {
         return Ok(());
     }
-    Err(Error::Provider(format!(
+    Err(Error::Policy(format!(
         "hkdfguard policy: tpm.tcti \"{tcti}\" must start with one of: {}",
         TCTI_KINDS.join(", ")
     )))
@@ -386,9 +386,9 @@ const SHA256_TPM_NAME_LEN: usize = 2 + 32;
 // Decodes a policy-supplied TPM Name and checks it is a SHA-256 Name.
 fn parse_tpm_name(field: &str, hex: &str) -> Result<Vec<u8>> {
     let bytes = parse_hex(hex)
-        .ok_or_else(|| Error::Provider(format!("hkdfguard policy: {field} is not valid hex")))?;
+        .ok_or_else(|| Error::Policy(format!("hkdfguard policy: {field} is not valid hex")))?;
     if bytes.len() != SHA256_TPM_NAME_LEN {
-        return Err(Error::Provider(format!(
+        return Err(Error::Policy(format!(
             "hkdfguard policy: {field} is {} bytes, expected {SHA256_TPM_NAME_LEN} (a SHA-256 TPM Name)",
             bytes.len()
         )));
@@ -542,7 +542,7 @@ impl Policy {
     /// `[table]` header lands inside that table and is rejected.
     pub fn from_toml_str(doc: &str) -> Result<Policy> {
         let raw: PolicyFile = toml::from_str(doc)
-            .map_err(|e| Error::Provider(format!("invalid hkdfguard policy: {e}")))?;
+            .map_err(|e| Error::Policy(format!("invalid hkdfguard policy: {e}")))?;
         Self::validate(raw)
     }
 
@@ -550,13 +550,13 @@ impl Policy {
         let selection = match raw.selection.mode {
             SelectionModeTag::Require => {
                 let provider = raw.selection.provider.ok_or_else(|| {
-                    Error::Provider(
+                    Error::Policy(
                         "hkdfguard policy: selection.mode \"require\" needs a selection.provider"
                             .to_string(),
                     )
                 })?;
                 if raw.selection.level.is_some() {
-                    return Err(Error::Provider(
+                    return Err(Error::Policy(
                         "hkdfguard policy: selection.mode \"require\" must not also set selection.level"
                             .to_string(),
                     ));
@@ -565,13 +565,13 @@ impl Policy {
             }
             SelectionModeTag::RequireLevel => {
                 let level = raw.selection.level.ok_or_else(|| {
-                    Error::Provider(
+                    Error::Policy(
                         "hkdfguard policy: selection.mode \"require-level\" needs a selection.level"
                             .to_string(),
                     )
                 })?;
                 if raw.selection.provider.is_some() {
-                    return Err(Error::Provider(
+                    return Err(Error::Policy(
                         "hkdfguard policy: selection.mode \"require-level\" must not also set selection.provider"
                             .to_string(),
                     ));
@@ -580,7 +580,7 @@ impl Policy {
             }
             SelectionModeTag::Prefer => {
                 if raw.selection.provider.is_some() || raw.selection.level.is_some() {
-                    return Err(Error::Provider(
+                    return Err(Error::Policy(
                         "hkdfguard policy: selection.mode \"prefer\" must not set selection.provider or selection.level"
                             .to_string(),
                     ));
@@ -597,7 +597,7 @@ impl Policy {
         // empty allowed list at evaluation time.
         if let (SelectionMode::Require(p), Some(min)) = (selection, minimum_protection) {
             if p.protection_level() < min {
-                return Err(Error::Provider(format!(
+                return Err(Error::Policy(format!(
                     "hkdfguard policy: selection requires provider \"{}\" ({}), below key_requirements.minimum_protection ({})",
                     p.policy_name(),
                     p.protection_level().as_str(),
@@ -609,7 +609,7 @@ impl Policy {
         let mut seen = Vec::new();
         for p in &raw.preferred_order {
             if seen.contains(p) {
-                return Err(Error::Provider(format!(
+                return Err(Error::Policy(format!(
                     "hkdfguard policy: preferred_order lists \"{}\" more than once",
                     p.policy_name()
                 )));
@@ -622,7 +622,7 @@ impl Policy {
             .setup_min_delay_ms
             .unwrap_or(DEFAULT_SETUP_MIN_DELAY_MS);
         if setup_min_delay_ms > MAX_SETUP_MIN_DELAY_MS {
-            return Err(Error::Provider(format!(
+            return Err(Error::Policy(format!(
                 "hkdfguard policy: startup_behavior.setup_min_delay_ms is {setup_min_delay_ms}, above the {MAX_SETUP_MIN_DELAY_MS} ms maximum"
             )));
         }
@@ -639,7 +639,7 @@ impl Policy {
                 .insert(crate::normalize_service(service), bytes)
                 .is_some()
             {
-                return Err(Error::Provider(format!(
+                return Err(Error::Policy(format!(
                     "hkdfguard policy: tpm.pinned_names lists \"{service}\" more than once (names are compared case-insensitively)"
                 )));
             }
@@ -657,7 +657,7 @@ impl Policy {
         if raw.tpm.session_encryption == SessionEncryption::Required
             && pinned_session_salt_key_name.is_none()
         {
-            return Err(Error::Provider(
+            return Err(Error::Policy(
                 "hkdfguard policy: tpm.session_encryption \"required\" needs tpm.pinned_session_salt_key_name; \
                  without a pinned salt key the encrypted session can be man-in-the-middled on the bus"
                     .to_string(),
@@ -809,7 +809,7 @@ impl PolicyEvaluator for Policy {
         let mut candidates = match self.selection {
             SelectionMode::Require(provider) => {
                 if !compiled.contains(&provider) {
-                    return Err(Error::Provider(format!(
+                    return Err(Error::Policy(format!(
                         "hkdfguard policy requires provider \"{}\", but it is not compiled into this build",
                         provider.policy_name()
                     )));
@@ -880,14 +880,14 @@ const POLICY_FILE_REQUIREMENTS: crate::secure_file::FileRequirements = crate::se
 /// there for why).
 pub fn load() -> Option<Result<Policy>> {
     if let Some(snapshot) = SNAPSHOT.with(|s| s.borrow().clone()) {
-        return snapshot.map(|r| r.map_err(Error::Provider));
+        return snapshot.map(|r| r.map_err(Error::Policy));
     }
     read_from_disk()
 }
 
 /// The policy as one C ABI call sees it: `None` for no file, else the
 /// parsed policy or the reason it was refused (every refusal is an
-/// `Error::Provider`, so its message is all there is to keep).
+/// `Error::Policy`, so its message is all there is to keep).
 type Snapshot = Option<std::result::Result<Policy, String>>;
 
 thread_local! {
@@ -931,7 +931,7 @@ pub(crate) fn snapshot_for_call() -> SnapshotGuard {
         }
         let snapshot: Snapshot = read_from_disk().map(|r| {
             r.map_err(|e| match e {
-                Error::Provider(msg) => msg,
+                Error::Policy(msg) => msg,
                 other => other.to_string(),
             })
         });
@@ -944,7 +944,7 @@ pub(crate) fn snapshot_for_call() -> SnapshotGuard {
 /// outcome means.
 fn read_from_disk() -> Option<Result<Policy>> {
     let path = policy_file_path();
-    let fail = |what: String| Some(Err(Error::Provider(format!("hkdfguard policy file {}: {what}", path.display()))));
+    let fail = |what: String| Some(Err(Error::Policy(format!("hkdfguard policy file {}: {what}", path.display()))));
 
     if let Err(e) = crate::secure_file::check_location(&path, crate::secure_file::config_owner()) {
         return fail(format!("refusing to trust its location ({e})"));
@@ -964,7 +964,7 @@ fn read_from_disk() -> Option<Result<Policy>> {
     };
 
     Some(Policy::from_toml_str(text).map_err(|e| match e {
-        Error::Provider(msg) => Error::Provider(format!("{} ({})", msg, path.display())),
+        Error::Policy(msg) => Error::Policy(format!("{} ({})", msg, path.display())),
         other => other,
     }))
 }
@@ -1355,7 +1355,7 @@ mod tests {
         let err = policy
             .allowed_providers(&compiled(&[ProviderType::ExternalSecret, ProviderType::Ephemeral]))
             .unwrap_err();
-        assert!(matches!(err, Error::Provider(_)));
+        assert!(matches!(err, Error::Policy(_)));
     }
 
     // ---- Require-level mode ----
@@ -1817,7 +1817,7 @@ mod tests {
         let _guard = snapshot_for_call();
         for _ in 0..2 {
             match load() {
-                Some(Err(Error::Provider(msg))) => assert!(msg.contains("invalid hkdfguard policy"), "unexpected: {msg}"),
+                Some(Err(Error::Policy(msg))) => assert!(msg.contains("invalid hkdfguard policy"), "unexpected: {msg}"),
                 other => panic!("a malformed policy must stay refused within the call, got {other:?}"),
             }
         }
@@ -2033,8 +2033,8 @@ mod tests {
         let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n"); // missing required `provider`
 
         match load() {
-            Some(Err(_)) => {}
-            other => panic!("expected Some(Err(_)), got {other:?}"),
+            Some(Err(Error::Policy(_))) => {}
+            other => panic!("expected Some(Err(Error::Policy(_))), got {other:?}"),
         }
 
     }
@@ -2045,8 +2045,8 @@ mod tests {
         let _policy = TestPolicy::at(path);
         let result = load();
         match result {
-            Some(Err(_)) => {}
-            other => panic!("{why}: expected Some(Err(_)) (fail closed), got {other:?}"),
+            Some(Err(Error::Policy(_))) => {}
+            other => panic!("{why}: expected Some(Err(Error::Policy(_))) (fail closed), got {other:?}"),
         }
     }
 

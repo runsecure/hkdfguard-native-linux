@@ -451,21 +451,46 @@ fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [
 }
 
 // Maps a library status code to a human-readable description, for a
-// clearer error message than a bare integer.
+// clearer error message than a bare integer. Covers every code the Linux
+// library can return (the shared table's Windows/macOS-only codes, and
+// KEK_ACCESS_DENIED/KEK_INVALID, which Linux never returns, fall through
+// to "unknown"). Only the message depends on this: the tool's own exit
+// codes don't.
 fn describe_status(code: c_int) -> String {
     match code {
         status::INVALID_ARGUMENT => "invalid argument (bad DEK length, etc.)".to_string(),
+        status::BUFFER_TOO_SMALL => "the output buffer was too small".to_string(),
         status::PROVIDER_UNAVAILABLE => "no KEK provider is available on this host".to_string(),
         status::PROVIDER_ERROR => "the selected KEK provider failed".to_string(),
         status::CRYPTO_ERROR => "a cryptographic operation failed".to_string(),
         status::INTERNAL_ERROR => "an internal error occurred in the hkdfguard library".to_string(),
         status::INVALID_SERVICE_NAME => "the service name is missing, empty, too long, or contains an invalid character".to_string(),
-        status::KEK_NOT_FOUND => "no KEK exists yet for this service".to_string(),
-        status::FINGERPRINT_MISMATCH => {
+        status::POLICY_INVALID => {
+            "the hkdfguard policy file is invalid or can't be trusted (see the library's log for why)".to_string()
+        }
+        status::PAYLOAD_MALFORMED => "the wrapped payload is malformed".to_string(),
+        status::PAYLOAD_AUTH_FAILED => {
+            "the wrapped payload failed authentication (tampered, wrong service, or wrong KEK)".to_string()
+        }
+        status::PAYLOAD_UNSUPPORTED => "the wrapped payload's version is not supported".to_string(),
+        status::KEK_FINGERPRINT_MISMATCH => {
             "the wrapped payload's KEK fingerprint does not match the current KEK for this service".to_string()
         }
+        status::KEK_NOT_FOUND => "no KEK exists yet for this service".to_string(),
         status::PROCESS_HARDENING_FAILED => {
             "could not disable core dumps / ptrace access for this process".to_string()
+        }
+        status::FILE_NOT_FOUND => "the key file, or a directory in its path, does not exist".to_string(),
+        status::FILE_ACCESS_DENIED => "permission to open the key file was denied".to_string(),
+        status::FILE_IO => "the key file is not a regular file, or reading it failed".to_string(),
+        status::FILE_TOO_SHORT => "the key file is shorter than a wrapped DEK".to_string(),
+        status::FILE_TOO_LONG => "the key file is longer than a wrapped DEK".to_string(),
+        status::FILE_PLAINTEXT_KEY => {
+            "the key file looks like an UNWRAPPED DEK; treat it as a key exposure".to_string()
+        }
+        status::FILE_MALFORMED => "the key file is not a well-formed wrapped DEK".to_string(),
+        status::FILE_UNTRUSTED => {
+            "the key file, or a directory in its path, is owned by another user or writable by group/others".to_string()
         }
         other => format!("unknown status code {other}"),
     }
@@ -894,6 +919,37 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn every_status_the_linux_library_returns_is_described() {
+        for code in [
+            status::INVALID_ARGUMENT,
+            status::BUFFER_TOO_SMALL,
+            status::PROVIDER_UNAVAILABLE,
+            status::PROVIDER_ERROR,
+            status::CRYPTO_ERROR,
+            status::INTERNAL_ERROR,
+            status::INVALID_SERVICE_NAME,
+            status::POLICY_INVALID,
+            status::PAYLOAD_MALFORMED,
+            status::PAYLOAD_AUTH_FAILED,
+            status::PAYLOAD_UNSUPPORTED,
+            status::KEK_FINGERPRINT_MISMATCH,
+            status::KEK_NOT_FOUND,
+            status::PROCESS_HARDENING_FAILED,
+            status::FILE_NOT_FOUND,
+            status::FILE_ACCESS_DENIED,
+            status::FILE_IO,
+            status::FILE_TOO_SHORT,
+            status::FILE_TOO_LONG,
+            status::FILE_PLAINTEXT_KEY,
+            status::FILE_MALFORMED,
+            status::FILE_UNTRUSTED,
+        ] {
+            assert!(!describe_status(code).starts_with("unknown"), "status {code} has no description");
+        }
+        assert_eq!(describe_status(status::MAC_KEYCHAIN_READ_FAILED), "unknown status code -100");
+    }
 
     // Only this user can write to it, whatever the umask: the library refuses
     // to trust a policy or secret mount in a group-writable directory.

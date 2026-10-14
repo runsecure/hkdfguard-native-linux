@@ -964,7 +964,7 @@ mod tests {
         let _policy_dir = write_policy("[selection]\nmode = \"require\"\nprovider = \"quantum-vault\"\n");
 
         let err = expect_err(create_kek("com.company.orders"));
-        assert!(matches!(err, Error::Provider(_)), "a malformed policy must fail closed, not fall back to the default chain");
+        assert!(matches!(err, Error::Policy(_)), "a malformed policy must fail closed, not fall back to the default chain");
 
     }
 }

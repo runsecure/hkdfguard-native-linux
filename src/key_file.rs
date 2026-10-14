@@ -24,7 +24,7 @@
 //!   one.
 //! - **Integrity.** The file must be owned by root or by this process's
 //!   user, and must not be writable by group or others; otherwise
-//!   [`KeyFileError::AccessDenied`]. A wrapped DEK is ciphertext, so reading
+//!   [`KeyFileError::Untrusted`]. A wrapped DEK is ciphertext, so reading
 //!   it gains nothing -- but *replacing* it does: anyone who can write the
 //!   file and can also wrap under the service's KEK (on TPM2, any process
 //!   in the `tss` group with the derivation secret) could plant a DEK they
@@ -35,7 +35,9 @@
 //!   and the one the path names it in, each up to `/`: owned by root or
 //!   this user, and not writable by group or others unless sticky
 //!   (`/tmp`-style). Otherwise someone else could rename a file of their
-//!   choosing over the key, or retarget a symlink to one.
+//!   choosing over the key, or retarget a symlink to one. (The OS itself
+//!   refusing to open the file -- e.g. `EACCES` -- is the separate
+//!   [`KeyFileError::AccessDenied`].)
 
 use crate::crypto::{DEK_LEN, MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN, TAG_LEN};
 use crate::error::status;
@@ -52,10 +54,14 @@ use zeroize::Zeroizing;
 pub enum KeyFileError {
     /// The file, or a directory in its path, does not exist.
     NotFound,
-    /// The calling process may not open the file; or the file is owned by
-    /// another user, or is writable by group or others, so someone else
-    /// could have replaced its contents.
+    /// The OS refused to let the calling process open the file (or search
+    /// a directory in its path), e.g. `EACCES`.
     AccessDenied,
+    /// The file, or a directory deciding what its path names, is owned by
+    /// another user or is writable by group or others -- or the file was
+    /// swapped between being checked and being opened -- so someone else
+    /// could have replaced its contents.
+    Untrusted,
     /// Not a regular file (a directory, FIFO, device...), or the read failed.
     Io,
     /// Shorter than the smallest payload, or than its own header declares.
@@ -73,6 +79,7 @@ impl KeyFileError {
         match self {
             KeyFileError::NotFound => status::FILE_NOT_FOUND,
             KeyFileError::AccessDenied => status::FILE_ACCESS_DENIED,
+            KeyFileError::Untrusted => status::FILE_UNTRUSTED,
             KeyFileError::Io => status::FILE_IO,
             KeyFileError::TooShort => status::FILE_TOO_SHORT,
             KeyFileError::TooLong => status::FILE_TOO_LONG,
@@ -85,9 +92,10 @@ impl KeyFileError {
     pub fn describe(self) -> &'static str {
         match self {
             KeyFileError::NotFound => "the file, or a directory in its path, does not exist",
-            KeyFileError::AccessDenied => {
-                "this process may not open the file, or the file or a directory deciding what its path names \
-                 is owned by another user or writable by group/others"
+            KeyFileError::AccessDenied => "this process may not open the file",
+            KeyFileError::Untrusted => {
+                "the file or a directory deciding what its path names is owned by another user or writable by \
+                 group/others, so someone else could have replaced it"
             }
             KeyFileError::Io => "not a regular file, or reading it failed",
             KeyFileError::TooShort => "the file is shorter than a wrapped DEK, or than its header declares",
@@ -142,10 +150,13 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
     let target_real = std::fs::canonicalize(path).map_err(open_error)?;
     check_location(path, &target_real)?;
     let mut file = secure_file::open_checked(&target_real, &req).map_err(|e| match e.raw_os_error() {
-        Some(libc::ELOOP) => KeyFileError::AccessDenied, // became a symlink after it was resolved
+        Some(libc::ELOOP) => KeyFileError::Untrusted, // became a symlink after it was resolved
+        // No OS error behind it: `open_checked`'s own owner/mode check on
+        // the opened descriptor refused the file, not the kernel.
+        None if e.kind() == io::ErrorKind::PermissionDenied => KeyFileError::Untrusted,
         _ => open_error(e),
     })?;
-    secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::AccessDenied)?;
+    secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::Untrusted)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
     if size == DEK_LEN as u64 {
         return Err(KeyFileError::PlaintextKey);
@@ -181,13 +192,17 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
 fn check_location(path: &Path, target_real: &Path) -> Result<(), KeyFileError> {
     let check = |dir: &Path| {
         secure_file::check_dir_chain_for_existing_file(dir, Owner::RootOrCurrentUser)
-            .map_err(|_| KeyFileError::AccessDenied)
+            .map_err(|_| KeyFileError::Untrusted)
     };
-    let target_dir = target_real.parent().ok_or(KeyFileError::AccessDenied)?;
+    // Only `/` has no parent, and `/` is a directory, not a key file.
+    let target_dir = target_real.parent().ok_or(KeyFileError::Io)?;
     check(target_dir)?;
 
     let named_in = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let named_in = std::fs::canonicalize(named_in).map_err(|_| KeyFileError::AccessDenied)?;
+    let named_in = std::fs::canonicalize(named_in).map_err(|e| match e.kind() {
+        io::ErrorKind::PermissionDenied => KeyFileError::AccessDenied, // the OS refused to resolve it
+        _ => KeyFileError::Untrusted, // can't confirm what names the file, so it isn't trusted
+    })?;
     if named_in != target_dir {
         check(&named_in)?;
     }
@@ -550,7 +565,7 @@ mod tests {
         }
         for mode in [0o620, 0o660, 0o602, 0o606, 0o666, 0o622] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied), "mode {mode:o} lets someone else replace the key");
+            assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted), "mode {mode:o} lets someone else replace the key");
         }
     }
 
@@ -561,7 +576,7 @@ mod tests {
         let link = dir.path().join("current.key");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert_eq!(read(&link).err(), Some(KeyFileError::AccessDenied));
+        assert_eq!(read(&link).err(), Some(KeyFileError::Untrusted));
     }
 
     fn chmod(path: &Path, mode: u32) {
@@ -579,7 +594,7 @@ mod tests {
         assert!(read(&path).is_ok());
         for mode in [0o770, 0o707, 0o777] {
             chmod(&dir, mode);
-            assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied), "dir mode {mode:o}: the key could be renamed over");
+            assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted), "dir mode {mode:o}: the key could be renamed over");
         }
         // Sticky: only the file's owner (checked) can rename or replace it.
         chmod(&dir, 0o1777);
@@ -598,7 +613,7 @@ mod tests {
         assert!(read(&path).is_ok());
 
         chmod(&base.path().join("a"), 0o777);
-        assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied), "`b` itself could be swapped out");
+        assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted), "`b` itself could be swapped out");
         chmod(&base.path().join("a"), 0o700);
     }
 
@@ -612,7 +627,7 @@ mod tests {
         assert!(read(&link).is_ok());
 
         chmod(shared.path(), 0o777);
-        assert_eq!(read(&link).err(), Some(KeyFileError::AccessDenied), "the file actually read sits where others can replace it");
+        assert_eq!(read(&link).err(), Some(KeyFileError::Untrusted), "the file actually read sits where others can replace it");
         chmod(shared.path(), 0o700);
     }
 
@@ -626,7 +641,7 @@ mod tests {
         assert!(read(&link).is_ok());
 
         chmod(shared.path(), 0o777);
-        assert_eq!(read(&link).err(), Some(KeyFileError::AccessDenied), "others could retarget the link");
+        assert_eq!(read(&link).err(), Some(KeyFileError::Untrusted), "others could retarget the link");
         chmod(shared.path(), 0o700);
     }
 
@@ -646,12 +661,12 @@ mod tests {
         assert_eq!(read_with_proc_root(&link, no_proc).unwrap().as_slice(), &bytes[..], "symlinks still resolve");
 
         chmod(&path, 0o666);
-        assert_eq!(read_with_proc_root(&path, no_proc).err(), Some(KeyFileError::AccessDenied), "file checks");
+        assert_eq!(read_with_proc_root(&path, no_proc).err(), Some(KeyFileError::Untrusted), "file checks");
         chmod(&path, 0o600);
 
         let elsewhere = write(shared.path(), "wrapped.key", &bytes);
         chmod(shared.path(), 0o777);
-        assert_eq!(read_with_proc_root(&elsewhere, no_proc).err(), Some(KeyFileError::AccessDenied), "directory checks");
+        assert_eq!(read_with_proc_root(&elsewhere, no_proc).err(), Some(KeyFileError::Untrusted), "directory checks");
         chmod(shared.path(), 0o700);
     }
 
@@ -677,7 +692,7 @@ mod tests {
         let dir = secure_file::private_tempdir();
         let path = write(dir.path(), "wrapped.key", &valid());
         std::os::unix::fs::chown(&path, Some(65534), Some(65534)).unwrap(); // nobody
-        assert_eq!(read(&path).err(), Some(KeyFileError::AccessDenied));
+        assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted));
     }
 
     #[test]
@@ -705,6 +720,7 @@ mod tests {
         let all = [
             KeyFileError::NotFound,
             KeyFileError::AccessDenied,
+            KeyFileError::Untrusted,
             KeyFileError::Io,
             KeyFileError::TooShort,
             KeyFileError::TooLong,

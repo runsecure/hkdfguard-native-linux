@@ -164,7 +164,9 @@ pub extern "C" fn hkdfguard_wrap_dek(
 /// - `service`: must match the value passed to `hkdfguard_wrap_dek` when
 ///   this payload was produced (case-insensitively -- see that function's
 ///   doc comment); any other mismatch is indistinguishable from tampering
-///   and yields [`status::CRYPTO_ERROR`]. An invalid service string (see
+///   and yields [`status::PAYLOAD_AUTH_FAILED`] (or, when the other
+///   service's KEK differs, [`status::KEK_FINGERPRINT_MISMATCH`] first).
+///   An invalid service string (see
 ///   `hkdfguard_wrap_dek`'s doc comment) yields
 ///   [`status::INVALID_SERVICE_NAME`].
 /// - `wrapped` / `wrapped_len`: the wrapped payload bytes.
@@ -391,7 +393,7 @@ fn generate_and_wrap_impl(
     let mut dek = zeroize::Zeroizing::new([0u8; crypto::DEK_LEN]); // scrubbed on drop, panic included
     if getrandom::fill(&mut dek[..]).is_err() {
         log::error!("hkdfguard: the OS random number generator failed; no DEK generated");
-        return status::INTERNAL_ERROR;
+        return status::CRYPTO_ERROR; // an RNG failure, like wrap's own (see crypto::wrap)
     }
 
     let code = wrap_impl(service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
@@ -989,6 +991,49 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    fn unwrap_reports_each_kind_of_bad_payload_with_its_own_code() {
+        // Structurally broken, an unknown version, and well-formed but
+        // tampered are three different problems for the caller, so each has
+        // its own status code rather than all collapsing into CRYPTO_ERROR.
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders").unwrap();
+            create_kek_for_test(&service);
+            let dek = [0x5Au8; 32];
+            let mut wrapped_buf = [0u8; 512];
+            let mut wrapped_len: c_int = wrapped_buf.len() as c_int;
+            let rc = hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, wrapped_buf.as_mut_ptr(), &mut wrapped_len);
+            assert_eq!(rc, status::OK);
+            let wrapped = wrapped_buf[..wrapped_len as usize].to_vec();
+
+            let unwrap = |bytes: &[u8]| {
+                let mut out = [0xAAu8; 32];
+                let mut out_len: c_int = out.len() as c_int;
+                let rc = hkdfguard_unwrap_dek(service.as_ptr(), bytes.as_ptr(), bytes.len() as c_int, out.as_mut_ptr(), &mut out_len);
+                assert_eq!(out, [0u8; 32], "output buffer must be zeroed on failure");
+                rc
+            };
+
+            assert_eq!(unwrap(&wrapped[..wrapped.len() - 1]), status::PAYLOAD_MALFORMED, "truncated");
+            let mut trailing = wrapped.clone();
+            trailing.push(0);
+            assert_eq!(unwrap(&trailing), status::PAYLOAD_MALFORMED, "trailing bytes");
+            let mut bad_provider = wrapped.clone();
+            bad_provider[1] = 0xFF; // byte 1 is the provider tag
+            assert_eq!(unwrap(&bad_provider), status::PAYLOAD_MALFORMED, "unknown provider type");
+
+            let mut bad_version = wrapped.clone();
+            bad_version[0] = payload::VERSION + 1; // byte 0 is the version
+            assert_eq!(unwrap(&bad_version), status::PAYLOAD_UNSUPPORTED, "unknown version");
+
+            let mut tampered = wrapped.clone();
+            let last_ciphertext_byte = tampered.len() - payload::FINGERPRINT_LEN - 1; // inside the tag, before the fingerprint
+            tampered[last_ciphertext_byte] ^= 0x01;
+            assert_eq!(unwrap(&tampered), status::PAYLOAD_AUTH_FAILED, "tampered tag");
+        });
+    }
+
+    #[test]
+    #[serial]
     fn generate_and_wrap_round_trip() {
         with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
@@ -1150,7 +1195,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len,
             );
-            assert_ne!(rc, status::OK); // must fail, since `garbage` isn't a valid payload
+            assert_eq!(rc, status::PAYLOAD_UNSUPPORTED); // must fail, since `garbage` isn't a valid payload (its version byte is 0)
             assert_eq!(out, [0u8; 32], "output buffer must be zeroed on failure"); // and the buffer must be scrubbed regardless
         });
     }
@@ -1731,8 +1776,8 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::FINGERPRINT_MISMATCH);
-        assert_eq!(rc, -16, "must match macOS's HKDFGuardStatus.fingerprintMismatch");
+        assert_eq!(rc, status::KEK_FINGERPRINT_MISMATCH);
+        assert_eq!(rc, -16, "pinned by the status table shared with Windows and macOS");
         assert_eq!(out, [0u8; 32], "output buffer must still be zeroed on failure");
 
     }
@@ -1920,7 +1965,7 @@ mod ffi_tests {
         for mode in [0o660, 0o606] {
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
             let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
-            assert_eq!((rc, out_len), (status::FILE_ACCESS_DENIED, 0), "mode {mode:o}");
+            assert_eq!((rc, out_len), (status::FILE_UNTRUSTED, 0), "mode {mode:o}");
             assert!(out.iter().all(|&b| b == 0), "mode {mode:o}: nothing of the file is handed over");
         }
         // Read-only for others is fine: the contents are ciphertext.
@@ -1934,7 +1979,7 @@ mod ffi_tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
-        assert_eq!((rc, out_len), (status::FILE_ACCESS_DENIED, 0), "writable directory");
+        assert_eq!((rc, out_len), (status::FILE_UNTRUSTED, 0), "writable directory");
         assert!(out.iter().all(|&b| b == 0));
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }

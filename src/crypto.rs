@@ -56,7 +56,7 @@
 //! [`unwrap`] additionally checks the wrapped payload's embedded KEK
 //! fingerprint (see [`kek_fingerprint`]) against the public key of the KEK
 //! `service` currently resolves to, *before* attempting ECDH/AES-GCM --
-//! see [`crate::error::Error::FingerprintMismatch`].
+//! see [`crate::error::Error::KekFingerprintMismatch`].
 //!
 //! Memory note: the DEK plaintext is kept in stack-allocated `[u8; DEK_LEN]`
 //! buffers for the *entire* wrap/unwrap operation -- we deliberately use
@@ -265,7 +265,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     let payload = Payload::from_bytes(wrapped)?; // parse and structurally validate the wire format (ciphertext stays a heap Vec, but it's ciphertext, not a secret)
 
     if payload.ciphertext.len() != DEK_LEN + TAG_LEN {
-        return Err(Error::Crypto("wrapped ciphertext has unexpected length")); // malformed/tampered length; bail out before touching any crypto
+        return Err(Error::Malformed("wrapped ciphertext has unexpected length")); // malformed/tampered length; bail out before touching any crypto
     }
 
     let provider = provider::get_by_type(payload.provider_type)?; // must use the exact provider that originally wrapped this DEK
@@ -275,10 +275,10 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     // was actually wrapped under the KEK `service` resolves to *right now*
     // -- catches a rotated/replaced/wrong KEK with a specific, unambiguous
     // error instead of collapsing into a generic AEAD authentication
-    // failure indistinguishable from tampering (see `Error::FingerprintMismatch`).
+    // failure indistinguishable from tampering (see `Error::KekFingerprintMismatch`).
     let current_fingerprint = kek_fingerprint(&handle.public_key()?);
     if current_fingerprint != payload.fingerprint {
-        return Err(Error::FingerprintMismatch);
+        return Err(Error::KekFingerprintMismatch);
     }
 
     // Must exactly mirror what `wrap` bound: every non-ciphertext byte of
@@ -298,7 +298,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     let (ct_part, tag_part) = payload.ciphertext.split_at(DEK_LEN);
     let mut dek = Zeroizing::new([0u8; DEK_LEN]);
     dek.copy_from_slice(ct_part); // still ciphertext at this point
-    let tag = Tag::try_from(tag_part).map_err(|_| Error::Crypto("wrapped ciphertext has unexpected length"))?;
+    let tag = Tag::try_from(tag_part).map_err(|_| Error::Malformed("wrapped ciphertext has unexpected length"))?;
 
     let cipher = Aes256Gcm::new(aes_key(&wrapping_key));
     let auth_result =
@@ -311,9 +311,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
         // decryption -- scrub it before returning rather than ever
         // handing it back to the caller.
         dek.zeroize();
-        return Err(Error::Crypto(
-            "AES-256-GCM authentication failed (tampered, wrong service, or wrong KEK)",
-        ));
+        return Err(Error::AuthFailed); // tampered, wrong service, or wrong KEK -- PAYLOAD_AUTH_FAILED, not CRYPTO_ERROR
     }
 
     Ok(dek) // genuine plaintext DEK, stack-resident from decryption through to the caller
@@ -431,7 +429,7 @@ mod tests {
             // Caught by the fingerprint check now, before AEAD is even
             // attempted: billing's KEK has a different public key than
             // orders', so the payload's embedded fingerprint can't match.
-            assert!(matches!(err, Error::FingerprintMismatch));
+            assert!(matches!(err, Error::KekFingerprintMismatch));
         });
     }
 
@@ -450,7 +448,7 @@ mod tests {
             let last_ciphertext_byte = wrapped.len() - FINGERPRINT_LEN - 1;
             wrapped[last_ciphertext_byte] ^= 0x01; // flip one bit in the ciphertext/tag
             let err = unwrap("com.company.orders", &wrapped).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_))); // AEAD authentication must catch the tamper
+            assert!(matches!(err, Error::AuthFailed)); // AEAD authentication must catch the tamper
         });
     }
 
@@ -463,7 +461,7 @@ mod tests {
             let mut wrapped = wrap("com.company.orders", &dek).unwrap();
             wrapped.truncate(wrapped.len() - 5); // chop bytes out of the ciphertext/tag region
             let err = unwrap("com.company.orders", &wrapped).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_))); // must be rejected by the explicit length check, not panic in `split_at`
+            assert!(matches!(err, Error::Malformed(_))); // must be rejected by the explicit length check, not panic in `split_at`
         });
     }
 
@@ -832,7 +830,7 @@ mod tests {
 
             let err = unwrap(service, &forged.to_bytes()).unwrap_err();
             assert!(
-                matches!(err, Error::Crypto(_)),
+                matches!(err, Error::AuthFailed),
                 "a forged payload must fail AEAD authentication, got {err:?}"
             );
 
@@ -965,9 +963,9 @@ mod tests {
 
             let err = unwrap(service, &wrapped).unwrap_err();
             // Caught by the fingerprint check, before ECDH/AES-GCM is ever
-            // attempted -- not a generic `Error::Crypto`, which is what
+            // attempted -- not a generic `Error::AuthFailed`, which is what
             // this would have looked like before this check existed.
-            assert!(matches!(err, Error::FingerprintMismatch));
+            assert!(matches!(err, Error::KekFingerprintMismatch));
 
         }
     }
@@ -987,7 +985,7 @@ mod tests {
             let tampered_bytes = payload.to_bytes();
 
             let err = unwrap("com.company.orders", &tampered_bytes).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_)));
+            assert!(matches!(err, Error::AuthFailed));
         });
     }
 
@@ -1036,7 +1034,7 @@ mod tests {
             let tampered_bytes = payload.to_bytes();
 
             let err = unwrap("com.company.orders", &tampered_bytes).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_)));
+            assert!(matches!(err, Error::AuthFailed));
         });
     }
 }

@@ -141,20 +141,33 @@ warning (`memory not locked as a whole`).
 | -1 | `HKDFGUARD_ERR_INVALID_ARGUMENT` | Null pointer, DEK length other than 32, negative capacity |
 | -2 | `HKDFGUARD_ERR_BUFFER_TOO_SMALL` | `*out_len` now holds the size needed |
 | -3 | `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` | No allowed provider is available on this host |
-| -4 | `HKDFGUARD_ERR_PROVIDER_ERROR` | A provider is present but failing, or the policy can't be used |
-| -5 | `HKDFGUARD_ERR_CRYPTO_ERROR` | The wrapped data is corrupt, tampered with, or for a different service |
-| -6 | `HKDFGUARD_ERR_INTERNAL_ERROR` | An internal failure: a bug in the library (a caught panic), or the OS random number generator failing while generating a DEK |
+| -4 | `HKDFGUARD_ERR_PROVIDER_ERROR` | A provider is present but failing |
+| -5 | `HKDFGUARD_ERR_CRYPTO_ERROR` | A cryptographic step failed for a reason other than authentication, such as the OS random number generator failing |
+| -6 | `HKDFGUARD_ERR_INTERNAL_ERROR` | An internal failure: a bug in the library (a caught panic) |
 | -8 | `HKDFGUARD_ERR_INVALID_SERVICE_NAME` | The service name breaks the naming rules |
-| -9 | `HKDFGUARD_ERR_KEK_NOT_FOUND` | The service has no KEK yet: provision it first |
-| -16 | `HKDFGUARD_ERR_FINGERPRINT_MISMATCH` | The payload was wrapped under a different KEK than the service has now |
-| -17 | `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` | `hkdfguard_harden_process` couldn't apply its settings |
-| -18 | `HKDFGUARD_ERR_FILE_TOO_SHORT` | `hkdfguard_open_file`: the file is shorter than a wrapped DEK, or than its header says (a truncated copy) |
-| -19 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
-| -20 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
-| -21 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
-| -22 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
-| -23 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: this process may not read the file; or the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write; a sticky directory such as `/tmp` is fine |
-| -24 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
+| -9 | `HKDFGUARD_ERR_POLICY_INVALID` | The policy file can't be used: it doesn't parse, a setting is invalid, it or its directory has unsafe ownership or permissions, or it requires a provider this build lacks |
+| -10 | `HKDFGUARD_ERR_PAYLOAD_MALFORMED` | The wrapped data isn't a well-formed payload: truncated, extra bytes, or a field no wrap produces |
+| -11 | `HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED` | The wrapped data failed authentication: tampered with, or for a different service |
+| -12 | `HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED` | The wrapped data has a payload version this library doesn't know |
+| -16 | `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH` | The payload was wrapped under a different KEK than the service has now |
+| -17 | `HKDFGUARD_ERR_KEK_NOT_FOUND` | The service has no KEK yet: provision it first |
+| -20 | `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` | `hkdfguard_harden_process` couldn't apply its settings |
+| -32 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
+| -33 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: the OS refused to let this process open the file (for example, no read permission) |
+| -34 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
+| -35 | `HKDFGUARD_ERR_FILE_TOO_SHORT` | `hkdfguard_open_file`: the file is shorter than a wrapped DEK, or than its header says (a truncated copy) |
+| -36 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
+| -37 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
+| -38 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
+| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write; a sticky directory such as `/tmp` is fine |
+
+The numbers are the same in the Windows and macOS builds of this library,
+which share one status table. `hkdfguard.h` also defines the codes only
+those platforms return (`HKDFGUARD_ERR_KEK_ACCESS_DENIED` (-18) and
+`HKDFGUARD_ERR_KEK_INVALID` (-19), and the platform-specific codes from -64
+down); Linux never returns them. A platform-specific code always refines a
+common one (its comment in the header says which), so it is safe to handle
+it as that code.
 
 The library doesn't print its reasons for a failure. To see why a call
 fails, run the CLI as the same user; see [troubleshooting.md](troubleshooting.md).

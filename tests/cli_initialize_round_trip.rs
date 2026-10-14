@@ -392,7 +392,7 @@ fn cli_key_file_opens_through_the_library_and_its_dek_input_is_refused() {
         // The CLI's 0600 key file, loosened so another group member could
         // replace it: refused, until the mode is restored.
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o660)).unwrap();
-        assert_eq!(open_via_library(&key_path).0, status::FILE_ACCESS_DENIED);
+        assert_eq!(open_via_library(&key_path).0, status::FILE_UNTRUSTED);
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(open_via_library(&key_path).0, status::OK);
     });

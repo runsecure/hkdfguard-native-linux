@@ -88,7 +88,7 @@ hkdfguard_unwrap_dek("com.company.orders", wrapped, wrapped_len, recovered, &rec
 ```
 
 `hkdfguard_wrap_dek` and `hkdfguard_generate_and_wrap_dek` return
-`HKDFGUARD_ERR_KEK_NOT_FOUND` (`-9`) if `hkdfguard_create_kek` has never
+`HKDFGUARD_ERR_KEK_NOT_FOUND` (`-17`) if `hkdfguard_create_kek` has never
 succeeded for that `service`; `hkdfguard_kek_exists` reports whether it
 has, without creating anything.
 
