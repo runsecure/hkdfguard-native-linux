@@ -252,6 +252,8 @@ const HEX_DEK_LEN: usize = 2 * DEK_LEN;
 /// length up to this is far below [`MIN_WRAPPED_LEN`], so no payload can
 /// ever be mistaken for a plaintext key, however it is padded.
 const MAX_PLAINTEXT_TEXT_LEN: usize = 96;
+// Checked at compile time: plaintext detection can never refuse a real payload.
+const _: () = assert!(MAX_PLAINTEXT_TEXT_LEN < MIN_WRAPPED_LEN && DEK_LEN < MIN_WRAPPED_LEN);
 
 // 32 raw bytes, or 32 bytes written as text: base64 (standard or URL-safe,
 // with or without its `=` padding -- the CLI's own DEK input format is
@@ -470,10 +472,9 @@ mod tests {
 
     #[test]
     fn no_valid_payload_can_be_mistaken_for_a_plaintext_key() {
-        // Every plaintext form, padding included, is far shorter than the
-        // smallest payload, so detection can never refuse a real one.
-        assert!(MAX_PLAINTEXT_TEXT_LEN < MIN_WRAPPED_LEN && DEK_LEN < MIN_WRAPPED_LEN);
-        // The smallest real payload is accepted as one.
+        // Every plaintext form, padding included, is shorter than the
+        // smallest payload (asserted at compile time beside
+        // MAX_PLAINTEXT_TEXT_LEN). The smallest real payload is accepted as one.
         assert_eq!(check(&payload_with_key_id(0)), Ok(()));
     }
 
