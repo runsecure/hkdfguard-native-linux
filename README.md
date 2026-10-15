@@ -126,6 +126,16 @@ host settings -- no swap or encrypted swap, `kernel.yama.ptrace_scope` of
 2 or 3, and for a systemd service `LimitCORE=0` and
 `ProtectProc=invisible`.
 
+`hkdfguard_harden_process_with_flags(flags)` is the same call with options;
+`hkdfguard_harden_process()` is `..._with_flags(0)`. The one flag,
+`HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE`, makes the call fail unless no
+other process of the same user can debug or inject code into this one. It
+exists for macOS, where that depends on the host executable's code signature
+and is otherwise only a logged warning. On Linux `PR_SET_DUMPABLE` already
+guarantees it, so the flag is accepted and changes nothing -- a
+cross-platform caller can pass it everywhere. Unknown flag bits return
+`HKDFGUARD_ERR_INVALID_ARGUMENT` before anything is changed.
+
 The `hkdfguard` command always calls it, and refuses to run if it fails.
 The CLI also locks its memory out of swap with `mlockall`, but only when
 the process has `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK` (root, or
@@ -1213,7 +1223,7 @@ src/
   lib.rs                    C ABI: hkdfguard_create_kek / hkdfguard_kek_exists /
                              hkdfguard_wrap_dek / hkdfguard_unwrap_dek /
                              hkdfguard_generate_and_wrap_dek /
-                             hkdfguard_harden_process; the setup-call gate
+                             hkdfguard_harden_process(_with_flags); the setup-call gate
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format (version 1)
   crypto.rs                 ECDH(H_salt) -> HKDF-SHA512 -> AES-256-GCM protocol; salt-to-point hashing

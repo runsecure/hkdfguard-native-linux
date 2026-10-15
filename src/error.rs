@@ -57,7 +57,7 @@ pub mod status {
     pub const KEK_NOT_FOUND: i32 = -17; // no persistent KEK exists yet for this service; call hkdfguard_create_kek first
     pub const KEK_ACCESS_DENIED: i32 = -18; // shared-table code: the KEK exists but this process may not use it -- not currently returned on Linux
     pub const KEK_INVALID: i32 = -19; // shared-table code: the KEK exists but is corrupt or has an invalid ACL -- not currently returned on Linux
-    pub const PROCESS_HARDENING_FAILED: i32 = -20; // hkdfguard_harden_process could not disable core dumps or ptrace access
+    pub const PROCESS_HARDENING_FAILED: i32 = -20; // hkdfguard_harden_process could not disable core dumps or ptrace access, or (with REQUIRE_PROTECTED_SIGNATURE) the process can still be debugged by its own user
     // -21..-31 reserved.
 
     // ---- Key file (hkdfguard_open_file's refusals) ----

@@ -116,6 +116,7 @@ warning (`memory not locked as a whole`).
 | `int hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int* out_len)` | Generate a random DEK and return only its wrapped form |
 | `int hkdfguard_open_file(const char* path, uint8_t* out, int* out_len)` | Read a wrapped-key file, checking its length and form; `*out_len` is the number of bytes read. Doesn't unwrap |
 | `int hkdfguard_harden_process(void)` | Opt in to process hardening: no core dumps, no same-user debugging |
+| `int hkdfguard_harden_process_with_flags(unsigned int flags)` | The same, with options. `HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE` makes a debuggable process a failure on macOS (where it depends on code signing); on Linux it's accepted and changes nothing |
 
 **Rules that matter.**
 

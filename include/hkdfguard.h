@@ -87,7 +87,7 @@ extern "C" {
 #define HKDFGUARD_ERR_KEK_NOT_FOUND (-17)       /* no KEK exists yet for this service; call hkdfguard_create_kek first */
 #define HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18)   /* the KEK exists but this process may not use it -- not currently returned on Linux */
 #define HKDFGUARD_ERR_KEK_INVALID (-19)         /* the KEK exists but is corrupt or has an invalid ACL -- not currently returned on Linux */
-#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED (-20) /* hkdfguard_harden_process could not disable core dumps or ptrace access */
+#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED (-20) /* hkdfguard_harden_process could not disable core dumps or ptrace access, or (with HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) the process can still be debugged by its own user */
 /* -21..-31 reserved. */
 
 /* Key file: hkdfguard_open_file's refusals. */
@@ -127,9 +127,44 @@ extern "C" {
  * when credentials change). Root and CAP_SYS_PTRACE are unaffected; that
  * is host configuration. Idempotent.
  *
+ * Same as hkdfguard_harden_process_with_flags(0).
+ *
  * Returns HKDFGUARD_OK, or HKDFGUARD_ERR_PROCESS_HARDENING_FAILED.
  */
 int hkdfguard_harden_process(void);
+
+/*
+ * Flags for hkdfguard_harden_process_with_flags. Shared by every platform:
+ * a flag has the same bit everywhere, and every platform accepts every
+ * flag defined here.
+ *
+ * HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE: fail with
+ *     HKDFGUARD_ERR_PROCESS_HARDENING_FAILED unless no other process of the
+ *     same user can attach a debugger to, or inject code into, this
+ *     process.
+ *       macOS: that depends on the host executable's code signature --
+ *         Hardened Runtime, without the get-task-allow entitlement (which
+ *         Xcode adds to Debug builds) or ones that allow DYLD_* injection.
+ *         The library can check the signature but not change it. Without
+ *         this flag a weak signature is logged as a warning and the call
+ *         still succeeds, so unsigned development hosts (python, dotnet,
+ *         Xcode Debug builds) work; pass it in release builds of a signed
+ *         app to make a weak signature a startup failure.
+ *       Linux: PR_SET_DUMPABLE already guarantees it whatever the binary,
+ *         so the flag is accepted and adds no further check.
+ */
+#define HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE 0x1u
+
+/*
+ * hkdfguard_harden_process, with `flags` -- a bitwise OR of
+ * HKDFGUARD_HARDEN_* flags, or 0 -- choosing how strict it is.
+ *
+ * Returns HKDFGUARD_OK; HKDFGUARD_ERR_INVALID_ARGUMENT if `flags` has a
+ * bit this library doesn't know (checked before anything is changed, so a
+ * newer flag is never silently ignored); or
+ * HKDFGUARD_ERR_PROCESS_HARDENING_FAILED.
+ */
+int hkdfguard_harden_process_with_flags(unsigned int flags);
 
 /*
  * Ensures a persistent KEK exists for `service`, creating one (on the

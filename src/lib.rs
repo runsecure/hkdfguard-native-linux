@@ -18,7 +18,7 @@ mod secure_file; // hardened, check-then-read-safe file access + self-wiping Sec
 
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
-use std::os::raw::{c_char, c_int}; // C-ABI-compatible integer/char types
+use std::os::raw::{c_char, c_int, c_uint}; // C-ABI-compatible integer/char types
 use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
 use std::sync::atomic::{AtomicU32, Ordering}; // per-process count of setup calls, for the misuse warning
 use std::sync::Mutex; // serializes setup calls (see `gated_setup`)
@@ -336,12 +336,46 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
 /// again) and `prctl(PR_SET_DUMPABLE, 0)`. Other platforms: only the core
 /// limit. Idempotent.
 ///
+/// Same as [`hkdfguard_harden_process_with_flags`] with no flags.
+///
 /// # Returns
 /// [`status::OK`], or [`status::PROCESS_HARDENING_FAILED`] if either step
 /// failed (logged with the OS error). Never throws/unwinds.
 #[no_mangle]
 pub extern "C" fn hkdfguard_harden_process() -> c_int {
-    match std::panic::catch_unwind(harden_process_impl) {
+    hkdfguard_harden_process_with_flags(0)
+}
+
+/// Flags for [`hkdfguard_harden_process_with_flags`]. Shared by every
+/// platform's C ABI: a flag has the same bit everywhere, and every platform
+/// accepts every flag defined here.
+pub mod harden_flags {
+    /// Fail with `PROCESS_HARDENING_FAILED` unless no other process of the
+    /// same user can attach a debugger to, or inject code into, this
+    /// process. On macOS that depends on the host executable's code
+    /// signature (Hardened Runtime, no `get-task-allow`), which the library
+    /// can only check, not change, so without this flag a weak signature
+    /// is only logged. On Linux `PR_SET_DUMPABLE` already guarantees it
+    /// whatever the binary, so the flag adds no further check.
+    pub const REQUIRE_PROTECTED_SIGNATURE: u32 = 0x1;
+
+    /// Every flag this build knows. Any other bit is refused, so a flag
+    /// added later is never silently ignored by an older library.
+    pub const ALL: u32 = REQUIRE_PROTECTED_SIGNATURE;
+}
+
+/// [`hkdfguard_harden_process`], with `flags` (a bitwise OR of
+/// [`harden_flags`] constants, or 0) choosing how strict it is. See
+/// [`harden_flags::REQUIRE_PROTECTED_SIGNATURE`].
+///
+/// # Returns
+/// [`status::OK`]; [`status::INVALID_ARGUMENT`] if `flags` has a bit not
+/// in [`harden_flags::ALL`], before anything is changed; or
+/// [`status::PROCESS_HARDENING_FAILED`] if a step failed (logged with the
+/// OS error). Never throws/unwinds.
+#[no_mangle]
+pub extern "C" fn hkdfguard_harden_process_with_flags(flags: c_uint) -> c_int {
+    match std::panic::catch_unwind(|| harden_process_impl(flags)) {
         Ok(code) => code,
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_harden_process boundary");
@@ -350,7 +384,15 @@ pub extern "C" fn hkdfguard_harden_process() -> c_int {
     }
 }
 
-fn harden_process_impl() -> c_int {
+fn harden_process_impl(flags: c_uint) -> c_int {
+    if flags & !harden_flags::ALL != 0 {
+        log::error!("hkdfguard: hkdfguard_harden_process_with_flags: unknown flag bits {:#x}", flags & !harden_flags::ALL);
+        return status::INVALID_ARGUMENT;
+    }
+    // REQUIRE_PROTECTED_SIGNATURE needs nothing more here: on Linux the
+    // non-dumpable flag below is what stops same-user debuggers, and it is
+    // applied (or this fails) either way.
+
     let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: setrlimit reads a valid, fully initialized rlimit.
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
