@@ -25,8 +25,8 @@ skip if they ever run as root. The script:
 
 1. `cargo build` / `cargo test` with the default features (external-secret,
    ephemeral) -- unit tests plus the CLI integration tests
-   in [`tests/cli_initialize_round_trip.rs`](../tests/cli_initialize_round_trip.rs),
-   which drive the `hkdfguard-v1-initialize` binary as a real subprocess.
+   in [`tests/cli_round_trip.rs`](../tests/cli_round_trip.rs),
+   which drive the `hkdfguard` binary as a real subprocess.
 2. `cargo build --features tpm2,pkcs11` -- confirms this crate actually
    *links* against real `libtss2-esys` and the PKCS#11 loader (only
    type-checking, not linking, could be verified outside Docker).
@@ -36,7 +36,7 @@ skip if they ever run as root. The script:
    against it.
 5. Builds `libhkdfguard_v1.so` in release mode and runs
    [`examples/wrap_unwrap.c`](../examples/wrap_unwrap.c) against it.
-6. Runs `hkdfguard-v1-initialize` (release build) to wrap a fresh random
+6. Runs `hkdfguard` (release build) to wrap a fresh random
    DEK to a file, then runs
    [`examples/cli_unwrap_check.c`](../examples/cli_unwrap_check.c), which
    loads `libhkdfguard_v1.so` dynamically and confirms it
@@ -159,7 +159,7 @@ runs [`entrypoint-build.sh`](entrypoint-build.sh) inside each, which:
    supports every KEK provider (TPM2, PKCS#11, external secret, ephemeral),
    not just the ones enabled by default.
 3. Copies `libhkdfguard_v1.so`,
-   `libhkdfguard_v1.a`, the `hkdfguard-v1-initialize` CLI
+   `libhkdfguard_v1.a`, the `hkdfguard` CLI
    binary, and `include/hkdfguard.h` into `/dist` inside the container,
    which `build-dist.sh` bind-mounts to `dist/linux-amd64` or
    `dist/linux-arm64` on the host respectively -- so each architecture's
@@ -168,12 +168,12 @@ runs [`entrypoint-build.sh`](entrypoint-build.sh) inside each, which:
    ```
    dist/
      linux-amd64/
-       hkdfguard-v1-initialize
+       hkdfguard
        hkdfguard.h
        libhkdfguard_v1.a
        libhkdfguard_v1.so
      linux-arm64/
-       hkdfguard-v1-initialize
+       hkdfguard
        hkdfguard.h
        libhkdfguard_v1.a
        libhkdfguard_v1.so

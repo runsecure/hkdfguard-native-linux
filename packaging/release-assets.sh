@@ -73,7 +73,7 @@ for dir in "$artifacts"/binaries-*/; do
     install -m 0644 "$dir/libhkdfguard_v1.so" "$bin/lib/libhkdfguard.so.1"
     ln -s libhkdfguard.so.1 "$bin/lib/libhkdfguard.so"
     install -m 0644 "$dir/libhkdfguard_v1.a" "$bin/lib/libhkdfguard.a"
-    install -m 0755 "$dir/hkdfguard-v1-initialize" "$bin/bin/"
+    install -m 0755 "$dir/hkdfguard" "$bin/bin/"
     install -m 0644 "$dir/hkdfguard.h" "$bin/include/"
     install -m 0644 LICENSE "$stage/THIRD-PARTY-LICENSES.txt" "$bin/"
     tarball "hkdfguard-$version-linux-$arch" "$bin"

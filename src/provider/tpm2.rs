@@ -1257,7 +1257,7 @@ fn unpinned_service_instructions(context: &Arc<Mutex<Option<Context>>>, service:
     // The service name itself stays out of the message: it is logged, and
     // service names are kept out of the log (see the C ABI's "(redacted)"
     // lines). The placeholder is the name the caller passed, which the
-    // caller -- `hkdfguard-v1-initialize provision`, say -- already knows.
+    // caller -- `hkdfguard provision`, say -- already knows.
     match name {
         Ok(name) => format!(
             "tpm.require_pinned_names is set and this service has no pinned TPM Name. To provision \

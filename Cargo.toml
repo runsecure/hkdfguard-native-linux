@@ -25,7 +25,7 @@ getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
 libc = "0.2"
-# Decodes the CLI's base64 DEK input (src/bin/hkdfguard-v1-initialize), and
+# Decodes the CLI's base64 DEK input (src/bin/hkdfguard.rs), and
 # lets hkdfguard_open_file recognise that same text as a plaintext key;
 # already pulled in transitively by other dependencies, so this adds no new
 # compiled code to the dependency graph.

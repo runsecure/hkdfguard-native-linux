@@ -138,7 +138,7 @@ set, provisioning an unlisted service fails and prints the exact line to
 add:
 
 ```sh
-sudo hkdfguard-v1-initialize provision -sn com.company.orders
+sudo hkdfguard provision -sn com.company.orders
 #   error: ... add this to the policy file, with <service> replaced by the service name ...
 #     [tpm.pinned_names]
 #     "<service>" = "000b..."

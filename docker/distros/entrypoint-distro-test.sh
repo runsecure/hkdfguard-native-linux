@@ -129,7 +129,7 @@ if [ "$PREBUILT" = 1 ]; then
     # The final image adds openssl-libs and libstdc++ for SoftHSM2 alone:
     # HKDFGuard itself must run on stock UBI Micro, i.e. need nothing
     # beyond glibc and libgcc_s.
-    for bin in target/release/libhkdfguard_v1.so target/release/hkdfguard-v1-initialize; do
+    for bin in target/release/libhkdfguard_v1.so target/release/hkdfguard; do
         LDD=$(ldd "$bin")
         echo "$bin:"; echo "$LDD"
         while read -r lib _; do
@@ -207,8 +207,8 @@ SERVICE=com.hkdfguard.distrotest.pkcs11
 DEK_FILE=$(as_ci mktemp)
 head -c 32 /dev/urandom | ci_write "$DEK_FILE"
 WRAPPED_FILE=$(as_ci mktemp)
-as_ci target/release/hkdfguard-v1-initialize provision --service-name "$SERVICE"
-base64 -w0 < "$DEK_FILE" | as_ci target/release/hkdfguard-v1-initialize wrap \
+as_ci target/release/hkdfguard provision --service-name "$SERVICE"
+base64 -w0 < "$DEK_FILE" | as_ci target/release/hkdfguard wrap \
     --key-file-path "$WRAPPED_FILE" --service-name "$SERVICE" --dek-stdin --force
 run_c target/c/cli_unwrap_check "$WRAPPED_FILE" "$SERVICE" "$DEK_FILE"
 echo "pkcs11: CLI-wrapped key unwrapped by a separate process through the .so."

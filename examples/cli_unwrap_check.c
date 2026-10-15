@@ -1,12 +1,12 @@
 /*
- * Verifies that a wrapped-key file produced by the hkdfguard-v1-initialize
+ * Verifies that a wrapped-key file produced by the hkdfguard
  * CLI tool (which links this crate's Rust code statically, as an rlib)
  * unwraps cleanly through libhkdfguard_v1.so loaded
  * dynamically here -- proving the wrapped payload's wire format is truly
  * consumer-independent, not an artifact of both sides sharing one binary.
  *
  * Usage: cli_unwrap_check <wrapped-file> <service> <expected-dek-file>
- *   <wrapped-file>       output of `hkdfguard-v1-initialize`
+ *   <wrapped-file>       output of `hkdfguard wrap`
  *   <service>            the exact --service-name the CLI wrapped it under
  *   <expected-dek-file>  the original 32 raw DEK bytes given to the CLI
  *                         (before base64-encoding for --dek)

@@ -21,9 +21,9 @@
 //!
 //! Usage:
 //! ```text
-//! hkdfguard-v1-initialize provision --service-name|-sn <name>
+//! hkdfguard provision --service-name|-sn <name>
 //!
-//! hkdfguard-v1-initialize wrap \
+//! hkdfguard wrap \
 //!     --key-file-path|-kf <path> \
 //!     --service-name|-sn <name> \
 //!     (--dek-stdin | --dek-file <path>) \
@@ -44,10 +44,10 @@
 //!
 //! ```text
 //! # stdin -- printf is a shell builtin, so nothing reaches argv
-//! printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap -kf key.bin -sn svc --dek-stdin
+//! printf '%s' "$DEK_B64" | hkdfguard wrap -kf key.bin -sn svc --dek-stdin
 //!
 //! # file -- e.g. a Kubernetes/Vault secret mount or a systemd credential
-//! hkdfguard-v1-initialize wrap -kf key.bin -sn svc --dek-file "$CREDENTIALS_DIRECTORY/dek"
+//! hkdfguard wrap -kf key.bin -sn svc --dek-file "$CREDENTIALS_DIRECTORY/dek"
 //! ```
 //!
 //! A `--dek-file` must be a regular file, must not be a symlink, must be
@@ -96,7 +96,7 @@ const KEY_FILE_MODE: u32 = 0o600;
 // overwrites as specified.
 const SECURE_DELETE_ROUNDS: usize = 4;
 
-const PROGRAM_NAME: &str = "hkdfguard-v1-initialize";
+const PROGRAM_NAME: &str = "hkdfguard";
 const DEK_LEN: usize = 32;
 // Mirrors the library's own cap (see cstr_to_service in src/lib.rs) so this
 // tool can give a specific, immediate error instead of relying on the

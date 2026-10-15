@@ -1,14 +1,14 @@
 .\" Keep in step with print_usage() and the header comment in
-.\" src/bin/hkdfguard-v1-initialize.rs.
-.TH HKDFGUARD-V1-INITIALIZE 1 2026-10-02 "hkdfguard" "User Commands"
+.\" src/bin/hkdfguard.rs.
+.TH HKDFGUARD 1 2026-10-02 "hkdfguard" "User Commands"
 .SH NAME
-hkdfguard-v1-initialize \- provision a service's HKDFGuard KEK and wrap DEKs under it
+hkdfguard \- provision a service's HKDFGuard KEK and wrap DEKs under it
 .SH SYNOPSIS
-.B hkdfguard-v1-initialize provision
+.B hkdfguard provision
 .BR \-\-service\-name | \-sn
 .I name
 .PP
-.B hkdfguard-v1-initialize wrap
+.B hkdfguard wrap
 .BR \-\-key\-file\-path | \-kf
 .I path
 .BR \-\-service\-name | \-sn
@@ -17,7 +17,7 @@ hkdfguard-v1-initialize \- provision a service's HKDFGuard KEK and wrap DEKs und
 .IR path )
 .RB [ \-\-force | \-f ]
 .SH DESCRIPTION
-.B hkdfguard-v1-initialize
+.B hkdfguard
 sets up and uses the persistent, per-service Key Encryption Key (KEK) of
 the HKDFGuard library. The KEK lives on the strongest provider that the
 host has and that policy allows: a TPM 2.0, a PKCS#11 token, or an
@@ -100,10 +100,10 @@ Per-host secret mixed into TPM-derived KEKs.
 Default PKCS#11 user PIN file.
 .SH EXAMPLES
 .nf
-hkdfguard-v1-initialize provision \-sn com.company.orders
-printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap \e
+hkdfguard provision \-sn com.company.orders
+printf '%s' "$DEK_B64" | hkdfguard wrap \e
     \-kf /var/lib/app/key.bin \-sn com.company.orders \-\-dek\-stdin
-hkdfguard-v1-initialize wrap \-kf /var/lib/app/key.bin \e
+hkdfguard wrap \-kf /var/lib/app/key.bin \e
     \-sn com.company.orders \-\-dek\-file "$CREDENTIALS_DIRECTORY/dek"
 .fi
 .PP

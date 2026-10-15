@@ -7,7 +7,7 @@ and the host is configured ([configuration.md](configuration.md)).
 
 - [Concepts](#concepts)
 - [The deployment workflow](#the-deployment-workflow)
-- [The CLI: `hkdfguard-v1-initialize`](#the-cli-hkdfguard-v1-initialize)
+- [The CLI: `hkdfguard`](#the-cli-hkdfguard)
 - [The C API](#the-c-api)
 - [Building and linking](#building-and-linking)
 - [Running as a service](#running-as-a-service)
@@ -43,10 +43,10 @@ deployment (once per host and DEK)                application (every start)
 
 ```sh
 # 1. Once per host: make sure the service has a KEK.
-sudo hkdfguard-v1-initialize provision -sn com.company.orders
+sudo hkdfguard provision -sn com.company.orders
 
 # 2. Wrap the DEK, delivered by your secrets pipeline, into a key file.
-printf '%s' "$DEK_B64" | sudo hkdfguard-v1-initialize wrap \
+printf '%s' "$DEK_B64" | sudo hkdfguard wrap \
     -kf /var/lib/orders/dek.wrapped -sn com.company.orders --dek-stdin
 
 # 3. Let the service read the key file (and nobody else).
@@ -63,11 +63,11 @@ What `provision` does depends on the provider:
 | External secret | Checks the delivered file and that it holds a valid key: the file itself is the provisioning. |
 | Ephemeral | Creates a key that lives only in that one process (so `provision` from the CLI is pointless for it). |
 
-## The CLI: `hkdfguard-v1-initialize`
+## The CLI: `hkdfguard`
 
 ```
-hkdfguard-v1-initialize provision --service-name|-sn <name>
-hkdfguard-v1-initialize wrap --key-file-path|-kf <path> --service-name|-sn <name> \
+hkdfguard provision --service-name|-sn <name>
+hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
                              (--dek-stdin | --dek-file <path>) [--force|-f]
 ```
 
@@ -173,7 +173,7 @@ The library doesn't print its reasons for a failure. To see why a call
 fails, run the CLI as the same user; see [troubleshooting.md](troubleshooting.md).
 
 **Example: unwrapping a key file at startup.** This reads the file
-`hkdfguard-v1-initialize wrap` wrote, recovers the DEK, and wipes it after
+`hkdfguard wrap` wrote, recovers the DEK, and wipes it after
 use:
 
 ```c
@@ -308,7 +308,7 @@ it never touches the command line (`%d` is the unit's credentials directory):
 [Service]
 Type=oneshot
 LoadCredential=dek:/etc/orders/dek.b64
-ExecStart=/usr/bin/hkdfguard-v1-initialize wrap -kf /var/lib/orders/dek.wrapped \
+ExecStart=/usr/bin/hkdfguard wrap -kf /var/lib/orders/dek.wrapped \
     -sn com.company.orders --dek-file %d/dek --force
 LimitMEMLOCK=infinity
 ```

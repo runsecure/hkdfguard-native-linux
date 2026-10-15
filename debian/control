@@ -56,5 +56,5 @@ Description: DEK wrapping under a TPM2, PKCS#11 or external-secret KEK - command
  per-service Key Encryption Key (KEK) held by a TPM 2.0, a PKCS#11 token,
  or an administrator-provisioned secret file.
  .
- This package contains hkdfguard-v1-initialize, which provisions a
+ This package contains the hkdfguard command, which provisions a
  service's KEK and wraps DEKs under it at deployment time.

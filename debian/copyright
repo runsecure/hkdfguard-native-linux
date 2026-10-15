@@ -2,7 +2,7 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: hkdfguard
 Source: https://github.com/torinblair/KeyProtectionCore-Linux
 Comment:
- The library and hkdfguard-v1-initialize statically link Rust crates
+ The library and the hkdfguard command statically link Rust crates
  distributed under Apache-2.0, MIT, BSD-3-Clause, ISC and Unlicense
  terms (several dual-licensed). Their license and notice texts are
  installed as /usr/share/doc/libhkdfguard1/THIRD-PARTY-LICENSES.txt,

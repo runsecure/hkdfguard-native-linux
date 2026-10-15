@@ -40,7 +40,7 @@ override_dh_auto_install:
 	sed -e 's|@LIBDIR@|/$(LIBDIR)|' -e 's|@VERSION@|$(DEB_VERSION_UPSTREAM)|' \
 		packaging/hkdfguard.pc.in > debian/tmp/$(LIBDIR)/pkgconfig/hkdfguard.pc
 	install -D -m 0644 packaging/policy.toml.example debian/tmp/usr/share/hkdfguard/policy.toml.example
-	install -D -m 0755 target/release/hkdfguard-v1-initialize debian/tmp/usr/bin/hkdfguard-v1-initialize
+	install -D -m 0755 target/release/hkdfguard debian/tmp/usr/bin/hkdfguard
 
 # dwz rejects some of the DWARF rustc emits; the -dbgsym packages are
 # still produced without it.

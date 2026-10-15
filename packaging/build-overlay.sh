@@ -35,7 +35,7 @@ trap cleanup EXIT
 
 case "$arch" in amd64) multiarch=x86_64-linux-gnu ;; arm64) multiarch=aarch64-linux-gnu ;; esac
 expected_overlay="-rw-r--r-- 0/0 usr/lib/$multiarch/libhkdfguard.so.1
--rwxr-xr-x 0/0 usr/bin/hkdfguard-v1-initialize"
+-rwxr-xr-x 0/0 usr/bin/hkdfguard"
 expected_dev="$expected_overlay
 -rw-r--r-- 0/0 etc/hkdfguard/policy.toml"
 

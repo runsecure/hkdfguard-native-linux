@@ -28,7 +28,7 @@
 #   7. C ABI round trip (examples/wrap_unwrap.c) against the .so
 #      with the KEK on the TPM -- once under `auto`, once under that
 #      `required` + pinned policy.
-#   8. CLI -> separate C consumer: hkdfguard-v1-initialize wraps via stdin,
+#   8. CLI -> separate C consumer: hkdfguard wraps via stdin,
 #      cli_unwrap_check unwraps through the .so. Cross-process persistence
 #      on the real TPM.
 #   9. If SoftHSM2 is present: the pkcs11 conformance suite.
@@ -232,8 +232,8 @@ if [ "$MODE" = "reboot" ]; then
             # On a TPM the KEK is derived on demand, so `provision` reports
             # it as already present; it is still the one command that makes
             # the setup calls, so run it as a real deployment would.
-            "$BIN"/hkdfguard-v1-initialize provision --service-name "$SERVICE"
-            base64 -w0 < "$STATE/dek.bin" | "$BIN"/hkdfguard-v1-initialize wrap \
+            "$BIN"/hkdfguard provision --service-name "$SERVICE"
+            base64 -w0 < "$STATE/dek.bin" | "$BIN"/hkdfguard wrap \
                 --key-file-path "$STATE/wrapped.key" --service-name "$SERVICE" --dek-stdin --force
             note "service key Name: $(cat "$STATE/service-name.hex")"
             note "wrapped DEK saved. Now REBOOT this machine, then run: scripts/native-tpm-test.sh reboot verify"
@@ -346,11 +346,11 @@ note "every ECDH in that run went through a salted, AES-128-CFB-encrypted sessio
 # ---------------------------------------------------------------------
 # 8. CLI -> separate C consumer, across processes, on the TPM
 # ---------------------------------------------------------------------
-section "hkdfguard-v1-initialize (stdin) -> cli_unwrap_check via the .so, KEK on the TPM"
+section "hkdfguard (stdin) -> cli_unwrap_check via the .so, KEK on the TPM"
 CLI_SERVICE=com.hkdfguard.nativetest.cli
 ( umask 077; head -c 32 /dev/urandom > "$WORK/dek.bin" )
-"$BIN"/hkdfguard-v1-initialize provision --service-name "$CLI_SERVICE"
-base64 -w0 < "$WORK/dek.bin" | "$BIN"/hkdfguard-v1-initialize wrap \
+"$BIN"/hkdfguard provision --service-name "$CLI_SERVICE"
+base64 -w0 < "$WORK/dek.bin" | "$BIN"/hkdfguard wrap \
     --key-file-path "$WORK/wrapped.key" --service-name "$CLI_SERVICE" --dek-stdin --force
 LD_LIBRARY_PATH="$BIN" "$WORK/cli_unwrap_check" "$WORK/wrapped.key" "$CLI_SERVICE" "$WORK/dek.bin"
 use_base_policy

@@ -1,5 +1,5 @@
-//! Integration test for the `hkdfguard-v1-initialize` CLI tool
-//! (`src/bin/hkdfguard-v1-initialize.rs`): runs it as a real, separate
+//! Integration test for the `hkdfguard` CLI tool
+//! (`src/bin/hkdfguard.rs`): runs it as a real, separate
 //! process -- `provision` and then `wrap` -- then loads this crate as a
 //! library (in *this* process) and confirms `hkdfguard_unwrap_dek`
 //! recovers exactly the DEK that was fed to it. The DEK goes in on stdin
@@ -85,19 +85,19 @@ fn with_provisioned_external_secret<F: FnOnce()>(service: &str, f: F) {
 }
 
 fn cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_hkdfguard-v1-initialize"))
+    Command::new(env!("CARGO_BIN_EXE_hkdfguard"))
 }
 
-// `hkdfguard-v1-initialize provision --service-name <service>`
+// `hkdfguard provision --service-name <service>`
 fn run_provision(service: &str) -> Output {
     cli()
         .arg("provision")
         .args(["--service-name", service])
         .output()
-        .expect("failed to run hkdfguard-v1-initialize provision")
+        .expect("failed to run hkdfguard provision")
 }
 
-// `hkdfguard-v1-initialize wrap --key-file-path <path> --service-name
+// `hkdfguard wrap --key-file-path <path> --service-name
 // <service> --dek-stdin [extra]`, with the base64 DEK written to the
 // subprocess's stdin -- how a deployment pipeline is expected to supply it.
 fn run_wrap_stdin(key_path: &Path, service: &str, dek: &[u8; 32], extra_args: &[&str]) -> Output {
@@ -112,7 +112,7 @@ fn run_wrap_stdin(key_path: &Path, service: &str, dek: &[u8; 32], extra_args: &[
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn hkdfguard-v1-initialize wrap");
+        .expect("failed to spawn hkdfguard wrap");
     // A CLI that refuses before reading stdin (e.g. an existing key file
     // without --force) may already have exited, closing the pipe: that is
     // a BrokenPipe here, not a test failure. The caller judges the outcome
@@ -123,7 +123,7 @@ fn run_wrap_stdin(key_path: &Path, service: &str, dek: &[u8; 32], extra_args: &[
         Err(e) => panic!("failed to write the DEK to the CLI's stdin: {e}"),
     }
     drop(child.stdin.take()); // close stdin so the child sees EOF
-    child.wait_with_output().expect("failed to run hkdfguard-v1-initialize wrap")
+    child.wait_with_output().expect("failed to run hkdfguard wrap")
 }
 
 fn unwrap_via_library(service: &str, wrapped: &[u8]) -> (c_int, [u8; 32]) {
@@ -200,7 +200,7 @@ fn cli_force_overwrite_secure_deletes_then_rewraps() {
         // The file on disk must now unwrap to the *second* DEK, not the first.
         // (Whether the overwrite actually delete-and-recreated the file
         // rather than truncating it in place is covered separately by the
-        // secure_delete unit tests in src/bin/hkdfguard-v1-initialize.rs --
+        // secure_delete unit tests in src/bin/hkdfguard.rs --
         // inode number isn't a reliable signal for that here, since some
         // filesystems immediately reuse a just-freed inode for a new file.)
         let wrapped = fs::read(&key_path).unwrap();
@@ -293,7 +293,7 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .args(["--service-name", "com.example.fileinput"])
             .args(["--dek-file", dek_path.to_str().unwrap()])
             .output()
-            .expect("failed to run hkdfguard-v1-initialize");
+            .expect("failed to run hkdfguard");
         assert!(output.status.success(), "--dek-file should succeed: {}", stderr_of(&output));
 
         // Round-trips through the library, exactly as the stdin path does.
@@ -313,7 +313,7 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .args(["--service-name", "com.example.fileinput"])
             .args(["--dek-file", loose_path.to_str().unwrap()])
             .output()
-            .expect("failed to run hkdfguard-v1-initialize");
+            .expect("failed to run hkdfguard");
         assert!(!output.status.success(), "a group-readable DEK file must be refused");
         assert!(!loose_key_path.exists(), "nothing should have been written");
 
@@ -326,7 +326,7 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .args(["--service-name", "com.example.fileinput"])
             .args(["--dek", &STANDARD.encode(original_dek)])
             .output()
-            .expect("failed to run hkdfguard-v1-initialize");
+            .expect("failed to run hkdfguard");
         assert!(!output.status.success(), "--dek must no longer be accepted");
         assert!(stderr_of(&output).contains("cmdline"), "error should explain the exposure");
         assert!(!argv_key_path.exists(), "nothing should have been written");
@@ -337,7 +337,7 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .arg(key_path.to_str().unwrap())
             .args(["--service-name", "com.example.fileinput", "--dek-stdin"])
             .output()
-            .expect("failed to run hkdfguard-v1-initialize");
+            .expect("failed to run hkdfguard");
         assert!(!output.status.success());
         assert!(stderr_of(&output).contains("--key-file-path"), "must point at the new flag");
     });

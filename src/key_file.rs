@@ -1,7 +1,7 @@
 //! Reading a wrapped-DEK key file, for `hkdfguard_open_file`.
 //!
-//! A key file is one wrapped payload exactly as `hkdfguard-v1-initialize
-//! wrap` (or a caller storing `hkdfguard_wrap_dek`'s output) wrote it: the
+//! A key file is one wrapped payload exactly as `hkdfguard wrap`
+//! (or a caller storing `hkdfguard_wrap_dek`'s output) wrote it: the
 //! raw bytes of [`crate::payload`], nothing before or after. Reading one
 //! never unwraps it -- no provider is reached and no KEK is opened -- but
 //! the file is checked as far as it can be without a KEK:

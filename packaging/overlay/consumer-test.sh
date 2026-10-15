@@ -23,7 +23,7 @@ multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || gcc -print-mul
 libdir=/usr/lib/$multiarch
 
 section "overlay layout"
-for f in "$libdir/libhkdfguard.so.1" /usr/bin/hkdfguard-v1-initialize; do
+for f in "$libdir/libhkdfguard.so.1" /usr/bin/hkdfguard; do
     [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }
 done
 case "$mode" in
@@ -36,7 +36,7 @@ case "$mode" in
                || { echo "overlay-dev must ship /etc/hkdfguard/policy.toml as root:root 0644" >&2; exit 1; } ;;
     *) echo "usage: $0 plain|dev" >&2; exit 2 ;;
 esac
-hkdfguard-v1-initialize --help >/dev/null
+hkdfguard --help >/dev/null
 echo "files in place; CLI runs"
 
 # Linked by SONAME: the runtime overlay has no libhkdfguard.so dev symlink.
@@ -66,8 +66,8 @@ build cli_unwrap_check
 cli_round_trip() { # cli_round_trip <service> <expected provider byte>
     install -m 0600 /dev/null "$work/dek.bin"
     head -c 32 /dev/urandom > "$work/dek.bin"
-    hkdfguard-v1-initialize provision -sn "$1"
-    base64 -w0 < "$work/dek.bin" | hkdfguard-v1-initialize wrap -kf "$work/wrapped.key" -sn "$1" --dek-stdin --force
+    hkdfguard provision -sn "$1"
+    base64 -w0 < "$work/dek.bin" | hkdfguard wrap -kf "$work/wrapped.key" -sn "$1" --dek-stdin --force
     "$work/cli_unwrap_check" "$work/wrapped.key" "$1" "$work/dek.bin"
     local provider
     provider=$(od -An -tu1 -j1 -N1 "$work/wrapped.key" | tr -d ' ')
@@ -89,7 +89,7 @@ else
     # In one process, ephemeral keys work. The CLI logs which provider it
     # fell back to; the library itself installs no logger.
     "$work/wrap_unwrap"
-    hkdfguard-v1-initialize provision -sn com.company.ephemeral 2> "$work/ephemeral.log" \
+    hkdfguard provision -sn com.company.ephemeral 2> "$work/ephemeral.log" \
         || { cat "$work/ephemeral.log" >&2; exit 1; }
     grep -q 'EPHEMERAL' "$work/ephemeral.log" || { cat "$work/ephemeral.log" >&2; echo "expected the ephemeral fallback warning" >&2; exit 1; }
     echo "the CLI reports the ephemeral fallback"

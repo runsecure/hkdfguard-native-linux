@@ -4,7 +4,7 @@ HKDFGuard for Linux ships in three forms. Pick one per host:
 
 | Form | Use it when | Gives you |
 |---|---|---|
-| [Packages](#packages-deb-and-rpm) (`.deb`, `.rpm`) | Installing on a server or VM | The library, the `hkdfguard-v1-initialize` CLI, development files, man page, example policy |
+| [Packages](#packages-deb-and-rpm) (`.deb`, `.rpm`) | Installing on a server or VM | The library, the `hkdfguard` CLI, development files, man page, example policy |
 | [Standalone tarball](#standalone-tarball) | No package fits (another distribution, a custom layout) | The same library and CLI as plain files |
 | [Container overlay image](#container-overlay-image) | Building a container image | Only the library and the CLI, at their installed paths |
 
@@ -62,7 +62,7 @@ The release tarball for your distribution holds these packages:
 | Debian, Ubuntu | RHEL 10, Amazon Linux 2023 | SLES 16 | Contents |
 |---|---|---|---|
 | `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | The shared library `libhkdfguard.so.1`, an empty `/etc/hkdfguard` (root, `0755`), the example policy |
-| `hkdfguard` | `hkdfguard` | `hkdfguard` | The `hkdfguard-v1-initialize` CLI and its man page |
+| `hkdfguard` | `hkdfguard` | `hkdfguard` | The `hkdfguard` CLI and its man page |
 | `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` (only for building software against the library) |
 | (in `libhkdfguard-dev`) | `hkdfguard-static` | `hkdfguard-devel-static` | The static library `libhkdfguard.a` |
 
@@ -106,7 +106,7 @@ from the attestation and checksums you verified above, so zypper needs
 **Check the installation**
 
 ```sh
-hkdfguard-v1-initialize --help
+hkdfguard --help
 ls -l /usr/share/hkdfguard/policy.toml.example
 ```
 
@@ -123,7 +123,7 @@ hkdfguard-<version>-linux-<arch>/
   lib/libhkdfguard.so.1          the shared library (its SONAME)
   lib/libhkdfguard.so            link for compiling with -lhkdfguard
   lib/libhkdfguard.a             the static library
-  bin/hkdfguard-v1-initialize    the CLI
+  bin/hkdfguard    the CLI
   include/hkdfguard.h            the C header
   LICENSE, THIRD-PARTY-LICENSES.txt
 ```
@@ -138,7 +138,7 @@ tar -xzf hkdfguard-0.1.0-linux-amd64.tar.gz
 cd hkdfguard-0.1.0-linux-amd64
 sudo install -m 0644 lib/libhkdfguard.so.1 /usr/local/lib/
 sudo ln -sf libhkdfguard.so.1 /usr/local/lib/libhkdfguard.so
-sudo install -m 0755 bin/hkdfguard-v1-initialize /usr/local/bin/
+sudo install -m 0755 bin/hkdfguard /usr/local/bin/
 sudo install -m 0644 include/hkdfguard.h /usr/local/include/
 sudo install -d -m 0755 -o root -g root /etc/hkdfguard
 sudo ldconfig
@@ -155,7 +155,7 @@ at the paths the Ubuntu 24.04 packages use, for copying into your own image:
 
 ```
 /usr/lib/<multiarch>/libhkdfguard.so.1
-/usr/bin/hkdfguard-v1-initialize
+/usr/bin/hkdfguard
 ```
 
 | Image | Policy |

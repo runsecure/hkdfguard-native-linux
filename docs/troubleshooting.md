@@ -19,7 +19,7 @@ the service's groups**, for the same service name:
 ```sh
 sudo systemd-run --pty --uid=orders --gid=orders \
     -p SupplementaryGroups="tss hkdfguard" \
-    hkdfguard-v1-initialize provision -sn com.company.orders
+    hkdfguard provision -sn com.company.orders
 ```
 
 (`sudo -u orders ...` works too, but only with the user's permanent groups,
@@ -124,7 +124,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 `wrap` never creates a key. The CLI says:
 
 ```
-no KEK is provisioned for service "com.company.orders"; run `hkdfguard-v1-initialize provision --service-name com.company.orders` first
+no KEK is provisioned for service "com.company.orders"; run `hkdfguard provision --service-name com.company.orders` first
 ```
 
 Run `provision`; from code, call `hkdfguard_create_kek` once at startup.

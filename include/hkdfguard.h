@@ -296,7 +296,7 @@ int hkdfguard_generate_and_wrap_dek(
     int* out_len);
 
 /*
- * Reads a wrapped-key file -- one written by `hkdfguard-v1-initialize wrap`,
+ * Reads a wrapped-key file -- one written by `hkdfguard wrap`,
  * or the output of hkdfguard_wrap_dek saved as-is -- into `out`, exactly as
  * stored, after checking that it is a complete, well-formed wrapped DEK.
  * Never unwraps: nothing is decrypted, no provider is reached and no KEK is

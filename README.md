@@ -125,7 +125,7 @@ host settings -- no swap or encrypted swap, `kernel.yama.ptrace_scope` of
 2 or 3, and for a systemd service `LimitCORE=0` and
 `ProtectProc=invisible`.
 
-`hkdfguard-v1-initialize` always calls it, and refuses to run if it fails.
+The `hkdfguard` command always calls it, and refuses to run if it fails.
 The CLI also locks its memory out of swap with `mlockall`, but only when
 the process has `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK` (root, or
 `LimitMEMLOCK=infinity`). Under a finite limit, locking future
@@ -137,7 +137,11 @@ copies while it wraps are not locked.
 
 See [`examples/wrap_unwrap.c`](examples/wrap_unwrap.c) for a complete,
 buildable example, and [`include/hkdfguard.h`](include/hkdfguard.h) for the
-full API contract (status codes, buffer sizing, safety requirements).
+full API contract (status codes, buffer sizing, safety requirements). The
+status codes are one table shared with the Windows and macOS libraries: a
+name always has the same number on every platform, and the header defines
+every code, including the few only another platform returns. The table,
+with what each code means, is in [docs/usage.md](docs/usage.md#the-c-api).
 
 ## Provider chain
 
@@ -202,7 +206,8 @@ process running as that user could otherwise rewrite the policy, or
 delete it to switch policy off. Only a *missing* file in a trusted
 directory means "no policy"; a file that exists but is unreadable, too
 broadly writable, wrongly owned, or malformed -- or one in a directory
-someone untrusted could change -- makes every operation fail closed.
+someone untrusted could change -- makes every operation fail closed with
+`HKDFGUARD_ERR_POLICY_INVALID` (`-9`).
 (Only test builds -- see "Testing against scratch configuration" -- also accept the process's own user.)
 
 ### Setup calls are deliberately slow
@@ -219,7 +224,7 @@ once a process has made more than 10 setup calls.
 
 The floor is about load, not secrecy. It does not hide which services
 have a key: `hkdfguard_wrap_dek` is not rate-limited — it is the hot path
-— and answers `KEK_NOT_FOUND` (`-9`) at once for a service with none, so
+— and answers `KEK_NOT_FOUND` (`-17`) at once for a service with none, so
 anything that can call the library can find out quickly. Treat service
 names as public identifiers, never as secrets.
 
@@ -275,7 +280,8 @@ in the policy. The provider then derives from the TPM seed and service
 name alone and logs a warning that any local process able to open the TPM
 can reproduce the keys. Adding or removing the secret changes every TPM
 KEK, so DEKs wrapped before the change fail their fingerprint check
-(`-16`) -- decide before wrapping anything.
+(`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`, `-16`) -- decide before
+wrapping anything.
 
 > **This changes the KEK.** Adding, removing, or altering the secret
 > derives a different key, so DEKs wrapped beforehand will fail their
@@ -355,7 +361,7 @@ the production derivation (so with the derivation secret, if one is
 configured):
 
 ```text
-$ hkdfguard-v1-initialize provision -sn com.company.orders
+$ hkdfguard provision -sn com.company.orders
 error: hkdfguard: create_kek failed for service (redacted): provider error: TPM2: tpm.require_pinned_names
 is set and this service has no pinned TPM Name. To provision it, add this to the policy file, with <service>
 replaced by the service name, and run provision again:
@@ -533,13 +539,15 @@ builds: the Ubuntu 24.04 `.deb`s and the EL10 `.rpm`s from
 `packaging/build-packages.sh` (see "Packages"), installed and configured
 only through a root-owned `/etc/hkdfguard/policy.toml` that requires the
 TPM, with a `0440` derivation secret, and run as an unprivileged service
-account in the `tss` group. `hkdfguard-v1-initialize provision` and
+account in the `tss` group. `hkdfguard provision` and
 `wrap` followed by an unwrap through the installed library succeeded; a
 group-writable policy, a world-readable derivation secret, `TSS2_LOG` at
 `debug`, and the service losing access to `/dev/tpmrm0` were each refused
-(`-4`), with no fallback to another provider; an unwrap under the wrong
-service was refused (`-16`); and a DEK wrapped before a guest reboot
-unwrapped after it.
+with no fallback to another provider -- the policy as
+`HKDFGUARD_ERR_POLICY_INVALID` (`-9`), the other three as
+`HKDFGUARD_ERR_PROVIDER_ERROR` (`-4`); an unwrap under the wrong service
+was refused as `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH` (`-16`); and a DEK
+wrapped before a guest reboot unwrapped after it.
 
 > **Dictionary-attack lockout on Hyper-V vTPMs.** A new Hyper-V vTPM
 > allows only **3** failed authorizations, forgives one every **1000 s**,
@@ -685,7 +693,7 @@ SUSE's naming policy and runs `ldconfig` from scriptlets:
 | `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, an empty `/etc/hkdfguard` (root, `0755`), the example policy `/usr/share/hkdfguard/policy.toml.example`, README, third-party licenses |
 | `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
 | (in `libhkdfguard-dev`) | `hkdfguard-static` | `hkdfguard-devel-static` | `libhkdfguard.a` |
-| `hkdfguard` | `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
+| `hkdfguard` | `hkdfguard` | `hkdfguard` | The `hkdfguard` command and its man page |
 
 All are built with every provider enabled, so the library depends on
 tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
@@ -792,7 +800,7 @@ install them to, for copying into another image
 
 ```
 /usr/lib/<multiarch>/libhkdfguard.so.1
-/usr/bin/hkdfguard-v1-initialize
+/usr/bin/hkdfguard
 ```
 
 They are taken from the tested `libhkdfguard1` and `hkdfguard` packages,
@@ -894,7 +902,7 @@ Every common mechanism meets the mode requirement with one setting:
 > or use `fsGroupChangePolicy: OnRootMismatch` with an owner that matches
 > the process's user.
 
-## Initializing a wrapped key (`hkdfguard-v1-initialize`)
+## Wrapping a key with the CLI (`hkdfguard`)
 
 Because a wrapped payload can only be produced on the host that holds the
 KEK, a deployment pipeline delivers the *plaintext* DEK to the host and
@@ -904,16 +912,16 @@ commands:
 ```sh
 # 1. Once, at deployment time: ensure the service has a KEK. This is the
 #    only command that makes the (deliberately slow) setup calls.
-hkdfguard-v1-initialize provision --service-name com.company.orders
+hkdfguard provision --service-name com.company.orders
 
 # 2. Wrap a DEK under it. Never creates a KEK: if none is provisioned it
 #    fails and names the command above.
-printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap \
+printf '%s' "$DEK_B64" | hkdfguard wrap \
     --key-file-path /var/lib/app/key.bin \
     --service-name com.company.orders --dek-stdin
 
 # ...or from a file: a Kubernetes/Vault secret mount, or a systemd credential
-hkdfguard-v1-initialize wrap \
+hkdfguard wrap \
     --key-file-path /var/lib/app/key.bin \
     --service-name com.company.orders \
     --dek-file "$CREDENTIALS_DIRECTORY/dek"
@@ -1079,7 +1087,8 @@ nothing on the module's path can be swapped before it is `dlopen`ed.
 
 Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
-fail closed -- and resolves each hardening knob to its strictest setting
+fail closed with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`) -- and resolves
+each hardening knob to its strictest setting
 (`session_encryption = "required"`, derivation secret required) rather than
 its default.
 
@@ -1217,13 +1226,13 @@ src/
     external_secret.rs      Provider 3 (feature `external-secret`, default)
     ephemeral.rs             Provider 4 (feature `ephemeral`, default)
   bin/
-    hkdfguard-v1-initialize.rs   CLI: `provision` and `wrap`
+    hkdfguard.rs            CLI: `provision` and `wrap`
 include/hkdfguard.h          C header
 examples/
   wrap_unwrap.c              Minimal C consumer (create_kek -> wrap -> unwrap)
   cli_unwrap_check.c         Unwraps a CLI-written key file through the .so
 tests/
-  cli_initialize_round_trip.rs   Drives the CLI as a real subprocess
+  cli_round_trip.rs          Drives the CLI as a real subprocess
   harden_process.rs              hkdfguard_harden_process, in its own process
 scripts/
   build-release.sh           cargo build --release, then links libhkdfguard.so.1
@@ -1257,7 +1266,7 @@ packaging/
   rpm/hkdfguard.spec         RPM packaging
   hkdfguard.pc.in            pkg-config template
   policy.toml.example        Annotated policy, installed to /usr/share/hkdfguard
-  hkdfguard-v1-initialize.1  Man page
+  hkdfguard.1                Man page
   third-party-licenses.py    License notices of the statically linked crates
 ```
 

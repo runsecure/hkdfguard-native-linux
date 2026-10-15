@@ -32,7 +32,7 @@ section "collecting release artifacts into $DIST_DIR"
 mkdir -p "$DIST_DIR"
 cp target/release/libhkdfguard_v1.so "$DIST_DIR"/
 cp target/release/libhkdfguard_v1.a "$DIST_DIR"/
-cp target/release/hkdfguard-v1-initialize "$DIST_DIR"/
+cp target/release/hkdfguard "$DIST_DIR"/
 cp include/hkdfguard.h "$DIST_DIR"/
 
 section "dist contents"
