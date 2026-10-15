@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds SoftHSM2 from source, for distributions that do not package it
 # without a subscription: SLES 15 (its softhsm is in SUSE Package Hub,
-# which the public openSUSE Backports mirror no longer carries for SP7)
+# which the public openSUSE Backports mirror does not carry for SP7)
 # and Red Hat UBI (softhsm is in RHEL, not in the UBI repositories).
 #
 # The tarball is GitHub's archive of the upstream release tag, pinned by

@@ -56,8 +56,8 @@ extern "C" {
  *
  * Every code in a platform band refines one common code, named in its
  * comment: a caller that doesn't care about the detail can treat it as that
- * common code. Numbers not listed are reserved: a retired number is never
- * reused for a different meaning.
+ * common code. Numbers not listed are reserved: a number is never reused
+ * for a different meaning.
  */
 
 /* General */
@@ -68,9 +68,9 @@ extern "C" {
 #define HKDFGUARD_ERR_PROVIDER_ERROR (-4)       /* a provider was reachable but failed to create, load, or use the KEK */
 #define HKDFGUARD_ERR_CRYPTO_ERROR (-5)         /* a cryptographic operation failed for a reason other than authentication: RNG, hash-to-curve, HKDF, or encryption */
 #define HKDFGUARD_ERR_INTERNAL_ERROR (-6)       /* an unexpected internal failure (a caught panic) */
-/* -7 (formerly INVALID_UTF8) is reserved, no longer returned by anything --
- * a `service` string that isn't valid UTF-8 is now just one more way for it
- * to be invalid, folded into HKDFGUARD_ERR_INVALID_SERVICE_NAME below. */
+/* -7 is reserved and never returned. A `service` string that isn't valid
+ * UTF-8 is one more way for it to be invalid, reported as
+ * HKDFGUARD_ERR_INVALID_SERVICE_NAME below. */
 #define HKDFGUARD_ERR_INVALID_SERVICE_NAME (-8) /* service is null, empty, not valid UTF-8, over 128 bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." */
 
 /* Policy */

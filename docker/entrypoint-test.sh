@@ -176,7 +176,7 @@ as_ci target/release/hkdfguard wrap \
     --force
 as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE2" "$CLISO_SERVICE" "$DEK_FILE"
 
-# The retired argv form must be refused outright, not silently accepted.
+# A DEK on the command line (--dek) must be refused outright, not silently accepted.
 if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard wrap \
         --key-file-path "$(mktemp -u)" --service-name "$CLISO_SERVICE" --dek AAAA 2>/dev/null; then
     echo "FAIL: --dek was accepted; it must be rejected" >&2
@@ -203,10 +203,9 @@ section "builds that ship take configuration only from /etc/hkdfguard/policy.tom
 # Release builds, and plain debug builds -- anything not made with
 # `--cfg hkdfguard_test_paths` -- must take every security setting from the
 # root-owned policy, never the environment. Install a real policy reaching
-# swtpm through `tpm.tcti`, then set every variable that ever redirected
-# configuration (HKDFGUARD_POLICY_FILE, and the retired TCTI, derivation-
-# secret, secret-mount and PKCS#11 ones) to values that would break anything
-# that read them. Both shipped-style builds must ignore them and work; the
+# swtpm through `tpm.tcti`, then set HKDFGUARD_POLICY_FILE and environment
+# variables naming a TCTI, derivation secret, secret mount and PKCS#11
+# module to values that would break anything that read them. Both shipped-style builds must ignore them and work; the
 # test build's CLI, as a control, must follow HKDFGUARD_POLICY_FILE to the
 # malformed policy and fail -- proving this check would catch a build that
 # honored it.
@@ -253,7 +252,7 @@ fi
 echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE and failed, as designed."
 
 # External secret: the policy names no directory, so the standard mount is
-# used; the retired variable pointing nowhere changes nothing.
+# used; HKDFGUARD_EXTERNAL_SECRET_DIR pointing nowhere changes nothing.
 cat > /etc/hkdfguard/policy.toml <<'TOML'
 [selection]
 mode = "require"
@@ -272,7 +271,7 @@ echo "release, debug: external-secret used the standard mount; HKDFGUARD_EXTERNA
 rm -rf /run/secrets/hkdfguard
 
 # PKCS#11: SoftHSM2 is installed, with an initialized token and a valid PIN
-# at the default PIN path, and the retired variables point at all of it --
+# at the default PIN path, and HKDFGUARD_PKCS11_* point at all of it --
 # but the policy names no module. Neither build may use PKCS#11 (no default
 # module search, variables ignored).
 cat > /etc/hkdfguard/policy.toml <<'TOML'

@@ -68,7 +68,7 @@ What `provision` does depends on the provider:
 ```
 hkdfguard provision --service-name|-sn <name>
 hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
-                             (--dek-stdin | --dek-file <path>) [--force|-f]
+               (--dek-stdin | --dek-file <path>) [--force|-f]
 ```
 
 | Option | Meaning |

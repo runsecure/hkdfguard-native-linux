@@ -9,7 +9,7 @@
  *   <wrapped-file>       output of `hkdfguard wrap`
  *   <service>            the exact --service-name the CLI wrapped it under
  *   <expected-dek-file>  the original 32 raw DEK bytes given to the CLI
- *                         (before base64-encoding for --dek)
+ *                         (before base64-encoding for --dek-stdin/--dek-file)
  *
  * Build (after `cargo build --release` and
  *   `ln -sf libhkdfguard_v1.so ../target/release/libhkdfguard.so.1`,

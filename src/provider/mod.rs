@@ -13,7 +13,7 @@
 //! provider instead. Ephemeral (in-memory, lost on restart) is never used
 //! unless a policy file explicitly allows it -- see [`allowed_chain`].
 //!
-//! Providers no longer auto-create a KEK on first wrap/unwrap: `wrap` calls
+//! Providers never auto-create a KEK on wrap/unwrap: `wrap` calls
 //! [`select_existing`], which only *loads* an already-created KEK and fails
 //! with [`crate::error::Error::KekNotFound`] if none exists yet; a KEK is
 //! created only via the explicit [`create_kek`] (the `hkdfguard_create_kek`
@@ -21,7 +21,7 @@
 //! without creating anything. TPM2 is the one exception -- see its own
 //! `kek_exists`/`load_kek` doc comments for why.
 //!
-//! The "allow-list" is now the full administrative policy engine in
+//! The "allow-list" is the full administrative policy engine in
 //! `crate::policy` (`/etc/hkdfguard/policy.toml`) -- see [`allowed_chain`],
 //! the sole point where every provider-selection function below crosses
 //! from "what's compiled into this build" to "what policy currently
@@ -40,7 +40,7 @@ pub mod tpm2;
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::policy::PolicyEvaluator; // brings `.allowed_providers()` into scope on `crate::policy::Policy`
-use p256::PublicKey; // the caller's ephemeral P-256 public key type used in `ecdh`
+use p256::PublicKey; // the P-256 point type `ecdh` takes: the payload's salt-derived point
 use std::sync::{Arc, OnceLock}; // `Arc` for shared provider ownership, `OnceLock` for the one-time warning flag
 use zeroize::Zeroizing; // wrapper that scrubs its contents from memory when dropped
 
@@ -54,25 +54,23 @@ pub enum ProviderType {
     Tpm2 = 1,           // matches payload byte value 1
     Pkcs11 = 2,          // matches payload byte value 2
     ExternalSecret = 3, // matches payload byte value 3
-    // 4 was SOFTWARE (a locally-generated, filesystem-encrypted-at-rest
-    // provider), removed. Deliberately left unassigned rather than reused
-    // or renumbered, so a payload wrapped under the old provider is
-    // rejected outright by `from_u8` as an unknown tag rather than
-    // misinterpreted as whatever a future provider 4 might be.
+    // 4 is unassigned and rejected by `from_u8` as an unknown tag. Never
+    // assign it or renumber onto it, so a payload carrying tag 4 is
+    // rejected outright rather than misinterpreted as some provider 4.
     Ephemeral = 5,       // matches payload byte value 5
 }
 
 impl ProviderType {
     // Converts a raw wire-format byte back into the enum, rejecting
     // anything outside the currently defined values (byte 4 included --
-    // see the `ProviderType` doc comment on the removed SOFTWARE tag).
+    // see the note on tag 4 in `ProviderType`).
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(ProviderType::Tpm2),
             2 => Some(ProviderType::Pkcs11),
             3 => Some(ProviderType::ExternalSecret),
             5 => Some(ProviderType::Ephemeral),
-            _ => None, // any other byte value (including the retired 4) is not a valid provider tag
+            _ => None, // any other byte value (including the unassigned 4) is not a valid provider tag
         }
     }
 
@@ -122,7 +120,7 @@ pub trait KekHandle {
     fn key_id(&self) -> &[u8]; // borrowed, non-secret bytes to embed in the payload
 
     /// Perform ECDH between this KEK's persistent private key and the given
-    /// ephemeral public key, returning the raw shared secret.
+    /// point (the payload's salt-derived `H_salt`), returning the raw shared secret.
     fn ecdh(&self, ephemeral_public_key: &PublicKey) -> Result<SharedSecret>; // never exposes the private key itself
 
     /// This KEK's own public key -- never secret (it's the public half of
@@ -370,7 +368,7 @@ fn attribute(provider_type: ProviderType, e: Error) -> Error {
 /// Walks the policy-allowed priority chain (TPM2 -> PKCS#11 -> External
 /// Secret -> Ephemeral, or whatever subset/order the policy configures)
 /// and creates (or reuses, if one already exists) a persistent
-/// KEK for `service` on the first reachable, allowed provider. This is now
+/// KEK for `service` on the first reachable, allowed provider. This is
 /// the *only* path that ever creates a KEK -- `wrap`/`unwrap` (via
 /// [`select_existing`]) only ever load one. Backs `hkdfguard_create_kek`.
 ///
@@ -462,7 +460,7 @@ mod tests {
 
     // Points HKDFGUARD_POLICY_FILE somewhere guaranteed not to exist, so
     // tests that don't care about policy behavior aren't accidentally
-    // affected by a real /etc/hkdfguard/policy.conf on the test host.
+    // affected by a real /etc/hkdfguard/policy.toml on the test host.
     fn clear_policy_env() {
         let _no_policy = crate::policy::test_support::TestPolicy::absent();
     }
@@ -511,7 +509,7 @@ mod tests {
             // casting to u8 and back through `from_u8` must return the same variant
             assert_eq!(ProviderType::from_u8(t as u8), Some(t));
         }
-        // 0, the retired 4 (formerly SOFTWARE), and 6 are all outside the
+        // 0, the unassigned 4, and 6 are all outside the
         // currently valid set and must be rejected.
         assert_eq!(ProviderType::from_u8(0), None);
         assert_eq!(ProviderType::from_u8(4), None);

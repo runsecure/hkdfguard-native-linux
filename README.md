@@ -24,7 +24,7 @@ This is deliberately *not* ECIES. An ephemeral-key scheme would let
 anyone holding the KEK's public key (not a secret — on a TPM, anyone who
 can reach the device can recompute it) derive the same wrapping key and
 mint a payload that unwraps to a DEK of their choosing. See
-[`src/crypto.rs`](src/crypto.rs) for the full rationale, and note the
+[docs/why-ecdh.md](docs/why-ecdh.md) for the full rationale, and note the
 consequence: a build server **cannot** pre-wrap a DEK for a host. DEKs
 are delivered to the host and wrapped there.
 
@@ -41,6 +41,7 @@ For installing, configuring and using HKDFGuard on a host:
 - [Configuration](docs/configuration.md): `/etc/hkdfguard/policy.toml`, setting up each provider, example policies, permissions
 - [Usage](docs/usage.md): the deployment workflow, the CLI, the C API, linking, running as a service
 - [Troubleshooting](docs/troubleshooting.md): finding out why a call fails, and what each error means
+- [Why ECDH](docs/why-ecdh.md): why keys are wrapped with ECDH against a hashed point, and the forgery attack that rules out ECIES
 
 The rest of this README covers the design and building from source.
 
@@ -66,8 +67,8 @@ same symlink (or set `LD_LIBRARY_PATH`) to run. Installed from the packages
 `pkg-config --cflags --libs hkdfguard`. The C header
 (`include/hkdfguard.h`) and exported C symbols (`hkdfguard_create_kek`,
 `hkdfguard_kek_exists`, `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`,
-`hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) are unaffected either way and keep
-their existing names.
+`hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) are the same
+either way.
 
 ```c
 #include "hkdfguard.h"
@@ -150,7 +151,7 @@ creates the `service`'s KEK on the first one that is available.
 `hkdfguard_wrap_dek` walks the same order but only ever *loads*: it uses
 the first provider that already holds a KEK for `service`, and never
 creates one. `hkdfguard_unwrap_dek` always uses the exact provider that
-originally wrapped the payload (recorded -- and authenticated -- in the
+wrapped the payload (recorded -- and authenticated -- in the
 payload itself, never in `service`). Providers are constructed fresh on
 every call; no session, login, or device connection is kept open between
 calls. (A PKCS#11 *module* stays loaded and initialized for the life of
@@ -633,8 +634,8 @@ unit, CLI, and integration tests; a real link against `libtss2-esys` and
 the PKCS#11 loader; the `tpm2`-feature unit tests; the `#[ignore]`d TPM
 conformance suite against swtpm; the `#[ignore]`d PKCS#11 tests against a
 fresh SoftHSM2 token; a C ABI round trip through the release `.so`; and the
-CLI flow (`provision`, then `wrap` via stdin and `--dek-file`, with the
-retired `--dek` and an unprovisioned `wrap` both asserted to be refused)
+CLI flow (`provision`, then `wrap` via stdin and `--dek-file`, with a
+`--dek` argument and an unprovisioned `wrap` both asserted to be refused)
 unwrapped by a separate C consumer. Every change in this repo is expected
 to pass it. See [`docker/README.md`](docker/README.md).
 
@@ -828,7 +829,7 @@ COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.1.0 / /
   their dynamic loader searches without `ldconfig`. RPM-family images
   (`/usr/lib64`) and musl-based ones (Alpine) need the packages instead.
 - **License notices aren't in the image.** The binaries statically link
-  crates under Apache-2.0, MIT, BSD-3-Clause, ISC and Unlicense terms,
+  crates under permissive open-source licenses,
   which require their notices to accompany the binaries. An image you
   distribute with the overlay in it should carry `LICENSE` and
   `THIRD-PARTY-LICENSES.txt` from the release's `linux-<arch>` tarball.
@@ -1273,8 +1274,7 @@ packaging/
 ## License
 
 HKDFGuard is licensed under the [Mozilla Public License 2.0](LICENSE)
-(`MPL-2.0`). Commits before this change were published under
-Apache-2.0, and copies already obtained under those terms keep them.
+(`MPL-2.0`).
 
 MPL-2.0 is file-level copyleft: if you distribute modified versions of
 this project's source files, those files must stay under MPL-2.0 and
@@ -1283,6 +1283,6 @@ their source must be made available. Programs that only link against
 own code; distributing a binary that includes this library only requires
 telling recipients where its source can be obtained (MPL-2.0 §3.2).
 
-The release binaries statically link Rust crates under Apache-2.0, MIT,
-BSD-3-Clause, ISC and Unlicense terms; their notices ship as
+The release binaries statically link Rust crates under their own
+permissive open-source licenses; their notices ship as
 `THIRD-PARTY-LICENSES.txt` (see `packaging/third-party-licenses.py`).

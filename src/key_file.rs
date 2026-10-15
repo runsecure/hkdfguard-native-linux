@@ -402,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_retired_provider_is_malformed() {
+    fn unknown_provider_is_malformed() {
         for provider in [0u8, 4, 6, 0xFF] {
             let mut bytes = valid();
             bytes[1] = provider;

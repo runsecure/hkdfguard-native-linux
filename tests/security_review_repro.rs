@@ -1,8 +1,5 @@
-//! Tests from the October 2026 security review, each driven through the
-//! public C ABI exactly as a consumer would hit it.
-//!
-//! All four are regression tests for findings that have been fixed (two
-//! High, one Medium, one Low): they assert the correct behavior.
+//! Security tests, each driven through the public C ABI exactly as a
+//! consumer would hit it.
 //!
 //! Every test here needs the library to read the test's own policy, which
 //! only a `--cfg hkdfguard_test_paths` build does:
@@ -68,11 +65,11 @@ fn exists(service: &CString) -> (c_int, c_int) {
 }
 
 // ---------------------------------------------------------------------
-// Fixed (was Low): wrap and unwrap check the caller's buffer before any
-// provider work. A size probe (NULL out, capacity 0) is answered with
-// HKDFGUARD_WRAPPED_MAX_LEN even for a service with no KEK -- before the
-// fix it walked the provider chain and answered KEK_NOT_FOUND -- and a
-// NULL out with a positive capacity is refused before wrapping.
+// Wrap and unwrap check the caller's buffer before any provider work. A
+// size probe (NULL out, capacity 0) is answered with
+// HKDFGUARD_WRAPPED_MAX_LEN even for a service with no KEK -- without
+// walking the provider chain -- and a NULL out with a positive capacity
+// is refused before wrapping.
 // ---------------------------------------------------------------------
 #[test]
 #[serial]
@@ -134,11 +131,9 @@ fn pkcs11_policy(f: &Pkcs11Fixture) -> String {
 }
 
 // ---------------------------------------------------------------------
-// Fixed (was High): with PKCS#11 as the provider, hkdfguard_create_kek
-// must actually create the key pair, so that kek_exists then answers 1
-// and wrap/unwrap round-trip. Before the fix, create_kek returned OK
-// without touching the token, kek_exists stayed 0, and wrap failed with
-// PROVIDER_ERROR.
+// With PKCS#11 as the provider, hkdfguard_create_kek must actually create
+// the key pair, so that kek_exists then answers 1 and wrap/unwrap
+// round-trip.
 // ---------------------------------------------------------------------
 #[test]
 #[serial]
@@ -174,11 +169,11 @@ fn pkcs11_create_kek_then_exists_then_wrap_and_unwrap_round_trip() {
 }
 
 // ---------------------------------------------------------------------
-// Fixed (was High): PKCS#11 wraps from several threads at once must all
-// succeed. Before the fix every call ran C_Initialize/C_Finalize on the
-// module, so a second concurrent call's C_Initialize failed with
-// CKR_CRYPTOKI_ALREADY_INITIALIZED, its context was dropped, and the drop
-// ran C_Finalize under the first call's live session.
+// PKCS#11 wraps from several threads at once must all succeed. If every
+// call ran C_Initialize/C_Finalize on the module, a second concurrent
+// call's C_Initialize would fail with CKR_CRYPTOKI_ALREADY_INITIALIZED,
+// and dropping its context would run C_Finalize under the first call's
+// live session.
 // ---------------------------------------------------------------------
 #[test]
 #[serial]
@@ -224,11 +219,10 @@ fn pkcs11_concurrent_wraps_all_succeed() {
 }
 
 // ---------------------------------------------------------------------
-// Fixed (was Medium): a *policy-named* derivation-secret file that is
-// missing must make the TPM provider Refused (the call fails), like a
-// policy-named TCTI that can't be opened -- never Absent, which under
-// `prefer` quietly moved the wrap to a weaker provider that happened to
-// hold a KEK for the service.
+// A *policy-named* derivation-secret file that is missing must make the
+// TPM provider Refused (the call fails), like a policy-named TCTI that
+// can't be opened -- never Absent, which under `prefer` would quietly move
+// the wrap to a weaker provider that happens to hold a KEK for the service.
 // ---------------------------------------------------------------------
 #[test]
 #[serial]

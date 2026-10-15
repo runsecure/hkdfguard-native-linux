@@ -1,7 +1,7 @@
 # Running HKDFGuard's tests and builds in Docker
 
-This crate's TPM2 and PKCS#11 providers can't be built or tested on the
-macOS machine this repo's core was written on (`tss-esapi-sys` only ships
+This crate's TPM2 and PKCS#11 providers can't be built or tested on
+macOS (`tss-esapi-sys` only ships
 pregenerated bindings for specific Linux target tuples, and there's no TPM
 or PKCS#11 module to talk to). This directory gives you a real Linux
 environment with `tpm2-tss`, `swtpm` (a software TPM2 simulator), and
@@ -29,7 +29,7 @@ skip if they ever run as root. The script:
    which drive the `hkdfguard` binary as a real subprocess.
 2. `cargo build --features tpm2,pkcs11` -- confirms this crate actually
    *links* against real `libtss2-esys` and the PKCS#11 loader (only
-   type-checking, not linking, could be verified outside Docker).
+   type-checking, not linking, can be verified outside Docker).
 3. Starts `swtpm`, sends `TPM2_Startup`, and runs the `#[ignore]`d TPM2
    test against it.
 4. Initializes a `SoftHSM2` token and runs the `#[ignore]`d PKCS#11 test

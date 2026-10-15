@@ -26,7 +26,7 @@ use std::fmt; // brings `fmt::Display`/`fmt::Formatter` into scope for the impl 
 /// one platform-specific band per platform (Windows -64..-79, Linux
 /// -80..-95, macOS -96..-111). A platform-band code always refines one
 /// common code, so a caller may treat it as that code. Gaps are reserved:
-/// never reuse a retired number for a different meaning.
+/// a number is never reused for a different meaning.
 pub mod status {
     // Each constant below is one possible return value of the exported C
     // functions; all are plain `i32`s so nothing Rust-specific crosses the
@@ -40,12 +40,9 @@ pub mod status {
     pub const PROVIDER_ERROR: i32 = -4; // a provider was reachable but failed to produce/load a key
     pub const CRYPTO_ERROR: i32 = -5; // a cryptographic operation failed for a reason other than authentication (RNG, hash-to-curve, HKDF, encryption)
     pub const INTERNAL_ERROR: i32 = -6; // an unexpected panic was caught at the FFI boundary
-    // -7 (formerly INVALID_UTF8) is reserved, no longer returned by
-    // anything: a `service` string that isn't valid UTF-8 is now just one
-    // more way for it to be invalid, folded into INVALID_SERVICE_NAME below
-    // -- see that constant's comment. Kept reserved, not reused, so a
-    // caller pattern-matching on -7 doesn't silently start matching
-    // something unrelated.
+    // -7 is reserved and never returned. A `service` string that isn't
+    // valid UTF-8 is one more way for it to be invalid, reported as
+    // INVALID_SERVICE_NAME below -- see that constant's comment.
     pub const INVALID_SERVICE_NAME: i32 = -8; // `service` is null, empty, not valid UTF-8, over MAX_SERVICE_LEN bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." -- one code for every way the service identifier itself can be wrong
     pub const POLICY_INVALID: i32 = -9; // the policy file can't be trusted or used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or its directory, or it requires a provider this build lacks
 

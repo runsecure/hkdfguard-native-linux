@@ -42,7 +42,7 @@
 //!   non-root service), in directories only root can change; one
 //!   trailing newline is ignored. The PIN itself is never read from the
 //!   environment (`/proc/<pid>/environ` is readable by same-user processes
-//!   and inherited by children); the retired `HKDFGUARD_PKCS11_PIN` is
+//!   and inherited by children); `HKDFGUARD_PKCS11_PIN`, if set, is
 //!   ignored with a warning.
 //!
 //! ## Design
@@ -100,8 +100,8 @@
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
-use elliptic_curve::sec1::ToSec1Point; // encodes our ephemeral public key into the raw bytes the token expects
-use p256::PublicKey; // the caller's ephemeral public key type
+use elliptic_curve::sec1::ToSec1Point; // encodes the payload's point into the raw bytes the token expects
+use p256::PublicKey; // the P-256 point type `ecdh` takes
 use sha2::{Digest as ShaDigest, Sha256}; // used for the CKA_ID tag (aliased to avoid clashing with cryptoki's own naming)
 use std::path::{Path, PathBuf}; // module-path validation and PIN-file location
 use std::sync::{Arc, Mutex, PoisonError}; // shared, lock-protected PKCS#11 session, and the process-wide module registry
@@ -143,8 +143,8 @@ struct OpenSession {
 /// canonical path. Kept for the life of the process and never finalized.
 ///
 /// `C_Initialize` and `C_Finalize` act on the module as a whole, for the
-/// whole process -- not on one caller's handle. Doing them per call, as an
-/// earlier revision did, was unsafe the moment two calls overlapped: the
+/// whole process -- not on one caller's handle. Doing them per call is
+/// unsafe the moment two calls overlap: the
 /// second `C_Initialize` fails with `CKR_CRYPTOKI_ALREADY_INITIALIZED`, the
 /// failed context is dropped, and `cryptoki`'s drop runs `C_Finalize` --
 /// tearing the module down under the first call's open session (undefined
@@ -415,7 +415,7 @@ fn open_session() -> Backend<OpenSession> {
         crate::provider::log_once(
             log::Level::Warn,
             format!(
-                "hkdfguard: HKDFGUARD_PKCS11_PIN is no longer supported and is ignored; put the PIN in a root-owned mode-0400 (or 0440, group = the service's group) file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE}) instead"
+                "hkdfguard: HKDFGUARD_PKCS11_PIN is set but ignored: the PIN is read only from a root-owned mode-0400 (or 0440, group = the service's group) file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE})"
             ),
         );
     }
@@ -660,9 +660,9 @@ impl KekProvider for Pkcs11Provider {
     // present, declines with `KeyNotProvisioned`: that is what lets the
     // provider chain move on to a provider that does hold the service's
     // key, and what keeps `hkdfguard_create_kek` the only path that creates
-    // one. (An earlier revision deferred all of this to `ecdh`, so
-    // create_kek reported success without creating anything and the chain
-    // could never move past PKCS#11.)
+    // one. (Deferring all of this to `ecdh` would let create_kek report
+    // success without creating anything, and the chain could never move
+    // past PKCS#11.)
     fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
         self.check_not_refused()?;
         let mut guard = self
@@ -1221,10 +1221,10 @@ mod tests {
     #[serial_test::serial]
     fn load_kek_creates_only_when_asked_and_kek_exists_tracks_it() {
         // The create_kek -> kek_exists -> wrap sequence the C ABI drives, at
-        // the provider level. An earlier revision deferred the token lookup
-        // to `ecdh`, so `load_kek(_, true)` created nothing (create_kek
-        // reported success with no key) and `load_kek(_, false)` never
-        // declined (the chain could not move past PKCS#11).
+        // the provider level. Deferring the token lookup to `ecdh` would
+        // make `load_kek(_, true)` create nothing (create_kek reporting
+        // success with no key) and `load_kek(_, false)` never decline (the
+        // chain could not move past PKCS#11).
         let service = "com.hkdfguard.test.provisioning";
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
@@ -1252,9 +1252,9 @@ mod tests {
     #[serial_test::serial]
     fn concurrent_providers_share_one_initialized_module() {
         // Every C ABI call constructs its own provider; several at once must
-        // all work. An earlier revision ran C_Initialize/C_Finalize per
-        // provider, so overlapping calls finalized the module under each
-        // other's open sessions and failed (or crashed the module).
+        // all work. Running C_Initialize/C_Finalize per provider would let
+        // overlapping calls finalize the module under each other's open
+        // sessions and fail (or crash the module).
         let service = "com.company.orders";
         let eph = p256::SecretKey::generate().public_key();
         let expected = {

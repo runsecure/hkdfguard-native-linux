@@ -190,7 +190,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
         "provision" => parse_provision(&mut args),
         "wrap" => parse_wrap(&mut args),
         other if !other.starts_with('-') && (other.contains('/') || other.ends_with(".key") || other.ends_with(".bin")) => Err(format!(
-            "unknown subcommand {other:?}. The key file path is no longer positional: use `wrap --key-file-path|-kf {other}`"
+            "unknown subcommand {other:?}: expected `provision` or `wrap`. To wrap a DEK into {other}, use `wrap --key-file-path|-kf {other}`"
         )),
         other => Err(format!("unknown subcommand {other:?}: expected `provision` or `wrap`")),
     }
@@ -251,9 +251,8 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
                 }
                 set_source(&mut dek_source, DekSource::File(value))?;
             }
-            // Removed rather than deprecated: accepting the DEK on argv
-            // exposes it via /proc/<pid>/cmdline, so leaving it in place
-            // "for compatibility" would just preserve the vulnerability.
+            // Rejected outright, with no compatibility path: accepting the
+            // DEK on argv exposes it via /proc/<pid>/cmdline.
             // A clear error beats a silent "unrecognized argument".
             "--dek" | "-d" => {
                 return Err(
@@ -600,7 +599,7 @@ const MAX_REPLACEABLE_KEY_FILE_LEN: u64 = 64 * 1024;
 //
 // If the file can't be opened for writing (EACCES/EPERM -- this tool
 // doesn't own it), the overwrite passes are skipped entirely and this falls
-// back to a plain `remove_file`, per explicit product direction: destroying
+// back to a plain `remove_file`: destroying
 // the old bytes first is worth attempting, but not worth failing the whole
 // command over when this process isn't even allowed to write to the file
 // it's about to replace -- matches this project's macOS/Windows tools.
@@ -979,10 +978,9 @@ mod tests {
     // `secure_delete`'s multi-pass overwrite content isn't observable from
     // outside the function by the time it returns (the file is gone by
     // then) -- what's directly testable here is its documented end state:
-    // the file no longer exists. (An inode-number check was tried as a
-    // stronger signal in this crate's CLI integration tests, but dropped:
-    // some filesystems reuse a just-freed inode immediately for a new
-    // file, which made that check flaky rather than meaningful.)
+    // the file no longer exists. (An inode-number check would not be a
+    // reliable stronger signal: some filesystems reuse a just-freed inode
+    // immediately for a new file.)
     #[test]
     fn secure_delete_removes_the_file() {
         let file = NamedTempFile::new().unwrap();
@@ -1105,9 +1103,9 @@ mod tests {
 
     #[test]
     fn old_positional_key_file_form_is_rejected_with_a_pointer_to_the_new_flag() {
-        // The pre-subcommand invocation put the key file first. It must
-        // fail -- and say what to do instead -- rather than being read as
-        // a subcommand name.
+        // A key file path given where the subcommand belongs must fail --
+        // and say what to do instead -- rather than being read as a
+        // subcommand name.
         let err = expect_parse_err(argv(&["prog", "key.bin", "-sn", "svc", "--dek-stdin"]));
         assert!(err.contains("--key-file-path"), "{err}");
 

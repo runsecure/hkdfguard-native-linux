@@ -6,7 +6,7 @@
 //! (TPM2, PKCS#11, an externally provisioned secret, and an in-memory
 //! ephemeral key). There is deliberately no software-backed (PKCS#8-file)
 //! provider on this platform, so `require: pkcs8` -- the Windows-parity
-//! token the original design sketch used for that concept -- is not part
+//! token for that concept -- is not part
 //! of this vocabulary; a deployment without TPM2/PKCS#11 hardware should
 //! provision a KEK via `external-secret` instead.
 //!
@@ -917,12 +917,12 @@ impl Drop for SnapshotGuard {
 /// Reads the policy file once and makes that reading the one every
 /// [`load`] on this thread returns until the guard drops.
 ///
-/// Without this, a single call read the file several times -- the provider
-/// chain, each provider's settings, the TPM's pins and session mode, the
-/// setup floor -- and a root edit landing mid-call (or an editor that
-/// writes the file non-atomically) could give one operation two different
-/// policies: say, the chain from the old file and the TPM pins from the
-/// new one. A snapshot makes every decision in a call come from one
+/// Without this, a single call would read the file several times -- the
+/// provider chain, each provider's settings, the TPM's pins and session
+/// mode, the setup floor -- and a root edit landing mid-call (or an editor
+/// that writes the file non-atomically) could give one operation two
+/// different policies: say, the chain from the old file and the TPM pins
+/// from the new one. A snapshot makes every decision in a call come from one
 /// version of the file.
 pub(crate) fn snapshot_for_call() -> SnapshotGuard {
     SNAPSHOT.with(|s| {
@@ -1151,9 +1151,7 @@ pub(crate) fn allow_ephemeral_policy_for_tests() -> test_support::TestPolicy {
 /// `tpm2` or `pkcs11` features compiled in and a real (or simulated)
 /// device reachable, the priority chain selects TPM2/PKCS#11 first, and
 /// a test that assumed external-secret would win either fails or -- much
-/// worse -- silently stops exercising the thing it is named after. That
-/// is exactly what happened to the rotation and provider-identity tests
-/// the first time the suite ran under `--features tpm2` against swtpm.
+/// worse -- silently stops exercising the thing it is named after.
 #[cfg(test)]
 pub(crate) fn require_provider_policy_for_tests(provider: &str) -> test_support::TestPolicy {
     test_support::TestPolicy::write(&format!("[selection]\nmode = \"require\"\nprovider = \"{provider}\"\n"))
@@ -1485,11 +1483,10 @@ mod tests {
 
     #[test]
     fn container_policy_is_not_a_policy_table() {
-        // `max_ephemeral_lifetime_seconds` was once accepted and validated
-        // but never enforced -- a setting that read as a limit and did
-        // nothing. The table is gone, so a policy that sets it fails to
-        // load instead of implying a control that doesn't exist.
-        // (Ephemeral keys already live only as long as the process; its
+        // `[container_policy]` is not part of the schema, so a policy that
+        // sets `max_ephemeral_lifetime_seconds` fails to load instead of
+        // implying a lifetime limit that nothing enforces.
+        // (Ephemeral keys live only as long as the process; its
         // gate is `preferred_order` naming it, see
         // `Policy::ephemeral_explicitly_listed`.)
         for doc in [
@@ -1522,7 +1519,7 @@ mod tests {
             "preferred_ordr = [\"tpm2\"]\n[selection]\nmode = \"prefer\"\n",
             // duplicate entries in preferred_order
             "preferred_order = [\"tpm2\", \"tpm2\"]\n[selection]\nmode = \"prefer\"\n",
-            // the removed [container_policy] table (see
+            // the unsupported [container_policy] table (see
             // container_policy_is_not_a_policy_table)
             "[selection]\nmode = \"prefer\"\n[container_policy]\nmax_ephemeral_lifetime_seconds = 3600\n",
             // require a provider below the stated minimum protection
@@ -1910,7 +1907,7 @@ mod tests {
     #[test]
     fn a_non_ascii_pinned_name_is_a_policy_error_not_a_panic() {
         // 68 bytes, even, with a two-byte character straddling the first
-        // two-byte step: the old `&str`-slicing decoder panicked here.
+        // two-byte step: a `&str`-slicing decoder would panic here.
         let name = format!("a{}0", "é".repeat(33));
         for doc in [
             format!("[selection]\nmode = \"prefer\"\n[tpm]\npinned_session_salt_key_name = \"{name}\"\n"),

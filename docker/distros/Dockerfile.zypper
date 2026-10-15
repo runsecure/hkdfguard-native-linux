@@ -10,8 +10,8 @@
 #     The repository's signing key is pinned by SHA-256
 #     (BACKPORTS_KEY_SHA256), so a changed key fails the build instead of
 #     being trusted on first use.
-#   - BACKPORTS_REPO empty (SLES 15 SP7, whose Backports repository no
-#     longer carries softhsm): build it from pinned upstream source
+#   - BACKPORTS_REPO empty (SLES 15 SP7, whose Backports repository does
+#     not carry softhsm): build it from pinned upstream source
 #     (build-softhsm.sh).
 #
 # BASE_IMAGE is always passed by run-distro-tests.sh, pinned by digest

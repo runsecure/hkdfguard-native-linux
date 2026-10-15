@@ -10,7 +10,7 @@ Build-Depends: debhelper-compat (= 13),
                pkgconf,
                python3,
 Standards-Version: 4.7.2
-Homepage: https://github.com/torinblair/KeyProtectionCore-Linux
+Homepage: https://github.com/runsecure/hkdfguard-native-linux
 Rules-Requires-Root: no
 
 Package: libhkdfguard1

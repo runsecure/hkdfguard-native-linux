@@ -42,8 +42,8 @@
 //!   `..data/` directory, and refusing that would refuse the most common
 //!   delivery mechanism outright -- but only while the resolution stays
 //!   within the mount directory. A link that leads anywhere else is
-//!   refused. That keeps the property the old blanket symlink ban was
-//!   after (nothing in the mount can redirect a read to an arbitrary host
+//!   refused. That keeps the property a blanket symlink ban would
+//!   give (nothing in the mount can redirect a read to an arbitrary host
 //!   path) without breaking the platform that needs symlinks.
 //!
 //! All checks are made on the opened descriptor, and the resolved path is
@@ -375,7 +375,7 @@ mod tests {
 
     // Writes a secret file the way a correctly configured platform would:
     // owner-only. `std::fs::write` alone inherits the umask (usually
-    // 0644), which the provider now refuses.
+    // 0644), which the provider refuses.
     fn provision(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, bytes.as_ref()).unwrap();

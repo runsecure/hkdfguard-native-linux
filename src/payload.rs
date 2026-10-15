@@ -12,7 +12,7 @@
 //! offset  size  field
 //! 0       1     version            (currently 1)
 //! 1       1     provider_type      (1=TPM2 2=PKCS11 3=EXTERNAL_SECRET 5=EPHEMERAL;
-//!                                   4 was SOFTWARE, retired -- see `ProviderType`)
+//!                                   4 is unassigned and rejected -- see `ProviderType`)
 //! 2       2     key_id_len (u16)
 //! 4       N     key_id             (provider-specific opaque identifier)
 //! 4+N     32    salt               (per-payload random salt: hashed to the ECDH point, and HKDF's salt)
@@ -41,7 +41,7 @@
 //! [`Payload::authenticated_bytes`].
 
 use crate::error::{Error, Result}; // this module's own error type + `Result<T, Error>` alias
-use crate::provider::ProviderType; // the 1..=5 provider tag stored in the payload
+use crate::provider::ProviderType; // the provider tag stored in the payload (1, 2, 3 or 5)
 
 pub const VERSION: u8 = 1; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes
 pub const SALT_LEN: usize = 32; // per-payload HKDF salt; 32 bytes matches SHA-256's output size, HKDF's natural salt width
@@ -124,7 +124,7 @@ impl Payload {
 
         let provider_byte = cursor.take(1)?[0]; // read the raw provider-tag byte
         let provider_type = ProviderType::from_u8(provider_byte) // convert the raw byte into the enum
-            .ok_or(Error::Malformed("unknown provider type in wrapped payload"))?; // reject any value outside 1..=5
+            .ok_or(Error::Malformed("unknown provider type in wrapped payload"))?; // reject any value but 1, 2, 3 and 5
 
         let key_id_len = u16::from_le_bytes(cursor.take(2)?.try_into().unwrap()) as usize; // read the 2-byte length prefix, then widen to usize for indexing
         let key_id = cursor.take(key_id_len)?.to_vec(); // read exactly that many bytes and copy them into an owned Vec

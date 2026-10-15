@@ -802,8 +802,7 @@ mod ffi_tests {
     use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
     // Disables the external-secret provider so tests deterministically
     // land on Ephemeral -- the only provider left reachable once
-    // external-secret is unavailable, with no persisted-to-disk
-    // software-backed fallback in between.
+    // external-secret is unavailable.
     fn with_isolated_ephemeral_provider<F: FnOnce()>(f: F) {
         // Ephemeral is only reachable through an explicit policy opt-in
         // (see provider::allowed_chain), so write one.
@@ -812,7 +811,7 @@ mod ffi_tests {
     }
 
     // Calls the real hkdfguard_create_kek FFI entry point and asserts it
-    // succeeded -- wrap/generate_and_wrap now only ever load an existing
+    // succeeded -- wrap/generate_and_wrap only ever load an existing
     // KEK, so every test below that wraps something must provision it
     // first, exactly as a real caller would.
     fn create_kek_for_test(service: &CString) {
@@ -1070,7 +1069,7 @@ mod ffi_tests {
     #[serial]
     fn generate_and_wrap_produces_independent_deks() {
         // Each call sources its own fresh CSPRNG randomness for the DEK
-        // itself, not just a fresh nonce/ephemeral key -- this is the
+        // itself, not just a fresh salt/nonce -- this is the
         // check that actually distinguishes "generates a new DEK" from
         // "wraps a fixed/reused buffer."
         with_isolated_ephemeral_provider(|| {
@@ -1523,7 +1522,7 @@ mod ffi_tests {
             );
             assert_eq!(out, dek);
 
-            // 128-byte service name (the new maximum)
+            // 128-byte service name (the maximum)
             let svc128 = CString::new("s".repeat(128)).unwrap();
             create_kek_for_test(&svc128);
             let mut wrapped2 = [0u8; 512];
@@ -1615,7 +1614,7 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn service_name_with_single_interior_and_trailing_dots_is_still_accepted() {
-        // The new rules only forbid a leading dot and consecutive dots;
+        // The dot rules only forbid a leading dot and consecutive dots;
         // ordinary dotted names (and a single trailing dot) are unaffected.
         with_isolated_ephemeral_provider(|| {
             for ok in ["com.example.dottest", "a.b.c.d", "x", "com.example.trailing."] {
@@ -1784,12 +1783,11 @@ mod ffi_tests {
 
     #[test]
     fn unterminated_service_buffer_is_rejected_without_over_reading() {
-        // Finding #13. A buffer of MAX_SERVICE_LEN + 1 non-NUL bytes and
-        // *no* terminator at all. The old `CStr::from_ptr` would have read
-        // past the end of this array looking for a zero byte; the bounded
-        // scan reads exactly the 129 bytes that exist, finds no NUL, and
-        // rejects. Under the old code this test would be undefined
-        // behavior, which is precisely the regression it guards against.
+        // A buffer of MAX_SERVICE_LEN + 1 non-NUL bytes and *no*
+        // terminator at all. `CStr::from_ptr` would read past the end of
+        // this array looking for a zero byte; the bounded scan reads
+        // exactly the 129 bytes that exist, finds no NUL, and rejects.
+        // An unbounded scan would make this test undefined behavior.
         let unterminated = [b'a'; MAX_SERVICE_LEN + 1];
         let rc = hkdfguard_create_kek(unterminated.as_ptr() as *const c_char);
         assert_eq!(rc, status::INVALID_SERVICE_NAME);

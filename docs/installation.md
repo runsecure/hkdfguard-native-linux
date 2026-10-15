@@ -123,7 +123,7 @@ hkdfguard-<version>-linux-<arch>/
   lib/libhkdfguard.so.1          the shared library (its SONAME)
   lib/libhkdfguard.so            link for compiling with -lhkdfguard
   lib/libhkdfguard.a             the static library
-  bin/hkdfguard    the CLI
+  bin/hkdfguard                  the CLI
   include/hkdfguard.h            the C header
   LICENSE, THIRD-PARTY-LICENSES.txt
 ```

@@ -25,7 +25,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK (CLI)
 License:        MPL-2.0 AND %{linked_licenses}
-URL:            https://github.com/torinblair/KeyProtectionCore-Linux
+URL:            https://github.com/runsecure/hkdfguard-native-linux
 Source0:        %{name}-%{version}.tar.gz
 
 # tss-esapi-sys ships pregenerated bindings for these Linux targets only.

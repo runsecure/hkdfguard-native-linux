@@ -1,13 +1,12 @@
-//! Provider 5: Ephemeral Memory-Only KEK (final fallback).
+//! Provider 5: Ephemeral Memory-Only KEK.
 //!
 //! Generates a fresh, cryptographically random P-256 KEK per service the
 //! first time it is requested, keeps it in memory for the lifetime of the
-//! process, and never persists it. Always available, so it is guaranteed to
-//! terminate the selection chain.
+//! process, and never persists it. Used only when the policy names it.
 //!
-//! Consequence (mandated by spec, logged loudly at selection time in
-//! `provider::select`): a process restart makes every DEK wrapped under an
-//! ephemeral KEK permanently unrecoverable.
+//! Consequence (logged as a warning when the chain serves a call from it,
+//! in `provider::walk_chain`): a process restart makes every DEK wrapped
+//! under an ephemeral KEK permanently unrecoverable.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // the traits/types this module implements

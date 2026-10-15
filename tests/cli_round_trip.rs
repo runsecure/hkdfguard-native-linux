@@ -317,8 +317,8 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
         assert!(!output.status.success(), "a group-readable DEK file must be refused");
         assert!(!loose_key_path.exists(), "nothing should have been written");
 
-        // The retired argv form is rejected outright, with an error that
-        // says why.
+        // The DEK on argv (`--dek`) is rejected outright, with an error
+        // that says why.
         let argv_key_path = out_dir.path().join("argv.key");
         let output = cli()
             .arg("wrap")
@@ -327,11 +327,11 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .args(["--dek", &STANDARD.encode(original_dek)])
             .output()
             .expect("failed to run hkdfguard");
-        assert!(!output.status.success(), "--dek must no longer be accepted");
+        assert!(!output.status.success(), "--dek must be refused");
         assert!(stderr_of(&output).contains("cmdline"), "error should explain the exposure");
         assert!(!argv_key_path.exists(), "nothing should have been written");
 
-        // And the pre-subcommand positional form fails with a pointer to
+        // And a positional key path fails with a pointer to
         // --key-file-path, rather than being misread as a subcommand.
         let output = cli()
             .arg(key_path.to_str().unwrap())
@@ -339,7 +339,7 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .output()
             .expect("failed to run hkdfguard");
         assert!(!output.status.success());
-        assert!(stderr_of(&output).contains("--key-file-path"), "must point at the new flag");
+        assert!(stderr_of(&output).contains("--key-file-path"), "must point at --key-file-path");
     });
 }
 
