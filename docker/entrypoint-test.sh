@@ -176,13 +176,6 @@ as_ci target/release/hkdfguard wrap \
     --force
 as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE2" "$CLISO_SERVICE" "$DEK_FILE"
 
-# A DEK on the command line (--dek) must be refused outright, not silently accepted.
-if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard wrap \
-        --key-file-path "$(mktemp -u)" --service-name "$CLISO_SERVICE" --dek AAAA 2>/dev/null; then
-    echo "FAIL: --dek was accepted; it must be rejected" >&2
-    exit 1
-fi
-
 # `wrap` never provisions: with nothing mounted for this service it must
 # fail and point at `provision`, rather than quietly creating a KEK.
 UNPROVISIONED_OUT=$(mktemp -u)

@@ -121,7 +121,7 @@ pub trait KekHandle {
 
     /// Perform ECDH between this KEK's persistent private key and the given
     /// point (the payload's salt-derived `H_salt`), returning the raw shared secret.
-    fn ecdh(&self, ephemeral_public_key: &PublicKey) -> Result<SharedSecret>; // never exposes the private key itself
+    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret>; // never exposes the private key itself
 
     /// This KEK's own public key -- never secret (it's the public half of
     /// the persistent keypair), used only by `crypto::wrap`/`crypto::unwrap`

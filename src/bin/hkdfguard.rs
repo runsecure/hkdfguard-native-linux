@@ -189,9 +189,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     match subcommand.as_str() {
         "provision" => parse_provision(&mut args),
         "wrap" => parse_wrap(&mut args),
-        other if !other.starts_with('-') && (other.contains('/') || other.ends_with(".key") || other.ends_with(".bin")) => Err(format!(
-            "unknown subcommand {other:?}: expected `provision` or `wrap`. To wrap a DEK into {other}, use `wrap --key-file-path|-kf {other}`"
-        )),
         other => Err(format!("unknown subcommand {other:?}: expected `provision` or `wrap`")),
     }
 }
@@ -203,7 +200,7 @@ fn parse_provision(args: &mut impl Iterator<Item = String>) -> Result<ParseOutco
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
             "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
-            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--dek" | "-d" | "--force" | "-f" => {
+            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--force" | "-f" => {
                 return Err(format!("{arg} is not valid for `provision`; it belongs to `wrap`"))
             }
             other => return Err(format!("unrecognized argument for `provision`: {other}")),
@@ -250,21 +247,6 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
                     return Err("--dek-file must not be empty".to_string());
                 }
                 set_source(&mut dek_source, DekSource::File(value))?;
-            }
-            // Rejected outright, with no compatibility path: accepting the
-            // DEK on argv exposes it via /proc/<pid>/cmdline.
-            // A clear error beats a silent "unrecognized argument".
-            "--dek" | "-d" => {
-                return Err(
-                    "--dek is no longer supported: the DEK would be visible to other processes \
-                     via /proc/<pid>/cmdline. Use --dek-stdin or --dek-file instead."
-                        .to_string(),
-                )
-            }
-            other if !other.starts_with('-') => {
-                return Err(format!(
-                    "unexpected positional argument {other:?}: the key file path is given as --key-file-path|-kf"
-                ))
             }
             other => return Err(format!("unrecognized argument for `wrap`: {other}")),
         }
@@ -1102,22 +1084,6 @@ mod tests {
     }
 
     #[test]
-    fn old_positional_key_file_form_is_rejected_with_a_pointer_to_the_new_flag() {
-        // A key file path given where the subcommand belongs must fail --
-        // and say what to do instead -- rather than being read as a
-        // subcommand name.
-        let err = expect_parse_err(argv(&["prog", "key.bin", "-sn", "svc", "--dek-stdin"]));
-        assert!(err.contains("--key-file-path"), "{err}");
-
-        let err = expect_parse_err(argv(&["prog", "/var/lib/app/wrapped", "-sn", "svc", "--dek-stdin"]));
-        assert!(err.contains("--key-file-path"), "{err}");
-
-        // And a stray positional inside `wrap` is refused the same way.
-        let err = expect_parse_err(argv(&["prog", "wrap", "key.bin", "-sn", "svc", "--dek-stdin"]));
-        assert!(err.contains("--key-file-path"), "{err}");
-    }
-
-    #[test]
     fn parse_provision() {
         assert_eq!(
             expect_run(argv(&["prog", "provision", "--service-name", "svc"])),
@@ -1188,17 +1154,6 @@ mod tests {
         // ambiguous invocation can't quietly wrap the wrong key.
         assert!(parse_args(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--dek-file", "/x"])).is_err());
         assert!(parse_args(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-file", "/x", "--dek-file", "/y"])).is_err());
-    }
-
-    #[test]
-    fn parse_wrap_rejects_the_removed_dek_flag_with_an_explanation() {
-        for flag in ["--dek", "-d"] {
-            let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", flag, "AAAA"]));
-            assert!(
-                err.contains("cmdline") && err.contains("--dek-stdin"),
-                "the error must explain why and point at the replacement, got: {err}"
-            );
-        }
     }
 
     // ---- provision / wrap against the real library, in-process ----

@@ -1070,7 +1070,7 @@ impl KekHandle for Tpm2Handle {
         &self.key_id
     }
 
-    fn ecdh(&self, ephemeral_public_key: &PublicKey) -> Result<SharedSecret> {
+    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
         let mut guard = self
             .context
             .lock() // only one caller may talk to the TPM at a time
@@ -1079,7 +1079,7 @@ impl KekHandle for Tpm2Handle {
             .as_mut()
             .ok_or(Error::Provider("TPM context not available".into()))?; // connection failed at construction time
 
-        let peer_point = encode_peer_point(ephemeral_public_key)?; // the payload's point, TPM-encoded
+        let peer_point = encode_peer_point(point)?; // the payload's point, TPM-encoded
 
         // Derives the key, reads it back, and verifies its Name (and any
         // policy-pinned Name) *before* it is used for ECDH -- so a key
@@ -1376,10 +1376,10 @@ fn encode_peer_point(peer_public: &PublicKey) -> Result<EccPoint> {
     let encoded = peer_public.to_sec1_point(false); // uncompressed SEC1 encoding, so X and Y are both directly available
     let x = encoded
         .x()
-        .ok_or(Error::Provider("ephemeral public key missing X".into()))?; // should never actually be missing for a valid point
+        .ok_or(Error::Provider("point has no X coordinate".into()))?; // should never actually be missing for a valid point
     let y = encoded
         .y()
-        .ok_or(Error::Provider("ephemeral public key missing Y".into()))?;
+        .ok_or(Error::Provider("point has no Y coordinate".into()))?;
 
     let x_param = EccParameter::try_from(x.to_vec())
         .map_err(|e| Error::Provider(format!("failed to encode peer point X: {e}")))?;
@@ -1684,20 +1684,20 @@ mod tests {
         let provider = Tpm2Provider::new();
         assert!(provider.probe(), "no TPM available");
 
-        let eph = p256::SecretKey::generate(); // stand-in "caller" ephemeral key for this test
-        let eph_pub = eph.public_key();
+        let peer_key = p256::SecretKey::generate(); // a stand-in peer key for this test
+        let peer = peer_key.public_key();
 
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first CreatePrimary for this service
         let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second, independent CreatePrimary for the same service
-        assert_eq!(*h1.ecdh(&eph_pub).unwrap(), *h2.ecdh(&eph_pub).unwrap()); // must yield the identical shared secret both times
+        assert_eq!(*h1.ecdh(&peer).unwrap(), *h2.ecdh(&peer).unwrap()); // must yield the identical shared secret both times
 
         // `public_key()` is itself a third, independent CreatePrimary --
         // deterministic CreatePrimary means it must report the exact same
         // public key `ecdh` used, verified by doing ECDH from the
         // ephemeral side against it and checking agreement.
         let reported_public = h1.public_key().unwrap();
-        let via_reported = p256::ecdh::diffie_hellman(eph.to_nonzero_scalar(), reported_public.as_affine());
-        assert_eq!(h1.ecdh(&eph_pub).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
+        let via_reported = p256::ecdh::diffie_hellman(peer_key.to_nonzero_scalar(), reported_public.as_affine());
+        assert_eq!(h1.ecdh(&peer).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
     }
 
     // ---------------------------------------------------------------
@@ -1811,8 +1811,8 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     fn different_services_produce_different_ecdh_secrets() {
-        let eph = p256::SecretKey::generate(); // one peer keypair, reused for every call below
-        let peer = eph.public_key();
+        let peer_key = p256::SecretKey::generate(); // one peer keypair, reused for every call below
+        let peer = peer_key.public_key();
 
         let z_orders = create_ecdh_secret("orders", &peer).unwrap();
         let z_billing = create_ecdh_secret("billing", &peer).unwrap();
@@ -1826,8 +1826,8 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     fn ecdh_repeatability_for_same_service() {
-        let eph = p256::SecretKey::generate();
-        let peer = eph.public_key();
+        let peer_key = p256::SecretKey::generate();
+        let peer = peer_key.public_key();
 
         let z1 = create_ecdh_secret("orders", &peer).unwrap();
         let z2 = create_ecdh_secret("orders", &peer).unwrap();

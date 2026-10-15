@@ -274,7 +274,7 @@ fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
 #[test]
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
-fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
+fn cli_accepts_the_dek_from_a_file_and_refuses_a_loose_one() {
     with_provisioned_external_secret("com.example.fileinput", || {
         let original_dek = [0x7Bu8; 32];
         let out_dir = tempdir().unwrap();
@@ -316,30 +316,6 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .expect("failed to run hkdfguard");
         assert!(!output.status.success(), "a group-readable DEK file must be refused");
         assert!(!loose_key_path.exists(), "nothing should have been written");
-
-        // The DEK on argv (`--dek`) is rejected outright, with an error
-        // that says why.
-        let argv_key_path = out_dir.path().join("argv.key");
-        let output = cli()
-            .arg("wrap")
-            .args(["--key-file-path", argv_key_path.to_str().unwrap()])
-            .args(["--service-name", "com.example.fileinput"])
-            .args(["--dek", &STANDARD.encode(original_dek)])
-            .output()
-            .expect("failed to run hkdfguard");
-        assert!(!output.status.success(), "--dek must be refused");
-        assert!(stderr_of(&output).contains("cmdline"), "error should explain the exposure");
-        assert!(!argv_key_path.exists(), "nothing should have been written");
-
-        // And a positional key path fails with a pointer to
-        // --key-file-path, rather than being misread as a subcommand.
-        let output = cli()
-            .arg(key_path.to_str().unwrap())
-            .args(["--service-name", "com.example.fileinput", "--dek-stdin"])
-            .output()
-            .expect("failed to run hkdfguard");
-        assert!(!output.status.success());
-        assert!(stderr_of(&output).contains("--key-file-path"), "must point at --key-file-path");
     });
 }
 

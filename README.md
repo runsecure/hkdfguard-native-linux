@@ -634,8 +634,8 @@ unit, CLI, and integration tests; a real link against `libtss2-esys` and
 the PKCS#11 loader; the `tpm2`-feature unit tests; the `#[ignore]`d TPM
 conformance suite against swtpm; the `#[ignore]`d PKCS#11 tests against a
 fresh SoftHSM2 token; a C ABI round trip through the release `.so`; and the
-CLI flow (`provision`, then `wrap` via stdin and `--dek-file`, with a
-`--dek` argument and an unprovisioned `wrap` both asserted to be refused)
+CLI flow (`provision`, then `wrap` via stdin and `--dek-file`, with an
+unprovisioned `wrap` asserted to be refused)
 unwrapped by a separate C consumer. Every change in this repo is expected
 to pass it. See [`docker/README.md`](docker/README.md).
 

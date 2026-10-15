@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
     }
 
     if (recovered_len != HKDFGUARD_DEK_LEN || memcmp(recovered, expected_dek, HKDFGUARD_DEK_LEN) != 0) {
-        fprintf(stderr, "unwrapped DEK does not match the original --dek input\n");
+        fprintf(stderr, "unwrapped DEK does not match the original DEK given to the CLI\n");
         return 1;
     }
 
