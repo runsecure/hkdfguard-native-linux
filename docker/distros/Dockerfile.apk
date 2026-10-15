@@ -9,7 +9,7 @@ FROM ${BASE_IMAGE}
 
 # Rust's musl targets link statically by default (crt-static). A static
 # executable cannot dlopen() a PKCS#11 module, and rustc drops the cdylib
-# (libhkdfguard_v1.so) from a crt-static build altogether, so every build
+# (libhkdfguard.so) from a crt-static build altogether, so every build
 # here turns it off. The entrypoint prepends BASE_RUSTFLAGS to the
 # RUSTFLAGS of each cargo invocation, because a RUSTFLAGS variable
 # replaces any target rustflags from configuration rather than adding to

@@ -41,7 +41,7 @@ use std::process::{Command, Output, Stdio};
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir()
 }
-use hkdfguard_v1::{hkdfguard_open_file, hkdfguard_unwrap_dek, status};
+use hkdfguard::{hkdfguard_open_file, hkdfguard_unwrap_dek, status};
 use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
@@ -361,6 +361,10 @@ fn cli_key_file_opens_through_the_library_and_its_dek_input_is_refused() {
         let full = fs::read(&key_path).unwrap();
         let copy = out_dir.path().join("copy.key");
         fs::write(&copy, &full[..full.len() - 1]).unwrap();
+        // Owner-only, like the CLI's own key file: under a umask of 002 the
+        // copy would be group-writable and refused as FILE_UNTRUSTED before
+        // its length is judged. (The rewrite below keeps this mode.)
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(open_via_library(&copy).0, status::FILE_TOO_SHORT);
         fs::write(&copy, [&full[..], b"\n".as_slice()].concat()).unwrap();
         assert_eq!(open_via_library(&copy).0, status::FILE_TOO_LONG);

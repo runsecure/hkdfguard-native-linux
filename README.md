@@ -52,8 +52,8 @@ scripts/build-release.sh
 ```
 
 Runs `cargo build --release`, which produces
-`target/release/libhkdfguard_v1.so` (dynamic) and
-`libhkdfguard_v1.a` (static) -- the `[lib] name` in
+`target/release/libhkdfguard.so` (dynamic) and
+`libhkdfguard.a` (static) -- the `[lib] name` in
 `Cargo.toml` controls that output name directly, and Cargo has no way to
 produce a name containing dots. The library's name on a running system is
 its SONAME, `libhkdfguard.so.1` ([`build.rs`](build.rs)): a program linked
@@ -61,7 +61,7 @@ against it records that name and looks for it at run time, and it is what
 the packages, the release tarballs and the container overlay install. The
 script's one additional step creates `target/release/libhkdfguard.so.1` as
 a symlink to Cargo's output. A plain `cargo build --release` still works
-for local iteration; link against `libhkdfguard_v1` directly and add the
+for local iteration; link against `libhkdfguard` directly and add the
 same symlink (or set `LD_LIBRARY_PATH`) to run. Installed from the packages
 (see "Packages"), the library is simply `-lhkdfguard`, via
 `pkg-config --cflags --libs hkdfguard`. The C header
@@ -1113,7 +1113,7 @@ its default.
   dependency bump. 
 - **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
-  static linking (`libhkdfguard_v1.a`), and RustCrypto's P-256/HKDF-SHA512/
+  static linking (`libhkdfguard.a`), and RustCrypto's P-256/HKDF-SHA512/
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.
@@ -1247,7 +1247,7 @@ tests/
   harden_process.rs              hkdfguard_harden_process, in its own process
 scripts/
   build-release.sh           cargo build --release, then links libhkdfguard.so.1
-                              (the SONAME) to Cargo's libhkdfguard_v1.so
+                              (the SONAME) to Cargo's libhkdfguard.so
   native-tpm-preflight.sh    Read-only check of a real Linux TPM host
   native-tpm-test.sh         Full matrix on a real TPM; `reboot capture|verify`
   tpm-reboot-test.sh         swtpm-restart approximation of reboot persistence

@@ -69,10 +69,10 @@ for dir in "$artifacts"/binaries-*/; do
     bin="$stage/bin-$arch"
     mkdir -p "$bin/lib" "$bin/bin" "$bin/include"
     # Named as the packages install them: the library under its SONAME
-    # (build.rs), not Cargo's libhkdfguard_v1.
-    install -m 0644 "$dir/libhkdfguard_v1.so" "$bin/lib/libhkdfguard.so.1"
+    # (build.rs), not Cargo's libhkdfguard.
+    install -m 0644 "$dir/libhkdfguard.so" "$bin/lib/libhkdfguard.so.1"
     ln -s libhkdfguard.so.1 "$bin/lib/libhkdfguard.so"
-    install -m 0644 "$dir/libhkdfguard_v1.a" "$bin/lib/libhkdfguard.a"
+    install -m 0644 "$dir/libhkdfguard.a" "$bin/lib/libhkdfguard.a"
     install -m 0755 "$dir/hkdfguard" "$bin/bin/"
     install -m 0644 "$dir/hkdfguard.h" "$bin/include/"
     install -m 0644 LICENSE "$stage/THIRD-PARTY-LICENSES.txt" "$bin/"

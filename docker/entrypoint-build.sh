@@ -30,8 +30,8 @@ as_ci cargo build --release --all-features
 
 section "collecting release artifacts into $DIST_DIR"
 mkdir -p "$DIST_DIR"
-cp target/release/libhkdfguard_v1.so "$DIST_DIR"/
-cp target/release/libhkdfguard_v1.a "$DIST_DIR"/
+cp target/release/libhkdfguard.so "$DIST_DIR"/
+cp target/release/libhkdfguard.a "$DIST_DIR"/
 cp target/release/hkdfguard "$DIST_DIR"/
 cp include/hkdfguard.h "$DIST_DIR"/
 

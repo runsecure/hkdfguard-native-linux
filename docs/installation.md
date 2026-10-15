@@ -203,7 +203,7 @@ cd hkdfguard-native-linux
 cargo build --release --all-features    # tpm2 and pkcs11 are not in the default features
 ```
 
-The library is `target/release/libhkdfguard_v1.so` (Cargo can't produce the
+The library is `target/release/libhkdfguard.so` (Cargo can't produce the
 installed name); `scripts/build-release.sh` builds it and adds the
 `libhkdfguard.so.1` name. To build the packages themselves, with tests and a
 smoke test in a clean container for each distribution, use Docker:

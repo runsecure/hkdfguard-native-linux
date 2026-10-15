@@ -15,7 +15,7 @@
 //! test needs `HKDFGUARD_TEST_TPM=1` and a reachable TPM. Without those
 //! they report themselves as skipped and pass.
 
-use hkdfguard_v1::{hkdfguard_create_kek, hkdfguard_kek_exists, hkdfguard_unwrap_dek, hkdfguard_wrap_dek, status};
+use hkdfguard::{hkdfguard_create_kek, hkdfguard_kek_exists, hkdfguard_unwrap_dek, hkdfguard_wrap_dek, status};
 use serial_test::serial;
 use std::ffi::CString;
 use std::fs;

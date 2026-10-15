@@ -81,7 +81,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::ExitCode;
 use zeroize::Zeroize;
-use hkdfguard_v1::{
+use hkdfguard::{
     hkdfguard_create_kek, hkdfguard_harden_process, hkdfguard_kek_exists, hkdfguard_wrap_dek, status,
 };
 

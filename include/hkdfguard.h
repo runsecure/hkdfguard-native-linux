@@ -362,7 +362,8 @@ int hkdfguard_generate_and_wrap_dek(
  *                with: HKDFGUARD_WRAPPED_MAX_LEN for a capacity too small
  *                for any payload (answered without opening the file),
  *                otherwise the file's exact length.
- *                0 on every other failure.
+ *                Left unchanged on every other failure, as with
+ *                hkdfguard_wrap_dek and hkdfguard_unwrap_dek.
  *           A buffer of HKDFGUARD_WRAPPED_MAX_LEN bytes always fits.
  *
  * The file's length is checked against the payload's own header (the

@@ -104,9 +104,9 @@ python3 packaging/third-party-licenses.py target/THIRD-PARTY-LICENSES.txt
 
 %install
 # The library goes in under its SONAME (see build.rs), not Cargo's name.
-install -D -m 0755 target/release/libhkdfguard_v1.so %{buildroot}%{_libdir}/libhkdfguard.so.1
+install -D -m 0755 target/release/libhkdfguard.so %{buildroot}%{_libdir}/libhkdfguard.so.1
 ln -s libhkdfguard.so.1 %{buildroot}%{_libdir}/libhkdfguard.so
-install -D -m 0644 target/release/libhkdfguard_v1.a %{buildroot}%{_libdir}/libhkdfguard.a
+install -D -m 0644 target/release/libhkdfguard.a %{buildroot}%{_libdir}/libhkdfguard.a
 install -D -m 0644 include/hkdfguard.h %{buildroot}%{_includedir}/hkdfguard.h
 install -d %{buildroot}%{_libdir}/pkgconfig
 sed -e 's|@LIBDIR@|%{_libdir}|' -e 's|@VERSION@|%{version}|' \
