@@ -67,7 +67,9 @@ int main(int argc, char** argv) {
     uint8_t probe[HKDFGUARD_WRAPPED_MAX_LEN];
     int probe_len = (int)sizeof(probe);
     rc = hkdfguard_open_file(expected_dek_path, probe, &probe_len);
-    if (rc != HKDFGUARD_ERR_FILE_PLAINTEXT_KEY || probe_len != 0) {
+    /* On failure *out_len is left as the caller set it (only
+     * BUFFER_TOO_SMALL reports a size through it). */
+    if (rc != HKDFGUARD_ERR_FILE_PLAINTEXT_KEY || probe_len != (int)sizeof(probe)) {
         fprintf(stderr, "hkdfguard_open_file on a raw DEK returned %d (len %d), expected %d\n",
                 rc, probe_len, HKDFGUARD_ERR_FILE_PLAINTEXT_KEY);
         return 1;

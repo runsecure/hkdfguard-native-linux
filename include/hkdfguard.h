@@ -10,6 +10,22 @@
  * opened, on the host holding the KEK: it is not possible to pre-wrap a
  * DEK for a host from elsewhere.
  *
+ * Shared across platforms (Linux, Windows, macOS): the function names and
+ * signatures, the status codes, the HKDFGUARD_* flags, and the semantics of
+ * every call. NOT shared: the wrapped-payload format. Each platform has its
+ * own -- here ECDH against a per-payload hashed point, HKDF-SHA512, and
+ * AES-256-GCM, with an in-band version byte, 132..276 bytes; on macOS, HPKE
+ * (RFC 9180) base mode, a fixed 146 bytes -- and its own size, which is why
+ * HKDFGUARD_WRAPPED_MAX_LEN has the same name but a per-platform value. A
+ * payload is opened only on the host whose KEK wrapped it, so formats never
+ * need to interoperate: treat a payload as opaque bytes, size buffers with
+ * HKDFGUARD_WRAPPED_MAX_LEN (or a size probe), and never parse it. Moving a
+ * service to another platform means re-wrapping its DEKs there, under that
+ * host's KEK. The formats also differ in who can CREATE a payload: here
+ * only the KEK holder can (see the crate's README), while on macOS anyone
+ * with the KEK's public key can, and that platform relies on the key file's
+ * ownership checks instead (see its header).
+ *
  * No Rust type, TPM handle, OpenSSL structure, or PKCS#11 object ever
  * crosses this boundary. No exception/panic ever crosses this boundary --
  * every function below returns a plain status code. (That relies on the
