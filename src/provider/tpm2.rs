@@ -46,8 +46,8 @@
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
-use elliptic_curve::sec1::ToSec1Point; // lets us split the caller's ephemeral public key into X/Y coordinates
-use p256::PublicKey; // the caller's ephemeral public key type
+use elliptic_curve::sec1::ToSec1Point; // lets us split the payload's point into X/Y coordinates
+use p256::PublicKey; // the P-256 point type `ecdh` takes
 use sha2::{Digest as ShaDigest, Sha256}; // hashing used to build the per-service `unique` label (aliased to avoid clashing with tss-esapi's own `Digest`)
 use std::path::PathBuf; // location of the derivation-secret file
 use std::str::FromStr; // brings `TctiNameConf::from_str` into scope
@@ -83,7 +83,7 @@ use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its c
 //
 // Folding a root-owned host secret into `unique` makes the derived key
 // depend on the TPM seed *and* a file the attacker must also be able to
-// read, so local TPM access alone is no longer enough.
+// read, so local TPM access alone is not enough.
 //
 // `inSensitive.data` would seem like the more natural channel for this,
 // and it is *not* usable here: for an asymmetric object the TPM requires
@@ -294,10 +294,9 @@ fn read_owner_auth(path: &std::path::Path) -> Result<tss_esapi::structures::Auth
 pub struct Tpm2Provider {
     // A TPM ESYS context is not safe to drive concurrently; serialize
     // access to the (typically low-throughput, one DEK-wrap-at-a-time) TPM
-    // channel behind a mutex instead of opening a context per call. Shared
-    // (via Arc) with every handle so the actual CreatePrimary+ECDH_ZGen
-    // round trip can happen lazily in `KekHandle::ecdh`, once the caller's
-    // ephemeral public key is available.
+    // channel behind a mutex. Shared (via Arc) with every handle so the
+    // actual CreatePrimary+ECDH_ZGen round trip can happen lazily in
+    // `KekHandle::ecdh`, once the payload's point is known.
     context: Arc<Mutex<Option<Context>>>,
     // Set when a TPM is there but can't be trusted or used (see
     // `crate::provider::Backend::Refused`); every call then fails with it.
@@ -336,14 +335,13 @@ impl Default for Tpm2Provider {
     }
 }
 
-// Attempts to open a connection to a TPM: first via the standard
-// TCTI-selecting environment variables, then falling back to the default
-// Linux TPM resource-manager device node. Refuses to hand back a
-// connection to a TPM that fails `validate_tpm_compatibility` -- see that
-// function's doc comment -- treating it exactly like a connection that
-// couldn't be established at all, so `probe()`/`kek_exists()` correctly
-// report this provider as unavailable rather than silently producing KEKs
-// this crate's persistence model can't actually rely on.
+// Attempts to open a connection to the TPM named by `tpm.tcti` in policy,
+// else the default Linux TPM resource-manager device node (see
+// `resolve_tcti`). Refuses to hand back a connection to a TPM that fails
+// `validate_tpm_compatibility` -- see that function's doc comment --
+// returning `Backend::Refused` instead, so every call fails with the
+// reason rather than silently producing KEKs this crate's persistence
+// model can't actually rely on.
 fn open_context() -> Backend<Context> {
     // Checked before the TCTI is even opened: tpm2-tss starts logging from
     // the first command.
@@ -742,16 +740,16 @@ fn validate_tpm_compatibility(ctx: &mut Context) -> Result<bool> {
 /// silent: a TPM that accepted the request but derived the same key
 /// regardless would leave the derivation secret appearing to work while
 /// protecting nothing. Rather than trust the specification here, compare
-/// the two derivations and refuse the TPM if they match. (The earlier
-/// attempt to carry the secret in `inSensitive.data` failed loudly with
-/// `TPM_RC_ATTRIBUTES` instead of silently -- but a quiet failure is the
-/// case worth defending against, so the check stays.)
+/// the two derivations and refuse the TPM if they match. (Carrying the
+/// secret in `inSensitive.data` instead fails loudly with
+/// `TPM_RC_ATTRIBUTES` rather than silently -- but a quiet failure is the
+/// case worth defending against.)
 ///
 /// `Ok(None)` when no secret is configured -- there is nothing to verify,
 /// and nothing may be cached, since a secret provisioned later still
 /// needs checking. `Ok(Some(true))` when the secret demonstrably changes
-/// the derived key, `Ok(Some(false))` -- which makes the provider
-/// unavailable for the rest of the process -- when it makes no difference.
+/// the derived key, `Ok(Some(false))` -- which refuses the TPM
+/// (`Backend::Refused`) for the rest of the process -- when it makes no difference.
 fn validate_derivation_secret_is_honored(ctx: &mut Context) -> Result<Option<bool>> {
     let secret = read_derivation_secret()?;
     let Some(secret) = secret else {
@@ -1072,7 +1070,7 @@ impl KekHandle for Tpm2Handle {
         &self.key_id
     }
 
-    fn ecdh(&self, ephemeral_public_key: &PublicKey) -> Result<SharedSecret> {
+    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
         let mut guard = self
             .context
             .lock() // only one caller may talk to the TPM at a time
@@ -1081,7 +1079,7 @@ impl KekHandle for Tpm2Handle {
             .as_mut()
             .ok_or(Error::Provider("TPM context not available".into()))?; // connection failed at construction time
 
-        let peer_point = encode_peer_point(ephemeral_public_key)?; // the caller's ephemeral public key, TPM-encoded
+        let peer_point = encode_peer_point(point)?; // the payload's point, TPM-encoded
 
         // Derives the key, reads it back, and verifies its Name (and any
         // policy-pinned Name) *before* it is used for ECDH -- so a key
@@ -1214,8 +1212,8 @@ impl KekProvider for Tpm2Provider {
             ));
         }
         // The actual TPM2_CreatePrimary + TPM2_ECDH_ZGen round trip is
-        // deferred to `KekHandle::ecdh`, once the caller's ephemeral
-        // public key is available -- see the module-level design note for
+        // deferred to `KekHandle::ecdh`, once the payload's point
+        // is known -- see the module-level design note for
         // why CreatePrimary-on-demand stands in for "load a persistent KEK".
         Ok(Box::new(Tpm2Handle {
             key_id: service_fingerprint(service),
@@ -1254,15 +1252,13 @@ fn unpinned_service_instructions(context: &Arc<Mutex<Option<Context>>>, service:
         let (_public, name) = create_and_read_primary(ctx, service, secret.as_ref())?;
         Ok(hex(name.value()))
     })();
-    // The service name itself stays out of the message: it is logged, and
-    // service names are kept out of the log (see the C ABI's "(redacted)"
-    // lines). The placeholder is the name the caller passed, which the
-    // caller -- `hkdfguard-v1-initialize provision`, say -- already knows.
+    // Paste-ready: the entry names the (normalized) service itself. Service
+    // names are public identifiers, so the message carries it as-is.
     match name {
         Ok(name) => format!(
-            "tpm.require_pinned_names is set and this service has no pinned TPM Name. To provision \
-             it, add this to the policy file, with <service> replaced by the service name, and run \
-             provision again:\n  [tpm.pinned_names]\n  \"<service>\" = \"{name}\""
+            "tpm.require_pinned_names is set and service \"{service}\" has no pinned TPM Name. To \
+             provision it, add this to the policy file and run provision again:\n  [tpm.pinned_names]\n  \
+             \"{service}\" = \"{name}\""
         ),
         Err(e) => format!(
             "tpm.require_pinned_names is set and this service has no pinned TPM Name; deriving its \
@@ -1352,9 +1348,8 @@ fn service_unique_point(
 }
 
 // One half of the `unique` point. With `secret` absent this hashes
-// exactly what it always has -- prefix followed by the service name --
-// so a deployment that never provisions a secret keeps deriving the
-// identical KEK it did before this input existed.
+// exactly the prefix followed by the service name; that must never
+// change, or every KEK derived without a secret would change with it.
 fn unique_half(
     prefix: &[u8],
     service: &str,
@@ -1367,22 +1362,22 @@ fn unique_half(
         hasher.update(b":secret:"); // separates the secret from the service name it follows
         hasher.update(&secret[..]);
     }
-    // Same digest as a plain `finalize`, so every KEK is unchanged; the
-    // hasher's buffered copy of the secret's tail is scrubbed as well.
+    // Same digest as a plain `finalize`; the hasher's buffered copy of
+    // the secret's tail is scrubbed as well.
     crate::crypto::finalize_sha256_wiping(hasher)
 }
 
-// Converts the caller's ephemeral P-256 public key (a `p256::PublicKey`)
+// Converts the payload's P-256 point (a `p256::PublicKey`)
 // into the TPM crate's `EccPoint` representation, as required by
 // `ecdh_z_gen`.
 fn encode_peer_point(peer_public: &PublicKey) -> Result<EccPoint> {
     let encoded = peer_public.to_sec1_point(false); // uncompressed SEC1 encoding, so X and Y are both directly available
     let x = encoded
         .x()
-        .ok_or(Error::Provider("ephemeral public key missing X".into()))?; // should never actually be missing for a valid point
+        .ok_or(Error::Provider("point has no X coordinate".into()))?; // should never actually be missing for a valid point
     let y = encoded
         .y()
-        .ok_or(Error::Provider("ephemeral public key missing Y".into()))?;
+        .ok_or(Error::Provider("point has no Y coordinate".into()))?;
 
     let x_param = EccParameter::try_from(x.to_vec())
         .map_err(|e| Error::Provider(format!("failed to encode peer point X: {e}")))?;
@@ -1554,8 +1549,8 @@ mod tests {
     fn the_secret_changes_only_the_unique_field_not_the_attributes() {
         // sensitiveDataOrigin must stay SET either way: the TPM requires
         // it for an asymmetric key, and clearing it to pass
-        // inSensitive.data is what produced TPM_RC_ATTRIBUTES against
-        // swtpm. The secret therefore rides in `unique` instead, so the
+        // inSensitive.data makes swtpm fail with TPM_RC_ATTRIBUTES. The
+        // secret therefore rides in `unique` instead, so the
         // attributes are identical and only `unique` differs.
         let secret = Zeroizing::new([0x5au8; 32]);
         let plain = service_public_template("com.company.orders", None).unwrap();
@@ -1581,10 +1576,10 @@ mod tests {
     }
 
     #[test]
-    fn unique_without_a_secret_is_unchanged_from_the_original_derivation() {
-        // Backward compatibility: a deployment that never provisions a
-        // secret must keep deriving the identical KEK, so the no-secret
-        // label must still be exactly prefix || service.
+    fn unique_without_a_secret_is_exactly_prefix_and_service() {
+        // Stability: a deployment that never provisions a secret must
+        // keep deriving the identical KEK, so the no-secret label must
+        // stay exactly prefix || service.
         let expected_x = Sha256::digest([b"hkdfguard-tpm2-unique-x:".as_slice(), b"com.company.orders"].concat());
         let expected_y = Sha256::digest([b"hkdfguard-tpm2-unique-y:".as_slice(), b"com.company.orders"].concat());
 
@@ -1640,7 +1635,7 @@ mod tests {
     fn every_service_is_provisioned_without_the_allowlist() {
         let _no_policy = TestPolicy::absent();
         let no_policy = service_is_provisioned("com.company.anything").unwrap();
-        assert!(no_policy, "with no policy, the TPM serves every service (the historical behavior)");
+        assert!(no_policy, "with no policy, the TPM serves every service");
 
         let off = with_policy("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n", || {
             service_is_provisioned("com.company.anything").unwrap()
@@ -1687,20 +1682,20 @@ mod tests {
         let provider = Tpm2Provider::new();
         assert!(provider.probe(), "no TPM available");
 
-        let eph = p256::SecretKey::generate(); // stand-in "caller" ephemeral key for this test
-        let eph_pub = eph.public_key();
+        let peer_key = p256::SecretKey::generate(); // a stand-in peer key for this test
+        let peer = peer_key.public_key();
 
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first CreatePrimary for this service
         let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second, independent CreatePrimary for the same service
-        assert_eq!(*h1.ecdh(&eph_pub).unwrap(), *h2.ecdh(&eph_pub).unwrap()); // must yield the identical shared secret both times
+        assert_eq!(*h1.ecdh(&peer).unwrap(), *h2.ecdh(&peer).unwrap()); // must yield the identical shared secret both times
 
         // `public_key()` is itself a third, independent CreatePrimary --
         // deterministic CreatePrimary means it must report the exact same
         // public key `ecdh` used, verified by doing ECDH from the
         // ephemeral side against it and checking agreement.
         let reported_public = h1.public_key().unwrap();
-        let via_reported = p256::ecdh::diffie_hellman(eph.to_nonzero_scalar(), reported_public.as_affine());
-        assert_eq!(h1.ecdh(&eph_pub).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
+        let via_reported = p256::ecdh::diffie_hellman(peer_key.to_nonzero_scalar(), reported_public.as_affine());
+        assert_eq!(h1.ecdh(&peer).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
     }
 
     // ---------------------------------------------------------------
@@ -1814,8 +1809,8 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     fn different_services_produce_different_ecdh_secrets() {
-        let eph = p256::SecretKey::generate(); // one peer keypair, reused for every call below
-        let peer = eph.public_key();
+        let peer_key = p256::SecretKey::generate(); // one peer keypair, reused for every call below
+        let peer = peer_key.public_key();
 
         let z_orders = create_ecdh_secret("orders", &peer).unwrap();
         let z_billing = create_ecdh_secret("billing", &peer).unwrap();
@@ -1829,8 +1824,8 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     fn ecdh_repeatability_for_same_service() {
-        let eph = p256::SecretKey::generate();
-        let peer = eph.public_key();
+        let peer_key = p256::SecretKey::generate();
+        let peer = peer_key.public_key();
 
         let z1 = create_ecdh_secret("orders", &peer).unwrap();
         let z2 = create_ecdh_secret("orders", &peer).unwrap();
@@ -1931,10 +1926,10 @@ mod tests {
     // hardening above, neither of which can be confirmed by reading the
     // specification alone:
     //
-    //   1. `TPM2_CreatePrimary` genuinely mixes `inSensitive.data` into
+    //   1. `TPM2_CreatePrimary` genuinely mixes the `unique` field into
     //      the derivation. If it didn't, the derivation secret would look
     //      configured while protecting nothing -- which is exactly the
-    //      silent failure `validate_supplied_entropy_is_honored` guards
+    //      silent failure `validate_derivation_secret_is_honored` guards
     //      against at runtime.
     //   2. A TPM Name really is `nameAlg || H(marshalled TPMT_PUBLIC)`
     //      *as tss-esapi marshals it*. If the marshalling differed in any
@@ -1983,7 +1978,7 @@ mod tests {
 
         assert_ne!(
             with_secret, without_secret,
-            "this TPM ignores inSensitive.data, so a derivation secret would protect nothing"
+            "this TPM ignores the unique field, so a derivation secret would protect nothing"
         );
     }
 
@@ -2106,8 +2101,7 @@ mod tests {
         // salt, whose discrete log nobody knows. If a backend refused to
         // do ECDH against such a caller-supplied point, the entire
         // construction would be unusable there -- so confirm it against
-        // a real TPM before building on it, rather than assuming as
-        // happened with inSensitive.data.
+        // a real TPM before building on it, rather than assuming.
         //
         // Note what cannot be checked here: the *value* of Z can't be
         // independently recomputed, because that would need the point's
@@ -2464,10 +2458,9 @@ mod tests {
             })
             .unwrap();
             assert!(
-                message.contains(&format!("\"<service>\" = \"{actual}\"")),
-                "the refusal must carry a paste-ready pin for the real Name; got: {message}"
+                message.contains(&format!("\"{service}\" = \"{actual}\"")),
+                "the refusal must carry a paste-ready pin, for this service, of the real Name; got: {message}"
             );
-            assert!(!message.contains(service), "the refusal is logged, so it must not name the service: {message}");
 
             // Pinned (as the operator would, from that message): now it exists,
             // loads, and works end to end.

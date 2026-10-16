@@ -42,8 +42,8 @@
 //!   `..data/` directory, and refusing that would refuse the most common
 //!   delivery mechanism outright -- but only while the resolution stays
 //!   within the mount directory. A link that leads anywhere else is
-//!   refused. That keeps the property the old blanket symlink ban was
-//!   after (nothing in the mount can redirect a read to an arbitrary host
+//!   refused. That keeps the property a blanket symlink ban would
+//!   give (nothing in the mount can redirect a read to an arbitrary host
 //!   path) without breaking the platform that needs symlinks.
 //!
 //! All checks are made on the opened descriptor, and the resolved path is
@@ -133,10 +133,10 @@ impl KekHandle for ExternalSecretHandle {
         &self.key_id
     }
 
-    fn ecdh(&self, peer_public_key: &PublicKey) -> Result<SharedSecret> {
+    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
         let shared = p256::ecdh::diffie_hellman(
             self.secret_key.to_nonzero_scalar(), // our private scalar
-            peer_public_key.as_affine(),         // the payload's hashed point H_salt (see crypto.rs)
+            point.as_affine(),         // the payload's hashed point H_salt (see crypto.rs)
         );
         let mut out = [0u8; 32];
         out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared secret's raw bytes
@@ -375,7 +375,7 @@ mod tests {
 
     // Writes a secret file the way a correctly configured platform would:
     // owner-only. `std::fs::write` alone inherits the umask (usually
-    // 0644), which the provider now refuses.
+    // 0644), which the provider refuses.
     fn provision(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, bytes.as_ref()).unwrap();
@@ -679,12 +679,12 @@ mod tests {
             provision(dir, "com.company.orders", der.as_bytes()); // "provision" it as a mounted file
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let eph = SecretKey::generate(); // stand-in peer key
+            let peer_key = SecretKey::generate(); // stand-in peer key
             let expected = p256::ecdh::diffie_hellman(
                 secret_key.to_nonzero_scalar(),
-                eph.public_key().as_affine(),
+                peer_key.public_key().as_affine(),
             ); // compute the expected shared secret directly, independent of the provider
-            let actual = handle.ecdh(&eph.public_key()).unwrap();
+            let actual = handle.ecdh(&peer_key.public_key()).unwrap();
             assert_eq!(actual.as_slice(), expected.raw_secret_bytes().as_slice()); // provider's result must match
         });
     }
@@ -697,12 +697,12 @@ mod tests {
             provision(dir, "com.company.orders", secret_key.to_bytes()); // provision as raw 32-byte scalar this time
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let eph = SecretKey::generate();
+            let peer_key = SecretKey::generate();
             let expected = p256::ecdh::diffie_hellman(
                 secret_key.to_nonzero_scalar(),
-                eph.public_key().as_affine(),
+                peer_key.public_key().as_affine(),
             );
-            let actual = handle.ecdh(&eph.public_key()).unwrap();
+            let actual = handle.ecdh(&peer_key.public_key()).unwrap();
             assert_eq!(actual.as_slice(), expected.raw_secret_bytes().as_slice());
             // Since we provisioned the file ourselves, we independently
             // know the exact key -- `public_key()` must report that same

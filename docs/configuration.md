@@ -138,13 +138,13 @@ set, provisioning an unlisted service fails and prints the exact line to
 add:
 
 ```sh
-sudo hkdfguard-v1-initialize provision -sn com.company.orders
-#   error: ... add this to the policy file, with <service> replaced by the service name ...
+sudo hkdfguard provision -sn com.company.orders
+#   error: ... add this to the policy file and run provision again:
 #     [tpm.pinned_names]
-#     "<service>" = "000b..."
+#     "com.company.orders" = "000b..."
 ```
 
-Add the line (replacing `<service>` with the name), then run `provision`
+Add the line as printed, then run `provision`
 again; it reports "already provisioned". **Create the derivation secret
 before pinning:** the Name depends on it.
 
@@ -415,6 +415,9 @@ minimum_protection = "external"   # exclude providers below this level, whatever
 
 [startup_behavior]
 setup_min_delay_ms = 1000         # minimum duration of create_kek / kek_exists calls; 0 disables, max 60000
+
+[audit]
+unwrap_success = true             # false: no audit record for a successful unwrap (README "Audit trail")
 
 [tpm]
 tcti = "device:/dev/tpmrm0"

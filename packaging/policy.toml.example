@@ -70,7 +70,7 @@ mode = "prefer"
 #owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 
 # true: only services listed in [tpm.pinned_names] have a KEK on the TPM.
-# `hkdfguard-v1-initialize provision -sn <service>` then prints the exact
+# `hkdfguard provision -sn <service>` then prints the exact
 # entry to add for a service that isn't listed yet.
 #require_pinned_names = false
 

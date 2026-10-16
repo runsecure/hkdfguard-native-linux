@@ -80,7 +80,11 @@ pub struct FileRequirements {
 /// descriptor's own metadata. Only ever returns `ErrorKind::NotFound` when
 /// the file genuinely doesn't exist; a file that exists but fails a check
 /// is reported as `PermissionDenied` or `InvalidData`, so callers can tell
-/// "absent" apart from "present but untrustworthy".
+/// "absent" apart from "present but untrustworthy". A refusal by one of
+/// these checks never carries a `raw_os_error`, while the kernel refusing
+/// the open itself (`EACCES`, `ELOOP`, ...) always does, so callers can
+/// also tell "the OS said no" apart from "the file failed a trust check"
+/// (`key_file` reports them as different status codes).
 pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
     // O_NONBLOCK: opening a FIFO with no writer would otherwise block in
     // open(2) itself -- before the descriptor could be checked -- hanging

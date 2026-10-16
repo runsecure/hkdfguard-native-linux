@@ -3,7 +3,7 @@
 # Includes everything the default (external-secret/ephemeral) and
 # hardware-backed (tpm2 via swtpm, pkcs11 via SoftHSM2) providers need, so
 # the whole provider chain -- including the two providers that cannot be
-# built or tested on the macOS host this crate was originally written on --
+# built or tested on macOS --
 # can be exercised for real. See docker/README.md for usage.
 
 # Ubuntu 24.04 LTS: tpm2-tss 4.x (4.0.1) from distro packages, and glibc

@@ -7,7 +7,7 @@ and the host is configured ([configuration.md](configuration.md)).
 
 - [Concepts](#concepts)
 - [The deployment workflow](#the-deployment-workflow)
-- [The CLI: `hkdfguard-v1-initialize`](#the-cli-hkdfguard-v1-initialize)
+- [The CLI: `hkdfguard`](#the-cli-hkdfguard)
 - [The C API](#the-c-api)
 - [Building and linking](#building-and-linking)
 - [Running as a service](#running-as-a-service)
@@ -43,10 +43,10 @@ deployment (once per host and DEK)                application (every start)
 
 ```sh
 # 1. Once per host: make sure the service has a KEK.
-sudo hkdfguard-v1-initialize provision -sn com.company.orders
+sudo hkdfguard provision -sn com.company.orders
 
 # 2. Wrap the DEK, delivered by your secrets pipeline, into a key file.
-printf '%s' "$DEK_B64" | sudo hkdfguard-v1-initialize wrap \
+printf '%s' "$DEK_B64" | sudo hkdfguard wrap \
     -kf /var/lib/orders/dek.wrapped -sn com.company.orders --dek-stdin
 
 # 3. Let the service read the key file (and nobody else).
@@ -58,26 +58,27 @@ What `provision` does depends on the provider:
 
 | Provider | What `provision` does |
 |---|---|
-| TPM | Derives the key on demand, so it reports "already provisioned". With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
-| PKCS#11 | Generates the key pair on the token, once. |
+| TPM | Derives the key on demand, so it reports "already provisioned", after deriving it and checking any pinned Name. With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
+| PKCS#11 | Generates the key pair on the token, once; later runs find it there and report "already provisioned". |
 | External secret | Checks the delivered file and that it holds a valid key: the file itself is the provisioning. |
 | Ephemeral | Creates a key that lives only in that one process (so `provision` from the CLI is pointless for it). |
 
-## The CLI: `hkdfguard-v1-initialize`
+## The CLI: `hkdfguard`
 
 ```
-hkdfguard-v1-initialize provision --service-name|-sn <name>
-hkdfguard-v1-initialize wrap --key-file-path|-kf <path> --service-name|-sn <name> \
-                             (--dek-stdin | --dek-file <path>) [--force|-f]
+hkdfguard provision --service-name|-sn <name>
+hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
+               (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
 ```
 
 | Option | Meaning |
 |---|---|
 | `--service-name`, `-sn` | The service whose KEK is used |
-| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command) |
+| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file. |
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
-| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink, owned by root or you, mode `0400` or `0600` |
-| `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. |
+| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600` |
+| `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
+| `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
 
 Exit status: `0` success, `1` the operation failed, `2` invalid command line.
 
@@ -116,6 +117,7 @@ warning (`memory not locked as a whole`).
 | `int hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int* out_len)` | Generate a random DEK and return only its wrapped form |
 | `int hkdfguard_open_file(const char* path, uint8_t* out, int* out_len)` | Read a wrapped-key file, checking its length and form; `*out_len` is the number of bytes read. Doesn't unwrap |
 | `int hkdfguard_harden_process(void)` | Opt in to process hardening: no core dumps, no same-user debugging |
+| `int hkdfguard_harden_process_with_flags(unsigned int flags)` | The same, with options. `HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE` makes a debuggable process a failure on macOS (where it depends on code signing); on Linux it's accepted and changes nothing |
 
 **Rules that matter.**
 
@@ -141,26 +143,39 @@ warning (`memory not locked as a whole`).
 | -1 | `HKDFGUARD_ERR_INVALID_ARGUMENT` | Null pointer, DEK length other than 32, negative capacity |
 | -2 | `HKDFGUARD_ERR_BUFFER_TOO_SMALL` | `*out_len` now holds the size needed |
 | -3 | `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` | No allowed provider is available on this host |
-| -4 | `HKDFGUARD_ERR_PROVIDER_ERROR` | A provider is present but failing, or the policy can't be used |
-| -5 | `HKDFGUARD_ERR_CRYPTO_ERROR` | The wrapped data is corrupt, tampered with, or for a different service |
-| -6 | `HKDFGUARD_ERR_INTERNAL_ERROR` | An internal failure: a bug in the library (a caught panic), or the OS random number generator failing while generating a DEK |
+| -4 | `HKDFGUARD_ERR_PROVIDER_ERROR` | A provider is present but failing |
+| -5 | `HKDFGUARD_ERR_CRYPTO_ERROR` | A cryptographic step failed for a reason other than authentication, such as the OS random number generator failing |
+| -6 | `HKDFGUARD_ERR_INTERNAL_ERROR` | An internal failure: a bug in the library (a caught panic) |
 | -8 | `HKDFGUARD_ERR_INVALID_SERVICE_NAME` | The service name breaks the naming rules |
-| -9 | `HKDFGUARD_ERR_KEK_NOT_FOUND` | The service has no KEK yet: provision it first |
-| -16 | `HKDFGUARD_ERR_FINGERPRINT_MISMATCH` | The payload was wrapped under a different KEK than the service has now |
-| -17 | `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` | `hkdfguard_harden_process` couldn't apply its settings |
-| -18 | `HKDFGUARD_ERR_FILE_TOO_SHORT` | `hkdfguard_open_file`: the file is shorter than a wrapped DEK, or than its header says (a truncated copy) |
-| -19 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
-| -20 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
-| -21 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
-| -22 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
-| -23 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: this process may not read the file; or the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write; a sticky directory such as `/tmp` is fine |
-| -24 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
+| -9 | `HKDFGUARD_ERR_POLICY_INVALID` | The policy file can't be used: it doesn't parse, a setting is invalid, it or its directory has unsafe ownership or permissions, or it requires a provider this build lacks |
+| -10 | `HKDFGUARD_ERR_PAYLOAD_MALFORMED` | The wrapped data isn't a well-formed payload: truncated, extra bytes, or a field no wrap produces |
+| -11 | `HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED` | The wrapped data failed authentication: tampered with, or for a different service |
+| -12 | `HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED` | The wrapped data has a payload version this library doesn't know |
+| -16 | `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH` | The payload was wrapped under a different KEK than the service has now |
+| -17 | `HKDFGUARD_ERR_KEK_NOT_FOUND` | The service has no KEK yet: provision it first |
+| -20 | `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` | `hkdfguard_harden_process` couldn't apply its settings |
+| -32 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
+| -33 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: the OS refused to let this process open the file (for example, no read permission) |
+| -34 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
+| -35 | `HKDFGUARD_ERR_FILE_TOO_SHORT` | `hkdfguard_open_file`: the file is shorter than a wrapped DEK, or than its header says (a truncated copy) |
+| -36 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
+| -37 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
+| -38 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
+| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write; a sticky directory such as `/tmp` is fine |
+
+The numbers are the same in the Windows and macOS builds of this library,
+which share one status table. `hkdfguard.h` also defines the codes only
+those platforms return (`HKDFGUARD_ERR_KEK_ACCESS_DENIED` (-18) and
+`HKDFGUARD_ERR_KEK_INVALID` (-19), and the platform-specific codes from -64
+down); Linux never returns them. A platform-specific code always refines a
+common one (its comment in the header says which), so it is safe to handle
+it as that code.
 
 The library doesn't print its reasons for a failure. To see why a call
 fails, run the CLI as the same user; see [troubleshooting.md](troubleshooting.md).
 
 **Example: unwrapping a key file at startup.** This reads the file
-`hkdfguard-v1-initialize wrap` wrote, recovers the DEK, and wipes it after
+`hkdfguard wrap` wrote, recovers the DEK, and wipes it after
 use:
 
 ```c
@@ -295,7 +310,7 @@ it never touches the command line (`%d` is the unit's credentials directory):
 [Service]
 Type=oneshot
 LoadCredential=dek:/etc/orders/dek.b64
-ExecStart=/usr/bin/hkdfguard-v1-initialize wrap -kf /var/lib/orders/dek.wrapped \
+ExecStart=/usr/bin/hkdfguard wrap -kf /var/lib/orders/dek.wrapped \
     -sn com.company.orders --dek-file %d/dek --force
 LimitMEMLOCK=infinity
 ```

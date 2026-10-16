@@ -24,7 +24,7 @@ This is deliberately *not* ECIES. An ephemeral-key scheme would let
 anyone holding the KEK's public key (not a secret — on a TPM, anyone who
 can reach the device can recompute it) derive the same wrapping key and
 mint a payload that unwraps to a DEK of their choosing. See
-[`src/crypto.rs`](src/crypto.rs) for the full rationale, and note the
+[docs/why-ecdh.md](docs/why-ecdh.md) for the full rationale, and note the
 consequence: a build server **cannot** pre-wrap a DEK for a host. DEKs
 are delivered to the host and wrapped there.
 
@@ -32,6 +32,25 @@ Wire format version 1. Every byte of a payload except the ciphertext is
 bound into both the AEAD's associated data and the HKDF `info`, so the
 `provider_type` tag and the KEK fingerprint are authenticated rather
 than merely present.
+
+**The payload format is Linux's own.** The Linux, Windows, and macOS
+libraries share one C ABI: the function names and signatures, the status
+codes, the `HKDFGUARD_*` flags, and what every call does. The wrapped
+payload is not shared. Each platform has its own format and size: here,
+the scheme above with a version byte, 132–276 bytes; on macOS, HPKE (RFC
+9180) base mode, a fixed 146 bytes. That's why `HKDFGUARD_WRAPPED_MAX_LEN`
+has the same name everywhere but a per-platform value. A payload is only
+opened on the host whose KEK wrapped it, so the formats never need to
+interoperate:
+
+- Treat a payload as opaque bytes. Size buffers with
+  `HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
+- Moving a service to another platform means re-wrapping its DEKs there,
+  under that host's KEK. A payload never moves between platforms.
+- The platforms also differ in **who can create a payload**. Here only the
+  KEK holder can (see above). On macOS, anyone holding the KEK's public key
+  can, so that library relies on the key file's ownership checks instead
+  (see its README, "Sender authentication").
 
 ## Documentation
 
@@ -41,6 +60,7 @@ For installing, configuring and using HKDFGuard on a host:
 - [Configuration](docs/configuration.md): `/etc/hkdfguard/policy.toml`, setting up each provider, example policies, permissions
 - [Usage](docs/usage.md): the deployment workflow, the CLI, the C API, linking, running as a service
 - [Troubleshooting](docs/troubleshooting.md): finding out why a call fails, and what each error means
+- [Why ECDH](docs/why-ecdh.md): why keys are wrapped with ECDH against a hashed point, and the forgery attack that rules out ECIES
 
 The rest of this README covers the design and building from source.
 
@@ -51,8 +71,8 @@ scripts/build-release.sh
 ```
 
 Runs `cargo build --release`, which produces
-`target/release/libhkdfguard_v1.so` (dynamic) and
-`libhkdfguard_v1.a` (static) -- the `[lib] name` in
+`target/release/libhkdfguard.so` (dynamic) and
+`libhkdfguard.a` (static) -- the `[lib] name` in
 `Cargo.toml` controls that output name directly, and Cargo has no way to
 produce a name containing dots. The library's name on a running system is
 its SONAME, `libhkdfguard.so.1` ([`build.rs`](build.rs)): a program linked
@@ -60,14 +80,14 @@ against it records that name and looks for it at run time, and it is what
 the packages, the release tarballs and the container overlay install. The
 script's one additional step creates `target/release/libhkdfguard.so.1` as
 a symlink to Cargo's output. A plain `cargo build --release` still works
-for local iteration; link against `libhkdfguard_v1` directly and add the
+for local iteration; link against `libhkdfguard` directly and add the
 same symlink (or set `LD_LIBRARY_PATH`) to run. Installed from the packages
 (see "Packages"), the library is simply `-lhkdfguard`, via
 `pkg-config --cflags --libs hkdfguard`. The C header
 (`include/hkdfguard.h`) and exported C symbols (`hkdfguard_create_kek`,
 `hkdfguard_kek_exists`, `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`,
-`hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) are unaffected either way and keep
-their existing names.
+`hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) are the same
+either way.
 
 ```c
 #include "hkdfguard.h"
@@ -88,7 +108,7 @@ hkdfguard_unwrap_dek("com.company.orders", wrapped, wrapped_len, recovered, &rec
 ```
 
 `hkdfguard_wrap_dek` and `hkdfguard_generate_and_wrap_dek` return
-`HKDFGUARD_ERR_KEK_NOT_FOUND` (`-9`) if `hkdfguard_create_kek` has never
+`HKDFGUARD_ERR_KEK_NOT_FOUND` (`-17`) if `hkdfguard_create_kek` has never
 succeeded for that `service`; `hkdfguard_kek_exists` reports whether it
 has, without creating anything.
 
@@ -125,7 +145,17 @@ host settings -- no swap or encrypted swap, `kernel.yama.ptrace_scope` of
 2 or 3, and for a systemd service `LimitCORE=0` and
 `ProtectProc=invisible`.
 
-`hkdfguard-v1-initialize` always calls it, and refuses to run if it fails.
+`hkdfguard_harden_process_with_flags(flags)` is the same call with options;
+`hkdfguard_harden_process()` is `..._with_flags(0)`. The one flag,
+`HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE`, makes the call fail unless no
+other process of the same user can debug or inject code into this one. It
+exists for macOS, where that depends on the host executable's code signature
+and is otherwise only a logged warning. On Linux `PR_SET_DUMPABLE` already
+guarantees it, so the flag is accepted and changes nothing -- a
+cross-platform caller can pass it everywhere. Unknown flag bits return
+`HKDFGUARD_ERR_INVALID_ARGUMENT` before anything is changed.
+
+The `hkdfguard` command always calls it, and refuses to run if it fails.
 The CLI also locks its memory out of swap with `mlockall`, but only when
 the process has `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK` (root, or
 `LimitMEMLOCK=infinity`). Under a finite limit, locking future
@@ -137,7 +167,11 @@ copies while it wraps are not locked.
 
 See [`examples/wrap_unwrap.c`](examples/wrap_unwrap.c) for a complete,
 buildable example, and [`include/hkdfguard.h`](include/hkdfguard.h) for the
-full API contract (status codes, buffer sizing, safety requirements).
+full API contract (status codes, buffer sizing, safety requirements). The
+status codes are one table shared with the Windows and macOS libraries: a
+name always has the same number on every platform, and the header defines
+every code, including the few only another platform returns. The table,
+with what each code means, is in [docs/usage.md](docs/usage.md#the-c-api).
 
 ## Provider chain
 
@@ -146,7 +180,7 @@ creates the `service`'s KEK on the first one that is available.
 `hkdfguard_wrap_dek` walks the same order but only ever *loads*: it uses
 the first provider that already holds a KEK for `service`, and never
 creates one. `hkdfguard_unwrap_dek` always uses the exact provider that
-originally wrapped the payload (recorded -- and authenticated -- in the
+wrapped the payload (recorded -- and authenticated -- in the
 payload itself, never in `service`). Providers are constructed fresh on
 every call; no session, login, or device connection is kept open between
 calls. (A PKCS#11 *module* stays loaded and initialized for the life of
@@ -202,8 +236,69 @@ process running as that user could otherwise rewrite the policy, or
 delete it to switch policy off. Only a *missing* file in a trusted
 directory means "no policy"; a file that exists but is unreadable, too
 broadly writable, wrongly owned, or malformed -- or one in a directory
-someone untrusted could change -- makes every operation fail closed.
+someone untrusted could change -- makes every operation fail closed with
+`HKDFGUARD_ERR_POLICY_INVALID` (`-9`).
 (Only test builds -- see "Testing against scratch configuration" -- also accept the process's own user.)
+
+### Audit trail
+
+The library writes one syslog record per security-relevant event, whatever
+the host does about logging. The records use facility `authpriv` and tag
+`hkdfguard`, sent straight to `/dev/log`. On systemd hosts they land in the
+journal (`journalctl -t hkdfguard`); elsewhere in `/var/log/secure` or
+`/var/log/auth.log`. These are the Windows build's Event Log events, with the
+same IDs, meanings and severities, so one set of alerts covers both:
+
+| ID | Severity | When |
+|---|---|---|
+| 1000 | info | A KEK was created (not merely found). TPM2 keys are derived on demand, never created, so TPM2 doesn't produce this. |
+| 1001 | warning | A KEK was created on a provider other than the policy's first choice, which was unavailable or declined. |
+| 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
+| 1003 | info | A DEK was unwrapped. |
+| 2000 | warning | `KEK_ACCESS_DENIED`. |
+| 2002 | error | `KEK_INVALID`. |
+| 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2004 | error | `POLICY_INVALID`: every call fails closed until the policy is fixed. |
+| 2005 | error | `PROVIDER_UNAVAILABLE`, `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`. |
+| 2006 | error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
+| 2007 | warning | A process made more than 10 setup calls (see above). Logged once per process. |
+
+Each record is `key=value` fields followed by a sentence:
+
+```text
+hkdfguard[4242]: event=1002 op=hkdfguard_wrap_dek result=OK service="com.company.orders" provider=TPM2
+  kek_fingerprint=3f9c... payload_sha256=a01b... uid=990 euid=990 pid=4242 exe="/usr/bin/orders" msg="DEK wrapped"
+```
+
+The fields identify the caller (`uid`, `euid`, `pid`, `exe`) and the service
+by name: service names are public identifiers and are never redacted. Wrap
+and unwrap records also carry the KEK's fingerprint and a SHA-256 of the
+wrapped payload. Both are public, and the same payload hashes the same in its
+wrap record and in every unwrap record, which ties each unwrap back to the
+wrap that made it. That also makes a substituted older payload visible (see
+"Design decisions worth knowing"). To hash a key file for comparison, run
+`sha256sum <file>`.
+
+The records never contain DEKs, KEKs, shared secrets, derived keys or
+plaintext. Caller mistakes (`INVALID_ARGUMENT`, `BUFFER_TOO_SMALL`,
+`INVALID_SERVICE_NAME`) and `KEK_NOT_FOUND` aren't recorded. Delivery is
+best effort: non-blocking, and a missing `/dev/log` (as in a minimal
+container) never changes or delays a call. `openlog(3)` is never called, so
+the host's own syslog tag and facility are left alone. Anything on the host
+can write to `/dev/log` under any tag, so these records are an audit aid,
+not tamper-proof evidence.
+
+For a caller that legitimately unwraps often, the policy file can turn off
+the unwrap-success record (1003) alone:
+
+```toml
+[audit]
+unwrap_success = false   # default true
+```
+
+Only an explicit `false` in a valid policy turns it off. A missing policy,
+or one that is present but invalid, keeps it on. Wrap records and every
+failure record are always written.
 
 ### Setup calls are deliberately slow
 
@@ -219,7 +314,7 @@ once a process has made more than 10 setup calls.
 
 The floor is about load, not secrecy. It does not hide which services
 have a key: `hkdfguard_wrap_dek` is not rate-limited — it is the hot path
-— and answers `KEK_NOT_FOUND` (`-9`) at once for a service with none, so
+— and answers `KEK_NOT_FOUND` (`-17`) at once for a service with none, so
 anything that can call the library can find out quickly. Treat service
 names as public identifiers, never as secrets.
 
@@ -275,7 +370,8 @@ in the policy. The provider then derives from the TPM seed and service
 name alone and logs a warning that any local process able to open the TPM
 can reproduce the keys. Adding or removing the secret changes every TPM
 KEK, so DEKs wrapped before the change fail their fingerprint check
-(`-16`) -- decide before wrapping anything.
+(`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`, `-16`) -- decide before
+wrapping anything.
 
 > **This changes the KEK.** Adding, removing, or altering the secret
 > derives a different key, so DEKs wrapped beforehand will fail their
@@ -355,18 +451,17 @@ the production derivation (so with the derivation secret, if one is
 configured):
 
 ```text
-$ hkdfguard-v1-initialize provision -sn com.company.orders
-error: hkdfguard: create_kek failed for service (redacted): provider error: TPM2: tpm.require_pinned_names
-is set and this service has no pinned TPM Name. To provision it, add this to the policy file, with <service>
-replaced by the service name, and run provision again:
+$ hkdfguard provision -sn com.company.orders
+error: hkdfguard: create_kek failed for service "com.company.orders": provider error: TPM2:
+tpm.require_pinned_names is set and service "com.company.orders" has no pinned TPM Name. To provision it,
+add this to the policy file and run provision again:
   [tpm.pinned_names]
-  "<service>" = "000b..."
+  "com.company.orders" = "000b..."
 error: hkdfguard_create_kek failed for service "com.company.orders": the selected KEK provider failed (see the
-messages above for the provider's reason; where they show <service>, use "com.company.orders")
+messages above for the provider's reason)
 ```
 
-The library's own message uses a `<service>` placeholder because it keeps
-service names out of its log; `provision` fills it in on the line after.
+The entry is ready to paste as printed.
 
 Add the entry as root and run `provision` again; it then reports
 "already provisioned". The same entry also gives you substitution
@@ -533,13 +628,15 @@ builds: the Ubuntu 24.04 `.deb`s and the EL10 `.rpm`s from
 `packaging/build-packages.sh` (see "Packages"), installed and configured
 only through a root-owned `/etc/hkdfguard/policy.toml` that requires the
 TPM, with a `0440` derivation secret, and run as an unprivileged service
-account in the `tss` group. `hkdfguard-v1-initialize provision` and
+account in the `tss` group. `hkdfguard provision` and
 `wrap` followed by an unwrap through the installed library succeeded; a
 group-writable policy, a world-readable derivation secret, `TSS2_LOG` at
 `debug`, and the service losing access to `/dev/tpmrm0` were each refused
-(`-4`), with no fallback to another provider; an unwrap under the wrong
-service was refused (`-16`); and a DEK wrapped before a guest reboot
-unwrapped after it.
+with no fallback to another provider -- the policy as
+`HKDFGUARD_ERR_POLICY_INVALID` (`-9`), the other three as
+`HKDFGUARD_ERR_PROVIDER_ERROR` (`-4`); an unwrap under the wrong service
+was refused as `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH` (`-16`); and a DEK
+wrapped before a guest reboot unwrapped after it.
 
 > **Dictionary-attack lockout on Hyper-V vTPMs.** A new Hyper-V vTPM
 > allows only **3** failed authorizations, forgives one every **1000 s**,
@@ -625,8 +722,8 @@ unit, CLI, and integration tests; a real link against `libtss2-esys` and
 the PKCS#11 loader; the `tpm2`-feature unit tests; the `#[ignore]`d TPM
 conformance suite against swtpm; the `#[ignore]`d PKCS#11 tests against a
 fresh SoftHSM2 token; a C ABI round trip through the release `.so`; and the
-CLI flow (`provision`, then `wrap` via stdin and `--dek-file`, with the
-retired `--dek` and an unprovisioned `wrap` both asserted to be refused)
+CLI flow (`provision`, then `wrap` via stdin and `--dek-file`, with an
+unprovisioned `wrap` asserted to be refused)
 unwrapped by a separate C consumer. Every change in this repo is expected
 to pass it. See [`docker/README.md`](docker/README.md).
 
@@ -685,7 +782,7 @@ SUSE's naming policy and runs `ldconfig` from scriptlets:
 | `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard1` | `libhkdfguard.so.1`, an empty `/etc/hkdfguard` (root, `0755`), the example policy `/usr/share/hkdfguard/policy.toml.example`, README, third-party licenses |
 | `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
 | (in `libhkdfguard-dev`) | `hkdfguard-static` | `hkdfguard-devel-static` | `libhkdfguard.a` |
-| `hkdfguard` | `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
+| `hkdfguard` | `hkdfguard` | `hkdfguard` | The `hkdfguard` command and its man page |
 
 All are built with every provider enabled, so the library depends on
 tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
@@ -792,7 +889,7 @@ install them to, for copying into another image
 
 ```
 /usr/lib/<multiarch>/libhkdfguard.so.1
-/usr/bin/hkdfguard-v1-initialize
+/usr/bin/hkdfguard
 ```
 
 They are taken from the tested `libhkdfguard1` and `hkdfguard` packages,
@@ -820,7 +917,7 @@ COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.1.0 / /
   their dynamic loader searches without `ldconfig`. RPM-family images
   (`/usr/lib64`) and musl-based ones (Alpine) need the packages instead.
 - **License notices aren't in the image.** The binaries statically link
-  crates under Apache-2.0, MIT, BSD-3-Clause, ISC and Unlicense terms,
+  crates under permissive open-source licenses,
   which require their notices to accompany the binaries. An image you
   distribute with the overlay in it should carry `LICENSE` and
   `THIRD-PARTY-LICENSES.txt` from the release's `linux-<arch>` tarball.
@@ -894,7 +991,7 @@ Every common mechanism meets the mode requirement with one setting:
 > or use `fsGroupChangePolicy: OnRootMismatch` with an owner that matches
 > the process's user.
 
-## Initializing a wrapped key (`hkdfguard-v1-initialize`)
+## Wrapping a key with the CLI (`hkdfguard`)
 
 Because a wrapped payload can only be produced on the host that holds the
 KEK, a deployment pipeline delivers the *plaintext* DEK to the host and
@@ -904,25 +1001,29 @@ commands:
 ```sh
 # 1. Once, at deployment time: ensure the service has a KEK. This is the
 #    only command that makes the (deliberately slow) setup calls.
-hkdfguard-v1-initialize provision --service-name com.company.orders
+hkdfguard provision --service-name com.company.orders
 
 # 2. Wrap a DEK under it. Never creates a KEK: if none is provisioned it
 #    fails and names the command above.
-printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap \
+printf '%s' "$DEK_B64" | hkdfguard wrap \
     --key-file-path /var/lib/app/key.bin \
     --service-name com.company.orders --dek-stdin
 
 # ...or from a file: a Kubernetes/Vault secret mount, or a systemd credential
-hkdfguard-v1-initialize wrap \
+hkdfguard wrap \
     --key-file-path /var/lib/app/key.bin \
     --service-name com.company.orders \
     --dek-file "$CREDENTIALS_DIRECTORY/dek"
 ```
 
-`provision` is idempotent: it checks first and reports "already
-provisioned" without touching an existing KEK. On a TPM the KEK is derived
-on demand, so it always reports present; for `external-secret` the mounted
-file *is* the provisioning; only Ephemeral actually creates anything.
+`provision` is idempotent and never changes an existing KEK, but it
+always verifies one: it loads the KEK through the provider (on a TPM,
+deriving it and checking it against any pinned Name; on PKCS#11, finding
+the key pair on the token) and reports "already provisioned ... verified".
+So a KEK that is missing or wrong on the provider fails at deployment, not
+at the first wrap. On a TPM the KEK is derived on demand, so it always
+reports present; for `external-secret` the mounted file *is* the
+provisioning; only Ephemeral actually creates anything.
 
 The DEK is base64 of exactly 32 bytes, read from stdin or a file — never
 from a command-line argument or an environment variable, both of which are
@@ -935,21 +1036,46 @@ overwrites and replaces the existing key file, so a wrap that fails — no
 KEK, provider unavailable, bad input — never destroys the key file that
 was already there. It only ever overwrites a regular file at that exact
 path: a symlink there is refused rather than followed (following it would
-overwrite whatever it points to), as are a directory, FIFO, or device, and
-any file far larger than a wrapped key. The overwrite is best-effort: on
+overwrite whatever it points to), as are a directory, FIFO, or device, any
+file far larger than a wrapped key, and a file with more than one hard link
+(overwriting it would also destroy the file at its other name). The overwrite is best-effort: on
 copy-on-write or log-structured filesystems (btrfs, ZFS) and on flash
 storage, old blocks can survive it.
+
+The key file's folder must be a real folder at the path spelled: a
+`--key-file-path` that goes through a symbolic link anywhere above the file
+is refused, with or without `--force`, so a link planted where the operator
+writes can't redirect a `wrap --force` into another folder. Spell the real
+path (`/run/...`, not `/var/run/...`). This is checked before the DEK is
+read, and again on the open file before anything is overwritten or written.
 
 The key file is written `0600`, owned by whoever runs the command. It is
 ciphertext, but anyone who can read it *and* reach the provider — on a TPM
 host, any member of `tss` — can unwrap it, so nothing beyond its owner is
 granted by default. If the service that reads it runs as a different user,
-run `wrap` as that user, or `chown`/`chmod` the file deliberately.
+pass `--group <name|gid>`. The file then goes to that group and becomes `0640`
+(owner read/write, the group read-only), the same as the Windows tool's
+`--group`. The group is set on the open file before anything is written, so the
+payload is never readable by any other group. Only root, or a member of the
+group, can give a file to it. Over-broad groups are refused: `root`, `users`,
+`nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`, and gids 0 and 65534,
+matched by name and by gid. `hkdfguard_open_file` accepts the result, since
+group read is never a reason to refuse a key file.
 
-A `--dek-file` must be a regular file, not a symlink, owned by root or by
+A `--dek-file` must be reached through real folders (no symbolic link anywhere
+above it, as for the key file), and must be a regular file, not a symlink, owned by root or by
 the invoking user, with no group or other access (e.g. `0400`/`0600`) — the
 same rules the library applies to the PKCS#11 PIN and the TPM derivation
-secret. One trailing newline is ignored on both paths.
+secret. On both paths the input is strict standard base64 (`+/`, padded), at
+most 64 bytes: one trailing newline (LF or CRLF) is ignored, and no other
+whitespace is accepted. A leading UTF-8 byte-order mark (some Windows tools
+add one) is skipped, and UTF-16 input is refused with a message saying so.
+The Windows tool applies the same rules, so the same input works on both.
+Decoding uses RustCrypto's `base64ct`, constant time with respect to the DEK
+text, and any malformed input gets one fixed message that names no character
+or offset, so a mistyped DEK never ends up in a log. `--dek-stdin` refuses
+an interactive terminal: pipe the DEK in rather than typing or pasting it,
+so it isn't echoed or kept in the scrollback.
 
 > The remaining exposure is upstream of this tool: don't put the DEK in an
 > environment variable, and don't pipe it with an `echo` that resolves to
@@ -1061,6 +1187,9 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password
 dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, the only place looked
                                     # (default: first existing of the four conventional mounts)
 
+[audit]
+unwrap_success = true               # false: no audit record (1003) for a successful unwrap; see "Audit trail"
+
 [pkcs11]
 module = "/usr/lib/vendor/libhsm-pkcs11.so"   # PKCS#11 is used only when this is set (no default search); root-owned
 pin_file = "/etc/hkdfguard/pkcs11.pin"        # root-owned 0400, or 0440 with the service's group; this is the default
@@ -1079,7 +1208,8 @@ nothing on the module's path can be swapped before it is `dlopen`ed.
 
 Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
-fail closed -- and resolves each hardening knob to its strictest setting
+fail closed with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`) -- and resolves
+each hardening knob to its strictest setting
 (`session_encryption = "required"`, derivation secret required) rather than
 its default.
 
@@ -1093,7 +1223,7 @@ its default.
   dependency bump. 
 - **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
-  static linking (`libhkdfguard_v1.a`), and RustCrypto's P-256/HKDF-SHA512/
+  static linking (`libhkdfguard.a`), and RustCrypto's P-256/HKDF-SHA512/
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.
@@ -1192,9 +1322,12 @@ its default.
   life of the process; those keys still zeroize on drop
   (`elliptic_curve::SecretKey` implements `ZeroizeOnDrop`), but by
   definition can't be stack-only across calls.
-- **Logging** (via the `log` crate) covers provider selection, provider
-  initialization, migration events, and error codes -- never DEKs, KEKs,
-  shared secrets, HKDF output, plaintext, or ciphertext.
+- **Logging** comes in two kinds. The audit trail (see "Audit trail") is
+  syslog `authpriv` records, written whatever the host does. Diagnostics go
+  through the `log` crate: provider selection, provider initialization,
+  migration events and error reasons, seen only by a host that installs a
+  logger (the CLI logs to stderr). Neither ever carries DEKs, KEKs, shared
+  secrets, HKDF output, plaintext or ciphertext. Both name the service.
 
 ## Layout
 
@@ -1203,7 +1336,7 @@ src/
   lib.rs                    C ABI: hkdfguard_create_kek / hkdfguard_kek_exists /
                              hkdfguard_wrap_dek / hkdfguard_unwrap_dek /
                              hkdfguard_generate_and_wrap_dek /
-                             hkdfguard_harden_process; the setup-call gate
+                             hkdfguard_harden_process(_with_flags); the setup-call gate
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format (version 1)
   crypto.rs                 ECDH(H_salt) -> HKDF-SHA512 -> AES-256-GCM protocol; salt-to-point hashing
@@ -1217,17 +1350,17 @@ src/
     external_secret.rs      Provider 3 (feature `external-secret`, default)
     ephemeral.rs             Provider 4 (feature `ephemeral`, default)
   bin/
-    hkdfguard-v1-initialize.rs   CLI: `provision` and `wrap`
+    hkdfguard.rs            CLI: `provision` and `wrap`
 include/hkdfguard.h          C header
 examples/
   wrap_unwrap.c              Minimal C consumer (create_kek -> wrap -> unwrap)
   cli_unwrap_check.c         Unwraps a CLI-written key file through the .so
 tests/
-  cli_initialize_round_trip.rs   Drives the CLI as a real subprocess
+  cli_round_trip.rs          Drives the CLI as a real subprocess
   harden_process.rs              hkdfguard_harden_process, in its own process
 scripts/
   build-release.sh           cargo build --release, then links libhkdfguard.so.1
-                              (the SONAME) to Cargo's libhkdfguard_v1.so
+                              (the SONAME) to Cargo's libhkdfguard.so
   native-tpm-preflight.sh    Read-only check of a real Linux TPM host
   native-tpm-test.sh         Full matrix on a real TPM; `reboot capture|verify`
   tpm-reboot-test.sh         swtpm-restart approximation of reboot persistence
@@ -1257,15 +1390,14 @@ packaging/
   rpm/hkdfguard.spec         RPM packaging
   hkdfguard.pc.in            pkg-config template
   policy.toml.example        Annotated policy, installed to /usr/share/hkdfguard
-  hkdfguard-v1-initialize.1  Man page
+  hkdfguard.1                Man page
   third-party-licenses.py    License notices of the statically linked crates
 ```
 
 ## License
 
 HKDFGuard is licensed under the [Mozilla Public License 2.0](LICENSE)
-(`MPL-2.0`). Commits before this change were published under
-Apache-2.0, and copies already obtained under those terms keep them.
+(`MPL-2.0`).
 
 MPL-2.0 is file-level copyleft: if you distribute modified versions of
 this project's source files, those files must stay under MPL-2.0 and
@@ -1274,6 +1406,6 @@ their source must be made available. Programs that only link against
 own code; distributing a binary that includes this library only requires
 telling recipients where its source can be obtained (MPL-2.0 §3.2).
 
-The release binaries statically link Rust crates under Apache-2.0, MIT,
-BSD-3-Clause, ISC and Unlicense terms; their notices ship as
+The release binaries statically link Rust crates under their own
+permissive open-source licenses; their notices ship as
 `THIRD-PARTY-LICENSES.txt` (see `packaging/third-party-licenses.py`).

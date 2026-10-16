@@ -42,7 +42,7 @@
 //!   non-root service), in directories only root can change; one
 //!   trailing newline is ignored. The PIN itself is never read from the
 //!   environment (`/proc/<pid>/environ` is readable by same-user processes
-//!   and inherited by children); the retired `HKDFGUARD_PKCS11_PIN` is
+//!   and inherited by children); `HKDFGUARD_PKCS11_PIN`, if set, is
 //!   ignored with a warning.
 //!
 //! ## Design
@@ -100,8 +100,8 @@
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
-use elliptic_curve::sec1::ToSec1Point; // encodes our ephemeral public key into the raw bytes the token expects
-use p256::PublicKey; // the caller's ephemeral public key type
+use elliptic_curve::sec1::ToSec1Point; // encodes the payload's point into the raw bytes the token expects
+use p256::PublicKey; // the P-256 point type `ecdh` takes
 use sha2::{Digest as ShaDigest, Sha256}; // used for the CKA_ID tag (aliased to avoid clashing with cryptoki's own naming)
 use std::path::{Path, PathBuf}; // module-path validation and PIN-file location
 use std::sync::{Arc, Mutex, PoisonError}; // shared, lock-protected PKCS#11 session, and the process-wide module registry
@@ -143,8 +143,8 @@ struct OpenSession {
 /// canonical path. Kept for the life of the process and never finalized.
 ///
 /// `C_Initialize` and `C_Finalize` act on the module as a whole, for the
-/// whole process -- not on one caller's handle. Doing them per call, as an
-/// earlier revision did, was unsafe the moment two calls overlapped: the
+/// whole process -- not on one caller's handle. Doing them per call is
+/// unsafe the moment two calls overlap: the
 /// second `C_Initialize` fails with `CKR_CRYPTOKI_ALREADY_INITIALIZED`, the
 /// failed context is dropped, and `cryptoki`'s drop runs `C_Finalize` --
 /// tearing the module down under the first call's open session (undefined
@@ -415,7 +415,7 @@ fn open_session() -> Backend<OpenSession> {
         crate::provider::log_once(
             log::Level::Warn,
             format!(
-                "hkdfguard: HKDFGUARD_PKCS11_PIN is no longer supported and is ignored; put the PIN in a root-owned mode-0400 (or 0440, group = the service's group) file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE}) instead"
+                "hkdfguard: HKDFGUARD_PKCS11_PIN is set but ignored: the PIN is read only from a root-owned mode-0400 (or 0440, group = the service's group) file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE})"
             ),
         );
     }
@@ -564,7 +564,7 @@ impl KekHandle for Pkcs11Handle {
         &self.key_id
     }
 
-    fn ecdh(&self, ephemeral_public_key: &PublicKey) -> Result<SharedSecret> {
+    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
         let mut guard = self
             .state
             .lock() // only one caller may drive the session at a time
@@ -573,7 +573,7 @@ impl KekHandle for Pkcs11Handle {
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?; // session setup failed at construction time
 
-        let peer_point_bytes = ephemeral_public_key.to_sec1_point(false).as_bytes().to_vec(); // raw uncompressed point bytes the token expects as CKM_ECDH1_DERIVE's public data
+        let peer_point_bytes = point.to_sec1_point(false).as_bytes().to_vec(); // raw uncompressed point bytes the token expects as CKM_ECDH1_DERIVE's public data
 
         let params = Ecdh1DeriveParams::new(EcKdf::null(), &peer_point_bytes); // CKD_NULL: no extra KDF on-token, we do HKDF ourselves afterward
         let derive_template = [
@@ -660,9 +660,9 @@ impl KekProvider for Pkcs11Provider {
     // present, declines with `KeyNotProvisioned`: that is what lets the
     // provider chain move on to a provider that does hold the service's
     // key, and what keeps `hkdfguard_create_kek` the only path that creates
-    // one. (An earlier revision deferred all of this to `ecdh`, so
-    // create_kek reported success without creating anything and the chain
-    // could never move past PKCS#11.)
+    // one. (Deferring all of this to `ecdh` would let create_kek report
+    // success without creating anything, and the chain could never move
+    // past PKCS#11.)
     fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
         self.check_not_refused()?;
         let mut guard = self
@@ -1200,20 +1200,20 @@ mod tests {
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
 
-        let eph = p256::SecretKey::generate(); // stand-in "caller" ephemeral key for this test
-        let eph_pub = eph.public_key();
+        let peer_key = p256::SecretKey::generate(); // a stand-in peer key for this test
+        let peer = peer_key.public_key();
 
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call: generates the key pair on the token
         let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second call: must find and reuse the same one
-        assert_eq!(*h1.ecdh(&eph_pub).unwrap(), *h2.ecdh(&eph_pub).unwrap()); // same underlying key -> same shared secret
+        assert_eq!(*h1.ecdh(&peer).unwrap(), *h2.ecdh(&peer).unwrap()); // same underlying key -> same shared secret
 
         // `public_key()` must report the exact key `ecdh` actually used --
         // verified independently, by doing ECDH from the ephemeral side
         // against the reported public key and checking it agrees with
         // `h1.ecdh` above.
         let reported_public = h1.public_key().unwrap();
-        let via_reported = p256::ecdh::diffie_hellman(eph.to_nonzero_scalar(), reported_public.as_affine());
-        assert_eq!(h1.ecdh(&eph_pub).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
+        let via_reported = p256::ecdh::diffie_hellman(peer_key.to_nonzero_scalar(), reported_public.as_affine());
+        assert_eq!(h1.ecdh(&peer).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
     }
 
     #[test]
@@ -1221,10 +1221,10 @@ mod tests {
     #[serial_test::serial]
     fn load_kek_creates_only_when_asked_and_kek_exists_tracks_it() {
         // The create_kek -> kek_exists -> wrap sequence the C ABI drives, at
-        // the provider level. An earlier revision deferred the token lookup
-        // to `ecdh`, so `load_kek(_, true)` created nothing (create_kek
-        // reported success with no key) and `load_kek(_, false)` never
-        // declined (the chain could not move past PKCS#11).
+        // the provider level. Deferring the token lookup to `ecdh` would
+        // make `load_kek(_, true)` create nothing (create_kek reporting
+        // success with no key) and `load_kek(_, false)` never decline (the
+        // chain could not move past PKCS#11).
         let service = "com.hkdfguard.test.provisioning";
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
@@ -1240,8 +1240,8 @@ mod tests {
         let created = provider.load_kek(service, true).unwrap(); // hkdfguard_create_kek's path
         assert!(provider.kek_exists(service).unwrap(), "create must leave a key the token reports");
         let loaded = provider.load_kek(service, false).unwrap(); // hkdfguard_wrap_dek's path
-        let eph = p256::SecretKey::generate().public_key();
-        assert_eq!(*created.ecdh(&eph).unwrap(), *loaded.ecdh(&eph).unwrap(), "both handles must drive the same key");
+        let peer = p256::SecretKey::generate().public_key();
+        assert_eq!(*created.ecdh(&peer).unwrap(), *loaded.ecdh(&peer).unwrap(), "both handles must drive the same key");
         assert_eq!(created.public_key().unwrap(), loaded.public_key().unwrap());
 
         with_open(&provider, |open| destroy_all_for(open, service));
@@ -1252,15 +1252,15 @@ mod tests {
     #[serial_test::serial]
     fn concurrent_providers_share_one_initialized_module() {
         // Every C ABI call constructs its own provider; several at once must
-        // all work. An earlier revision ran C_Initialize/C_Finalize per
-        // provider, so overlapping calls finalized the module under each
-        // other's open sessions and failed (or crashed the module).
+        // all work. Running C_Initialize/C_Finalize per provider would let
+        // overlapping calls finalize the module under each other's open
+        // sessions and fail (or crash the module).
         let service = "com.company.orders";
-        let eph = p256::SecretKey::generate().public_key();
+        let peer = p256::SecretKey::generate().public_key();
         let expected = {
             let setup = Pkcs11Provider::new();
             assert!(setup.probe(), "no PKCS#11 session available");
-            *setup.load_kek(service, true).unwrap().ecdh(&eph).unwrap()
+            *setup.load_kek(service, true).unwrap().ecdh(&peer).unwrap()
         };
 
         let threads: Vec<_> = (0..4)
@@ -1269,7 +1269,7 @@ mod tests {
                     (0..8)
                         .map(|_| {
                             let provider = Pkcs11Provider::new();
-                            provider.load_kek(service, false).and_then(|h| h.ecdh(&eph)).map(|z| *z)
+                            provider.load_kek(service, false).and_then(|h| h.ecdh(&peer)).map(|z| *z)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1401,8 +1401,8 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| destroy_all_for(open, service));
 
-        let eph = p256::SecretKey::generate().public_key();
-        provider.load_kek(service, true).unwrap().ecdh(&eph).unwrap(); // generates the pair
+        let peer = p256::SecretKey::generate().public_key();
+        provider.load_kek(service, true).unwrap().ecdh(&peer).unwrap(); // generates the pair
 
         with_open(&provider, |open| {
             let info = open.session.get_session_info().unwrap();
@@ -1441,8 +1441,8 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| destroy_all_for(open, service));
 
-        let eph = p256::SecretKey::generate().public_key();
-        provider.load_kek(service, true).unwrap().ecdh(&eph).unwrap();
+        let peer = p256::SecretKey::generate().public_key();
+        provider.load_kek(service, true).unwrap().ecdh(&peer).unwrap();
         with_open(&provider, |open| plant_key_pair(open, service, key_id(service)));
 
         // Refused when the key is loaded -- before any ECDH is attempted.

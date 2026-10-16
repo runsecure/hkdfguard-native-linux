@@ -1,13 +1,12 @@
-//! Provider 5: Ephemeral Memory-Only KEK (final fallback).
+//! Provider 5: Ephemeral Memory-Only KEK.
 //!
 //! Generates a fresh, cryptographically random P-256 KEK per service the
 //! first time it is requested, keeps it in memory for the lifetime of the
-//! process, and never persists it. Always available, so it is guaranteed to
-//! terminate the selection chain.
+//! process, and never persists it. Used only when the policy names it.
 //!
-//! Consequence (mandated by spec, logged loudly at selection time in
-//! `provider::select`): a process restart makes every DEK wrapped under an
-//! ephemeral KEK permanently unrecoverable.
+//! Consequence (logged as a warning when the chain serves a call from it,
+//! in `provider::walk_chain`): a process restart makes every DEK wrapped
+//! under an ephemeral KEK permanently unrecoverable.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // the traits/types this module implements
@@ -51,12 +50,12 @@ impl KekHandle for EphemeralHandle {
         &self.key_id // just hand back the borrowed bytes
     }
 
-    fn ecdh(&self, ephemeral_public_key: &PublicKey) -> Result<SharedSecret> {
-        // Standard P-256 ECDH: combine our private scalar with the caller's
-        // ephemeral public point to get the shared secret.
+    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
+        // Standard P-256 ECDH: combine our private scalar with the
+        // payload's point to get the shared secret.
         let shared = p256::ecdh::diffie_hellman(
             self.secret_key.to_nonzero_scalar(), // our persistent (for this process) private scalar
-            ephemeral_public_key.as_affine(),     // the caller's one-time public point
+            point.as_affine(),     // the payload's point
         );
         let mut out = [0u8; 32]; // fixed-size buffer to hold the 32-byte shared secret
         out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared X-coordinate bytes in
@@ -160,11 +159,11 @@ mod tests {
         let handle = provider.load_kek("com.company.pubkey-test", true).unwrap();
         let reported_public = handle.public_key().unwrap();
 
-        let eph = SecretKey::generate();
-        let eph_pub = eph.public_key();
+        let peer_key = SecretKey::generate();
+        let peer = peer_key.public_key();
 
-        let via_handle = handle.ecdh(&eph_pub).unwrap();
-        let via_reported = p256::ecdh::diffie_hellman(eph.to_nonzero_scalar(), reported_public.as_affine());
+        let via_handle = handle.ecdh(&peer).unwrap();
+        let via_reported = p256::ecdh::diffie_hellman(peer_key.to_nonzero_scalar(), reported_public.as_affine());
 
         assert_eq!(via_handle.as_slice(), via_reported.raw_secret_bytes().as_slice());
     }
@@ -182,11 +181,11 @@ mod tests {
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call creates the key
         let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second call must reuse it
 
-        let eph = SecretKey::generate(); // a throwaway "caller" ephemeral key for this test
-        let eph_pub = eph.public_key();
+        let peer_key = SecretKey::generate(); // a throwaway peer key for this test
+        let peer = peer_key.public_key();
 
-        let s1 = h1.ecdh(&eph_pub).unwrap();
-        let s2 = h2.ecdh(&eph_pub).unwrap();
+        let s1 = h1.ecdh(&peer).unwrap();
+        let s2 = h2.ecdh(&peer).unwrap();
         assert_eq!(*s1, *s2); // same underlying key -> same shared secret against the same peer point
     }
 
@@ -196,11 +195,11 @@ mod tests {
         let h1 = provider.load_kek("com.company.orders", true).unwrap();
         let h2 = provider.load_kek("com.company.billing", true).unwrap(); // a different service name
 
-        let eph = SecretKey::generate();
-        let eph_pub = eph.public_key();
+        let peer_key = SecretKey::generate();
+        let peer = peer_key.public_key();
 
-        let s1 = h1.ecdh(&eph_pub).unwrap();
-        let s2 = h2.ecdh(&eph_pub).unwrap();
+        let s1 = h1.ecdh(&peer).unwrap();
+        let s2 = h2.ecdh(&peer).unwrap();
         assert_ne!(*s1, *s2); // different services must never share a KEK, so the secrets must differ
     }
 
@@ -214,8 +213,8 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let service = if i % 2 == 0 { "service.a" } else { "service.b" };
                 let h = p.load_kek(service, true).unwrap();
-                let eph = SecretKey::generate();
-                h.ecdh(&eph.public_key()).unwrap()
+                let peer_key = SecretKey::generate();
+                h.ecdh(&peer_key.public_key()).unwrap()
             }));
         }
 
@@ -226,10 +225,10 @@ mod tests {
         // Verify that keys for service.a and service.b are stable
         let ha = provider.load_kek("service.a", true).unwrap();
         let hb = provider.load_kek("service.b", true).unwrap();
-        let eph = SecretKey::generate();
+        let peer_key = SecretKey::generate();
         assert_ne!(
-            *ha.ecdh(&eph.public_key()).unwrap(),
-            *hb.ecdh(&eph.public_key()).unwrap()
+            *ha.ecdh(&peer_key.public_key()).unwrap(),
+            *hb.ecdh(&peer_key.public_key()).unwrap()
         );
     }
 }

@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, ephemeral)."
-repository = "https://github.com/torinblair/KeyProtectionCore-Linux"
+repository = "https://github.com/runsecure/hkdfguard-native-linux"
 
 [lib]
-name = "hkdfguard_v1"
+name = "hkdfguard"
 # cdylib: shared object for dynamic linking.
 # staticlib: archive for static linking into a host binary.
 # rlib: lets this crate also be used directly from Rust (tests, examples).
@@ -25,11 +25,15 @@ getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
 libc = "0.2"
-# Decodes the CLI's base64 DEK input (src/bin/hkdfguard-v1-initialize), and
-# lets hkdfguard_open_file recognise that same text as a plaintext key;
-# already pulled in transitively by other dependencies, so this adds no new
-# compiled code to the dependency graph.
+# Lets hkdfguard_open_file recognise base64 text as a plaintext key, and
+# encodes test fixtures; already pulled in transitively by other
+# dependencies, so this adds no new compiled code to the dependency graph.
 base64 = "0.23"
+# Decodes the CLI's base64 DEK input (src/bin/hkdfguard.rs) in constant
+# time: no branch or table lookup depends on the secret text, and its errors
+# carry no input data. RustCrypto's, already in the graph through pkcs8, so
+# this adds no new crate.
+base64ct = "1.8"
 # Policy file (/etc/hkdfguard/policy.toml) parsing. Parse + deserialize
 # only: this crate never writes TOML.
 serde = { version = "1", features = ["derive"] }
@@ -37,7 +41,7 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 
 # Optional hardware-backed provider dependencies. Not enabled by default
 # because they require system libraries (tpm2-tss / a PKCS#11 module) that
-# are not present on every build host. See README.md "Provider build matrix".
+# are not present on every build host. See README.md "Build & verification matrix".
 tss-esapi = { version = "7", optional = true }
 cryptoki = { version = "0.12.1", optional = true }
 

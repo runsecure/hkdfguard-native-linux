@@ -25,11 +25,11 @@ test_executables() {
 }
 
 RUSTFLAGS="$BASE_RUSTFLAGS" cargo build --locked --release --features pkcs11
-ln -sf libhkdfguard_v1.so target/release/libhkdfguard.so.1
+ln -sf libhkdfguard.so target/release/libhkdfguard.so.1
 
 mkdir -p target/c target/test-lists
 for prog in examples/wrap_unwrap.c examples/cli_unwrap_check.c docker/distros/ephemeral_cross_process.c; do
-    cc -I include "$prog" -L target/release -lhkdfguard_v1 -o "target/c/$(basename "$prog" .c)"
+    cc -I include "$prog" -L target/release -lhkdfguard -o "target/c/$(basename "$prog" .c)"
 done
 
 RUSTFLAGS="$BASE_RUSTFLAGS" cargo test --locked --no-run --message-format=json \
