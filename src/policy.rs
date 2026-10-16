@@ -191,6 +191,27 @@ struct PolicyFile {
     external_secret: ExternalSecretPolicy,
     #[serde(default)]
     pkcs11: Pkcs11Policy,
+    #[serde(default)]
+    audit: AuditPolicy,
+}
+
+/// Audit-trail settings (`[audit]`); see `crate::audit`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditPolicy {
+    /// Whether a successful unwrap writes audit event 1003. Only an
+    /// explicit `false` turns it off -- the counterpart of the Windows
+    /// build's AuditUnwrapSuccess = 0 -- for a caller that legitimately
+    /// unwraps often. Wrap events and every failure event are written
+    /// regardless.
+    #[serde(default = "default_true")]
+    unwrap_success: bool,
+}
+
+impl Default for AuditPolicy {
+    fn default() -> Self {
+        AuditPolicy { unwrap_success: true }
+    }
 }
 
 /// External-secret provider settings (`[external_secret]`).
@@ -526,6 +547,7 @@ pub struct Policy {
     tpm_owner_auth_file: Option<PathBuf>,
     external_secret_dir: Option<PathBuf>,
     pkcs11: Pkcs11Settings,
+    audit_unwrap_success: bool,
 }
 
 impl Policy {
@@ -708,6 +730,7 @@ impl Policy {
             tpm_owner_auth_file,
             external_secret_dir,
             pkcs11,
+            audit_unwrap_success: raw.audit.unwrap_success,
         })
     }
 
@@ -751,6 +774,12 @@ impl Policy {
     /// [`setup_min_delay`] for why it exists.
     pub fn setup_min_delay(&self) -> Duration {
         self.setup_min_delay
+    }
+
+    /// Whether a successful unwrap is audited (`audit.unwrap_success`) --
+    /// see the module-level [`audit_unwrap_success`].
+    pub fn audit_unwrap_success(&self) -> bool {
+        self.audit_unwrap_success
     }
 
     /// Whether the TPM provider must refuse to run without a
@@ -995,6 +1024,18 @@ pub(crate) fn setup_min_delay() -> Duration {
     match load() {
         Some(Ok(policy)) => policy.setup_min_delay(),
         Some(Err(_)) | None => Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS),
+    }
+}
+
+/// Whether a successful unwrap writes audit event 1003
+/// (`audit.unwrap_success`). `true` unless a valid policy explicitly sets
+/// it `false`: no policy file, a policy that doesn't mention it, and one
+/// that is present but invalid all keep it on -- a broken policy must
+/// never be what silently reduces auditing.
+pub(crate) fn audit_unwrap_success() -> bool {
+    match load() {
+        Some(Ok(policy)) => policy.audit_unwrap_success(),
+        Some(Err(_)) | None => true,
     }
 }
 

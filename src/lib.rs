@@ -8,6 +8,7 @@
 //! unwind across it -- see [`hkdfguard_wrap_dek`], [`hkdfguard_unwrap_dek`],
 //! and [`hkdfguard_generate_and_wrap_dek`].
 
+mod audit; // the audit trail: syslog (authpriv) records, the Windows build's Event Log events
 mod crypto; // ECDH -> HKDF -> AES-GCM protocol
 mod error; // internal error type + public status codes
 mod key_file; // reading and checking a wrapped-DEK key file (hkdfguard_open_file)
@@ -91,6 +92,7 @@ fn gated_setup<T>(f: impl FnOnce() -> T) -> T {
              connection plus at least {} ms",
             floor.as_millis()
         );
+        audit::setup_calls_exceeded(SETUP_CALLS_WARN_AT, floor.as_millis());
     }
 
     if let Some(remaining) = floor.checked_sub(entered.elapsed()) {
@@ -147,11 +149,12 @@ pub extern "C" fn hkdfguard_wrap_dek(
     // here and converted into a normal error code instead of unwinding
     // into the C caller (which would be undefined behavior).
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wrap_impl(service, dek, dek_len, out, out_len)
+        wrap_impl(audit::Op::Wrap, service, dek, dek_len, out, out_len)
     })) {
         Ok(code) => code, // normal path: whatever status code `wrap_impl` returned
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_wrap_dek boundary");
+            audit_internal_error(audit::Op::Wrap, service);
             status::INTERNAL_ERROR // a panic means a bug in this crate, not a normal failure
         }
     }
@@ -202,8 +205,18 @@ pub extern "C" fn hkdfguard_unwrap_dek(
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_unwrap_dek boundary");
             zero_caller_buffer(out, capacity);
+            audit_internal_error(audit::Op::Unwrap, service);
             status::INTERNAL_ERROR
         }
+    }
+}
+
+// Audits a panic caught at an ABI boundary as INTERNAL_ERROR (event
+// 2005), as the Windows build audits anything that escapes. Only when the
+// service name is valid: an invalid one is a caller mistake, never audited.
+fn audit_internal_error(op: audit::Op, service: *const c_char) {
+    if let Ok(service) = cstr_to_service(service) {
+        audit::operation_failed(op, &service, status::INTERNAL_ERROR);
     }
 }
 
@@ -250,6 +263,7 @@ pub extern "C" fn hkdfguard_create_kek(service: *const c_char) -> c_int {
         Ok(code) => code,
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_create_kek boundary");
+            audit_internal_error(audit::Op::CreateKek, service);
             status::INTERNAL_ERROR
         }
     }
@@ -277,6 +291,7 @@ pub extern "C" fn hkdfguard_kek_exists(service: *const c_char, exists: *mut c_in
         Ok(code) => code,
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_kek_exists boundary");
+            audit_internal_error(audit::Op::KekExists, service);
             status::INTERNAL_ERROR
         }
     }
@@ -313,6 +328,7 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
         Ok(code) => code,
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_generate_and_wrap_dek boundary");
+            audit_internal_error(audit::Op::GenerateAndWrap, service);
             status::INTERNAL_ERROR
         }
     }
@@ -435,10 +451,13 @@ fn generate_and_wrap_impl(
     let mut dek = zeroize::Zeroizing::new([0u8; crypto::DEK_LEN]); // scrubbed on drop, panic included
     if getrandom::fill(&mut dek[..]).is_err() {
         log::error!("hkdfguard: the OS random number generator failed; no DEK generated");
+        if let Ok(service) = cstr_to_service(service) {
+            audit::operation_failed(audit::Op::GenerateAndWrap, &service, status::CRYPTO_ERROR);
+        }
         return status::CRYPTO_ERROR; // an RNG failure, like wrap's own (see crypto::wrap)
     }
 
-    let code = wrap_impl(service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
+    let code = wrap_impl(audit::Op::GenerateAndWrap, service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
     dek.zeroize(); // our local copy of the freshly generated DEK is no longer needed; scrub it now
     code
 }
@@ -521,11 +540,24 @@ fn create_kek_impl(service: *const c_char) -> c_int {
     };
 
     let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
-    gated_setup(|| match provider::create_kek(&service_str) {
-        Ok(_) => status::OK,
-        Err(e) => {
-            log::error!("hkdfguard: create_kek failed for service (redacted): {e}"); // never log the service name or key material
-            e.status_code()
+    gated_setup(|| {
+        // Asked first, so the audit trail records a KEK being *created*
+        // (1000/1001), not every idempotent re-run. If the question itself
+        // fails, the create below reports the real error.
+        let existed = provider::kek_exists(&service_str).unwrap_or(false);
+        match provider::create_kek(&service_str) {
+            Ok((provider, _handle)) => {
+                if !existed {
+                    audit::kek_created(&service_str, provider.provider_type(), provider::preferred_type());
+                }
+                status::OK
+            }
+            Err(e) => {
+                log::error!("hkdfguard: create_kek failed for service \"{service_str}\": {e}"); // never key material
+                let code = e.status_code();
+                audit::operation_failed(audit::Op::CreateKek, &service_str, code);
+                code
+            }
         }
     })
 }
@@ -551,8 +583,10 @@ fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
             status::OK
         }
         Err(e) => {
-            log::error!("hkdfguard: kek_exists failed for service (redacted): {e}");
-            e.status_code()
+            log::error!("hkdfguard: kek_exists failed for service \"{service_str}\": {e}");
+            let code = e.status_code();
+            audit::operation_failed(audit::Op::KekExists, &service_str, code);
+            code
         }
     })
 }
@@ -561,6 +595,7 @@ fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
 // `catch_unwind` wrapper above. Returns a plain status code; never panics
 // intentionally (validates everything before touching unsafe pointers).
 fn wrap_impl(
+    op: audit::Op, // Wrap or GenerateAndWrap, for the audit trail
     service: *const c_char,
     dek: *const u8,
     dek_len: c_int,
@@ -613,8 +648,10 @@ fn wrap_impl(
     let wrapped = match result {
         Ok(w) => w,
         Err(e) => {
-            log::error!("hkdfguard: wrap failed for service (redacted): {e}"); // logs only the error description, never key material
-            return e.status_code();
+            log::error!("hkdfguard: wrap failed for service \"{service_str}\": {e}"); // logs only the error description, never key material
+            let code = e.status_code();
+            audit::operation_failed(op, &service_str, code);
+            return code;
         }
     };
 
@@ -633,6 +670,9 @@ fn wrap_impl(
         ptr::copy_nonoverlapping(wrapped.as_ptr(), out, wrapped.len()); // copy the wrapped payload into the caller's buffer
         *out_len = wrapped.len() as c_int; // tell the caller exactly how many bytes were written
     }
+    // Who wrapped, for which service, under which KEK, and a hash of the
+    // exact payload handed back (public bytes only -- see `audit`).
+    audit::dek_operation(op, &service_str, &wrapped);
     status::OK
 }
 
@@ -692,9 +732,11 @@ fn unwrap_impl(
     let mut dek = match crypto::unwrap(&service_str, wrapped_slice) {
         Ok(dek) => dek, // recovered plaintext DEK, in a self-zeroizing local
         Err(e) => {
-            log::error!("hkdfguard: unwrap failed for service (redacted): {e}"); // log the reason, never the key material
+            log::error!("hkdfguard: unwrap failed for service \"{service_str}\": {e}"); // log the reason, never the key material
             zero_out_buffer();
-            return e.status_code();
+            let code = e.status_code();
+            audit::operation_failed(audit::Op::Unwrap, &service_str, code);
+            return code;
         }
     };
 
@@ -705,6 +747,11 @@ fn unwrap_impl(
         *out_len = crypto::DEK_LEN as c_int; // always exactly 32 on success
     }
     dek.zeroize(); // our local copy has served its purpose; scrub it now rather than waiting for scope exit
+    // Unless policy turns it off (audit.unwrap_success = false): who
+    // unwrapped, and the same payload hash its wrap record carries.
+    if policy::audit_unwrap_success() {
+        audit::dek_operation(audit::Op::Unwrap, &service_str, wrapped_slice);
+    }
     status::OK
 }
 
@@ -816,9 +863,14 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
     let wrapped = match key_file::read(&path) {
         Ok(contents) => contents, // wiped when it drops at the end of this function
         Err(e) => {
-            // The path is left out, as service names are: it often contains one.
-            log::error!("hkdfguard: hkdfguard_open_file refused a key file: {}", e.describe());
-            return fail(e.status_code());
+            log::error!("hkdfguard: hkdfguard_open_file refused key file {}: {}", path.display(), e.describe());
+            let code = e.status_code();
+            // The one open_file failure that is audited: a possible key
+            // exposure an administrator needs to hear about (event 2006).
+            if code == status::FILE_PLAINTEXT_KEY {
+                audit::plaintext_key_file(&path);
+            }
+            return fail(code);
         }
     };
     let len = wrapped.as_slice().len(); // at most MAX_WRAPPED_LEN, so it fits a c_int
@@ -2111,5 +2163,111 @@ mod ffi_tests {
         let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
         assert_eq!(rc, status::OK);
         assert_eq!(&out[..out_len as usize], &bytes[..]);
+    }
+
+    // ---- the audit trail (see `audit`; records are captured in memory in test builds) ----
+
+    #[test]
+    #[serial]
+    fn create_wrap_and_unwrap_are_audited_with_the_service_and_one_payload_hash() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.audit.trail").unwrap();
+            create_kek_for_test(&service);
+            let created = audit::captured_containing("service=\"com.company.audit.trail\"");
+            // The test policy prefers external-secret, which isn't set up
+            // here, so the KEK lands on Ephemeral: a fallback (1001).
+            assert!(
+                created.iter().any(|r| r.starts_with("<84>")
+                    && r.contains("event=1001 op=hkdfguard_create_kek")
+                    && r.contains("provider=EPHEMERAL preferred=EXTERNAL_SECRET")),
+                "creating the KEK off the first choice is audited as a fallback: {created:?}"
+            );
+            // A second create finds it: no second creation record.
+            create_kek_for_test(&service);
+            let again = audit::captured_containing("service=\"com.company.audit.trail\"");
+            assert_eq!(
+                again.iter().filter(|r| r.contains("event=1000 ") || r.contains("event=1001 ")).count(),
+                1,
+                "only a real creation is audited"
+            );
+
+            let wrapped = wrapped_for_test(&service, &[7u8; 32]);
+            let mut out = [0u8; 32];
+            let mut out_len = out.len() as c_int;
+            assert_eq!(
+                hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped.len() as c_int, out.as_mut_ptr(), &mut out_len),
+                status::OK
+            );
+
+            use sha2::{Digest, Sha256};
+            let hash: String = Sha256::digest(&wrapped).iter().map(|b| format!("{b:02x}")).collect();
+            let records = audit::captured_containing(&hash);
+            assert!(records.iter().any(|r| r.contains("event=1002 op=hkdfguard_wrap_dek result=OK service=\"com.company.audit.trail\"")), "{records:?}");
+            assert!(records.iter().any(|r| r.contains("event=1003 op=hkdfguard_unwrap_dek result=OK service=\"com.company.audit.trail\"")), "{records:?}");
+            assert!(records.iter().all(|r| r.contains("kek_fingerprint=") && r.contains(" uid=")), "{records:?}");
+
+            // A tampered payload: the failed unwrap is audited (2003).
+            let mut tampered = wrapped.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 1;
+            let mut out_len = out.len() as c_int;
+            assert_ne!(
+                hkdfguard_unwrap_dek(service.as_ptr(), tampered.as_ptr(), tampered.len() as c_int, out.as_mut_ptr(), &mut out_len),
+                status::OK
+            );
+            let failures = audit::captured_containing("op=hkdfguard_unwrap_dek result=");
+            assert!(failures.iter().any(|r| r.contains("event=2003 ") && r.contains("service=\"com.company.audit.trail\"")), "{failures:?}");
+
+            // A caller mistake is not.
+            let before = audit::captured_containing("com.company.audit.trail").len();
+            let mut tiny = [0u8; 1];
+            let mut tiny_len = 1;
+            assert_eq!(
+                hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped.len() as c_int, tiny.as_mut_ptr(), &mut tiny_len),
+                status::BUFFER_TOO_SMALL
+            );
+            assert_eq!(audit::captured_containing("com.company.audit.trail").len(), before);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn audit_unwrap_success_false_silences_only_the_unwrap_success_record() {
+        let _policy = crate::policy::test_support::TestPolicy::write(
+            "preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[audit]\nunwrap_success = false\n",
+        );
+        let service = CString::new("com.company.audit.quiet").unwrap();
+        create_kek_for_test(&service);
+        let wrapped = wrapped_for_test(&service, &[9u8; 32]);
+        let mut out = [0u8; 32];
+        let mut out_len = out.len() as c_int;
+        assert_eq!(
+            hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped.len() as c_int, out.as_mut_ptr(), &mut out_len),
+            status::OK
+        );
+        let records = audit::captured_containing("service=\"com.company.audit.quiet\"");
+        assert!(records.iter().any(|r| r.contains("event=1002 ")), "wrap is still audited: {records:?}");
+        assert!(!records.iter().any(|r| r.contains("event=1003 ")), "unwrap success is not: {records:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn an_audit_section_with_a_non_boolean_is_an_invalid_policy() {
+        let _policy = crate::policy::test_support::TestPolicy::write(
+            "preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[audit]\nunwrap_success = 0\n",
+        );
+        assert!(matches!(crate::policy::load(), Some(Err(_))));
+        assert!(crate::policy::audit_unwrap_success(), "a broken policy keeps unwrap auditing on");
+    }
+
+    #[test]
+    #[serial]
+    fn a_plaintext_key_file_is_audited_with_its_path() {
+        let (_dir, path) = key_file_with(&[9u8; 32]);
+        let (rc, _, _) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!(rc, status::FILE_PLAINTEXT_KEY);
+        let shown = path.to_str().unwrap();
+        let records = audit::captured_containing(shown);
+        assert!(records.iter().any(|r| r.contains("event=2006 op=hkdfguard_open_file")), "{records:?}");
     }
 }

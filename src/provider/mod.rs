@@ -245,6 +245,13 @@ fn allowed_types() -> Result<Vec<ProviderType>> {
     policy.allowed_providers(&compiled)
 }
 
+/// The policy's first choice of provider (the head of the allowed chain),
+/// for the audit trail's "created somewhere else" event (1001). `None` if
+/// the policy can't be read -- the call it's for then fails closed anyway.
+pub(crate) fn preferred_type() -> Option<ProviderType> {
+    allowed_types().ok().and_then(|types| types.first().copied())
+}
+
 /// Ensures the "no persistent provider available, running on EPHEMERAL"
 /// warning is logged once per process rather than on every wrap call.
 static EPHEMERAL_WARNED: OnceLock<()> = OnceLock::new(); // `set()` succeeds exactly once per process; later calls fail harmlessly
@@ -255,9 +262,9 @@ static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new())
 /// Logs `message` at warn level the first time this process sees it, and
 /// never again. For events that are worth an operator's attention but
 /// would repeat on every call -- a fallback, a migration hint -- so the
-/// log shows each distinct one once instead of flooding. Messages never
-/// carry a service name (see the C ABI's "(redacted)" lines), so this is
-/// bounded by the number of provider combinations, not of services.
+/// log shows each distinct one once instead of flooding. Bounded by the
+/// number of distinct messages: provider combinations, and the services a
+/// process uses where a message names one.
 fn warn_once(message: String) {
     log_once(log::Level::Warn, message);
 }

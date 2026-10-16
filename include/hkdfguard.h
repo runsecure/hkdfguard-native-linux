@@ -181,9 +181,13 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * to create. With `tpm.require_pinned_names: true` in the policy file, a
  * service exists on the TPM only if policy pins its Name; for an unpinned
  * service this call fails and logs (at error level) the policy entry to
- * add, with the service name shown as a `<service>` placeholder (service
- * names are kept out of the log). Provisioning on TPM is that root-owned
- * policy edit.
+ * add, ready to paste. Provisioning on TPM is that root-owned policy
+ * edit.
+ *
+ * Audited: creating a KEK, every wrap and unwrap, and the failures an
+ * administrator needs to see are written to syslog (facility authpriv,
+ * tag hkdfguard) with the Windows build's event IDs - see README.md,
+ * "Audit trail".
  *
  * Deliberately slow: this and hkdfguard_kek_exists are setup calls, meant
  * to run once per application startup, and each takes at least

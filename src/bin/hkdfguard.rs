@@ -663,12 +663,9 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
 
     let rc = hkdfguard_create_kek(service_c.as_ptr());
     if rc != status::OK {
-        // The library keeps service names out of its log, so where it asks
-        // for one (a `<service>` placeholder in a policy entry to add), the
-        // name is given here.
         return Err(format!(
             "hkdfguard_create_kek failed for service \"{service_name}\": {} (see the messages above for the \
-             provider's reason; where they show <service>, use \"{service_name}\")",
+             provider's reason)",
             describe_status(rc)
         ));
     }

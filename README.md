@@ -221,6 +221,66 @@ someone untrusted could change -- makes every operation fail closed with
 `HKDFGUARD_ERR_POLICY_INVALID` (`-9`).
 (Only test builds -- see "Testing against scratch configuration" -- also accept the process's own user.)
 
+### Audit trail
+
+The library writes one syslog record per security-relevant event, whatever
+the host does about logging. The records use facility `authpriv` and tag
+`hkdfguard`, sent straight to `/dev/log`. On systemd hosts they land in the
+journal (`journalctl -t hkdfguard`); elsewhere in `/var/log/secure` or
+`/var/log/auth.log`. These are the Windows build's Event Log events, with the
+same IDs, meanings and severities, so one set of alerts covers both:
+
+| ID | Severity | When |
+|---|---|---|
+| 1000 | info | A KEK was created (not merely found). TPM2 keys are derived on demand, never created, so TPM2 doesn't produce this. |
+| 1001 | warning | A KEK was created on a provider other than the policy's first choice, which was unavailable or declined. |
+| 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
+| 1003 | info | A DEK was unwrapped. |
+| 2000 | warning | `KEK_ACCESS_DENIED`. |
+| 2002 | error | `KEK_INVALID`. |
+| 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2004 | error | `POLICY_INVALID`: every call fails closed until the policy is fixed. |
+| 2005 | error | `PROVIDER_UNAVAILABLE`, `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`. |
+| 2006 | error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
+| 2007 | warning | A process made more than 10 setup calls (see above). Logged once per process. |
+
+Each record is `key=value` fields followed by a sentence:
+
+```text
+hkdfguard[4242]: event=1002 op=hkdfguard_wrap_dek result=OK service="com.company.orders" provider=TPM2
+  kek_fingerprint=3f9c... payload_sha256=a01b... uid=990 euid=990 pid=4242 exe="/usr/bin/orders" msg="DEK wrapped"
+```
+
+The fields identify the caller (`uid`, `euid`, `pid`, `exe`) and the service
+by name: service names are public identifiers and are never redacted. Wrap
+and unwrap records also carry the KEK's fingerprint and a SHA-256 of the
+wrapped payload. Both are public, and the same payload hashes the same in its
+wrap record and in every unwrap record, which ties each unwrap back to the
+wrap that made it. That also makes a substituted older payload visible (see
+"Design decisions worth knowing"). To hash a key file for comparison, run
+`sha256sum <file>`.
+
+The records never contain DEKs, KEKs, shared secrets, derived keys or
+plaintext. Caller mistakes (`INVALID_ARGUMENT`, `BUFFER_TOO_SMALL`,
+`INVALID_SERVICE_NAME`) and `KEK_NOT_FOUND` aren't recorded. Delivery is
+best effort: non-blocking, and a missing `/dev/log` (as in a minimal
+container) never changes or delays a call. `openlog(3)` is never called, so
+the host's own syslog tag and facility are left alone. Anything on the host
+can write to `/dev/log` under any tag, so these records are an audit aid,
+not tamper-proof evidence.
+
+For a caller that legitimately unwraps often, the policy file can turn off
+the unwrap-success record (1003) alone:
+
+```toml
+[audit]
+unwrap_success = false   # default true
+```
+
+Only an explicit `false` in a valid policy turns it off. A missing policy,
+or one that is present but invalid, keeps it on. Wrap records and every
+failure record are always written.
+
 ### Setup calls are deliberately slow
 
 `hkdfguard_create_kek` and `hkdfguard_kek_exists` are meant to run once
@@ -373,17 +433,16 @@ configured):
 
 ```text
 $ hkdfguard provision -sn com.company.orders
-error: hkdfguard: create_kek failed for service (redacted): provider error: TPM2: tpm.require_pinned_names
-is set and this service has no pinned TPM Name. To provision it, add this to the policy file, with <service>
-replaced by the service name, and run provision again:
+error: hkdfguard: create_kek failed for service "com.company.orders": provider error: TPM2:
+tpm.require_pinned_names is set and service "com.company.orders" has no pinned TPM Name. To provision it,
+add this to the policy file and run provision again:
   [tpm.pinned_names]
-  "<service>" = "000b..."
+  "com.company.orders" = "000b..."
 error: hkdfguard_create_kek failed for service "com.company.orders": the selected KEK provider failed (see the
-messages above for the provider's reason; where they show <service>, use "com.company.orders")
+messages above for the provider's reason)
 ```
 
-The library's own message uses a `<service>` placeholder because it keeps
-service names out of its log; `provision` fills it in on the line after.
+The entry is ready to paste as printed.
 
 Add the entry as root and run `provision` again; it then reports
 "already provisioned". The same entry also gives you substitution
@@ -1080,6 +1139,9 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password
 dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, the only place looked
                                     # (default: first existing of the four conventional mounts)
 
+[audit]
+unwrap_success = true               # false: no audit record (1003) for a successful unwrap; see "Audit trail"
+
 [pkcs11]
 module = "/usr/lib/vendor/libhsm-pkcs11.so"   # PKCS#11 is used only when this is set (no default search); root-owned
 pin_file = "/etc/hkdfguard/pkcs11.pin"        # root-owned 0400, or 0440 with the service's group; this is the default
@@ -1212,9 +1274,12 @@ its default.
   life of the process; those keys still zeroize on drop
   (`elliptic_curve::SecretKey` implements `ZeroizeOnDrop`), but by
   definition can't be stack-only across calls.
-- **Logging** (via the `log` crate) covers provider selection, provider
-  initialization, migration events, and error codes -- never DEKs, KEKs,
-  shared secrets, HKDF output, plaintext, or ciphertext.
+- **Logging** comes in two kinds. The audit trail (see "Audit trail") is
+  syslog `authpriv` records, written whatever the host does. Diagnostics go
+  through the `log` crate: provider selection, provider initialization,
+  migration events and error reasons, seen only by a host that installs a
+  logger (the CLI logs to stderr). Neither ever carries DEKs, KEKs, shared
+  secrets, HKDF output, plaintext or ciphertext. Both name the service.
 
 ## Layout
 

@@ -25,9 +25,12 @@ sudo systemd-run --pty --uid=orders --gid=orders \
 (`sudo -u orders ...` works too, but only with the user's permanent groups,
 not a systemd unit's `SupplementaryGroups=`.)
 
-The output names the provider and the exact reason. Service names are kept
-out of the library's own messages: they appear as `(redacted)` or
-`<service>`, and the CLI repeats the real name on its last line.
+The output names the provider, the service and the exact reason.
+
+Every failure worth an administrator's attention is also in the audit trail,
+with the caller and service, whatever process hit it:
+`journalctl -t hkdfguard` (or `grep hkdfguard /var/log/secure` or
+`/var/log/auth.log`). Event IDs are listed in the README, "Audit trail".
 
 The library re-reads `/etc/hkdfguard/policy.toml` on every call, so after
 fixing the policy or a file, just try again. Nothing needs restarting.
@@ -93,7 +96,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 |---|---|
 | `TPM derivation secret at ... is present but unusable` | Make it `root:<group> 0440` or `root:root 0400`, a regular file (not a symlink), and not empty |
 | `TSS2_LOG enables debug/trace logging in tpm2-tss ...` | Unset `TSS2_LOG`, or lower it to `info` or below: at debug levels tpm2-tss logs secrets |
-| `tpm.require_pinned_names is set and this service has no pinned TPM Name` | The service isn't in `[tpm.pinned_names]`. Add the line the message prints (replacing `<service>`), then run `provision` again. |
+| `tpm.require_pinned_names is set and this service has no pinned TPM Name` | The service isn't in `[tpm.pinned_names]`. Add the line the message prints, then run `provision` again. |
 | A pinned Name mismatch | The TPM derives a different key than the pinned one: the derivation secret changed, the TPM was cleared or replaced, or the pin was learned before the secret was created. Re-learn the pin only once you're sure which key is right: see [Fingerprint mismatch](#fingerprint-mismatch--16). |
 | A failed owner authorization | `owner_auth_file` and the TPM's owner password disagree. Set both in the same change. |
 | `could not open the configured TCTI` | The `tcti` the policy names can't be opened. Check the path, or that `tpm2-abrmd` is running for `tabrmd:`. |

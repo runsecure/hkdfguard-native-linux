@@ -1252,15 +1252,13 @@ fn unpinned_service_instructions(context: &Arc<Mutex<Option<Context>>>, service:
         let (_public, name) = create_and_read_primary(ctx, service, secret.as_ref())?;
         Ok(hex(name.value()))
     })();
-    // The service name itself stays out of the message: it is logged, and
-    // service names are kept out of the log (see the C ABI's "(redacted)"
-    // lines). The placeholder is the name the caller passed, which the
-    // caller -- `hkdfguard provision`, say -- already knows.
+    // Paste-ready: the entry names the (normalized) service itself. Service
+    // names are public identifiers, so the message carries it as-is.
     match name {
         Ok(name) => format!(
-            "tpm.require_pinned_names is set and this service has no pinned TPM Name. To provision \
-             it, add this to the policy file, with <service> replaced by the service name, and run \
-             provision again:\n  [tpm.pinned_names]\n  \"<service>\" = \"{name}\""
+            "tpm.require_pinned_names is set and service \"{service}\" has no pinned TPM Name. To \
+             provision it, add this to the policy file and run provision again:\n  [tpm.pinned_names]\n  \
+             \"{service}\" = \"{name}\""
         ),
         Err(e) => format!(
             "tpm.require_pinned_names is set and this service has no pinned TPM Name; deriving its \
@@ -2460,10 +2458,9 @@ mod tests {
             })
             .unwrap();
             assert!(
-                message.contains(&format!("\"<service>\" = \"{actual}\"")),
-                "the refusal must carry a paste-ready pin for the real Name; got: {message}"
+                message.contains(&format!("\"{service}\" = \"{actual}\"")),
+                "the refusal must carry a paste-ready pin, for this service, of the real Name; got: {message}"
             );
-            assert!(!message.contains(service), "the refusal is logged, so it must not name the service: {message}");
 
             // Pinned (as the operator would, from that message): now it exists,
             // loads, and works end to end.
