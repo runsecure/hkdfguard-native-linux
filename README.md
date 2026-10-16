@@ -1062,10 +1062,20 @@ group, can give a file to it. Over-broad groups are refused: `root`, `users`,
 matched by name and by gid. `hkdfguard_open_file` accepts the result, since
 group read is never a reason to refuse a key file.
 
-A `--dek-file` must be a regular file, not a symlink, owned by root or by
+A `--dek-file` must be reached through real folders (no symbolic link anywhere
+above it, as for the key file), and must be a regular file, not a symlink, owned by root or by
 the invoking user, with no group or other access (e.g. `0400`/`0600`) — the
 same rules the library applies to the PKCS#11 PIN and the TPM derivation
-secret. One trailing newline is ignored on both paths.
+secret. On both paths the input is strict standard base64 (`+/`, padded), at
+most 64 bytes: one trailing newline (LF or CRLF) is ignored, and no other
+whitespace is accepted. A leading UTF-8 byte-order mark (some Windows tools
+add one) is skipped, and UTF-16 input is refused with a message saying so.
+The Windows tool applies the same rules, so the same input works on both.
+Decoding uses RustCrypto's `base64ct`, constant time with respect to the DEK
+text, and any malformed input gets one fixed message that names no character
+or offset, so a mistyped DEK never ends up in a log. `--dek-stdin` refuses
+an interactive terminal: pipe the DEK in rather than typing or pasting it,
+so it isn't echoed or kept in the scrollback.
 
 > The remaining exposure is upstream of this tool: don't put the DEK in an
 > environment variable, and don't pipe it with an `echo` that resolves to

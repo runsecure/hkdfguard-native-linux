@@ -77,7 +77,7 @@
 //! filesystems (e.g. btrfs, ZFS), or on flash storage doing wear-leveling
 //! remaps, where the original blocks may still exist elsewhere.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64ct::{Base64, Encoding as _};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -135,6 +135,19 @@ const MAX_DECODED_LEN: usize = MAX_DEK_INPUT_LEN / 4 * 3;
 // Mode bits that must be clear on a --dek-file: no access at all for
 // group or others.
 const FORBID_GROUP_OTHER_ACCESS: u32 = 0o077;
+// Any DEK input that isn't strict, padded, standard base64 -- the Windows
+// tool's wording. Deliberately fixed: it names no character, offset or bit
+// pattern, so a mistyped DEK never puts part of itself into a log.
+const INVALID_BASE64_DEK_MESSAGE: &str =
+    "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)";
+// Refusing to read the DEK from an interactive terminal -- the Windows
+// tool's wording.
+const TERMINAL_DEK_MESSAGE: &str = "refusing to read the DEK from an interactive terminal, where it would be \
+                                    echoed and kept in the scrollback; pipe it in instead, e.g. \
+                                    printf '%s' \"$DEK_B64\" | hkdfguard wrap ... --dek-stdin";
+// Refusing UTF-16 DEK input -- the Windows tool's wording.
+const UTF16_DEK_MESSAGE: &str = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text \
+                                 (in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)";
 
 // Where the base64 DEK is read from. Never argv, never the environment --
 // see this file's header comment.
@@ -320,6 +333,11 @@ fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN
         }
     }
     if filled > MAX_DEK_INPUT_LEN {
+        // UTF-16 doubles the text, so it is over the limit long before
+        // decode_dek could say why: name it here instead.
+        if buf.starts_with(b"\xFF\xFE") || buf.starts_with(b"\xFE\xFF") {
+            return Err(UTF16_DEK_MESSAGE.to_string());
+        }
         return Err(format!(
             "{what} is longer than {MAX_DEK_INPUT_LEN} bytes; expected base64 of a {DEK_LEN}-byte DEK"
         ));
@@ -332,6 +350,12 @@ fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN
 // ownership/permission checks made against the *opened descriptor* rather
 // than the path, so nothing can be swapped between the check and the read.
 fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<usize, String> {
+    // No symbolic link in the folders above it either, as for the key file
+    // (and as the Windows tool requires of its --dek-file): a redirected
+    // folder could make the deployment wrap a DEK someone else planted.
+    // O_NOFOLLOW below covers the file itself; `require_opened_at` confirms
+    // the descriptor is the file at the spelled path.
+    let spelled = require_real_folder(Path::new(path))?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
@@ -343,6 +367,7 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
                 format!("failed to open --dek-file {path}: {e}")
             }
         })?;
+    require_opened_at(&file, Path::new(path), &spelled)?;
 
     let meta = file
         .metadata()
@@ -373,12 +398,23 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
 
 // Decodes the base64 DEK text, tolerating exactly one trailing newline
 // (optionally CRLF) so a file written by `printf '%s\n'` or an editor
-// still works. Only base64 is accepted: raw 32-byte input fails to decode
-// with a clear error rather than being silently misinterpreted.
+// still works, and a leading UTF-8 byte-order mark, which some Windows
+// tools (PowerShell, .NET) prepend; a UTF-16 byte-order mark is refused as
+// such, since the fix is on the sending side. Then strict standard base64
+// (the `+/` alphabet, canonical padding, zero unused bits): no other
+// whitespace anywhere. Decoded with base64ct, in constant time with respect
+// to the secret text, and any failure reported with one fixed message. The Windows tool applies these rules exactly, so the
+// same input is accepted or refused on both. Only base64 is accepted: raw
+// 32-byte input fails to decode with a clear error rather than being
+// silently misinterpreted.
 //
 // Decodes into `out` (the caller's `DekScratch`), never into a fresh
 // allocation, and returns the DEK as a slice of it.
 fn decode_dek<'a>(text: &[u8], out: &'a mut [u8; MAX_DECODED_LEN]) -> Result<&'a [u8], String> {
+    let text = text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(text);
+    if text.starts_with(b"\xFF\xFE") || text.starts_with(b"\xFE\xFF") {
+        return Err(UTF16_DEK_MESSAGE.to_string());
+    }
     let trimmed = match text.strip_suffix(b"\n") {
         Some(t) => t.strip_suffix(b"\r").unwrap_or(t),
         None => text,
@@ -387,9 +423,9 @@ fn decode_dek<'a>(text: &[u8], out: &'a mut [u8; MAX_DECODED_LEN]) -> Result<&'a
         return Err("the DEK input is empty".to_string());
     }
 
-    let len = STANDARD
-        .decode_slice(trimmed, out)
-        .map_err(|e| format!("the DEK input is not valid base64: {e}"))?;
+    // Constant time over the secret text (base64ct: no data-dependent branch
+    // or table lookup), and the error carries no input data either way.
+    let len = Base64::decode(trimmed, out).map_err(|_| INVALID_BASE64_DEK_MESSAGE.to_string())?.len();
     if len != DEK_LEN {
         return Err(format!("the DEK must decode to exactly {DEK_LEN} bytes, got {len}"));
     }
@@ -453,6 +489,12 @@ impl Drop for DekScratch {
 fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [u8], String> {
     let len = match source {
         DekSource::Stdin => {
+            // A DEK typed or pasted at a terminal is echoed and stays in the
+            // scrollback: refuse a terminal outright rather than read it.
+            // SAFETY: isatty takes a descriptor number and only inspects it.
+            if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+                return Err(TERMINAL_DEK_MESSAGE.to_string());
+            }
             let stdin = std::io::stdin();
             let mut locked = stdin.lock();
             read_bounded(&mut locked, "the DEK on stdin", &mut scratch.text)?
@@ -673,7 +715,7 @@ fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
     let real = fs::canonicalize(folder).map_err(|e| format!("failed to resolve the folder of {}: {e}", path.display()))?;
     if real != folder {
         return Err(format!(
-            "{}'s folder {} resolves through a symbolic link to {}; the key file path must be a real path with \
+            "{}'s folder {} resolves through a symbolic link to {}; the path must be a real path with \
              no links in it",
             path.display(),
             folder.display(),
@@ -1104,6 +1146,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serial_test::serial;
     use tempfile::NamedTempFile;
 
@@ -1297,6 +1340,23 @@ mod tests {
         let err = secure_delete(&base.join("link/victim.key")).unwrap_err();
         assert!(err.contains("symbolic link"), "{err}");
         assert_eq!(fs::read(real.join("victim.key")).unwrap(), b"not yours");
+    }
+
+    #[test]
+    fn read_dek_file_refuses_a_file_reached_through_a_symlinked_folder() {
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("dek.b64"), valid_b64()).unwrap();
+        fs::set_permissions(real.join("dek.b64"), fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&real, base.join("link")).unwrap();
+        let mut buf = [0u8; MAX_DEK_INPUT_LEN + 1];
+        let err = read_dek_file(base.join("link/dek.b64").to_str().unwrap(), &mut buf).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        // The real path reads.
+        assert!(read_dek_file(real.join("dek.b64").to_str().unwrap(), &mut buf).is_ok());
     }
 
     #[test]
@@ -1604,6 +1664,58 @@ mod tests {
         assert!(decode_dek(STANDARD.encode([0u8; 33]).as_bytes()).is_err(), "33 bytes");
         // Raw 32 bytes is not accepted as a silent alternative encoding.
         assert!(decode_dek(&[0x5au8; DEK_LEN]).is_err(), "raw bytes must not decode");
+        // The Windows tool's rules, case for case (tests/test_cli.ps1 12b2).
+        let b64 = valid_b64();
+        assert!(decode_dek(format!(" {b64}").as_bytes()).is_err(), "a leading space");
+        assert!(decode_dek(format!("{}\n{}", &b64[..20], &b64[20..]).as_bytes()).is_err(), "a line break inside");
+        assert!(decode_dek(format!("{} {}", &b64[..20], &b64[20..]).as_bytes()).is_err(), "a space inside");
+        assert!(decode_dek(b64.trim_end_matches('=').as_bytes()).is_err(), "missing padding");
+        let zeros = STANDARD.encode([0u8; DEK_LEN]);
+        assert!(decode_dek(format!("{}B=", &zeros[..42]).as_bytes()).is_err(), "non-zero bits before the padding");
+        let mut mixed = vec![0xFBu8, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF];
+        mixed.extend(1..=26u8);
+        let standard = STANDARD.encode(&mixed);
+        assert!(standard.contains('+') && standard.contains('/'));
+        assert_eq!(decode_dek(standard.as_bytes()).unwrap(), &mixed[..], "the '+' and '/' characters");
+        assert!(decode_dek(standard.replace('+', "-").replace('/', "_").as_bytes()).is_err(), "the URL-safe alphabet");
+    }
+
+    #[test]
+    fn decode_dek_reports_every_malformed_input_with_one_fixed_message() {
+        // No character, offset or bit pattern of the input reaches the
+        // message -- a mistyped DEK never puts part of itself into a log.
+        let b64 = valid_b64();
+        let zeros = STANDARD.encode([0u8; DEK_LEN]);
+        let mut mixed = vec![0xFBu8, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF];
+        mixed.extend(1..=26u8);
+        let url_safe = STANDARD.encode(&mixed).replace('+', "-").replace('/', "_");
+        let cases = [
+            format!(" {b64}"),
+            format!("{} {}", &b64[..20], &b64[20..]),
+            b64.trim_end_matches('=').to_string(),
+            format!("{}B=", &zeros[..42]),
+            format!("{b64}\n\n"),
+            url_safe,
+            "not base64!!".to_string(),
+        ];
+        let mut out = [0u8; MAX_DECODED_LEN];
+        for case in cases {
+            let err = decode_dek(case.as_bytes(), &mut out).unwrap_err();
+            assert_eq!(err, INVALID_BASE64_DEK_MESSAGE, "for {case:?}");
+        }
+    }
+
+    #[test]
+    fn decode_dek_skips_a_utf8_bom_and_refuses_utf16() {
+        let b64 = valid_b64();
+        let mut out = [0u8; MAX_DECODED_LEN];
+        let with_bom = [b"\xEF\xBB\xBF".as_slice(), b64.as_bytes(), b"\r\n"].concat();
+        assert_eq!(decode_dek(&with_bom, &mut out).unwrap(), [0x5au8; DEK_LEN]);
+        for bom in [b"\xFF\xFE".as_slice(), b"\xFE\xFF".as_slice()] {
+            let utf16 = [bom, b64.as_bytes()].concat();
+            let err = decode_dek(&utf16, &mut out).unwrap_err();
+            assert!(err.contains("UTF-16"), "{err}");
+        }
     }
 
     #[test]
@@ -1614,6 +1726,12 @@ mod tests {
 
         let at_limit = vec![b'A'; MAX_DEK_INPUT_LEN];
         assert_eq!(read_bounded(&mut at_limit.as_slice(), "test", &mut buf).unwrap(), MAX_DEK_INPUT_LEN);
+
+        // UTF-16 base64 of a DEK is 90 bytes: over the limit, and named as
+        // UTF-16 rather than as merely too long.
+        let utf16: Vec<u8> = [0xFFu8, 0xFE].into_iter().chain(valid_b64().bytes().flat_map(|b| [b, 0])).collect();
+        let err = read_bounded(&mut utf16.as_slice(), "stdin", &mut buf).unwrap_err();
+        assert!(err.contains("UTF-16"), "{err}");
     }
 
     // ---- memory locking decision ----

@@ -76,7 +76,7 @@ hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 | `--service-name`, `-sn` | The service whose KEK is used |
 | `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file. |
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
-| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink, owned by root or you, mode `0400` or `0600` |
+| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600` |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
 | `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
 

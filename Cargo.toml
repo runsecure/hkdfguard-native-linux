@@ -25,11 +25,15 @@ getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
 libc = "0.2"
-# Decodes the CLI's base64 DEK input (src/bin/hkdfguard.rs), and
-# lets hkdfguard_open_file recognise that same text as a plaintext key;
-# already pulled in transitively by other dependencies, so this adds no new
-# compiled code to the dependency graph.
+# Lets hkdfguard_open_file recognise base64 text as a plaintext key, and
+# encodes test fixtures; already pulled in transitively by other
+# dependencies, so this adds no new compiled code to the dependency graph.
 base64 = "0.23"
+# Decodes the CLI's base64 DEK input (src/bin/hkdfguard.rs) in constant
+# time: no branch or table lookup depends on the secret text, and its errors
+# carry no input data. RustCrypto's, already in the graph through pkcs8, so
+# this adds no new crate.
+base64ct = "1.8"
 # Policy file (/etc/hkdfguard/policy.toml) parsing. Parse + deserialize
 # only: this crate never writes TOML.
 serde = { version = "1", features = ["derive"] }

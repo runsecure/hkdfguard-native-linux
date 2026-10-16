@@ -299,6 +299,43 @@ fn cli_group_makes_the_key_file_group_readable_and_it_still_opens() {
 
 #[test]
 #[serial]
+fn cli_refuses_to_read_the_dek_from_a_terminal() {
+    // A real pseudo-terminal as stdin: what an operator typing or pasting
+    // the DEK would give the CLI. Refused before anything is read, so no
+    // provider is needed and nothing is written.
+    use std::os::fd::FromRawFd;
+    let (mut controller, mut device) = (-1, -1);
+    // SAFETY: openpty writes two descriptors into the given ints; the rest are optional (NULL).
+    let rc = unsafe {
+        libc::openpty(&mut controller, &mut device, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+    };
+    if rc != 0 {
+        eprintln!("skipping: no pseudo-terminal available ({})", std::io::Error::last_os_error());
+        return;
+    }
+    // SAFETY: both descriptors were just returned by openpty and are owned here.
+    let (controller, device) = unsafe { (std::fs::File::from_raw_fd(controller), std::fs::File::from_raw_fd(device)) };
+
+    let dir = tempdir().unwrap();
+    let key_path = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+    let output = cli()
+        .arg("wrap")
+        .args(["--key-file-path", key_path.to_str().unwrap()])
+        .args(["--service-name", "com.example.terminal"])
+        .arg("--dek-stdin")
+        .stdin(Stdio::from(device))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run hkdfguard wrap");
+    drop(controller);
+    assert!(!output.status.success(), "reading the DEK from a terminal must be refused");
+    assert!(stderr_of(&output).contains("interactive terminal"), "says why: {}", stderr_of(&output));
+    assert!(!key_path.exists(), "nothing written");
+}
+
+#[test]
+#[serial]
 fn cli_rejects_pre_existing_file_without_force() {
     // This scenario never reaches the KEK provider at all -- `wrap`'s own
     // pre-check refuses an existing output file before reading the DEK or
