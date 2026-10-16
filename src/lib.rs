@@ -504,7 +504,7 @@ fn cstr_to_service(ptr: *const c_char) -> Result<String, c_int> {
     }
     // SAFETY: the loop above established that `len` bytes starting at `ptr`
     // are readable and non-NUL.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
     let s = std::str::from_utf8(bytes).map_err(|_| status::INVALID_SERVICE_NAME)?; // reject non-UTF-8 byte sequences
     if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
         return Err(status::INVALID_SERVICE_NAME); // only ASCII alphanumeric characters and '.' are allowed
@@ -820,7 +820,7 @@ fn cstr_to_path(ptr: *const c_char) -> Result<std::path::PathBuf, c_int> {
         return Err(status::INVALID_ARGUMENT);
     }
     // SAFETY: the loop above established that `len` bytes at `ptr` are readable.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
     Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
 }
 
