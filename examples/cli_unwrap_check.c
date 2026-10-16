@@ -63,13 +63,21 @@ int main(int argc, char** argv) {
     }
 
     /* The expected-DEK file is a plaintext key: hkdfguard_open_file must
-     * refuse it as one, and leave nothing of it in the buffer. */
+     * refuse it as one, leave nothing of it in the buffer, and leave
+     * *out_len as the caller set it (as on every failure but
+     * BUFFER_TOO_SMALL). */
     uint8_t probe[HKDFGUARD_WRAPPED_MAX_LEN];
+    memset(probe, 0xAA, sizeof(probe));
     int probe_len = (int)sizeof(probe);
     rc = hkdfguard_open_file(expected_dek_path, probe, &probe_len);
-    if (rc != HKDFGUARD_ERR_FILE_PLAINTEXT_KEY || probe_len != 0) {
-        fprintf(stderr, "hkdfguard_open_file on a raw DEK returned %d (len %d), expected %d\n",
-                rc, probe_len, HKDFGUARD_ERR_FILE_PLAINTEXT_KEY);
+    int probe_zeroed = 1;
+    for (size_t i = 0; i < sizeof(probe); ++i) {
+        probe_zeroed &= probe[i] == 0;
+    }
+    if (rc != HKDFGUARD_ERR_FILE_PLAINTEXT_KEY || probe_len != (int)sizeof(probe) || !probe_zeroed) {
+        fprintf(stderr, "hkdfguard_open_file on a raw DEK returned %d (len %d, buffer %s), expected %d (len %d, zeroed)\n",
+                rc, probe_len, probe_zeroed ? "zeroed" : "not zeroed", HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                (int)sizeof(probe));
         return 1;
     }
 

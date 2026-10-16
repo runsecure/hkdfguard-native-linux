@@ -997,10 +997,14 @@ hkdfguard wrap \
     --dek-file "$CREDENTIALS_DIRECTORY/dek"
 ```
 
-`provision` is idempotent: it checks first and reports "already
-provisioned" without touching an existing KEK. On a TPM the KEK is derived
-on demand, so it always reports present; for `external-secret` the mounted
-file *is* the provisioning; only Ephemeral actually creates anything.
+`provision` is idempotent and never changes an existing KEK, but it
+always verifies one: it loads the KEK through the provider (on a TPM,
+deriving it and checking it against any pinned Name; on PKCS#11, finding
+the key pair on the token) and reports "already provisioned ... verified".
+So a KEK that is missing or wrong on the provider fails at deployment, not
+at the first wrap. On a TPM the KEK is derived on demand, so it always
+reports present; for `external-secret` the mounted file *is* the
+provisioning; only Ephemeral actually creates anything.
 
 The DEK is base64 of exactly 32 bytes, read from stdin or a file — never
 from a command-line argument or an environment variable, both of which are
@@ -1013,10 +1017,18 @@ overwrites and replaces the existing key file, so a wrap that fails — no
 KEK, provider unavailable, bad input — never destroys the key file that
 was already there. It only ever overwrites a regular file at that exact
 path: a symlink there is refused rather than followed (following it would
-overwrite whatever it points to), as are a directory, FIFO, or device, and
-any file far larger than a wrapped key. The overwrite is best-effort: on
+overwrite whatever it points to), as are a directory, FIFO, or device, any
+file far larger than a wrapped key, and a file with more than one hard link
+(overwriting it would also destroy the file at its other name). The overwrite is best-effort: on
 copy-on-write or log-structured filesystems (btrfs, ZFS) and on flash
 storage, old blocks can survive it.
+
+The key file's folder must be a real folder at the path spelled: a
+`--key-file-path` that goes through a symbolic link anywhere above the file
+is refused, with or without `--force`, so a link planted where the operator
+writes can't redirect a `wrap --force` into another folder. Spell the real
+path (`/run/...`, not `/var/run/...`). This is checked before the DEK is
+read, and again on the open file before anything is overwritten or written.
 
 The key file is written `0600`, owned by whoever runs the command. It is
 ciphertext, but anyone who can read it *and* reach the provider — on a TPM

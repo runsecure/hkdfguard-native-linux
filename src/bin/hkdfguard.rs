@@ -62,9 +62,14 @@
 //!
 //! ## Overwriting
 //!
+//! The key file's folder must be a real folder at the path spelled: no
+//! symbolic link anywhere above the file (see [`require_real_folder`]),
+//! checked before the DEK is read and again on the open descriptor.
+//!
 //! When `--force` replaces an existing file at `--key-file-path`, the wrap
 //! is completed in memory *first*, and only then is the old file securely
-//! overwritten in place and removed (see [`secure_delete`]). A wrap that
+//! overwritten in place and removed (see [`secure_delete`]); a file with
+//! more than one hard link is refused. A wrap that
 //! fails -- no KEK provisioned, provider unavailable, bad DEK input --
 //! therefore never destroys the key file that was already there. The
 //! secure overwrite is a best-effort measure against a plain read of the
@@ -78,7 +83,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::raw::c_int;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::io::AsRawFd;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroize;
 use hkdfguard::{
@@ -561,6 +567,75 @@ fn path_is_taken(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+// The absolute path `path` spells, relative paths resolved against the
+// current directory and `.`/`..` resolved lexically -- no link followed.
+// What every check below compares the real location against: anything
+// that differs means a link redirected the path.
+fn spelled_absolute(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path).map_err(|e| format!("failed to resolve {}: {e}", path.display()))?;
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir => out.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => out.push(name),
+            Component::Prefix(_) => return Err(format!("{} is not a Unix path", path.display())),
+        }
+    }
+    Ok(out)
+}
+
+// The folder the key file is named in must be a real folder at the place
+// spelled: no symbolic link anywhere in it. `create_new` and `O_NOFOLLOW`
+// only guard the last component, so without this a symlinked folder above
+// the key file is followed silently -- and whoever can plant one where the
+// operator writes could redirect an (often root) `wrap --force` into
+// overwriting and deleting a file in another folder. Refused, not
+// tolerated, as the Windows tool refuses junctions and links above the
+// path: there is no legitimate reason for a key file to be reached through
+// one. Spell the real path instead (`/run`, not `/var/run`).
+fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
+    let spelled = spelled_absolute(path)?;
+    let folder = spelled.parent().ok_or_else(|| format!("{} has no parent folder", path.display()))?;
+    let real = fs::canonicalize(folder).map_err(|e| format!("failed to resolve the folder of {}: {e}", path.display()))?;
+    if real != folder {
+        return Err(format!(
+            "{}'s folder {} resolves through a symbolic link to {}; the key file path must be a real path with \
+             no links in it",
+            path.display(),
+            folder.display(),
+            real.display()
+        ));
+    }
+    Ok(spelled)
+}
+
+// After an open: `file` must be the file at `spelled` (see
+// `require_real_folder`) -- nothing was swapped between the folder check
+// and the open. Judged from the descriptor: where the kernel says it is
+// (/proc/self/fd), and its device and inode against what the spelled path
+// names now. Without /proc only the second applies.
+fn require_opened_at(file: &File, path: &Path, spelled: &Path) -> Result<(), String> {
+    if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+        if actual != spelled {
+            return Err(format!(
+                "{} was opened at {} instead; refusing to use it (a folder in its path changed)",
+                path.display(),
+                actual.display()
+            ));
+        }
+    }
+    let opened = file.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    let named = fs::symlink_metadata(spelled).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+        return Err(format!("{} was moved or replaced while it was being opened; refusing to use it", path.display()));
+    }
+    Ok(())
+}
+
 // Largest existing file `--force` will overwrite. A wrapped key is a few
 // hundred bytes; something far bigger at the key path isn't one, and
 // overwriting it would also mean allocating and writing that much eight
@@ -575,9 +650,14 @@ const MAX_REPLACEABLE_KEY_FILE_LEN: u64 = 64 * 1024;
 // Only ever a regular file, and only the one at `path` itself: a symlink
 // there is refused rather than followed (following it would overwrite
 // whatever it points at -- any file this user can write), as are a FIFO
-// (which would block the open forever), a directory, and a device. The
-// descriptor is opened `O_NOFOLLOW|O_NONBLOCK` and re-checked against what
-// was examined, so nothing swapped in between gets overwritten either.
+// (which would block the open forever), a directory, and a device. So is a
+// file with more than one name (hard links): the overwrite passes write
+// the file itself, so they would also destroy the contents at its other
+// name -- any file someone could link into the key's folder. The Windows
+// tool refuses the same. The descriptor is opened `O_NOFOLLOW|O_NONBLOCK`
+// and re-checked against what was examined, and against where `path`
+// spells (`require_opened_at`), so nothing swapped in between gets
+// overwritten either.
 //
 // If the file can't be opened for writing (EACCES/EPERM -- this tool
 // doesn't own it), the overwrite passes are skipped entirely and this falls
@@ -591,12 +671,20 @@ fn secure_delete(path: &Path) -> Result<(), String> {
         if !meta.file_type().is_file() {
             return Err(refuse("is not a regular file (a symlink, directory, FIFO, or device)"));
         }
+        if meta.nlink() != 1 {
+            return Err(refuse(&format!(
+                "has {} hard links; the key file must have exactly one name, so that overwriting it cannot alter a \
+                 file at some other path",
+                meta.nlink()
+            )));
+        }
         if meta.len() > MAX_REPLACEABLE_KEY_FILE_LEN {
             return Err(refuse(&format!("is {} bytes, far larger than any wrapped key", meta.len())));
         }
         Ok(meta.len() as usize)
     };
 
+    let spelled = require_real_folder(path)?;
     let examined = fs::symlink_metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
     check(&examined)?;
 
@@ -607,6 +695,7 @@ fn secure_delete(path: &Path) -> Result<(), String> {
     {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Checked above: a regular file with one name, in a real folder.
             return fs::remove_file(path).map_err(|e| {
                 format!("failed to remove {} after permission-denied secure delete: {e}", path.display())
             });
@@ -618,6 +707,7 @@ fn secure_delete(path: &Path) -> Result<(), String> {
     if (opened.dev(), opened.ino()) != (examined.dev(), examined.ino()) {
         return Err(refuse("was replaced while it was being examined"));
     }
+    require_opened_at(&file, path, &spelled)?;
     let len = check(&opened)?;
 
     let mut buf = vec![0u8; len];
@@ -645,9 +735,16 @@ fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String
         .map_err(|e| format!("secure delete: failed to sync {}: {e}", path.display()))
 }
 
-// `provision`: the only place the setup calls are made. Checks first so
-// the outcome can be reported precisely -- "already provisioned" versus
-// "provisioned now" -- and so an existing KEK is never touched.
+// `provision`: the only place the setup calls are made. Always calls
+// hkdfguard_create_kek, whether or not the KEK exists, as the Windows tool
+// does: for an existing KEK that call loads it through the provider
+// (`load_kek`) -- on TPM2, deriving the key and checking it against the
+// pinned Name; on PKCS#11, finding the key pair on the token -- so a key
+// that exists in policy but not on the provider, or doesn't match its pin,
+// fails here at deployment rather than at the first wrap. kek_exists alone
+// can't tell: on TPM2 it only consults the policy. kek_exists is still
+// asked first, only to report the outcome precisely -- "provisioned" versus
+// "already provisioned". Neither call changes an existing KEK.
 fn run_provision(mut service_name: String) -> Result<(), String> {
     let service_c = prepare_service(&mut service_name)?;
 
@@ -655,10 +752,6 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
     let rc = hkdfguard_kek_exists(service_c.as_ptr(), &mut exists);
     if rc != status::OK {
         return Err(format!("hkdfguard_kek_exists failed: {}", describe_status(rc)));
-    }
-    if exists == 1 {
-        println!("KEK already provisioned for service \"{service_name}\"; nothing to do");
-        return Ok(());
     }
 
     let rc = hkdfguard_create_kek(service_c.as_ptr());
@@ -669,7 +762,11 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
             describe_status(rc)
         ));
     }
-    println!("KEK provisioned for service \"{service_name}\"");
+    if exists == 1 {
+        println!("KEK already provisioned for service \"{service_name}\"; verified, nothing to do");
+    } else {
+        println!("KEK provisioned for service \"{service_name}\"");
+    }
     Ok(())
 }
 
@@ -687,6 +784,10 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
     if path_is_taken(path) && !force {
         return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
     }
+    // Also before any provider work or reading the DEK: the key file's
+    // folder must be a real folder at its spelled location. Checked again,
+    // with the open descriptor, when the file is replaced and created below.
+    require_real_folder(path)?;
 
     let service_c = prepare_service(&mut service_name)?;
 
@@ -727,6 +828,7 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
     // this runs, `path` is always either brand new or was just deleted by
     // `secure_delete` above, so `set_permissions` below is defense-in-depth
     // against the umask, not strictly required.
+    let spelled = require_real_folder(path)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -739,6 +841,15 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
                 format!("failed to open {key_file_path}: {e}")
             }
         })?;
+    // The file just created must be at the spelled path. If a folder was
+    // swapped for a link after the check above, nothing is written: the
+    // (still empty) file is removed from wherever it actually landed.
+    if let Err(e) = require_opened_at(&file, path, &spelled) {
+        if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+            let _ = fs::remove_file(actual);
+        }
+        return Err(e);
+    }
     file.write_all(&wrapped)
         .map_err(|e| format!("failed to write {key_file_path}: {e}"))?;
     file.set_permissions(fs::Permissions::from_mode(KEY_FILE_MODE))
@@ -1034,6 +1145,73 @@ mod tests {
         drop(file);
         fs::remove_file(&path).ok();
         assert!(secure_delete(&path).is_err());
+    }
+
+    #[test]
+    fn secure_delete_refuses_a_hard_linked_file_and_leaves_both_names_intact() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        fs::write(&key, b"payload").unwrap();
+        let other = base.join("elsewhere.dat");
+        fs::hard_link(&key, &other).unwrap();
+        let err = secure_delete(&key).unwrap_err();
+        assert!(err.contains("2 hard links"), "{err}");
+        assert_eq!(fs::read(&other).unwrap(), b"payload", "the other name's contents are untouched");
+        assert!(key.exists(), "the key file itself is left in place");
+    }
+
+    #[test]
+    fn spelled_absolute_resolves_dots_lexically() {
+        assert_eq!(spelled_absolute(Path::new("/a/./b/../c/key")).unwrap(), PathBuf::from("/a/c/key"));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(spelled_absolute(Path::new("key")).unwrap(), cwd.join("key"));
+    }
+
+    #[test]
+    fn require_real_folder_refuses_a_symlinked_folder_anywhere_above_the_file() {
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        let link = base.join("link");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(require_real_folder(&real.join("k")).unwrap(), real.join("k"));
+        assert!(require_real_folder(&real.join("sub/../k")).is_ok(), "`..` resolved lexically is fine");
+
+        let err = require_real_folder(&link.join("k")).unwrap_err();
+        assert!(err.contains("symbolic link") && err.contains(real.to_str().unwrap()), "{err}");
+        let err = require_real_folder(&link.join("sub/k")).unwrap_err();
+        assert!(err.contains("symbolic link"), "a link further up is refused too: {err}");
+    }
+
+    #[test]
+    fn secure_delete_refuses_a_file_reached_through_a_symlinked_folder() {
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("victim.key"), b"not yours").unwrap();
+        symlink(&real, base.join("link")).unwrap();
+        let err = secure_delete(&base.join("link/victim.key")).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(fs::read(real.join("victim.key")).unwrap(), b"not yours");
+    }
+
+    #[test]
+    fn require_opened_at_accepts_the_file_at_its_spelled_path() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("k");
+        fs::write(&key, b"x").unwrap();
+        let file = File::open(&key).unwrap();
+        assert!(require_opened_at(&file, &key, &key).is_ok());
+        let other = base.join("other");
+        fs::write(&other, b"y").unwrap();
+        assert!(require_opened_at(&file, &key, &other).is_err(), "opened somewhere other than spelled");
     }
 
     #[test]

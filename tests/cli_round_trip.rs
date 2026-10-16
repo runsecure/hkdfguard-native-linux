@@ -158,8 +158,9 @@ fn cli_provision_then_wrap_unwraps_to_original_input() {
         let provisioned = run_provision("com.example.orders");
         assert!(provisioned.status.success(), "provision failed: {}", stderr_of(&provisioned));
         assert!(
-            String::from_utf8_lossy(&provisioned.stdout).contains("already provisioned"),
-            "external-secret must report the mounted file as already provisioned"
+            String::from_utf8_lossy(&provisioned.stdout).contains("already provisioned")
+                && String::from_utf8_lossy(&provisioned.stdout).contains("verified"),
+            "external-secret must report the mounted file as already provisioned, and verified"
         );
 
         let output = run_wrap_stdin(&key_path, "com.example.orders", &original_dek, &[]);
@@ -207,6 +208,47 @@ fn cli_force_overwrite_secure_deletes_then_rewraps() {
         let (rc, recovered) = unwrap_via_library("com.example.rotation", &wrapped);
         assert_eq!(rc, status::OK);
         assert_eq!(recovered, second_dek, "file must contain the second wrap, not the first");
+    });
+}
+
+#[test]
+#[serial]
+fn cli_refuses_a_key_path_through_a_symlinked_folder() {
+    // Refused before the DEK is read or any provider reached, so no
+    // external secret is needed.
+    let dir = tempdir().unwrap();
+    let base = fs::canonicalize(dir.path()).unwrap();
+    let real = base.join("real");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+
+    let output = run_wrap_stdin(&base.join("link/wrapped.key"), "com.example.linked", &[0x42u8; 32], &[]);
+    assert!(!output.status.success(), "a key path through a symlinked folder must be refused");
+    assert!(stderr_of(&output).contains("symbolic link"), "says why: {}", stderr_of(&output));
+    assert!(!real.join("wrapped.key").exists(), "nothing is created in the folder the link points at");
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_force_refuses_a_hard_linked_key_file() {
+    with_provisioned_external_secret("com.example.hardlink", || {
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key_path = base.join("wrapped.key");
+        let first = run_wrap_stdin(&key_path, "com.example.hardlink", &[1u8; 32], &[]);
+        assert!(first.status.success(), "initial wrap: {}", stderr_of(&first));
+        let original = fs::read(&key_path).unwrap();
+
+        // A second name for the key file, as someone able to link into the
+        // folder could make; overwriting the key would destroy it too.
+        let other = base.join("someone-elses.dat");
+        fs::hard_link(&key_path, &other).unwrap();
+        let forced = run_wrap_stdin(&key_path, "com.example.hardlink", &[2u8; 32], &["--force"]);
+        assert!(!forced.status.success(), "--force onto a hard-linked key file must be refused");
+        assert!(stderr_of(&forced).contains("hard links"), "says why: {}", stderr_of(&forced));
+        assert_eq!(fs::read(&other).unwrap(), original, "the other name's contents are untouched");
+        assert_eq!(fs::read(&key_path).unwrap(), original, "the key file is untouched");
     });
 }
 

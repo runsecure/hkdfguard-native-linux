@@ -58,8 +58,8 @@ What `provision` does depends on the provider:
 
 | Provider | What `provision` does |
 |---|---|
-| TPM | Derives the key on demand, so it reports "already provisioned". With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
-| PKCS#11 | Generates the key pair on the token, once. |
+| TPM | Derives the key on demand, so it reports "already provisioned", after deriving it and checking any pinned Name. With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
+| PKCS#11 | Generates the key pair on the token, once; later runs find it there and report "already provisioned". |
 | External secret | Checks the delivered file and that it holds a valid key: the file itself is the provisioning. |
 | Ephemeral | Creates a key that lives only in that one process (so `provision` from the CLI is pointless for it). |
 
@@ -74,10 +74,10 @@ hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 | Option | Meaning |
 |---|---|
 | `--service-name`, `-sn` | The service whose KEK is used |
-| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command) |
+| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file. |
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
 | `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink, owned by root or you, mode `0400` or `0600` |
-| `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. |
+| `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
 
 Exit status: `0` success, `1` the operation failed, `2` invalid command line.
 
