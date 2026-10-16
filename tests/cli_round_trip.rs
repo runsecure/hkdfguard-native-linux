@@ -254,6 +254,51 @@ fn cli_force_refuses_a_hard_linked_key_file() {
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_group_makes_the_key_file_group_readable_and_it_still_opens() {
+    use std::os::unix::fs::MetadataExt;
+    with_provisioned_external_secret("com.example.grouped", || {
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+
+        // Without --group: owner-only.
+        let plain = base.join("plain.key");
+        let out = run_wrap_stdin(&plain, "com.example.grouped", &[3u8; 32], &[]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        assert_eq!(fs::metadata(&plain).unwrap().mode() & 0o777, 0o600);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("owner read/write,"), "{}", String::from_utf8_lossy(&out.stdout));
+
+        // With --group (this process's own group, which it may give):
+        // 0640, that group, and the library still opens and unwraps it.
+        // SAFETY: no arguments, cannot fail.
+        let gid = unsafe { libc::getegid() };
+        if gid == 0 {
+            eprintln!("skipping: running as root, whose group --group refuses");
+            return;
+        }
+        let grouped = base.join("grouped.key");
+        let out = run_wrap_stdin(&grouped, "com.example.grouped", &[4u8; 32], &["--group", &gid.to_string()]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        let meta = fs::metadata(&grouped).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o640, "owner rw, group r");
+        assert_eq!(meta.gid(), gid);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("read-only"), "{}", String::from_utf8_lossy(&out.stdout));
+        let (rc, wrapped) = open_via_library(&grouped);
+        assert_eq!(rc, status::OK, "a group-readable key file is trusted (it is ciphertext)");
+        let (rc, recovered) = unwrap_via_library("com.example.grouped", &wrapped);
+        assert_eq!((rc, recovered), (status::OK, [4u8; 32]));
+
+        // An over-broad group is refused before anything is written.
+        let broad = base.join("broad.key");
+        let out = run_wrap_stdin(&broad, "com.example.grouped", &[5u8; 32], &["--group", "root"]);
+        assert!(!out.status.success());
+        assert!(stderr_of(&out).contains("over-broad"), "{}", stderr_of(&out));
+        assert!(!broad.exists(), "nothing written");
+    });
+}
+
+#[test]
+#[serial]
 fn cli_rejects_pre_existing_file_without_force() {
     // This scenario never reaches the KEK provider at all -- `wrap`'s own
     // pre-check refuses an existing output file before reading the DEK or

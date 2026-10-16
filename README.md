@@ -1053,7 +1053,14 @@ The key file is written `0600`, owned by whoever runs the command. It is
 ciphertext, but anyone who can read it *and* reach the provider — on a TPM
 host, any member of `tss` — can unwrap it, so nothing beyond its owner is
 granted by default. If the service that reads it runs as a different user,
-run `wrap` as that user, or `chown`/`chmod` the file deliberately.
+pass `--group <name|gid>`. The file then goes to that group and becomes `0640`
+(owner read/write, the group read-only), the same as the Windows tool's
+`--group`. The group is set on the open file before anything is written, so the
+payload is never readable by any other group. Only root, or a member of the
+group, can give a file to it. Over-broad groups are refused: `root`, `users`,
+`nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`, and gids 0 and 65534,
+matched by name and by gid. `hkdfguard_open_file` accepts the result, since
+group read is never a reason to refuse a key file.
 
 A `--dek-file` must be a regular file, not a symlink, owned by root or by
 the invoking user, with no group or other access (e.g. `0400`/`0600`) — the

@@ -96,6 +96,17 @@ use hkdfguard::{
 // member, on a TPM host) can unwrap it, so group read is not the default.
 // A deployment that wants a group to read it grants that deliberately.
 const KEY_FILE_MODE: u32 = 0o600;
+// With --group: rw-r-----, the owner plus that one group, read-only. The
+// Windows tool's --group grants the same (owner read/write, the group read).
+const KEY_FILE_GROUP_MODE: u32 = 0o640;
+
+// Groups --group refuses: each covers essentially every account on a
+// typical host, or the host's administrators or log readers -- granting one
+// read access is no narrower than world-readable for this purpose. Matched
+// by resolved gid, so a numeric gid can't dodge the list. gid 0 and the
+// overflow gid 65534 are refused whatever their names. The Windows tool
+// refuses its own equivalents (Everyone, Users, Authenticated Users, ...).
+const OVER_BROAD_GROUPS: &[&str] = &["root", "users", "nogroup", "nobody", "wheel", "sudo", "adm", "staff"];
 
 // Number of (all-zero pass, random pass) rounds `secure_delete` runs before
 // removing the file -- 2 passes per round, so this yields 8 total
@@ -143,6 +154,8 @@ enum Command {
         service_name: String,
         dek_source: DekSource,
         force: bool,
+        // --group: who besides the owner may read the key file. None: no one.
+        group: Option<String>,
     },
 }
 
@@ -155,12 +168,14 @@ fn print_usage() {
     eprintln!(
         "Usage:\n\
          \x20 {PROGRAM_NAME} provision --service-name|-sn <name>\n\
-         \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>) [--force|-f]\n\
+         \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n\
+         \x20      [--group|-g <name>] [--force|-f]\n\
          \n\
          provision  ensures a KEK exists for the service. Run once, at deployment time;\n\
          \x20          this is the only command that makes the (deliberately slow) setup calls.\n\
          wrap       wraps a DEK under the service's existing KEK and writes the payload to\n\
-         \x20          --key-file-path. Fails if the KEK has not been provisioned.\n\
+         \x20          --key-file-path, readable by its owner only, or also by --group's\n\
+         \x20          members (mode 0640). Fails if the KEK has not been provisioned.\n\
          \n\
          The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n\
          from a command-line argument or an environment variable, both of which are\n\
@@ -206,7 +221,7 @@ fn parse_provision(args: &mut impl Iterator<Item = String>) -> Result<ParseOutco
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
             "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
-            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--force" | "-f" => {
+            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--force" | "-f" | "--group" | "-g" => {
                 return Err(format!("{arg} is not valid for `provision`; it belongs to `wrap`"))
             }
             other => return Err(format!("unrecognized argument for `provision`: {other}")),
@@ -222,6 +237,7 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
     let mut service_name: Option<String> = None;
     let mut dek_source: Option<DekSource> = None;
     let mut force = false;
+    let mut group: Option<String> = None;
 
     // Rejects a second DEK source rather than letting the last one win:
     // silently ignoring one of two explicitly-requested inputs is exactly
@@ -246,6 +262,16 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
                 }
                 key_file_path = Some(value);
             }
+            "--group" | "-g" => {
+                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
+                if value.is_empty() {
+                    return Err("--group must not be empty".to_string());
+                }
+                if group.is_some() {
+                    return Err("give --group at most once".to_string());
+                }
+                group = Some(value);
+            }
             "--dek-stdin" => set_source(&mut dek_source, DekSource::Stdin)?,
             "--dek-file" => {
                 let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
@@ -267,6 +293,7 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
         service_name,
         dek_source,
         force,
+        group,
     }))
 }
 
@@ -560,6 +587,49 @@ fn prepare_service(service_name: &mut str) -> Result<CString, String> {
     CString::new(&*service_name).map_err(|_| "the service name must not contain a NUL byte".to_string())
 }
 
+// Looks a group up by name, or by gid when `spec` is all digits, returning
+// its gid and name. `None` if no such group exists.
+fn lookup_group(spec: &str) -> Result<Option<(libc::gid_t, String)>, String> {
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let mut buf = vec![0u8; 16 * 1024];
+    let rc = if !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit()) {
+        let gid: libc::gid_t = spec.parse().map_err(|_| format!("--group {spec} is not a valid gid"))?;
+        // SAFETY: every pointer is to a live, correctly sized local.
+        unsafe { libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) }
+    } else {
+        let name = CString::new(spec).map_err(|_| "--group must not contain a NUL byte".to_string())?;
+        // SAFETY: as above; `name` is NUL-terminated.
+        unsafe { libc::getgrnam_r(name.as_ptr(), &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) }
+    };
+    if rc != 0 {
+        return Err(format!("could not look up group {spec}: {}", std::io::Error::from_raw_os_error(rc)));
+    }
+    if result.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: getgr*_r set gr_name to a NUL-terminated string inside `buf`.
+    let name = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }.to_string_lossy().into_owned();
+    Ok(Some((grp.gr_gid, name)))
+}
+
+// Resolves --group to the gid the key file is given, refusing a group that
+// doesn't exist or is over-broad (see OVER_BROAD_GROUPS). Done before the
+// DEK is read or any provider reached, so a bad --group costs nothing.
+fn resolve_key_file_group(spec: &str) -> Result<(libc::gid_t, String), String> {
+    let (gid, name) = lookup_group(spec)?.ok_or_else(|| format!("--group \"{spec}\" does not name a group on this host"))?;
+    let listed = OVER_BROAD_GROUPS
+        .iter()
+        .any(|broad| *broad == name || matches!(lookup_group(broad), Ok(Some((g, _))) if g == gid));
+    if gid == 0 || gid == 65534 || listed {
+        return Err(format!(
+            "--group \"{spec}\" ({name}, gid {gid}) is an over-broad group (it covers essentially every account, or the \
+             host's administrators); name a dedicated group for the service that unwraps this key"
+        ));
+    }
+    Ok((gid, name))
+}
+
 // Whether anything at all occupies `path` -- including a dangling symlink,
 // which `Path::exists` (it follows links) reports as absent, and which the
 // `create_new` below would then fail on with a misleading "already exists".
@@ -773,7 +843,13 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
 // `wrap`: no setup calls. The wrap is completed in memory before the
 // existing key file (if any) is touched, so a failure -- most likely "no
 // KEK provisioned" -- never costs the caller the key file they had.
-fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSource, force: bool) -> Result<(), String> {
+fn run_wrap(
+    key_file_path: String,
+    mut service_name: String,
+    dek_source: DekSource,
+    force: bool,
+    group: Option<String>,
+) -> Result<(), String> {
     let path = Path::new(&key_file_path);
 
     // Fast, friendly pre-check: fail before reading the DEK or touching
@@ -788,6 +864,7 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
     // folder must be a real folder at its spelled location. Checked again,
     // with the open descriptor, when the file is replaced and created below.
     require_real_folder(path)?;
+    let group = group.as_deref().map(resolve_key_file_group).transpose()?;
 
     let service_c = prepare_service(&mut service_name)?;
 
@@ -850,13 +927,33 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
         }
         return Err(e);
     }
+    // --group: the file goes to that group on the open descriptor before a
+    // byte is written, so it never holds the payload under any other group.
+    // It is still 0600 here; the mode widens to 0640 only below, after the
+    // group is right. A non-root caller can only give groups it belongs to:
+    // the kernel's rule, reported plainly, and the empty file removed.
+    if let Some((gid, name)) = &group {
+        // SAFETY: a valid open descriptor; uid -1 leaves the owner as it is.
+        if unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, *gid) } != 0 {
+            let e = std::io::Error::last_os_error();
+            let _ = fs::remove_file(path); // just verified to be this file, at this path
+            return Err(format!(
+                "could not give {key_file_path} to group \"{name}\": {e} (only root, or a member of the group, can)"
+            ));
+        }
+    }
+    let mode = if group.is_some() { KEY_FILE_GROUP_MODE } else { KEY_FILE_MODE };
     file.write_all(&wrapped)
         .map_err(|e| format!("failed to write {key_file_path}: {e}"))?;
-    file.set_permissions(fs::Permissions::from_mode(KEY_FILE_MODE))
+    file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|e| format!("failed to set permissions on {key_file_path}: {e}"))?;
 
+    let access = match &group {
+        Some((_, name)) => format!("owner read/write + {name} read-only"),
+        None => "owner read/write".to_string(),
+    };
     println!(
-        "wrapped key written to {key_file_path} ({} bytes, service \"{service_name}\")",
+        "wrapped key written to {key_file_path} ({} bytes, {access}, service \"{service_name}\")",
         wrapped.len()
     );
     Ok(())
@@ -870,7 +967,8 @@ fn run(command: Command) -> Result<(), String> {
             service_name,
             dek_source,
             force,
-        } => run_wrap(key_file_path, service_name, dek_source, force),
+            group,
+        } => run_wrap(key_file_path, service_name, dek_source, force, group),
     }
 }
 
@@ -1283,6 +1381,8 @@ mod tests {
             vec!["--dek-stdin"],
             vec!["--dek-file", "/x"],
             vec!["--force"],
+            vec!["--group", "g"],
+            vec!["-g", "g"],
         ] {
             let mut a = vec!["prog", "provision", "-sn", "svc"];
             a.extend(flag.iter());
@@ -1294,11 +1394,12 @@ mod tests {
     #[test]
     fn parse_wrap_accepts_stdin_and_file_sources() {
         match expect_run(argv(&["prog", "wrap", "-kf", "key.bin", "-sn", "svc", "--dek-stdin"])) {
-            Command::Wrap { key_file_path, service_name, dek_source, force } => {
+            Command::Wrap { key_file_path, service_name, dek_source, force, group } => {
                 assert_eq!(key_file_path, "key.bin");
                 assert_eq!(service_name, "svc");
                 assert_eq!(dek_source, DekSource::Stdin);
                 assert!(!force);
+                assert_eq!(group, None, "--group is optional: owner-only by default");
             }
             other => panic!("expected Wrap, got {other:?}"),
         }
@@ -1329,6 +1430,43 @@ mod tests {
         // ambiguous invocation can't quietly wrap the wrong key.
         assert!(parse_args(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--dek-file", "/x"])).is_err());
         assert!(parse_args(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-file", "/x", "--dek-file", "/y"])).is_err());
+    }
+
+    #[test]
+    fn parse_wrap_takes_an_optional_group_once() {
+        match expect_run(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", "orders"])) {
+            Command::Wrap { group, .. } => assert_eq!(group.as_deref(), Some("orders")),
+            other => panic!("expected Wrap, got {other:?}"),
+        }
+        match expect_run(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "orders"])) {
+            Command::Wrap { group, .. } => assert_eq!(group.as_deref(), Some("orders")),
+            other => panic!("expected Wrap, got {other:?}"),
+        }
+        let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "a", "-g", "b"]));
+        assert!(err.contains("at most once"), "{err}");
+        let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", ""]));
+        assert!(err.contains("must not be empty"), "{err}");
+        assert!(expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group"])).contains("requires a value"));
+    }
+
+    #[test]
+    fn over_broad_and_unknown_groups_are_refused() {
+        for spec in ["root", "0", "65534"] {
+            let err = resolve_key_file_group(spec).unwrap_err();
+            assert!(err.contains("over-broad") || err.contains("does not name a group"), "{spec}: {err}");
+        }
+        assert!(resolve_key_file_group("root").unwrap_err().contains("over-broad"));
+        assert!(resolve_key_file_group("0").unwrap_err().contains("over-broad"), "by gid as well as by name");
+        // Any of the listed names that exists on this host is refused, by
+        // name and by its gid.
+        for broad in OVER_BROAD_GROUPS {
+            if let Ok(Some((gid, _))) = lookup_group(broad) {
+                assert!(resolve_key_file_group(broad).unwrap_err().contains("over-broad"), "{broad}");
+                assert!(resolve_key_file_group(&gid.to_string()).unwrap_err().contains("over-broad"), "{broad} as {gid}");
+            }
+        }
+        let err = resolve_key_file_group("hkdfguard-no-such-group-xyz").unwrap_err();
+        assert!(err.contains("does not name a group"), "{err}");
     }
 
     // ---- provision / wrap against the real library, in-process ----
@@ -1381,6 +1519,7 @@ mod tests {
                 "com.hkdfguard.clitest.neverprovisioned".to_string(),
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 true,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("provision --service-name"), "must point at the fix: {err}");
@@ -1407,10 +1546,32 @@ mod tests {
                 service,
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 false,
+                None,
             )
             .unwrap();
             assert!(key_path.exists());
             assert_eq!(fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, KEY_FILE_MODE);
+
+            // --group with a group this process may give (its own), unless
+            // that group is itself one --group refuses (running as root).
+            // SAFETY: no arguments, cannot fail.
+            let gid = unsafe { libc::getegid() };
+            if resolve_key_file_group(&gid.to_string()).is_ok() {
+                let grouped = dir.path().join("grouped.key");
+                run_wrap(
+                    grouped.to_str().unwrap().to_string(),
+                    "com.hkdfguard.clitest.roundtrip".to_string(),
+                    DekSource::File(dek_path.to_str().unwrap().to_string()),
+                    false,
+                    Some(gid.to_string()),
+                )
+                .unwrap();
+                let meta = fs::metadata(&grouped).unwrap();
+                assert_eq!(meta.permissions().mode() & 0o777, KEY_FILE_GROUP_MODE, "owner rw, group r");
+                assert_eq!(meta.gid(), gid, "given to the --group group");
+            } else {
+                eprintln!("skipping the --group round trip: this process's own group is one --group refuses");
+            }
         });
     }
 
