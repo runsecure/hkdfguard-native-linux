@@ -231,6 +231,29 @@ fn cli_refuses_a_key_path_through_a_symlinked_folder() {
 #[test]
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_wrap_writes_where_the_path_was_checked_not_where_a_link_before_dotdot_leads() {
+    // keys/link -> elsewhere/deep: the kernel would resolve keys/link/.. to
+    // `elsewhere`. The folder check resolves `..` as text, to `keys`, and the
+    // CLI must then write exactly there.
+    with_provisioned_external_secret("com.example.dotdot", || {
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let keys = base.join("keys");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("deep")).unwrap();
+        fs::create_dir(&keys).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
+
+        let output = run_wrap_stdin(&keys.join("link/../wrapped.key"), "com.example.dotdot", &[7u8; 32], &[]);
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        assert!(keys.join("wrapped.key").exists(), "written in the checked folder");
+        assert!(!elsewhere.join("wrapped.key").exists(), "nothing written where the link leads");
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_force_refuses_a_hard_linked_key_file() {
     with_provisioned_external_secret("com.example.hardlink", || {
         let dir = tempdir().unwrap();

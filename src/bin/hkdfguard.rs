@@ -632,27 +632,45 @@ fn prepare_service(service_name: &mut str) -> Result<CString, String> {
 // Looks a group up by name, or by gid when `spec` is all digits, returning
 // its gid and name. `None` if no such group exists.
 fn lookup_group(spec: &str) -> Result<Option<(libc::gid_t, String)>, String> {
-    let mut grp: libc::group = unsafe { std::mem::zeroed() };
-    let mut result: *mut libc::group = std::ptr::null_mut();
-    let mut buf = vec![0u8; 16 * 1024];
-    let rc = if !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit()) {
-        let gid: libc::gid_t = spec.parse().map_err(|_| format!("--group {spec} is not a valid gid"))?;
-        // SAFETY: every pointer is to a live, correctly sized local.
-        unsafe { libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) }
-    } else {
-        let name = CString::new(spec).map_err(|_| "--group must not contain a NUL byte".to_string())?;
-        // SAFETY: as above; `name` is NUL-terminated.
-        unsafe { libc::getgrnam_r(name.as_ptr(), &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) }
-    };
-    if rc != 0 {
-        return Err(format!("could not look up group {spec}: {}", std::io::Error::from_raw_os_error(rc)));
+    lookup_group_from(spec, GROUP_LOOKUP_INITIAL_BUF)
+}
+
+// getgr*_r need room for the whole entry, member list included, and report
+// ERANGE when it doesn't fit -- routine for a large directory (LDAP, AD)
+// group. Start here and double on ERANGE, up to GROUP_LOOKUP_MAX_BUF.
+const GROUP_LOOKUP_INITIAL_BUF: usize = 16 * 1024;
+const GROUP_LOOKUP_MAX_BUF: usize = 1024 * 1024;
+
+fn lookup_group_from(spec: &str, initial_buf: usize) -> Result<Option<(libc::gid_t, String)>, String> {
+    let by_gid = !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit());
+    let gid: libc::gid_t = if by_gid { spec.parse().map_err(|_| format!("--group {spec} is not a valid gid"))? } else { 0 };
+    let name = if by_gid { None } else { Some(CString::new(spec).map_err(|_| "--group must not contain a NUL byte".to_string())?) };
+
+    let mut size = initial_buf.max(1);
+    loop {
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let mut buf = vec![0u8; size];
+        let rc = match &name {
+            // SAFETY: every pointer is to a live, correctly sized local.
+            None => unsafe { libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) },
+            // SAFETY: as above; `name` is NUL-terminated.
+            Some(name) => unsafe { libc::getgrnam_r(name.as_ptr(), &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) },
+        };
+        if rc == libc::ERANGE && size < GROUP_LOOKUP_MAX_BUF {
+            size = (size * 2).min(GROUP_LOOKUP_MAX_BUF);
+            continue;
+        }
+        if rc != 0 {
+            return Err(format!("could not look up group {spec}: {}", std::io::Error::from_raw_os_error(rc)));
+        }
+        if result.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: getgr*_r set gr_name to a NUL-terminated string inside `buf`.
+        let found = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }.to_string_lossy().into_owned();
+        return Ok(Some((grp.gr_gid, found)));
     }
-    if result.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: getgr*_r set gr_name to a NUL-terminated string inside `buf`.
-    let name = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }.to_string_lossy().into_owned();
-    Ok(Some((grp.gr_gid, name)))
 }
 
 // Resolves --group to the gid the key file is given, refusing a group that
@@ -660,9 +678,27 @@ fn lookup_group(spec: &str) -> Result<Option<(libc::gid_t, String)>, String> {
 // DEK is read or any provider reached, so a bad --group costs nothing.
 fn resolve_key_file_group(spec: &str) -> Result<(libc::gid_t, String), String> {
     let (gid, name) = lookup_group(spec)?.ok_or_else(|| format!("--group \"{spec}\" does not name a group on this host"))?;
-    let listed = OVER_BROAD_GROUPS
-        .iter()
-        .any(|broad| *broad == name || matches!(lookup_group(broad), Ok(Some((g, _))) if g == gid));
+    // Fails closed: if a listed group can't be looked up, whether it is this
+    // gid can't be ruled out, so --group is refused rather than allowed.
+    let mut listed = false;
+    for broad in OVER_BROAD_GROUPS {
+        if *broad == name {
+            listed = true;
+            break;
+        }
+        match lookup_group(broad) {
+            Ok(Some((g, _))) if g == gid => {
+                listed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!(
+                    "--group \"{spec}\": can't confirm it isn't the over-broad group \"{broad}\" ({e}); refusing"
+                ))
+            }
+        }
+    }
     if gid == 0 || gid == 65534 || listed {
         return Err(format!(
             "--group \"{spec}\" ({name}, gid {gid}) is an over-broad group (it covers essentially every account, or the \
@@ -709,6 +745,13 @@ fn spelled_absolute(path: &Path) -> Result<PathBuf, String> {
 // tolerated, as the Windows tool refuses junctions and links above the
 // path: there is no legitimate reason for a key file to be reached through
 // one. Spell the real path instead (`/run`, not `/var/run`).
+//
+// Returns the checked path, and callers must use *that* for every
+// filesystem call that follows -- never `path` itself. The check resolves
+// `..` as text, but the kernel follows a symbolic link before applying a
+// `..` after it: `keys/link/../k` is checked as `keys/k`, yet handed to the
+// kernel it names `k` beside wherever `link` points. The returned path has
+// no `..` left, so the kernel reaches exactly the folder that was checked.
 fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
     let spelled = spelled_absolute(path)?;
     let folder = spelled.parent().ok_or_else(|| format!("{} has no parent folder", path.display()))?;
@@ -796,19 +839,22 @@ fn secure_delete(path: &Path) -> Result<(), String> {
         Ok(meta.len() as usize)
     };
 
+    // Every stat, open and remove below goes through `spelled`, the path
+    // require_real_folder checked -- never `path` as given, which the kernel
+    // could resolve into another folder (see require_real_folder).
     let spelled = require_real_folder(path)?;
-    let examined = fs::symlink_metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    let examined = fs::symlink_metadata(&spelled).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
     check(&examined)?;
 
     let mut file = match OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
+        .open(&spelled)
     {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             // Checked above: a regular file with one name, in a real folder.
-            return fs::remove_file(path).map_err(|e| {
+            return fs::remove_file(&spelled).map_err(|e| {
                 format!("failed to remove {} after permission-denied secure delete: {e}", path.display())
             });
         }
@@ -832,7 +878,7 @@ fn secure_delete(path: &Path) -> Result<(), String> {
     }
 
     drop(file);
-    fs::remove_file(path).map_err(|e| format!("failed to remove {} after secure delete: {e}", path.display()))
+    fs::remove_file(&spelled).map_err(|e| format!("failed to remove {} after secure delete: {e}", path.display()))
 }
 
 // Rewinds to the start of `file` and writes `buf` (the same length as the
@@ -892,7 +938,14 @@ fn run_wrap(
     force: bool,
     group: Option<String>,
 ) -> Result<(), String> {
-    let path = Path::new(&key_file_path);
+    // Before anything else -- reading the DEK, any provider work -- the key
+    // file's folder must be a real folder at its spelled location. Every
+    // filesystem call below then uses the path that check returns, never
+    // `key_file_path` as given (see require_real_folder); messages still
+    // show the operator's spelling. Checked again, with the open
+    // descriptor, when the file is replaced and created below.
+    let checked = require_real_folder(Path::new(&key_file_path))?;
+    let path = checked.as_path();
 
     // Fast, friendly pre-check: fail before reading the DEK or touching
     // the provider if the output path obviously already exists and --force
@@ -902,10 +955,6 @@ fn run_wrap(
     if path_is_taken(path) && !force {
         return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
     }
-    // Also before any provider work or reading the DEK: the key file's
-    // folder must be a real folder at its spelled location. Checked again,
-    // with the open descriptor, when the file is replaced and created below.
-    require_real_folder(path)?;
     let group = group.as_deref().map(resolve_key_file_group).transpose()?;
 
     let service_c = prepare_service(&mut service_name)?;
@@ -952,7 +1001,7 @@ fn run_wrap(
         .write(true)
         .create_new(true)
         .mode(KEY_FILE_MODE)
-        .open(&key_file_path)
+        .open(path)
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 format!("{key_file_path} already exists; pass --force|-f to overwrite")
@@ -965,7 +1014,7 @@ fn run_wrap(
     // (still empty) file is removed from wherever it actually landed.
     if let Err(e) = require_opened_at(&file, path, &spelled) {
         if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
-            let _ = fs::remove_file(actual);
+            remove_created_file(&actual, &file);
         }
         return Err(e);
     }
@@ -978,17 +1027,14 @@ fn run_wrap(
         // SAFETY: a valid open descriptor; uid -1 leaves the owner as it is.
         if unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, *gid) } != 0 {
             let e = std::io::Error::last_os_error();
-            let _ = fs::remove_file(path); // just verified to be this file, at this path
+            remove_created_file(path, &file);
             return Err(format!(
                 "could not give {key_file_path} to group \"{name}\": {e} (only root, or a member of the group, can)"
             ));
         }
     }
     let mode = if group.is_some() { KEY_FILE_GROUP_MODE } else { KEY_FILE_MODE };
-    file.write_all(&wrapped)
-        .map_err(|e| format!("failed to write {key_file_path}: {e}"))?;
-    file.set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(|e| format!("failed to set permissions on {key_file_path}: {e}"))?;
+    finish_key_file(&mut file, path, &key_file_path, &wrapped, mode)?;
 
     let access = match &group {
         Some((_, name)) => format!("owner read/write + {name} read-only"),
@@ -999,6 +1045,48 @@ fn run_wrap(
         wrapped.len()
     );
     Ok(())
+}
+
+// Removes the key file this run created -- but only if `path` still names
+// that very file: the same device and inode as the open descriptor. Linux
+// can't unlink through a descriptor, so this is the nearest thing to it; a
+// file someone renamed into place after the fact is left alone. Best
+// effort: it only ever runs on a path that is already failing.
+fn remove_created_file(path: &Path, file: &File) {
+    let (Ok(opened), Ok(named)) = (file.metadata(), fs::symlink_metadata(path)) else {
+        return;
+    };
+    if (opened.dev(), opened.ino()) == (named.dev(), named.ino()) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+// Writes the payload into the key file just created, gives it its final
+// mode, and flushes the file and then its folder to storage, so a reported
+// success survives a crash. On any failure the file is removed (see
+// remove_created_file): a failed wrap never leaves an empty or truncated key
+// file behind, for the next `wrap` to call "already exists" or a service to
+// read as malformed. `shown` is the path as the operator spelled it, for
+// messages.
+fn finish_key_file(file: &mut File, path: &Path, shown: &str, wrapped: &[u8], mode: u32) -> Result<(), String> {
+    let result = (|| {
+        file.write_all(wrapped).map_err(|e| format!("failed to write {shown}: {e}"))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("failed to set permissions on {shown}: {e}"))?;
+        file.sync_all().map_err(|e| format!("failed to flush {shown} to storage: {e}"))?;
+        sync_parent_folder(path).map_err(|e| format!("failed to flush the folder of {shown} to storage: {e}"))
+    })();
+    if result.is_err() {
+        remove_created_file(path, file);
+    }
+    result
+}
+
+// fsync on the folder, so the key file's directory entry -- not just its
+// contents -- is on storage.
+fn sync_parent_folder(path: &Path) -> std::io::Result<()> {
+    let folder = path.parent().ok_or_else(|| std::io::Error::other("the key file has no parent folder"))?;
+    File::open(folder)?.sync_all()
 }
 
 fn run(command: Command) -> Result<(), String> {
@@ -1357,6 +1445,88 @@ mod tests {
         assert!(err.contains("symbolic link"), "{err}");
         // The real path reads.
         assert!(read_dek_file(real.join("dek.b64").to_str().unwrap(), &mut buf).is_ok());
+    }
+
+    #[test]
+    fn secure_delete_never_follows_a_link_before_dotdot_into_another_folder() {
+        // keys/link -> elsewhere/deep, so to the kernel keys/link/.. is
+        // `elsewhere`, while the folder check resolves it as text to `keys`.
+        // The file in `elsewhere` is read-only, so opening it for writing
+        // fails and secure_delete takes its plain-remove fallback -- which
+        // must act on the checked path (keys/victim.key, absent) and leave
+        // elsewhere/victim.key alone.
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let keys = base.join("keys");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("deep")).unwrap();
+        fs::create_dir(&keys).unwrap();
+        symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
+        let victim = elsewhere.join("victim.key");
+        fs::write(&victim, b"someone else's file").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let err = secure_delete(&keys.join("link/../victim.key")).unwrap_err();
+        assert!(err.contains("failed to stat"), "nothing at the checked path keys/victim.key: {err}");
+        assert_eq!(fs::read(&victim).unwrap(), b"someone else's file", "the file in the other folder is untouched");
+    }
+
+    #[test]
+    fn remove_created_file_removes_only_the_file_it_created() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        fs::write(&key, b"").unwrap();
+        let file = File::open(&key).unwrap();
+
+        // Renamed away and another file put at the name: that one stays.
+        fs::rename(&key, base.join("moved.key")).unwrap();
+        fs::write(&key, b"someone else's file").unwrap();
+        remove_created_file(&key, &file);
+        assert_eq!(fs::read(&key).unwrap(), b"someone else's file", "a file renamed into place is left alone");
+
+        // Still the same file at the name: removed.
+        let moved = base.join("moved.key");
+        remove_created_file(&moved, &file);
+        assert!(!moved.exists(), "the created file itself is removed");
+    }
+
+    #[test]
+    fn finish_key_file_writes_flushes_and_sets_the_mode() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(KEY_FILE_MODE).open(&key).unwrap();
+        finish_key_file(&mut file, &key, "wrapped.key", b"payload", KEY_FILE_GROUP_MODE).unwrap();
+        assert_eq!(fs::read(&key).unwrap(), b"payload");
+        assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, KEY_FILE_GROUP_MODE);
+    }
+
+    #[test]
+    fn finish_key_file_removes_the_file_when_writing_fails() {
+        // A descriptor opened read-only: write_all fails, as a full disk or
+        // an I/O error would make it. No empty key file may be left behind.
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        fs::write(&key, b"").unwrap();
+        let mut read_only = File::open(&key).unwrap();
+        let err = finish_key_file(&mut read_only, &key, "wrapped.key", b"payload", KEY_FILE_MODE).unwrap_err();
+        assert!(err.contains("failed to write wrapped.key"), "{err}");
+        assert!(!key.exists(), "the failed key file is removed");
+    }
+
+    #[test]
+    fn lookup_group_grows_its_buffer_until_the_entry_fits() {
+        // Starting from a 1-byte buffer forces ERANGE on any real entry; the
+        // retry must still find this process's own group, by gid and name.
+        // SAFETY: no arguments, cannot fail.
+        let gid = unsafe { libc::getegid() };
+        let (found_gid, name) = lookup_group_from(&gid.to_string(), 1).unwrap().expect("own group by gid");
+        assert_eq!(found_gid, gid);
+        assert_eq!(lookup_group_from(&name, 1).unwrap(), Some((gid, name.clone())), "and by name");
+        assert_eq!(lookup_group_from(&gid.to_string(), 1).unwrap(), lookup_group(&gid.to_string()).unwrap());
     }
 
     #[test]
