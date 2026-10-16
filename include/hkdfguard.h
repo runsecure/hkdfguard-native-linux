@@ -12,7 +12,14 @@
  *
  * Shared across platforms (Linux, Windows, macOS): the function names and
  * signatures, the status codes, the HKDFGUARD_* flags, and the semantics of
- * every call. NOT shared: the wrapped-payload format. Each platform has its
+ * every call. Every function declared in this header is exported by every
+ * platform. A platform may export more, declared only in its own header:
+ * macOS adds hkdfguard_kek_fingerprint (the KEK's public-key fingerprint,
+ * for recording at provisioning and for its CLI's `retire` check) and
+ * hkdfguard_keychain_mode (which macOS keychain holds the KEKs). Neither
+ * has a Linux counterpart -- there is no keychain, and policy pins TPM KEKs
+ * (tpm.require_pinned_names) -- so a cross-platform caller must not rely on
+ * them. NOT shared: the wrapped-payload format. Each platform has its
  * own -- here ECDH against a per-payload hashed point, HKDF-SHA512, and
  * AES-256-GCM, with an in-band version byte, 132..276 bytes; on macOS, HPKE
  * (RFC 9180) base mode, a fixed 146 bytes -- and its own size, which is why
