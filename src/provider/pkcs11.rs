@@ -68,6 +68,9 @@
 //! `CKA_NEVER_EXTRACTABLE`, which the token sets only on a key generated
 //! on it and never exposed -- so an imported key with a known scalar,
 //! labelled and tagged to match, is refused (see `check_protections`).
+//! Both halves are `CKA_PRIVATE`, and only private objects are ever looked
+//! up, so nothing made by a session without the PIN is seen at all (see
+//! `find_unique`).
 //!
 //! A wrong PIN is tried once: after the token rejects it, this process
 //! attempts no further login with that PIN file until the file changes,
@@ -311,6 +314,13 @@ use crate::secure_file::FileIdentity;
 /// attempt is never pushed over by this library.
 static PIN_LATCHES: Mutex<Vec<(PathBuf, Option<FileIdentity>, String)>> = Mutex::new(Vec::new());
 
+/// Serializes the PIN-state check, `C_Login` and the latching of its
+/// result, so concurrent first calls spend one PIN attempt between them,
+/// not one each (see `open_session`). A login with the right PIN, or one
+/// already in effect, returns at once, so this costs nothing after the
+/// first call.
+static PIN_LOGIN_GATE: Mutex<()> = Mutex::new(());
+
 /// Why logins with the PIN file at `pin_file` are refused, if they are.
 /// `current` is the file's identity now; if it differs from the identity
 /// recorded with the latch, the file was changed and the latch is cleared,
@@ -424,14 +434,18 @@ fn open_session() -> Backend<OpenSession> {
         Err(e) => return Backend::Refused(format!("PIN file {}: {e}", pin_path.display())),
     };
     // A PIN this process has already seen the token reject is not tried
-    // again until the file changes: see `PIN_LATCHES`.
+    // again until the file changes: see `PIN_LATCHES`. Checked here to fail
+    // fast, and again under `PIN_LOGIN_GATE` just before the login.
     let pin_identity = FileIdentity::of(&pin_path);
-    if let Some(reason) = pin_login_blocked(&pin_path, pin_identity) {
-        return Backend::Refused(format!(
+    let login_disabled = |reason: String| {
+        Backend::Refused(format!(
             "PKCS#11 login disabled in this process: {reason}; correct the PIN file {} (any change to it re-enables \
              login) or restart the process",
             pin_path.display()
-        ));
+        ))
+    };
+    if let Some(reason) = pin_login_blocked(&pin_path, pin_identity) {
+        return login_disabled(reason);
     }
 
     let checked = match validate_module_path(&module) {
@@ -469,6 +483,17 @@ fn open_session() -> Backend<OpenSession> {
         Ok(i) => candidates[i].0,
         Err(reason) => return Backend::Refused(reason),
     };
+
+    // From here through the login's verdict, one call at a time: otherwise
+    // every call that passed the check above before the first rejection
+    // came back would spend an attempt of its own, and a burst of first
+    // calls could lock a token that allows three. The latch is re-checked
+    // under the gate, so a queued call sees a rejection the one ahead of it
+    // just recorded.
+    let _login_gate = PIN_LOGIN_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(reason) = pin_login_blocked(&pin_path, pin_identity) {
+        return login_disabled(reason);
+    }
 
     // The token reports the user PIN's state. Read it before spending an
     // attempt: a token that is locked, or down to its last try, is refused
@@ -734,12 +759,23 @@ fn find_key_pair_handles(session: &Session, service: &str) -> Result<Option<KeyP
 // the next -- or one planted alongside the real one. The match must also
 // carry the CKA_ID `generate_key_pair` gives it. Errors never name the
 // service: the C ABI logs them, and service names stay out of the log.
+//
+// Only `CKA_PRIVATE = true` objects are ever enumerated, both halves.
+// Creating a private object needs a login; a session that isn't logged in
+// can still create *public* ones (`CKA_PRIVATE = false`) on most tokens.
+// Without this filter, someone with access to the token but not the PIN
+// could plant a key pair under the service's label before it is
+// provisioned -- generated on the token, so it passes every protection
+// check -- and then, with no login, run ECDH with it for every payload. Or
+// plant one public-key object under the label and make the lookup fail as a
+// duplicate. Filtered, objects made without the PIN are invisible here.
 fn find_unique(session: &Session, class: ObjectClass, service: &str) -> Result<Option<ObjectHandle>> {
     let what = if class == ObjectClass::PRIVATE_KEY { "private key" } else { "public key" };
     let find_template = [
         Attribute::Class(class),
         Attribute::KeyType(KeyType::EC),
         Attribute::Label(key_label(service).into_bytes()),
+        Attribute::Private(true),
     ];
     let found = session
         .find_objects(&find_template) // C_FindObjects
@@ -776,7 +812,9 @@ fn find_unique(session: &Session, class: ObjectClass, service: &str) -> Result<O
 /// value exposed. A key imported from outside (`C_CreateObject`,
 /// `C_UnwrapKey`) has them false, whatever else its template says.
 fn required_protections(class: ObjectClass) -> Vec<Attribute> {
-    let mut required = vec![Attribute::EcParams(P256_EC_PARAMS.to_vec()), Attribute::Token(true)];
+    // CKA_PRIVATE again after the find template: a token that ignores an
+    // attribute in a search template must not slip a public object through.
+    let mut required = vec![Attribute::EcParams(P256_EC_PARAMS.to_vec()), Attribute::Token(true), Attribute::Private(true)];
     if class == ObjectClass::PRIVATE_KEY {
         required.extend([
             Attribute::Derive(true),
@@ -841,7 +879,7 @@ fn generate_key_pair(open: &OpenSession, service: &str) -> Result<KeyPair> {
         Attribute::Class(ObjectClass::PUBLIC_KEY),
         Attribute::KeyType(KeyType::EC),
         Attribute::Token(true),  // persist on the token, not just this session
-        Attribute::Private(false), // the public half doesn't need PKCS#11-level access restriction
+        Attribute::Private(true),  // only a logged-in session can create one -- see `find_unique`
         Attribute::Verify(false),  // this key pair is for ECDH, not signing/verification
         Attribute::Modifiable(false), // its label, ID and point can't be changed afterwards
         Attribute::EcParams(P256_EC_PARAMS.to_vec()), // selects the P-256 curve
@@ -916,13 +954,17 @@ fn generate_key_pair(open: &OpenSession, service: &str) -> Result<KeyPair> {
     ))
 }
 
-// How many EC objects of `class` carry the service's label.
+// How many private (CKA_PRIVATE = true) EC objects of `class` carry the
+// service's label: the same set `find_unique` considers. Counting public
+// objects too would let one planted without the PIN look like a concurrent
+// creation, so that this process destroys the pair it just generated.
 fn count_labelled(session: &Session, class: ObjectClass, service: &str) -> Result<usize> {
     session
         .find_objects(&[
             Attribute::Class(class),
             Attribute::KeyType(KeyType::EC),
             Attribute::Label(key_label(service).into_bytes()),
+            Attribute::Private(true),
         ])
         .map(|found| found.len())
         .map_err(|e| Error::Provider(format!("PKCS#11 find_objects failed: {e}")))
@@ -1371,6 +1413,106 @@ mod tests {
         assert!(msg.contains("Extractable"), "the error must say which protection is missing: {msg}");
         assert!(!msg.contains(service), "errors must not name the service: {msg}");
         assert!(provider.kek_exists(service).is_err(), "kek_exists must not answer either way");
+
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    // The objects someone with access to the token but not the PIN can make:
+    // CKA_PRIVATE = false, which a session that isn't logged in may create.
+    // (Made here from the provider's logged-in session -- login is
+    // per-application, so a test process can't hold an unauthenticated one
+    // -- but an object's CKA_PRIVATE, not who made it, is what matters.)
+    fn plant_public_key_pair(open: &OpenSession, service: &str) -> ObjectHandle {
+        let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
+        let label = key_label(service).into_bytes();
+        let (public, _private) = rw
+            .generate_key_pair(
+                &Mechanism::EccKeyPairGen,
+                &[
+                    Attribute::Token(true),
+                    Attribute::Private(false),
+                    Attribute::EcParams(P256_EC_PARAMS.to_vec()),
+                    Attribute::Label(label.clone()),
+                    Attribute::Id(key_id(service)),
+                ],
+                &[
+                    Attribute::Token(true),
+                    Attribute::Private(false),
+                    Attribute::Sensitive(true),
+                    Attribute::Extractable(false),
+                    Attribute::Derive(true),
+                    Attribute::Label(label),
+                    Attribute::Id(key_id(service)),
+                ],
+            )
+            .unwrap();
+        public
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_key_pair_made_without_the_pin_is_never_used() {
+        // Generated on the token, so it passes every other protection
+        // check -- yet its planter could ECDH with it with no login. It
+        // must be invisible: provisioning makes hkdfguard's own pair.
+        let service = "com.hkdfguard.test.publicpair";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        let planted_point = with_open(&provider, |open| {
+            destroy_all_for(open, service);
+            let planted = plant_public_key_pair(open, service);
+            let attrs = open.session.get_attributes(planted, &[AttributeType::EcPoint]).unwrap();
+            match attrs.as_slice() {
+                [Attribute::EcPoint(point)] => point.clone(),
+                other => panic!("planted public key has no EC point: {other:?}"),
+            }
+        });
+        assert!(!provider.kek_exists(service).unwrap(), "the planted pair must not count as provisioned");
+
+        let handle = provider.load_kek(service, true).expect("provisioning must make its own pair, not refuse");
+        let ours = handle.public_key().unwrap().to_sec1_point(false);
+        assert!(
+            !planted_point.ends_with(ours.as_bytes()),
+            "the service's KEK must be hkdfguard's pair, not the one planted without the PIN"
+        );
+        let peer = p256::SecretKey::generate().public_key();
+        handle.ecdh(&peer).unwrap();
+
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_public_key_planted_without_the_pin_cannot_block_provisioning() {
+        // Without the CKA_PRIVATE filter, one public object under the label
+        // makes the pair look half-present, and provisioning refuses forever.
+        let service = "com.hkdfguard.test.publicblock";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| {
+            destroy_all_for(open, service);
+            let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
+            let point = p256::SecretKey::generate().public_key().to_sec1_point(false);
+            let mut ec_point = vec![0x04, point.as_bytes().len() as u8]; // DER OCTET STRING around the point
+            ec_point.extend_from_slice(point.as_bytes());
+            rw.create_object(&[
+                Attribute::Class(ObjectClass::PUBLIC_KEY),
+                Attribute::KeyType(KeyType::EC),
+                Attribute::Token(true),
+                Attribute::Private(false),
+                Attribute::EcParams(P256_EC_PARAMS.to_vec()),
+                Attribute::EcPoint(ec_point),
+                Attribute::Label(key_label(service).into_bytes()),
+                Attribute::Id(key_id(service)),
+            ])
+            .unwrap();
+        });
+
+        let peer = p256::SecretKey::generate().public_key();
+        provider.load_kek(service, true).expect("a planted public object must not block provisioning").ecdh(&peer).unwrap();
+        provider.load_kek(service, false).expect("nor the lookups after it").ecdh(&peer).unwrap();
 
         with_open(&provider, |open| destroy_all_for(open, service));
     }
