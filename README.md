@@ -33,24 +33,8 @@ bound into both the AEAD's associated data and the HKDF `info`, so the
 `provider_type` tag and the KEK fingerprint are authenticated rather
 than merely present.
 
-**The payload format is Linux's own.** The Linux, Windows, and macOS
-libraries share one C ABI: the function names and signatures, the status
-codes, the `HKDFGUARD_*` flags, and what every call does. The wrapped
-payload is not shared. Each platform has its own format and size: here,
-the scheme above with a version byte, 132–276 bytes; on macOS, HPKE (RFC
-9180) base mode, a fixed 146 bytes. That's why `HKDFGUARD_WRAPPED_MAX_LEN`
-has the same name everywhere but a per-platform value. A payload is only
-opened on the host whose KEK wrapped it, so the formats never need to
-interoperate:
-
-- Treat a payload as opaque bytes. Size buffers with
-  `HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
-- Moving a service to another platform means re-wrapping its DEKs there,
-  under that host's KEK. A payload never moves between platforms.
-- The platforms also differ in **who can create a payload**. Here only the
-  KEK holder can (see above). On macOS, anyone holding the KEK's public key
-  can, so that library relies on the key file's ownership checks instead
-  (see its README, "Sender authentication").
+Treat a wrapped payload as opaque bytes: size buffers with
+`HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
 
 ## Documentation
 
