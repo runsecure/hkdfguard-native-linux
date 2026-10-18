@@ -490,7 +490,10 @@ from bus-visible nonces, and even a salted one can be man-in-the-middled
 if the attacker substitutes their own salt key at `TPM2_ReadPublic`, so
 the pin is what makes `required` mean something. The salt key is a
 deterministic primary with a fixed label, so its Name is stable and
-pinnable; it carries no derivation secret and protects nothing by itself.
+pinnable; it carries no derivation secret. It is a *restricted* storage
+key, so the TPM uses it only to unwrap session salts: someone who can send
+the TPM commands and recreate it still can't run ECDH with it to recover a
+session's salt.
 
 > **`auto` only defeats a passive listener.** The manufacturer it
 > decides from is read over the same bus it is protecting. On a discrete
@@ -564,7 +567,13 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 ```
 
 Set the policy entry in the same change as the password: with a password
-and no entry (or the reverse), every TPM call is refused. Back the file up
+and no entry (or the reverse), every TPM call is refused. Each process
+tries a rejected password once, then sends nothing Owner-authorized again
+until the file or the policy entry changes: every wrong attempt counts
+toward the TPM's dictionary-attack limit, which is TPM-wide (a Hyper-V
+vTPM allows 3 per 1000 s), so a service retrying would otherwise lock the
+whole TPM within seconds. After fixing the file, the next call tries again;
+nothing needs restarting. Back the file up
 with the derivation secret. The owner password applies to the whole Owner
 hierarchy, so anything else on the host that creates keys under it with an
 empty password -- `systemd-cryptenroll --tpm2-device`, tpm2-tss FAPI,

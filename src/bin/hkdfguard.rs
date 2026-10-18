@@ -83,7 +83,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::raw::c_int;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroize;
@@ -519,9 +519,14 @@ fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [
             if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
                 return Err(TERMINAL_DEK_MESSAGE.to_string());
             }
-            let stdin = std::io::stdin();
-            let mut locked = stdin.lock();
-            read_bounded(&mut locked, "the DEK on stdin", &mut scratch.text)?
+            // Straight from descriptor 0, never through `std::io::stdin()`:
+            // that is a BufReader whose 8 KiB heap buffer would receive the
+            // DEK first and keep it, unwiped and unlocked, for the life of
+            // the process. ManuallyDrop: the File must not close stdin.
+            // SAFETY: descriptor 0 stays open for the process's lifetime,
+            // and nothing else in this program reads it.
+            let mut fd0 = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDIN_FILENO) });
+            read_bounded(&mut *fd0, "the DEK on stdin", &mut scratch.text)?
         }
         DekSource::File(path) => read_dek_file(path, &mut scratch.text)?,
     };

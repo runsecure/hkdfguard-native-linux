@@ -781,31 +781,46 @@ mod tests {
             let kek_public = handle.public_key().unwrap();
             let h = payload_ecdh_point(&payload.salt).unwrap();
 
-            // The ephemeral-key attack, attempted: pick an ephemeral scalar, do ECDH
-            // against the KEK's public key, and try to derive the wrapping
-            // key from it.
+            // 1. The attack is real: whenever the host runs ECDH against a
+            // point the attacker chose -- as an ephemeral-key protocol's
+            // unwrap does, against the E in the payload -- the attacker
+            // knows the result from KEK_pub alone. (Without this, the rest
+            // of the test could pass for a broken protocol too.)
             let attacker_scalar = SecretKey::generate();
-            let attacker_z = p256::ecdh::diffie_hellman(
-                attacker_scalar.to_nonzero_scalar(),
-                kek_public.as_affine(),
+            let attacker_point = attacker_scalar.public_key();
+            let attacker_z = p256::ecdh::diffie_hellman(attacker_scalar.to_nonzero_scalar(), kek_public.as_affine());
+            let mut host_z_on_attacker_point = handle.ecdh(&attacker_point).unwrap();
+            assert_eq!(
+                host_z_on_attacker_point.as_slice(),
+                attacker_z.raw_secret_bytes().as_slice(),
+                "ECDH against an attacker-chosen point gives the attacker the shared secret"
             );
+            host_z_on_attacker_point.zeroize();
+
+            // 2. So the protocol must never do that, and doesn't: the only
+            // point unwrap ever uses is a hash of the salt. Recomputed here
+            // independently of `payload_ecdh_point` -- the first counter
+            // whose SHA-256 is a valid x-coordinate, even y -- so it is a
+            // hash output nobody knows the discrete log of, whatever salt
+            // an attacker writes into a payload.
+            let hashed = (0..=u8::MAX)
+                .find_map(|counter| {
+                    let x = Sha256::new().chain_update(PAYLOAD_POINT_DOMAIN).chain_update(payload.salt).chain_update([counter]).finalize();
+                    let mut compressed = [0x02u8; 33];
+                    compressed[1..].copy_from_slice(&x);
+                    PublicKey::from_sec1_bytes(&compressed).ok()
+                })
+                .unwrap();
+            assert_eq!(h, hashed, "unwrap's point is exactly the hash of the payload's salt");
+            assert_ne!(h, attacker_point, "and so never a point the attacker chose");
+
+            // The attacker's best attempt at a wrapping key, then: ECDH of
+            // their own scalar with KEK_pub, which is not what unwrap uses.
             let mut attacker_secret = [0u8; 32];
             attacker_secret.copy_from_slice(attacker_z.raw_secret_bytes().as_slice());
-
             let authenticated = payload.authenticated_bytes();
             let forged_key =
                 derive_wrapping_key(&attacker_secret, service, &payload.salt, &authenticated).unwrap();
-
-            // The genuine key, for comparison.
-            let mut genuine_z = handle.ecdh(&h).unwrap();
-            let genuine_key =
-                derive_wrapping_key(&genuine_z, service, &payload.salt, &authenticated).unwrap();
-            genuine_z.zeroize();
-
-            assert_ne!(
-                *forged_key, *genuine_key,
-                "a KEK-public-key holder must not be able to derive the wrapping key"
-            );
 
             // And concretely: a payload encrypted under the attacker's key
             // does not unwrap, even though every header byte is

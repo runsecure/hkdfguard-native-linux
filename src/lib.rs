@@ -153,8 +153,7 @@ pub extern "C" fn hkdfguard_wrap_dek(
     })) {
         Ok(code) => code, // normal path: whatever status code `wrap_impl` returned
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_wrap_dek boundary");
-            audit_internal_error(audit::Op::Wrap, service);
+            report_caught_panic("hkdfguard_wrap_dek", Some((audit::Op::Wrap, service)));
             status::INTERNAL_ERROR // a panic means a bug in this crate, not a normal failure
         }
     }
@@ -203,9 +202,8 @@ pub extern "C" fn hkdfguard_unwrap_dek(
     })) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_unwrap_dek boundary");
-            zero_caller_buffer(out, capacity);
-            audit_internal_error(audit::Op::Unwrap, service);
+            zero_caller_buffer(out, capacity); // first: the reporting below runs host code
+            report_caught_panic("hkdfguard_unwrap_dek", Some((audit::Op::Unwrap, service)));
             status::INTERNAL_ERROR
         }
     }
@@ -214,6 +212,20 @@ pub extern "C" fn hkdfguard_unwrap_dek(
 // Audits a panic caught at an ABI boundary as INTERNAL_ERROR (event
 // 2005), as the Windows build audits anything that escapes. Only when the
 // service name is valid: an invalid one is a caller mistake, never audited.
+// Logs, and where `audit_as` names an operation audits, a panic caught at
+// an ABI boundary. Called after the boundary's own cleanup (zeroing the
+// caller's buffer), and inside a catch_unwind of its own: the logger is the
+// host application's, and a panic out of it here would unwind across
+// `extern "C"` and abort the process.
+fn report_caught_panic(boundary: &str, audit_as: Option<(audit::Op, *const c_char)>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        log::error!("hkdfguard: internal panic caught at {boundary} boundary");
+        if let Some((op, service)) = audit_as {
+            audit_internal_error(op, service);
+        }
+    }));
+}
+
 fn audit_internal_error(op: audit::Op, service: *const c_char) {
     if let Ok(service) = cstr_to_service(service) {
         audit::operation_failed(op, &service, status::INTERNAL_ERROR);
@@ -262,8 +274,7 @@ pub extern "C" fn hkdfguard_create_kek(service: *const c_char) -> c_int {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| create_kek_impl(service))) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_create_kek boundary");
-            audit_internal_error(audit::Op::CreateKek, service);
+            report_caught_panic("hkdfguard_create_kek", Some((audit::Op::CreateKek, service)));
             status::INTERNAL_ERROR
         }
     }
@@ -290,8 +301,7 @@ pub extern "C" fn hkdfguard_kek_exists(service: *const c_char, exists: *mut c_in
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kek_exists_impl(service, exists))) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_kek_exists boundary");
-            audit_internal_error(audit::Op::KekExists, service);
+            report_caught_panic("hkdfguard_kek_exists", Some((audit::Op::KekExists, service)));
             status::INTERNAL_ERROR
         }
     }
@@ -327,8 +337,7 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
     })) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_generate_and_wrap_dek boundary");
-            audit_internal_error(audit::Op::GenerateAndWrap, service);
+            report_caught_panic("hkdfguard_generate_and_wrap_dek", Some((audit::Op::GenerateAndWrap, service)));
             status::INTERNAL_ERROR
         }
     }
@@ -394,7 +403,7 @@ pub extern "C" fn hkdfguard_harden_process_with_flags(flags: c_uint) -> c_int {
     match std::panic::catch_unwind(|| harden_process_impl(flags)) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_harden_process boundary");
+            report_caught_panic("hkdfguard_harden_process", None);
             status::INTERNAL_ERROR
         }
     }
@@ -740,18 +749,23 @@ fn unwrap_impl(
         }
     };
 
+    // Unless policy turns it off (audit.unwrap_success = false): who
+    // unwrapped, and the same payload hash its wrap record carries. Before
+    // the DEK is written: `out` may be the caller's `wrapped` buffer, and
+    // the record must hash the payload, never the DEK written over it.
+    // `wrapped_slice` is not read again after this.
+    if policy::audit_unwrap_success() {
+        audit::dek_operation(audit::Op::Unwrap, &service_str, wrapped_slice);
+    }
+
     // SAFETY: out is non-null and, per caller contract, writable for at
-    // least `capacity` >= DEK_LEN bytes.
+    // least `capacity` >= DEK_LEN bytes. `dek` is our own copy, so the two
+    // never overlap even when `out` is the caller's `wrapped` buffer.
     unsafe {
         ptr::copy_nonoverlapping(dek.as_ptr(), out, crypto::DEK_LEN); // hand the recovered DEK to the caller
         *out_len = crypto::DEK_LEN as c_int; // always exactly 32 on success
     }
     dek.zeroize(); // our local copy has served its purpose; scrub it now rather than waiting for scope exit
-    // Unless policy turns it off (audit.unwrap_success = false): who
-    // unwrapped, and the same payload hash its wrap record carries.
-    if policy::audit_unwrap_success() {
-        audit::dek_operation(audit::Op::Unwrap, &service_str, wrapped_slice);
-    }
     status::OK
 }
 
@@ -784,8 +798,8 @@ pub extern "C" fn hkdfguard_open_file(path: *const c_char, out: *mut u8, out_len
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_file_impl(path, out, out_len, capacity))) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_open_file boundary");
-            zero_caller_buffer(out, capacity);
+            zero_caller_buffer(out, capacity); // first: the reporting below runs host code
+            report_caught_panic("hkdfguard_open_file", None);
             status::INTERNAL_ERROR
         }
     }
@@ -1044,6 +1058,40 @@ mod ffi_tests {
             assert!(elapsed < Duration::from_millis(1000), "took {elapsed:?}; default floor used instead of policy");
         });
 
+    }
+
+    #[test]
+    #[serial]
+    fn unwrap_in_place_recovers_the_dek_and_audits_the_payload_not_the_dek() {
+        // One buffer as both `wrapped` and `out`: the DEK lands in it, and
+        // the audit record hashes the payload that was there before.
+        use sha2::{Digest, Sha256};
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.unwrapinplace").unwrap();
+            create_kek_for_test(&service);
+            let dek = [0x6Bu8; 32];
+            let mut buf = [0u8; crypto::MAX_WRAPPED_LEN];
+            let mut len = buf.len() as c_int;
+            assert_eq!(hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, buf.as_mut_ptr(), &mut len), status::OK);
+            let wrapped_hash: String = Sha256::digest(&buf[..len as usize]).iter().map(|b| format!("{b:02x}")).collect();
+            let dek_prefixed_hash: String = {
+                let mut aliased = buf[..len as usize].to_vec();
+                aliased[..32].copy_from_slice(&dek);
+                Sha256::digest(&aliased).iter().map(|b| format!("{b:02x}")).collect()
+            };
+
+            let mut out_len = buf.len() as c_int;
+            let ptr = buf.as_mut_ptr();
+            let rc = hkdfguard_unwrap_dek(service.as_ptr(), ptr, len, ptr, &mut out_len);
+            assert_eq!(rc, status::OK);
+            assert_eq!(out_len, 32);
+            assert_eq!(buf[..32], dek, "the DEK is written into the shared buffer");
+
+            let records = audit::captured_containing("service=\"com.company.unwrapinplace\"");
+            let unwrap_record = records.iter().find(|r| r.contains("op=hkdfguard_unwrap_dek")).expect("an unwrap record");
+            assert!(unwrap_record.contains(&wrapped_hash), "the record hashes the payload: {unwrap_record}");
+            assert!(!unwrap_record.contains(&dek_prefixed_hash), "never the DEK written over it");
+        });
     }
 
     #[test]

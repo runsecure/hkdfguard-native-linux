@@ -293,24 +293,7 @@ const DEFAULT_PIN_FILE: &str = "/etc/hkdfguard/pkcs11.pin";
 /// to bound the one up-front allocation `SecretBuffer` makes.
 const MAX_PIN_FILE_LEN: usize = 256;
 
-/// What identifies one version of the PIN file. A change to any of these
-/// means an operator touched the file, which clears a latched login failure
-/// (see [`PIN_LATCHES`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime: (i64, i64),
-}
-
-impl FileIdentity {
-    fn of(path: &Path) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let m = std::fs::metadata(path).ok()?;
-        Some(FileIdentity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()) })
-    }
-}
+use crate::secure_file::FileIdentity;
 
 /// PIN files this process must not log in with again, each with the
 /// identity the file had when its PIN was rejected and the reason.

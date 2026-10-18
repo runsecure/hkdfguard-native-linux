@@ -282,6 +282,27 @@ pub fn check_owner_and_mode(meta: &Metadata, owner: Option<Owner>, forbidden_mod
     Ok(())
 }
 
+/// What identifies one version of a credential file (the PKCS#11 PIN, the
+/// TPM owner password). A change to any of these means an operator touched
+/// the file, which clears a latched authentication failure: see
+/// `pkcs11::PIN_LATCHES` and `tpm2::OWNER_AUTH`.
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) len: u64,
+    pub(crate) mtime: (i64, i64),
+}
+
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11")), allow(dead_code))]
+impl FileIdentity {
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let m = std::fs::metadata(path).ok()?;
+        Some(FileIdentity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()) })
+    }
+}
+
 /// A byte buffer for secret file contents that is guaranteed to be zeroed
 /// once it's no longer needed: explicitly via [`SecretBuffer::wipe`] as
 /// soon as the caller is done with it, and unconditionally on drop -- so

@@ -291,7 +291,9 @@ int hkdfguard_wrap_dek(
  *                hkdfguard_wrap_dek) returns HKDFGUARD_ERR_INVALID_SERVICE_NAME.
  * wrapped:       pointer to the wrapped payload bytes.
  * wrapped_len:   length of `wrapped` in bytes.
- * out:           buffer to receive the recovered 32-byte DEK.
+ * out:           buffer to receive the recovered 32-byte DEK. May be the
+ *                same buffer as `wrapped` (or overlap it): `wrapped` is
+ *                read in full before anything is written to `out`.
  * out_len:       in: capacity of `out` in bytes.
  *                out: on HKDFGUARD_OK, always HKDFGUARD_DEK_LEN (32).
  *                     on HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required
