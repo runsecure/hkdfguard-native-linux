@@ -88,7 +88,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroize;
 use hkdfguard::{
-    hkdfguard_create_kek, hkdfguard_harden_process, hkdfguard_kek_exists, hkdfguard_wrap_dek, status,
+    harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
+    hkdfguard_wrap_dek, status,
 };
 
 // rw-------: the owning deployment user only. The payload is ciphertext,
@@ -211,6 +212,27 @@ fn take_service_name(arg: &str, args: &mut impl Iterator<Item = String>) -> Resu
     Ok(value)
 }
 
+// Stores a flag's value, refusing a second one rather than letting the last
+// win: `-kf a.key ... -kf b.key` is ambiguous about which file the operator
+// meant, and silently picking one is how the wrong key file gets written or
+// the wrong service's KEK gets used. `flag` is the flag's long name.
+fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("give {flag} at most once"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+// The command line as UTF-8 strings, or the (1-based) position of the
+// first argument that isn't valid UTF-8 -- reported as a usage error
+// rather than the panic `std::env::args()` raises.
+fn utf8_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.enumerate()
+        .map(|(i, a)| a.into_string().map_err(|_| format!("argument {i} is not valid UTF-8")))
+        .collect()
+}
+
 fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
     let mut args = args.skip(1); // skip argv[0]
 
@@ -233,7 +255,7 @@ fn parse_provision(args: &mut impl Iterator<Item = String>) -> Result<ParseOutco
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
-            "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
+            "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
             "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--force" | "-f" | "--group" | "-g" => {
                 return Err(format!("{arg} is not valid for `provision`; it belongs to `wrap`"))
             }
@@ -266,24 +288,26 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
-            "--force" | "-f" => force = true,
-            "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
+            "--force" | "-f" => {
+                if force {
+                    return Err("give --force at most once".to_string());
+                }
+                force = true;
+            }
+            "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
             "--key-file-path" | "-kf" => {
                 let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
                 if value.is_empty() {
                     return Err("--key-file-path must not be empty".to_string());
                 }
-                key_file_path = Some(value);
+                set_once(&mut key_file_path, "--key-file-path", value)?;
             }
             "--group" | "-g" => {
                 let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
                 if value.is_empty() {
                     return Err("--group must not be empty".to_string());
                 }
-                if group.is_some() {
-                    return Err("give --group at most once".to_string());
-                }
-                group = Some(value);
+                set_once(&mut group, "--group", value)?;
             }
             "--dek-stdin" => set_source(&mut dek_source, DekSource::Stdin)?,
             "--dek-file" => {
@@ -1201,8 +1225,11 @@ fn main() -> ExitCode {
     }
     // Before anything is read: this process holds a plaintext DEK, so it
     // must not be dumpable or debuggable by other processes of the same
-    // user. Refuse to run rather than handle a DEK unprotected.
-    let rc = hkdfguard_harden_process();
+    // user. Refuse to run rather than handle a DEK unprotected. The strict
+    // flag, as the Windows tool passes: on Linux it adds no check
+    // (PR_SET_DUMPABLE 0 already bars same-user ptrace), but the three
+    // tools should ask for the same thing.
+    let rc = hkdfguard_harden_process_with_flags(harden_flags::REQUIRE_PROTECTED_SIGNATURE);
     if rc != status::OK {
         eprintln!("error: {}; refusing to handle key material", describe_status(rc));
         return ExitCode::FAILURE;
@@ -1211,7 +1238,8 @@ fn main() -> ExitCode {
         eprintln!("error: {e}; refusing to handle key material");
         return ExitCode::FAILURE;
     }
-    match parse_args(std::env::args()) {
+    let parsed = utf8_args(std::env::args_os()).and_then(|args| parse_args(args.into_iter()));
+    match parsed {
         Ok(ParseOutcome::Help) => {
             print_usage();
             ExitCode::SUCCESS
@@ -1677,6 +1705,36 @@ mod tests {
         let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", ""]));
         assert!(err.contains("must not be empty"), "{err}");
         assert!(expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group"])).contains("requires a value"));
+    }
+
+    #[test]
+    fn every_repeated_flag_is_refused_rather_than_the_last_winning() {
+        for (parts, flag) in [
+            (vec!["prog", "wrap", "-kf", "a", "-kf", "b", "-sn", "svc", "--dek-stdin"], "--key-file-path"),
+            (vec!["prog", "wrap", "--key-file-path", "a", "-kf", "a", "-sn", "svc", "--dek-stdin"], "--key-file-path"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "a", "--service-name", "b", "--dek-stdin"], "--service-name"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-f", "--force"], "--force"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "a", "--group", "a"], "--group"),
+            (vec!["prog", "provision", "-sn", "a", "-sn", "a"], "--service-name"),
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert_eq!(err, format!("give {flag} at most once"), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_argument_is_a_usage_error_not_a_panic() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let args = vec![
+            OsString::from("prog"),
+            OsString::from("wrap"),
+            OsString::from("-kf"),
+            OsString::from_vec(vec![b'k', 0xff, b'y']),
+        ];
+        assert_eq!(utf8_args(args.into_iter()).unwrap_err(), "argument 3 is not valid UTF-8");
+        let ok = utf8_args(["prog", "provision"].into_iter().map(OsString::from)).unwrap();
+        assert_eq!(ok, ["prog", "provision"]);
     }
 
     #[test]
