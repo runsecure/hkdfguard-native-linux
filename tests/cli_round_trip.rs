@@ -421,6 +421,41 @@ fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
 #[test]
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_refuses_ephemeral_keys_with_an_explanation() {
+    // An ephemeral key would live only inside the CLI process: provision
+    // would "succeed" with a key gone on exit, and wrap would write a
+    // payload nothing could unwrap. Both must refuse and say why, whether
+    // ephemeral is required or reached as a fallback.
+    let empty_mount = tempdir().unwrap();
+    let policies = [
+        "[selection]\nmode = \"require\"\nprovider = \"ephemeral\"\n".to_string(),
+        format!(
+            "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"{}\"\n",
+            empty_mount.path().display()
+        ),
+    ];
+    for policy in &policies {
+        with_policy(policy, || {
+            let provisioned = run_provision("com.example.ephemeral");
+            assert!(!provisioned.status.success(), "provision must refuse an ephemeral KEK under {policy:?}");
+            let stderr = stderr_of(&provisioned);
+            assert!(stderr.contains("exist only inside the process"), "provision must explain why: {stderr}");
+
+            let out_dir = tempdir().unwrap();
+            let key_path = out_dir.path().join("wrapped.key");
+            fs::write(&key_path, b"the key file that was already here").unwrap();
+            let wrapped = run_wrap_stdin(&key_path, "com.example.ephemeral", &[0x42u8; 32], &["--force"]);
+            assert!(!wrapped.status.success(), "wrap must refuse an ephemeral KEK under {policy:?}");
+            let stderr = stderr_of(&wrapped);
+            assert!(stderr.contains("exist only inside the process"), "wrap must explain why: {stderr}");
+            assert_eq!(fs::read(&key_path).unwrap(), b"the key file that was already here");
+        });
+    }
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_accepts_the_dek_from_a_file_and_refuses_a_loose_one() {
     with_provisioned_external_secret("com.example.fileinput", || {
         let original_dek = [0x7Bu8; 32];

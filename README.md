@@ -110,6 +110,9 @@ hkdfguard_generate_and_wrap_dek("com.company.orders", wrapped, &wrapped_len);
 
 ### Hardening the host process (opt-in)
 
+(Automatic once the process holds an ephemeral key: see
+[Providers](#providers).)
+
 Keys and DEKs pass through your process's memory. `hkdfguard_harden_process`
 makes that memory harder to recover: it disables core dumps (`RLIMIT_CORE`
 set to 0, hard limit included) and calls `prctl(PR_SET_DUMPABLE, 0)`,
@@ -211,6 +214,13 @@ memory, so every DEK wrapped under one is lost on restart; without a
 policy (or a policy that never names it), a missing secret mount or
 unavailable TPM makes `hkdfguard_create_kek` fail rather than silently
 degrade to it.
+
+An ephemeral key's only protection is the process's memory, so the library
+hardens the process (as `hkdfguard_harden_process` does) before it creates
+the first one, and refuses to create it if that fails. The keys are kept in
+pages excluded from core dumps and, where `RLIMIT_MEMLOCK` allows, locked
+into RAM. The `hkdfguard` CLI refuses ephemeral keys outright: one it
+created would vanish when it exits.
 
 The policy file (`/etc/hkdfguard/policy.toml`) must be owned by root and
 not writable by group or others, and so must `/etc/hkdfguard` and every
@@ -949,7 +959,10 @@ key, so it is held to the same standard as the PKCS#11 PIN and the TPM
 derivation secret. `<mount>/<service>` must:
 
 - be **owned by root or by the process's user**, with **no group or other
-  access** — `0400` or `0600`;
+  access** — `0400` or `0600`. A root-owned file may also be readable by
+  its group (`root:<group> 0440`), which is how a non-root service reads
+  it; never by others, and never by the group of a file the service owns
+  itself;
 - be a **regular file** (not a directory, device, or FIFO);
 - **resolve to a path inside the mount.** Symlinks are followed —
   Kubernetes Secret volumes present every key as a symlink into `..data/`,
@@ -972,17 +985,19 @@ Every common mechanism meets the mode requirement with one setting:
 
 | Mechanism | Setting |
 |---|---|
-| Kubernetes `Secret` volume | `defaultMode: 0400` on the volume (files are root-owned) |
+| Kubernetes `Secret` volume | `defaultMode: 0400` on the volume (files are root-owned); a non-root pod also sets `fsGroup` |
 | Vault Agent template/sink | `perms = "0400"` |
 | Docker Swarm secret | `mode: 0400` (the default `0444` is refused) |
 | CSI Secrets Store | `defaultMode`/file permission in the `SecretProviderClass` |
 | systemd `LoadCredential=` | already `0400`, root-owned — works as-is |
 
-> **Kubernetes `fsGroup` caveat:** setting `fsGroup` on the pod can add
-> group-read to secret files even with `defaultMode: 0400`, which the
-> provider refuses. Either leave `fsGroup` unset for the secret volume,
-> or use `fsGroupChangePolicy: OnRootMismatch` with an owner that matches
-> the process's user.
+> **Non-root pods:** the kubelet always writes Secret files as root, so a
+> pod running as another user can only read them through `fsGroup`. With
+> `fsGroup` set, the kubelet makes each file `root:<fsGroup> 0440` and
+> adds the group to the pod's processes, and the provider accepts it.
+> Without `fsGroup`, a non-root pod is refused the file by the kernel.
+> Keep the KEK in a Secret of its own, so that only pods meant to hold it
+> mount it.
 
 ## Wrapping a key with the CLI (`hkdfguard`)
 
@@ -1351,6 +1366,7 @@ examples/
 tests/
   cli_round_trip.rs          Drives the CLI as a real subprocess
   harden_process.rs              hkdfguard_harden_process, in its own process
+  ephemeral_hardening.rs         Creating an ephemeral key hardens the process, in its own process
 scripts/
   build-release.sh           cargo build --release, then links libhkdfguard.so.1
                               (the SONAME) to Cargo's libhkdfguard.so

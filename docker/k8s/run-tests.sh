@@ -98,11 +98,14 @@ docker build -q -t "$IMAGE" -f docker/k8s/Dockerfile . || exit 1
 
 kubectl create namespace "$NS" >/dev/null
 
-# name | runAsUser | fsGroup | defaultMode (decimal; 256 = 0400, 292 = 0444) | mode | expected RESULT prefix
+# name | runAsUser | fsGroup | defaultMode (decimal; 256 = 0400, 288 = 0440, 292 = 0444) | mode | expected RESULT prefix
 SCENARIOS="
 root-0400|0|-|256|once|works
 nonroot-0400|10001|-|256|once|refused
-nonroot-fsgroup-0400|10001|10001|256|once|refused
+nonroot-fsgroup-0400|10001|10001|256|once|works
+nonroot-fsgroup-0440|10001|10001|288|once|works
+nonroot-fsgroup-other-0400|10001|20000|256|once|works
+nonroot-fsgroup-0444|10001|10001|292|once|refused
 nonroot-0444|10001|-|292|once|refused
 root-0400-rotate|0|-|256|rotate|rotated
 "

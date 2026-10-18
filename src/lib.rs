@@ -351,7 +351,9 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
 /// same-user debugger.
 ///
 /// Opt-in, because it changes process-wide state the host application
-/// owns: debuggers and crash reporters stop working for the process.
+/// owns: debuggers and crash reporters stop working for the process. The
+/// one exception is the ephemeral provider, whose key's only protection is
+/// this process's memory: it applies this itself before creating a key.
 /// Call it once, early in startup, and *after* any privilege change --
 /// the kernel resets the dumpable flag when a process's credentials
 /// change. Root, and a process with `CAP_SYS_PTRACE`, can still inspect
@@ -409,7 +411,17 @@ pub extern "C" fn hkdfguard_harden_process_with_flags(flags: c_uint) -> c_int {
     }
 }
 
-fn harden_process_impl(flags: c_uint) -> c_int {
+/// For the CLI: makes the ephemeral provider refuse to create or load a
+/// key in this process. An ephemeral key lives only in the process that
+/// creates it, so one created by a short-lived tool could never unwrap
+/// anything for the application it is preparing. Not part of the C ABI.
+#[doc(hidden)]
+pub fn refuse_ephemeral_keys_in_this_process() {
+    #[cfg(feature = "ephemeral")]
+    provider::ephemeral::refuse_in_this_process();
+}
+
+pub(crate) fn harden_process_impl(flags: c_uint) -> c_int {
     if flags & !harden_flags::ALL != 0 {
         log::error!("hkdfguard: hkdfguard_harden_process_with_flags: unknown flag bits {:#x}", flags & !harden_flags::ALL);
         return status::INVALID_ARGUMENT;

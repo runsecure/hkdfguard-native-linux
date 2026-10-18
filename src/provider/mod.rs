@@ -48,6 +48,22 @@ use zeroize::Zeroizing; // wrapper that scrubs its contents from memory when dro
 /// zeroized on drop. Never logged, never returned across the FFI boundary.
 pub type SharedSecret = Zeroizing<[u8; 32]>; // alias so every provider returns the same self-zeroizing type
 
+/// ECDH with a private key this process holds in software (the
+/// external-secret and ephemeral providers). `to_nonzero_scalar` returns a
+/// `Copy` type with no zeroing `Drop`, so the scalar is kept in one local,
+/// passed by reference, and wiped here; the result is written straight into
+/// the zeroizing output rather than through an unwiped stack array.
+#[cfg(any(feature = "external-secret", feature = "ephemeral"))]
+pub(crate) fn software_ecdh(secret_key: &p256::SecretKey, point: &PublicKey) -> SharedSecret {
+    use zeroize::Zeroize as _;
+    let mut scalar = secret_key.to_nonzero_scalar();
+    let shared = p256::ecdh::diffie_hellman(&scalar, point.as_affine()); // zeroized on drop
+    scalar.zeroize();
+    let mut out = SharedSecret::new([0u8; 32]);
+    out.copy_from_slice(shared.raw_secret_bytes().as_slice());
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] // cheap to copy/compare/hash; needed for logging, matching, and use as a map-ish key
 #[repr(u8)] // pins the enum's in-memory representation to a single byte, matching the wire format's provider tag
 pub enum ProviderType {

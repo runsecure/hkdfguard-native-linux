@@ -129,7 +129,8 @@ extern "C" {
  * working for the process -- hence opt-in. Call once, early in startup,
  * and after any privilege change (the kernel resets the dumpable flag
  * when credentials change). Root and CAP_SYS_PTRACE are unaffected; that
- * is host configuration. Idempotent.
+ * is host configuration. Idempotent. The library applies it itself before
+ * creating an ephemeral KEK, whose only protection is process memory.
  *
  * Same as hkdfguard_harden_process_with_flags(0).
  *

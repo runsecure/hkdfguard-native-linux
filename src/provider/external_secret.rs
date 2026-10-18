@@ -26,10 +26,14 @@
 //! secret this crate reads from disk:
 //!
 //! - **Owned by root or by this process's user**, with **no group or
-//!   other access** (`0400`/`0600`). A group- or world-readable private
-//!   key is refused, and refused loudly: it is reported as an error, never
-//!   as "not provisioned", so a misconfigured mount can't silently fall
-//!   through to a weaker provider.
+//!   other access** (`0400`/`0600`) -- except that a root-owned file may
+//!   also be group-readable (`root:<group> 0440`), which is what a
+//!   Kubernetes Secret volume becomes when the pod sets `fsGroup`, and how
+//!   a non-root service reads a root-owned secret. A world-readable key,
+//!   or a group-readable one the service owns itself, is refused, and
+//!   refused loudly: it is reported as an error, never as "not
+//!   provisioned", so a misconfigured mount can't silently fall through to
+//!   a weaker provider.
 //! - **In a mount nobody else can write to.** The mount directory and
 //!   every directory above it must be owned by root or this process's user
 //!   and not writable by group or others (sticky ancestors and read-only
@@ -51,8 +55,9 @@
 //! resolution and open -- see [`open_secret_within_mount`].
 //!
 //! Every common mechanism can meet the mode requirement with one setting:
-//! Kubernetes `defaultMode: 0400`, Vault Agent `perms = "0400"`, Docker
-//! Swarm `mode: 0400`; systemd `LoadCredential=` is already `0400`.
+//! Kubernetes `defaultMode: 0400` (`0440` with `fsGroup` for a non-root
+//! pod), Vault Agent `perms = "0400"`, Docker Swarm `mode: 0400`; systemd
+//! `LoadCredential=` is already `0400`.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
@@ -134,13 +139,7 @@ impl KekHandle for ExternalSecretHandle {
     }
 
     fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
-        let shared = p256::ecdh::diffie_hellman(
-            self.secret_key.to_nonzero_scalar(), // our private scalar
-            point.as_affine(),         // the payload's hashed point H_salt (see crypto.rs)
-        );
-        let mut out = [0u8; 32];
-        out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared secret's raw bytes
-        Ok(SharedSecret::new(out)) // wrap in the zeroizing alias
+        Ok(crate::provider::software_ecdh(&self.secret_key, point)) // point: the payload's hashed point H_salt (see crypto.rs)
     }
 
     fn public_key(&self) -> Result<PublicKey> {
@@ -240,7 +239,7 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
     owner: Some(Owner::RootOrCurrentUser),
     forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
     follow_symlinks: false, // applied to the already-resolved path; see below
-    allow_group_read_if_root_owned: false,
+    allow_group_read_if_root_owned: true, // root:<fsGroup> 0440, as the kubelet writes it for a non-root pod
 };
 
 /// Resolves `<mount>/<service>` to the real file it names, refuses the
@@ -496,7 +495,12 @@ mod tests {
             let secret_key = SecretKey::generate();
             let path = provision(dir, "com.company.orders", secret_key.to_bytes());
 
-            for mode in [0o644u32, 0o640, 0o604, 0o660, 0o444] {
+            // Group read is allowed only on a root-owned file, and the
+            // fixture is owned by whoever runs the tests.
+            // SAFETY: geteuid has no preconditions.
+            let root_owned = unsafe { libc::geteuid() } == 0;
+            let group_read: &[u32] = if root_owned { &[] } else { &[0o640, 0o440] };
+            for &mode in [0o644u32, 0o604, 0o660, 0o444].iter().chain(group_read) {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
                 match provider.load_kek("com.company.orders", true) {
                     Err(Error::Provider(msg)) => assert!(msg.contains("permissions"), "mode {mode:o}: {msg}"),
@@ -509,8 +513,9 @@ mod tests {
                 );
             }
 
-            // Owner-only modes are accepted.
-            for mode in [0o600u32, 0o400] {
+            // Owner-only modes are accepted, and root:<group> 0440 / 0640.
+            let group_read: &[u32] = if root_owned { &[0o640, 0o440] } else { &[] };
+            for &mode in [0o600u32, 0o400].iter().chain(group_read) {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
                 assert!(provider.kek_exists("com.company.orders").unwrap(), "mode {mode:o}");
                 provider.load_kek("com.company.orders", true).unwrap();

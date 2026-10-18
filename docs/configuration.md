@@ -272,7 +272,8 @@ a wrong format is reported when you provision, not later.
 
 **File rules.** The file must:
 - be owned by root or by the service's user, with no group or other access
-  (`0400` or `0600`);
+  (`0400` or `0600`), except that a root-owned file may also be readable by
+  its group (`root:<group> 0440`), so a non-root service can read it;
 - be a regular file;
 - resolve to a path inside the mount (symlinks are followed only while they
   stay inside it).
@@ -283,7 +284,7 @@ settings that meet the mode rule:
 
 | Mechanism | Setting |
 |---|---|
-| Kubernetes `Secret` volume | `defaultMode: 0400` (and leave `fsGroup` unset for that volume: it adds group read) |
+| Kubernetes `Secret` volume | `defaultMode: 0400`; for a non-root pod, set `fsGroup` (the kubelet then makes it `root:<fsGroup> 0440`) |
 | Vault Agent template or sink | `perms = "0400"` |
 | Docker Swarm secret | `mode: 0400` (the default `0444` is refused) |
 | CSI Secrets Store | `defaultMode` in the `SecretProviderClass` |
@@ -298,6 +299,18 @@ Keys live in process memory and vanish when the process exits, along with
 the ability to unwrap anything wrapped under them. Ephemeral is never used
 unless a policy names it, in `preferred_order` or as the `require`
 provider. Use it only for development and tests.
+
+Because the process's memory is the key's only protection, the library
+hardens the process before it creates the first ephemeral key: core dumps
+are disabled and the process is marked non-dumpable, as
+`hkdfguard_harden_process` does, and creating the key fails if that isn't
+possible. Debuggers and crash reporters stop working for that process. The
+keys themselves sit in pages excluded from core dumps and locked into RAM
+where `RLIMIT_MEMLOCK` allows (a warning is logged once if it doesn't).
+
+The `hkdfguard` CLI refuses ephemeral keys for `provision` and `wrap`: a
+key it created would be gone when it exits. Wrap DEKs from the application
+itself, for example with `hkdfguard_generate_and_wrap_dek`.
 
 ## Example policies
 
@@ -382,7 +395,7 @@ permissions so that only the service's own account can do both.
 | `/etc/hkdfguard/tpm.derivation-secret` | `root:<key-users> 0440` | Readable by the services allowed to use TPM keys |
 | `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | As above |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
-| External secret `<dir>/<service>` | root or the service's user, `0400` | Only that service |
+| External secret `<dir>/<service>` | root or the service's user, `0400`; or `root:<group> 0440` | Only that service (or the pod's `fsGroup`) |
 | Wrapped key files (CLI output) | `root:<service-group> 0640` | Only that service can read its wrapped DEK |
 
 A practical layout for several services on one host:

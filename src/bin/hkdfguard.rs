@@ -1243,6 +1243,10 @@ fn main() -> ExitCode {
         eprintln!("error: {e}; refusing to handle key material");
         return ExitCode::FAILURE;
     }
+    // An ephemeral KEK would exist only in this process: `provision` would
+    // create one that vanishes on exit, and `wrap` would produce a payload
+    // nothing could ever unwrap. The library refuses it with an explanation.
+    hkdfguard::refuse_ephemeral_keys_in_this_process();
     let parsed = utf8_args(std::env::args_os()).and_then(|args| parse_args(args.into_iter()));
     match parsed {
         Ok(ParseOutcome::Help) => {

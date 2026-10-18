@@ -115,7 +115,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 
 | Symptom | Fix |
 |---|---|
-| `permissions too broad (mode ...)` | The key file must be `0400` or `0600` with no group or other access. On Kubernetes, check `defaultMode`, and leave `fsGroup` unset for the secret volume. |
+| `permissions too broad (mode ...)` | The key file must be `0400` or `0600` with no group or other access, or `root:<group> 0440`. On Kubernetes, use `defaultMode: 0400` (never `0444`); a non-root pod also needs `fsGroup`. |
 | `owned by uid ..., which is not an allowed owner` | The key file must be owned by root or by the service's user |
 | `resolves to ..., outside the secret mount` | A symlink points out of the mount. Deliver the file inside it. |
 | `external secret is not a valid P-256 key (expected 32 raw bytes, PKCS#8 DER or SEC1 DER; PEM must be converted to DER)` | The file isn't one of the accepted forms. Most often it's PEM (text starting `-----BEGIN`): convert it with `openssl pkey -in key.pem -outform DER -out key.der`. Or the key is for another curve: only P-256 is accepted. |
