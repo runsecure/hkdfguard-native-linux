@@ -111,7 +111,7 @@ hkdfguard_generate_and_wrap_dek("com.company.orders", wrapped, &wrapped_len);
 ### Hardening the host process (opt-in)
 
 (Automatic once the process holds an ephemeral key: see
-[Providers](#providers).)
+[Provider chain](#provider-chain).)
 
 Keys and DEKs pass through your process's memory. `hkdfguard_harden_process`
 makes that memory harder to recover: it disables core dumps (`RLIMIT_CORE`

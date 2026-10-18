@@ -27,7 +27,7 @@ fn creating_an_ephemeral_key_hardens_the_process_and_locks_the_key_away() {
     std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
 
-    let service = CString::new("com.company.ephemeral-hardening").unwrap();
+    let service = CString::new("com.company.ephemeral.hardening").unwrap();
     assert_eq!(dumpable(), 1, "nothing may change before a key exists");
     assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
 
