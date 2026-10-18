@@ -227,7 +227,12 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   lockout.
 
 `provision` generates the key pair on the token: non-extractable, usable only
-for key derivation, and labelled with the service name.
+for key derivation, and labelled with the service name. Both halves are
+private objects (`CKA_PRIVATE`), and only private objects are ever looked up,
+so nothing someone creates on the token without the PIN is ever used. A pair
+provisioned before this rule existed has a public half that isn't private: it
+is reported as a private key whose public key is missing; delete both halves
+and run `provision` again (this changes that service's KEK).
 
 ### External secret (file)
 

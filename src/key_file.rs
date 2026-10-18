@@ -44,10 +44,8 @@ use crate::error::status;
 use crate::payload::{Payload, NONCE_LEN, SALT_LEN, VERSION};
 use crate::provider::ProviderType;
 use crate::secure_file::{self, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_WRITE};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::io;
 use std::path::Path;
-use zeroize::Zeroizing;
 
 /// Why a key file was refused. Each maps to its own C status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +274,19 @@ const _: () = assert!(MAX_PLAINTEXT_TEXT_LEN < MIN_WRAPPED_LEN && DEK_LEN < MIN_
 // whitespace an editor or `echo` adds. Every one of these is refused as
 // TooShort anyway; recognising them is what turns "wrong file" into "this
 // key is exposed".
+//
+// Constant-time in the contents: the only branches are on the length,
+// which the file's size already gives away. Every byte is visited twice
+// (once to find the text between the surrounding whitespace, once to test
+// it against all three alphabets at once) and every decision is mask
+// arithmetic, so how long this takes says nothing about where in a
+// would-be key the first non-matching byte sits. Nothing is decoded, so
+// the key is never reassembled either. The accepted set: whitespace is
+// what `trim_ascii` removes (space, tab, LF, FF, CR); hex is 64 digits of
+// either case; base64 is 43 characters, or 44 ending in `=`, all in one
+// alphabet, whose last character's 2 unused bits are zero -- exactly what
+// the base64 crate's STANDARD/URL_SAFE decoders, padded or not, accept as
+// 32 bytes. The Windows and macOS builds implement the same steps.
 fn looks_like_plaintext_dek(bytes: &[u8]) -> bool {
     if bytes.len() == DEK_LEN {
         return true;
@@ -283,23 +294,107 @@ fn looks_like_plaintext_dek(bytes: &[u8]) -> bool {
     if bytes.len() > MAX_PLAINTEXT_TEXT_LEN {
         return false;
     }
-    let text = bytes.trim_ascii();
-    match text.len() {
-        HEX_DEK_LEN => text.iter().all(u8::is_ascii_hexdigit),
-        43 | BASE64_DEK_LEN => {
-            use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-            let mut decoded = Zeroizing::new([0u8; BASE64_DEK_LEN]); // a decoded DEK is wiped as soon as it's been measured
-            [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD]
-                .iter()
-                .any(|engine| matches!(engine.decode_slice(text, &mut decoded[..]), Ok(n) if n == DEK_LEN))
+    ct::looks_like_text_dek(bytes) == 1
+}
+
+/// Branch-free byte classification for [`looks_like_plaintext_dek`]. Every
+/// function returns 0 or 1 and is straight-line arithmetic on `u32`, with
+/// no data-dependent branch or table lookup.
+mod ct {
+    /// 1 if `a == b`, else 0 (inputs below 2^31).
+    fn eq(a: u32, b: u32) -> u32 {
+        ((a ^ b).wrapping_sub(1)) >> 31
+    }
+
+    /// 1 if `lo <= c <= hi`, else 0 (inputs below 2^31).
+    fn in_range(c: u32, lo: u32, hi: u32) -> u32 {
+        // Both differences wrap negative exactly when c is inside.
+        (((lo.wrapping_sub(1)).wrapping_sub(c) & c.wrapping_sub(hi + 1)) >> 31) & 1
+    }
+
+    /// `a` if `cond` is 1, `b` if it is 0.
+    fn select(cond: u32, a: u32, b: u32) -> u32 {
+        b ^ ((a ^ b) & cond.wrapping_neg())
+    }
+
+    fn is_whitespace(c: u32) -> u32 {
+        eq(c, 0x20) | eq(c, 0x09) | eq(c, 0x0A) | eq(c, 0x0C) | eq(c, 0x0D)
+    }
+
+    fn is_hex(c: u32) -> u32 {
+        in_range(c, b'0' as u32, b'9' as u32) | in_range(c, b'a' as u32, b'f' as u32) | in_range(c, b'A' as u32, b'F' as u32)
+    }
+
+    /// (member, 6-bit value) of `c` in the base64 alphabet whose 62nd and
+    /// 63rd characters are `c62` and `c63`.
+    fn base64(c: u32, c62: u8, c63: u8) -> (u32, u32) {
+        let upper = in_range(c, b'A' as u32, b'Z' as u32);
+        let lower = in_range(c, b'a' as u32, b'z' as u32);
+        let digit = in_range(c, b'0' as u32, b'9' as u32);
+        let s62 = eq(c, c62 as u32);
+        let s63 = eq(c, c63 as u32);
+        let value = (c.wrapping_sub(b'A' as u32) & upper.wrapping_neg())
+            | (c.wrapping_sub(b'a' as u32 - 26) & lower.wrapping_neg())
+            | (c.wrapping_add(52 - b'0' as u32) & digit.wrapping_neg())
+            | (62 & s62.wrapping_neg())
+            | (63 & s63.wrapping_neg());
+        (upper | lower | digit | s62 | s63, value)
+    }
+
+    /// 1 if `bytes` (at most `MAX_PLAINTEXT_TEXT_LEN` long) is a DEK as
+    /// text with surrounding whitespace, else 0. See
+    /// `looks_like_plaintext_dek`.
+    pub(super) fn looks_like_text_dek(bytes: &[u8]) -> u32 {
+        use super::{BASE64_DEK_LEN, HEX_DEK_LEN};
+        const HEX: u32 = HEX_DEK_LEN as u32;
+        const PADDED: u32 = BASE64_DEK_LEN as u32;
+        // Pass 1: the first and last non-whitespace positions.
+        let (mut seen, mut start, mut end) = (0u32, 0u32, 0u32);
+        for (i, &b) in bytes.iter().enumerate() {
+            let i = i as u32;
+            let text = is_whitespace(b as u32) ^ 1;
+            start = select(text & (seen ^ 1), i, start);
+            end = select(text, i, end);
+            seen |= text;
         }
-        _ => false,
+        let text_len = (end.wrapping_sub(start) + 1) & seen.wrapping_neg();
+
+        // Pass 2: every byte between them against every alphabet, plus the
+        // values of the last two (the last may be the `=` of padding).
+        let (mut hex_ok, mut std_ok, mut url_ok, mut padded) = (1u32, 1u32, 1u32, 0u32);
+        let (mut std_last, mut std_prev, mut url_last, mut url_prev) = (0u32, 0u32, 0u32, 0u32);
+        for (i, &b) in bytes.iter().enumerate() {
+            let (i, c) = (i as u32, b as u32);
+            let inside = (in_range(i, start, end) & seen) ^ 1; // 1 outside the text
+            let is_end = eq(i, end);
+            let is_prev = eq(i.wrapping_add(1), end);
+            let pad = is_end & eq(c, b'=' as u32);
+            let (std_member, std_value) = base64(c, b'+', b'/');
+            let (url_member, url_value) = base64(c, b'-', b'_');
+            hex_ok &= is_hex(c) | inside;
+            std_ok &= std_member | pad | inside;
+            url_ok &= url_member | pad | inside;
+            padded |= pad;
+            std_last = select(is_end, std_value, std_last);
+            std_prev = select(is_prev, std_value, std_prev);
+            url_last = select(is_end, url_value, url_last);
+            url_prev = select(is_prev, url_value, url_prev);
+        }
+
+        // 43 data characters carry 258 bits: the last one's low 2 must be 0.
+        let shape = (eq(text_len, PADDED - 1) & (padded ^ 1)) | (eq(text_len, PADDED) & padded);
+        let std_canonical = eq(select(padded, std_prev, std_last) & 3, 0);
+        let url_canonical = eq(select(padded, url_prev, url_last) & 3, 0);
+        let hex = hex_ok & eq(text_len, HEX);
+        let base64 = shape & ((std_ok & std_canonical) | (url_ok & url_canonical));
+        seen & (hex | base64)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use crate::payload::FINGERPRINT_LEN;
     use std::os::unix::fs::PermissionsExt;
 
@@ -465,6 +560,96 @@ mod tests {
         }
         // And the CLI's own DEK input, exactly as the docs show writing it.
         assert_eq!(check(format!("{}\n", base64_dek()).as_bytes()), Err(KeyFileError::PlaintextKey));
+    }
+
+    // The decoder-based definition the constant-time detector replaced:
+    // trim, then hex, or any of the base64 crate's four engines yielding 32
+    // bytes. Kept here as the reference the new code must agree with.
+    fn reference_looks_like_plaintext_dek(bytes: &[u8]) -> bool {
+        use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+        if bytes.len() == DEK_LEN {
+            return true;
+        }
+        if bytes.len() > MAX_PLAINTEXT_TEXT_LEN {
+            return false;
+        }
+        let text = bytes.trim_ascii();
+        match text.len() {
+            HEX_DEK_LEN => text.iter().all(u8::is_ascii_hexdigit),
+            43 | BASE64_DEK_LEN => {
+                let mut decoded = [0u8; BASE64_DEK_LEN];
+                [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD]
+                    .iter()
+                    .any(|engine| matches!(engine.decode_slice(text, &mut decoded[..]), Ok(n) if n == DEK_LEN))
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn the_constant_time_detector_agrees_with_the_decoders() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64; // xorshift: deterministic, no extra dev-dependency
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_= \t\n\x0b\x0c\r!g";
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..20_000 {
+            let mut dek = [0u8; DEK_LEN];
+            dek.iter_mut().for_each(|b| *b = next() as u8);
+            let mut text = match next() % 5 {
+                0 => STANDARD.encode(dek).into_bytes(),
+                1 => URL_SAFE_NO_PAD.encode(dek).into_bytes(),
+                2 => dek.iter().map(|b| format!("{b:02X}")).collect::<String>().into_bytes(),
+                3 => (0..(next() % 70) as usize).map(|_| alphabet[(next() as usize) % alphabet.len()]).collect(),
+                _ => (0..(next() % 100) as usize).map(|_| next() as u8).collect(),
+            };
+            // Mutate: flip a character to another from the alphabet, and
+            // surround with whitespace, some of the time.
+            if !text.is_empty() && next() % 2 == 0 {
+                let at = (next() as usize) % text.len();
+                text[at] = alphabet[(next() as usize) % alphabet.len()];
+            }
+            if next() % 3 == 0 {
+                let ws = b" \t\n\x0c\r\x0b";
+                for _ in 0..next() % 4 {
+                    text.insert(0, ws[(next() as usize) % ws.len()]);
+                }
+                for _ in 0..next() % 4 {
+                    text.push(ws[(next() as usize) % ws.len()]);
+                }
+            }
+            cases.push(text);
+        }
+        let mut positives = 0;
+        for case in &cases {
+            let want = reference_looks_like_plaintext_dek(case);
+            positives += want as usize;
+            assert_eq!(looks_like_plaintext_dek(case), want, "{:?}", String::from_utf8_lossy(case));
+        }
+        assert!(positives > 4_000 && positives < 16_000, "the corpus must exercise both answers ({positives} positive)");
+    }
+
+    #[test]
+    fn the_detector_s_edge_cases_match_the_windows_build() {
+        let b64 = STANDARD.encode([0u8; DEK_LEN]); // "AAAA...A="
+        let plain = |s: &str| looks_like_plaintext_dek(s.as_bytes());
+        assert!(plain(&format!("{}{b64}{}", " ".repeat(30), "\n".repeat(22))), "96 bytes in all");
+        assert!(!plain(&format!("{}{b64}{}", " ".repeat(31), "\n".repeat(22))), "nothing over 96 bytes");
+        assert!(!plain(&format!("{}B=", &b64[..42])), "unused trailing bits set");
+        assert!(plain(&format!("{}E=", &b64[..42])), "trailing bits zero");
+        assert!(plain(&format!("+{}A", &b64[1..42])), "43 characters, standard alphabet");
+        assert!(!plain(&format!("+{}-A", &b64[1..41])), "mixed alphabets");
+        assert!(!plain(&format!("{}==", &b64[..42])), "\"==\"");
+        assert!(!plain(&format!("{b64}=")), "an extra '='");
+        assert!(!plain(&format!("\x0b{b64}")), "vertical tab is not trimmed");
+        assert!(plain(&format!("\x0c{b64}\x0c")), "form feed is");
+        assert!(!plain(""), "empty");
+        assert!(!plain(&" ".repeat(50)), "only whitespace");
     }
 
     #[test]

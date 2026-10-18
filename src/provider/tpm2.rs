@@ -63,7 +63,7 @@ use tss_esapi::interface_types::resource_handles::Hierarchy; // selects the Owne
 use tss_esapi::interface_types::session_handles::AuthSession; // a started session, as passed to execute_with_session
 use tss_esapi::structures::{
     EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, Name, Public, PublicBuilder,
-    PublicEccParametersBuilder, SymmetricDefinition,
+    PublicEccParametersBuilder, SymmetricDefinition, SymmetricDefinitionObject,
 }; // the TPM public-template types this module builds, the TPM2_ReadPublic "Name" value, and the session cipher
 use tss_esapi::traits::Marshall; // `.marshall()`, for serializing a `Public` area to its wire bytes
 use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its configuration type
@@ -287,6 +287,104 @@ fn read_owner_auth(path: &std::path::Path) -> Result<tss_esapi::structures::Auth
     auth
 }
 
+/// The Owner-hierarchy authorization this process has confirmed, and the
+/// one it has latched as rejected -- each keyed by the configured
+/// `tpm.owner_auth_file` (`None` when policy names none) and that file's
+/// identity.
+///
+/// Every Owner-authorized command with a wrong password counts toward the
+/// TPM's dictionary-attack limit, and that limit is TPM-wide: a Hyper-V
+/// vTPM allows 3 failures per 1000 s, after which every DA-protected object
+/// on the TPM is refused, for every tenant. `hkdfguard_wrap_dek` is not
+/// rate-limited, so a service retrying after an owner-password rotation
+/// would otherwise put the whole TPM into lockout within seconds. So: the
+/// first call confirms the authorization once, under this lock, so
+/// concurrent first calls wait for its verdict rather than each spending an
+/// attempt; a rejection latches, and no Owner-authorized command is sent
+/// again until the file -- or the policy setting -- changes.
+static OWNER_AUTH: Mutex<OwnerAuthState> = Mutex::new(OwnerAuthState { confirmed: None, rejected: None });
+
+type OwnerAuthKey = (Option<PathBuf>, Option<crate::secure_file::FileIdentity>);
+
+struct OwnerAuthState {
+    confirmed: Option<OwnerAuthKey>,
+    rejected: Option<(OwnerAuthKey, String)>,
+}
+
+/// Label for the primary created to confirm the Owner authorization.
+/// Leading underscores keep it outside the service-name charset.
+const OWNER_AUTH_PROBE_LABEL: &str = "__hkdfguard_owner_auth_probe__";
+
+fn owner_auth_key(file: Option<&std::path::Path>) -> OwnerAuthKey {
+    (file.map(std::path::Path::to_path_buf), file.and_then(crate::secure_file::FileIdentity::of))
+}
+
+/// Whether the TPM rejected the authorization itself (`TPM_RC_AUTH_FAIL`,
+/// which counts toward the DA limit, or `TPM_RC_BAD_AUTH`), as opposed to
+/// failing for some other reason.
+fn is_auth_rejection(e: &tss_esapi::Error) -> bool {
+    use tss_esapi::constants::Tss2ResponseCodeKind;
+    matches!(e, tss_esapi::Error::Tss2Error(rc) if matches!(rc.kind(), Some(Tss2ResponseCodeKind::AuthFail | Tss2ResponseCodeKind::BadAuth)))
+}
+
+fn rejection_reason(file: Option<&std::path::Path>) -> String {
+    let configured = match file {
+        Some(path) => format!("tpm.owner_auth_file {}", path.display()),
+        None => "the empty Owner password (policy names no tpm.owner_auth_file)".to_string(),
+    };
+    format!(
+        "the TPM rejected the Owner-hierarchy authorization from {configured}; no further Owner-authorized command \
+         will be sent by this process until that changes, so the TPM's dictionary-attack counter is not spent"
+    )
+}
+
+/// Confirms the Owner authorization set on `ctx` before any key is
+/// created, once per configured file version -- see [`OWNER_AUTH`].
+/// `probe` runs one Owner-authorized command and is called at most once
+/// per verdict.
+fn confirm_owner_auth(
+    file: Option<&std::path::Path>,
+    probe: impl FnOnce() -> std::result::Result<(), tss_esapi::Error>,
+) -> std::result::Result<(), String> {
+    let key = owner_auth_key(file);
+    let mut state = OWNER_AUTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((rejected, reason)) = &state.rejected {
+        if *rejected == key {
+            return Err(reason.clone());
+        }
+        state.rejected = None; // changed since: one attempt may find out whether the correction worked
+    }
+    if state.confirmed.as_ref() == Some(&key) {
+        return Ok(());
+    }
+    match probe() {
+        Ok(()) => {
+            state.confirmed = Some(key);
+            Ok(())
+        }
+        Err(e) if is_auth_rejection(&e) => {
+            let reason = rejection_reason(file);
+            state.confirmed = None;
+            state.rejected = Some((key, reason.clone()));
+            Err(reason)
+        }
+        Err(e) => Err(format!("could not confirm the TPM Owner authorization: {e}")), // not a verdict: retried next call
+    }
+}
+
+/// Records an Owner-authorization rejection seen after confirmation -- the
+/// password rotated underneath a running process -- so later calls stop at
+/// [`confirm_owner_auth`] instead of spending more attempts.
+fn note_owner_auth_failure(e: &tss_esapi::Error) {
+    if !is_auth_rejection(e) {
+        return;
+    }
+    let file = crate::policy::tpm_owner_auth_file().ok().flatten();
+    let mut state = OWNER_AUTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.confirmed = None;
+    state.rejected = Some((owner_auth_key(file.as_deref()), rejection_reason(file.as_deref())));
+}
+
 
 // Holds the shared, lazily-usable connection to the TPM. `None` means no
 // TPM was reachable at construction time (this provider is then simply
@@ -400,18 +498,33 @@ fn open_context() -> Backend<Context> {
     // that keys its HMAC with whatever authValue the context holds for the
     // handle -- so the password authorizes without ever crossing the bus.
     // Not a derivation input: setting it changes no KEK.
-    match crate::policy::tpm_owner_auth_file() {
-        Ok(Some(path)) => {
-            let auth = match read_owner_auth(&path) {
-                Ok(auth) => auth,
-                Err(e) => return Backend::Refused(e.to_string()),
-            };
-            if let Err(e) = ctx.tr_set_auth(tss_esapi::handles::ObjectHandle::from(Hierarchy::Owner), auth) {
-                return Backend::Refused(format!("could not set the TPM owner authorization: {e}"));
-            }
-        }
-        Ok(None) => {}
+    let owner_auth_file = match crate::policy::tpm_owner_auth_file() {
+        Ok(file) => file,
         Err(e) => return Backend::Refused(e.to_string()),
+    };
+    if let Some(path) = &owner_auth_file {
+        let auth = match read_owner_auth(path) {
+            Ok(auth) => auth,
+            Err(e) => return Backend::Refused(e.to_string()),
+        };
+        if let Err(e) = ctx.tr_set_auth(tss_esapi::handles::ObjectHandle::from(Hierarchy::Owner), auth) {
+            return Backend::Refused(format!("could not set the TPM owner authorization: {e}"));
+        }
+    }
+    // Before any key is created: a wrong Owner password spends one of the
+    // TPM's dictionary-attack attempts per command (see `OWNER_AUTH`).
+    let probe = |ctx: &mut Context| {
+        let template = primary_template(OWNER_AUTH_PROBE_LABEL, None, false).map_err(|_| {
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
+        })?;
+        let handle = ctx
+            .execute_with_nullauth_session(|ctx| ctx.create_primary(Hierarchy::Owner, template, None, None, None, None))?
+            .key_handle;
+        let _ = ctx.flush_context(handle.into());
+        Ok(())
+    };
+    if let Err(reason) = confirm_owner_auth(owner_auth_file.as_deref(), || probe(&mut ctx)) {
+        return Backend::Refused(reason);
     }
 
     // The conformance verdict is a fact about the TPM's *behavior*, not a
@@ -606,7 +719,10 @@ fn create_and_verify_primary_with(
             // TPM2_CreatePrimary: deterministically (re)derives this service's key from the TPM's own seed + `template`
             ctx.create_primary(Hierarchy::Owner, template.clone(), None, None, None, None)
         })
-        .map_err(|e| Error::Provider(format!("TPM2_CreatePrimary failed: {e}")))?
+        .map_err(|e| {
+            note_owner_auth_failure(&e);
+            Error::Provider(format!("TPM2_CreatePrimary failed: {e}"))
+        })?
         .key_handle;
 
     let (public, name, _qualified_name) = match ctx.read_public(key_handle) {
@@ -809,13 +925,17 @@ fn validate_derivation_secret_is_honored(ctx: &mut Context) -> Result<Option<boo
 // the session key. The cryptography lives in tpm2-tss's ESAPI layer,
 // which tss-esapi wraps; this module only configures the session.
 //
-// Two things are load-bearing. An *unsalted* session's key derives from
-// the two nonces, both visible on the bus, so the interposer computes it
-// too -- salting is the entire defense, not an option. And the salt
-// key's public half is itself learned over the bus at `TPM2_ReadPublic`,
-// so an interposer can substitute its own and man-in-the-middle the
-// session; that is what `tpm.pinned_session_salt_key_name` defeats, and
-// why `required` mode refuses to run without a pin.
+// Three things are load-bearing. An *unsalted* session's key derives
+// from the two nonces, both visible on the bus, so the interposer computes
+// it too -- salting is the entire defense, not an option. The salt key is
+// *restricted*: the TPM uses its private half only inside
+// `TPM2_StartAuthSession`, so nobody -- not even a process that can send
+// the TPM commands and recreate the key from its public template -- can
+// run ECDH with it to recover a session's salt. And the salt key's public
+// half is itself learned over the bus at `TPM2_ReadPublic`, so an
+// interposer can substitute its own and man-in-the-middle the session;
+// that is what `tpm.pinned_session_salt_key_name` defeats, and why
+// `required` mode refuses to run without a pin.
 //
 // Known limitation on a discrete TPM: parameter encryption covers only
 // the *first* parameter of a command, and `TPM2_CreatePrimary`'s first
@@ -922,21 +1042,23 @@ fn session_encryption_enabled(ctx: &mut Context) -> Result<bool> {
     }
 }
 
-/// Derives the deterministic session salt key: the same proven template
-/// shape as a service key (ECC P-256, unrestricted decrypt, no scheme --
-/// a valid `tpmKey` for `TPM2_StartAuthSession`'s one-pass-ECDH salt),
-/// under a fixed label and with **no** derivation secret. It must be
-/// derivable before anything secret is trusted, and it protects nothing
-/// on its own: its private half only ever unwraps session salts. Verifies
-/// the Name (self-consistency, and the policy pin if one is set) before
-/// returning the still-loaded handle; the caller flushes it.
+/// Derives the deterministic session salt key: a restricted ECC P-256
+/// storage key (see [`session_salt_key_template`]) -- a valid `tpmKey` for
+/// `TPM2_StartAuthSession`'s one-pass-ECDH salt, and usable for nothing
+/// else -- under a fixed label and with **no** derivation secret. It must
+/// be derivable before anything secret is trusted. Verifies the Name
+/// (self-consistency, and the policy pin if one is set) before returning
+/// the still-loaded handle; the caller flushes it.
 fn create_session_salt_key(ctx: &mut Context) -> Result<KeyHandle> {
-    let template = service_public_template(SESSION_SALT_KEY_LABEL, None)?;
+    let template = session_salt_key_template()?;
     let key_handle = ctx
         .execute_with_nullauth_session(|ctx| {
             ctx.create_primary(Hierarchy::Owner, template.clone(), None, None, None, None)
         })
-        .map_err(|e| Error::Provider(format!("TPM2_CreatePrimary (session salt key) failed: {e}")))?
+        .map_err(|e| {
+            note_owner_auth_failure(&e);
+            Error::Provider(format!("TPM2_CreatePrimary (session salt key) failed: {e}"))
+        })?
         .key_handle;
 
     let (public, name, _qualified_name) = match ctx.read_public(key_handle) {
@@ -1287,28 +1409,51 @@ fn service_public_template(
     service: &str,
     secret: Option<&Zeroizing<[u8; 32]>>,
 ) -> Result<Public> {
+    primary_template(service, secret, false)
+}
+
+/// Template for the session salt key: a *restricted* decrypt key, the shape
+/// of a standard storage root key (ECC P-256, AES-128-CFB, no scheme). The
+/// TPM refuses `TPM2_ECDH_ZGen` and `TPM2_ECC_Decrypt` with a restricted
+/// key, so its private half can only ever be used inside the TPM by
+/// `TPM2_StartAuthSession` to unwrap a session salt. An unrestricted key
+/// would let anyone able to send TPM commands recreate it (the template is
+/// public and the key deterministic), run ECDH_ZGen against the session's
+/// ephemeral point seen on the bus, recover the salt, and so decrypt Z.
+fn session_salt_key_template() -> Result<Public> {
+    primary_template(SESSION_SALT_KEY_LABEL, None, true)
+}
+
+// The shared shape of both primaries. `restricted` selects the session
+// salt key's storage-key form; a service key must be unrestricted to be
+// usable with TPM2_ECDH_ZGen.
+fn primary_template(label: &str, secret: Option<&Zeroizing<[u8; 32]>>, restricted: bool) -> Result<Public> {
     let object_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true) // key can never be moved to a different TPM
         .with_fixed_parent(true) // key can never be re-parented/duplicated
         .with_sensitive_data_origin(true) // the private part is generated by the TPM itself; required for an asymmetric key
         .with_user_with_auth(true) // standard "USER role" authorization is sufficient to use the key
-        .with_decrypt(true) // required: this key will be used for a decryption-family operation (ECDH)
+        .with_decrypt(true) // required: a decryption-family key (ECDH, or unwrapping a session salt)
         .with_sign_encrypt(false) // this key must not be usable for signing
-        .with_restricted(false) // unrestricted, so it's usable directly with TPM2_ECDH_ZGen
+        .with_restricted(restricted)
         .build()
         .map_err(|e| Error::Provider(format!("failed to build TPM object attributes: {e}")))?;
 
-    let ecc_params = PublicEccParametersBuilder::new()
+    let mut ecc_params = PublicEccParametersBuilder::new()
         .with_ecc_scheme(EccScheme::Null) // no fixed signing/KDF scheme baked into the key itself
         .with_curve(EccCurve::NistP256) // the mandated curve
         .with_key_derivation_function_scheme(KeyDerivationFunctionScheme::Null) // no on-TPM KDF; this crate does its own HKDF afterward
         .with_is_decryption_key(true) // mirrors the object attribute above, for the builder's own consistency checks
         .with_is_signing_key(false)
-        .with_restricted(false)
+        .with_restricted(restricted);
+    if restricted {
+        ecc_params = ecc_params.with_symmetric(SymmetricDefinitionObject::AES_128_CFB); // a restricted decrypt key must name its symmetric algorithm
+    }
+    let ecc_params = ecc_params
         .build()
         .map_err(|e| Error::Provider(format!("failed to build TPM ECC parameters: {e}")))?;
 
-    let unique = service_unique_point(service, secret)?; // the per-service (and, with a secret, per-host) label that differentiates this key
+    let unique = service_unique_point(label, secret)?; // the per-service (and, with a secret, per-host) label that differentiates this key
 
     PublicBuilder::new()
         .with_public_algorithm(PublicAlgorithm::Ecc)
@@ -1393,6 +1538,107 @@ mod tests {
     use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use crate::policy::test_support::TestPolicy;
     use serial_test::serial; // the tests below set process-wide env vars
+
+    // ---------------------------------------------------------------
+    // Owner-authorization latch (no TPM needed: the probe is a closure).
+    // ---------------------------------------------------------------
+
+    fn reset_owner_auth() {
+        *OWNER_AUTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            OwnerAuthState { confirmed: None, rejected: None };
+    }
+
+    // TPM_RC_AUTH_FAIL (format one, session 1), and TPM_RC_LOCKOUT (a warning).
+    fn auth_fail() -> tss_esapi::Error {
+        tss_esapi::Error::Tss2Error(tss_esapi::constants::Tss2ResponseCode::from(0x98E))
+    }
+    fn lockout() -> tss_esapi::Error {
+        tss_esapi::Error::Tss2Error(tss_esapi::constants::Tss2ResponseCode::from(0x921))
+    }
+
+    #[test]
+    #[serial]
+    fn a_rejected_owner_password_is_never_tried_again_until_the_file_changes() {
+        reset_owner_auth();
+        let dir = crate::secure_file::private_tempdir();
+        let file = dir.path().join("owner.auth");
+        std::fs::write(&file, b"wrong").unwrap();
+        assert!(is_auth_rejection(&auth_fail()) && !is_auth_rejection(&lockout()));
+
+        let err = confirm_owner_auth(Some(&file), || Err(auth_fail())).unwrap_err();
+        assert!(err.contains("rejected the Owner-hierarchy authorization"), "{err}");
+        for _ in 0..5 {
+            let again = confirm_owner_auth(Some(&file), || panic!("a latched password must not reach the TPM"));
+            assert_eq!(again.unwrap_err(), err);
+        }
+
+        // An operator corrects the file: exactly one attempt finds out.
+        std::fs::write(&file, b"corrected password").unwrap();
+        let mut probes = 0;
+        confirm_owner_auth(Some(&file), || {
+            probes += 1;
+            Ok(())
+        })
+        .unwrap();
+        confirm_owner_auth(Some(&file), || panic!("a confirmed password is not probed again")).unwrap();
+        assert_eq!(probes, 1);
+        reset_owner_auth();
+    }
+
+    #[test]
+    #[serial]
+    fn a_failure_that_is_not_an_auth_rejection_is_not_latched() {
+        reset_owner_auth();
+        // In lockout the TPM refuses without counting: nothing to protect,
+        // and no verdict about the password, so the next call tries again.
+        assert!(confirm_owner_auth(None, || Err(lockout())).unwrap_err().contains("could not confirm"));
+        let mut probed = false;
+        confirm_owner_auth(None, || {
+            probed = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(probed);
+        reset_owner_auth();
+    }
+
+    #[test]
+    #[serial]
+    fn a_rotation_after_confirmation_latches_at_the_failing_command() {
+        reset_owner_auth();
+        let _no_policy = TestPolicy::absent(); // so `note_owner_auth_failure` reads "no owner_auth_file"
+        confirm_owner_auth(None, || Ok(())).unwrap();
+        note_owner_auth_failure(&lockout()); // not an auth rejection: ignored
+        confirm_owner_auth(None, || panic!("still confirmed")).unwrap();
+        note_owner_auth_failure(&auth_fail()); // the password changed underneath the process
+        let err = confirm_owner_auth(None, || panic!("latched: must not reach the TPM")).unwrap_err();
+        assert!(err.contains("empty Owner password"), "{err}");
+        reset_owner_auth();
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_first_calls_spend_one_attempt_between_them() {
+        reset_owner_auth();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let attempts = attempts.clone();
+                std::thread::spawn(move || {
+                    confirm_owner_auth(None, || {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        Err(auth_fail())
+                    })
+                })
+            })
+            .collect();
+        for t in threads {
+            assert!(t.join().unwrap().is_err());
+        }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "a burst of first calls must spend one attempt, not one each");
+        reset_owner_auth();
+    }
 
     // ---------------------------------------------------------------
     // Derivation-secret and Name handling.
@@ -2276,6 +2522,29 @@ mod tests {
         .expect("its attributes must be readable");
         assert!(attributes.decrypt(), "the command's first parameter (inPoint) must be encrypted");
         assert!(attributes.encrypt(), "the response's first parameter (Z) must be encrypted");
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn the_tpm_refuses_ecdh_with_the_session_salt_key() {
+        // The salt key is restricted, so anyone who recreates it from its
+        // public template still can't use it to recover a session's salt:
+        // the TPM itself refuses ECDH_ZGen with it. A service key, for
+        // contrast, accepts the same point.
+        let point = encode_peer_point(&crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap()).unwrap();
+        let (salt_key_ecdh, service_key_ecdh) = with_tpm_context(|ctx| {
+            let salt_key = create_session_salt_key(ctx)?;
+            let refused = ctx.execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(salt_key, point.clone()));
+            let _ = ctx.flush_context(salt_key.into());
+            let (service_key, _, _) = create_and_verify_primary_with(ctx, "com.company.orders", None)?;
+            let accepted = ctx.execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(service_key, point.clone()));
+            let _ = ctx.flush_context(service_key.into());
+            Ok((refused.is_err(), accepted.is_ok()))
+        })
+        .unwrap();
+        assert!(salt_key_ecdh, "TPM2_ECDH_ZGen with the restricted session salt key must be refused by the TPM");
+        assert!(service_key_ecdh, "the control: a service key accepts the same point");
     }
 
     #[test]

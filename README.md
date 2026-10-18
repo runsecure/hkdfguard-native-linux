@@ -33,24 +33,8 @@ bound into both the AEAD's associated data and the HKDF `info`, so the
 `provider_type` tag and the KEK fingerprint are authenticated rather
 than merely present.
 
-**The payload format is Linux's own.** The Linux, Windows, and macOS
-libraries share one C ABI: the function names and signatures, the status
-codes, the `HKDFGUARD_*` flags, and what every call does. The wrapped
-payload is not shared. Each platform has its own format and size: here,
-the scheme above with a version byte, 132–276 bytes; on macOS, HPKE (RFC
-9180) base mode, a fixed 146 bytes. That's why `HKDFGUARD_WRAPPED_MAX_LEN`
-has the same name everywhere but a per-platform value. A payload is only
-opened on the host whose KEK wrapped it, so the formats never need to
-interoperate:
-
-- Treat a payload as opaque bytes. Size buffers with
-  `HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
-- Moving a service to another platform means re-wrapping its DEKs there,
-  under that host's KEK. A payload never moves between platforms.
-- The platforms also differ in **who can create a payload**. Here only the
-  KEK holder can (see above). On macOS, anyone holding the KEK's public key
-  can, so that library relies on the key file's ownership checks instead
-  (see its README, "Sender authentication").
+Treat a wrapped payload as opaque bytes: size buffers with
+`HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
 
 ## Documentation
 
@@ -506,7 +490,10 @@ from bus-visible nonces, and even a salted one can be man-in-the-middled
 if the attacker substitutes their own salt key at `TPM2_ReadPublic`, so
 the pin is what makes `required` mean something. The salt key is a
 deterministic primary with a fixed label, so its Name is stable and
-pinnable; it carries no derivation secret and protects nothing by itself.
+pinnable; it carries no derivation secret. It is a *restricted* storage
+key, so the TPM uses it only to unwrap session salts: someone who can send
+the TPM commands and recreate it still can't run ECDH with it to recover a
+session's salt.
 
 > **`auto` only defeats a passive listener.** The manufacturer it
 > decides from is read over the same bus it is protecting. On a discrete
@@ -580,7 +567,13 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 ```
 
 Set the policy entry in the same change as the password: with a password
-and no entry (or the reverse), every TPM call is refused. Back the file up
+and no entry (or the reverse), every TPM call is refused. Each process
+tries a rejected password once, then sends nothing Owner-authorized again
+until the file or the policy entry changes: every wrong attempt counts
+toward the TPM's dictionary-attack limit, which is TPM-wide (a Hyper-V
+vTPM allows 3 per 1000 s), so a service retrying would otherwise lock the
+whole TPM within seconds. After fixing the file, the next call tries again;
+nothing needs restarting. Back the file up
 with the derivation secret. The owner password applies to the whole Owner
 hierarchy, so anything else on the host that creates keys under it with an
 empty password -- `systemd-cryptenroll --tpm2-device`, tpm2-tss FAPI,

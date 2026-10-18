@@ -781,31 +781,46 @@ mod tests {
             let kek_public = handle.public_key().unwrap();
             let h = payload_ecdh_point(&payload.salt).unwrap();
 
-            // The ephemeral-key attack, attempted: pick an ephemeral scalar, do ECDH
-            // against the KEK's public key, and try to derive the wrapping
-            // key from it.
+            // 1. The attack is real: whenever the host runs ECDH against a
+            // point the attacker chose -- as an ephemeral-key protocol's
+            // unwrap does, against the E in the payload -- the attacker
+            // knows the result from KEK_pub alone. (Without this, the rest
+            // of the test could pass for a broken protocol too.)
             let attacker_scalar = SecretKey::generate();
-            let attacker_z = p256::ecdh::diffie_hellman(
-                attacker_scalar.to_nonzero_scalar(),
-                kek_public.as_affine(),
+            let attacker_point = attacker_scalar.public_key();
+            let attacker_z = p256::ecdh::diffie_hellman(attacker_scalar.to_nonzero_scalar(), kek_public.as_affine());
+            let mut host_z_on_attacker_point = handle.ecdh(&attacker_point).unwrap();
+            assert_eq!(
+                host_z_on_attacker_point.as_slice(),
+                attacker_z.raw_secret_bytes().as_slice(),
+                "ECDH against an attacker-chosen point gives the attacker the shared secret"
             );
+            host_z_on_attacker_point.zeroize();
+
+            // 2. So the protocol must never do that, and doesn't: the only
+            // point unwrap ever uses is a hash of the salt. Recomputed here
+            // independently of `payload_ecdh_point` -- the first counter
+            // whose SHA-256 is a valid x-coordinate, even y -- so it is a
+            // hash output nobody knows the discrete log of, whatever salt
+            // an attacker writes into a payload.
+            let hashed = (0..=u8::MAX)
+                .find_map(|counter| {
+                    let x = Sha256::new().chain_update(PAYLOAD_POINT_DOMAIN).chain_update(payload.salt).chain_update([counter]).finalize();
+                    let mut compressed = [0x02u8; 33];
+                    compressed[1..].copy_from_slice(&x);
+                    PublicKey::from_sec1_bytes(&compressed).ok()
+                })
+                .unwrap();
+            assert_eq!(h, hashed, "unwrap's point is exactly the hash of the payload's salt");
+            assert_ne!(h, attacker_point, "and so never a point the attacker chose");
+
+            // The attacker's best attempt at a wrapping key, then: ECDH of
+            // their own scalar with KEK_pub, which is not what unwrap uses.
             let mut attacker_secret = [0u8; 32];
             attacker_secret.copy_from_slice(attacker_z.raw_secret_bytes().as_slice());
-
             let authenticated = payload.authenticated_bytes();
             let forged_key =
                 derive_wrapping_key(&attacker_secret, service, &payload.salt, &authenticated).unwrap();
-
-            // The genuine key, for comparison.
-            let mut genuine_z = handle.ecdh(&h).unwrap();
-            let genuine_key =
-                derive_wrapping_key(&genuine_z, service, &payload.salt, &authenticated).unwrap();
-            genuine_z.zeroize();
-
-            assert_ne!(
-                *forged_key, *genuine_key,
-                "a KEK-public-key holder must not be able to derive the wrapping key"
-            );
 
             // And concretely: a payload encrypted under the attacker's key
             // does not unwrap, even though every header byte is
@@ -890,6 +905,27 @@ mod tests {
         let header = include_str!("../include/hkdfguard.h");
         let expected = format!("#define HKDFGUARD_WRAPPED_MAX_LEN {MAX_WRAPPED_LEN}");
         assert!(header.contains(&expected), "include/hkdfguard.h must contain `{expected}`");
+    }
+
+    #[test]
+    fn payload_ecdh_point_known_vectors() {
+        // Computed independently (Python: Euler's criterion on x^3 - 3x + b
+        // mod p) and pinned in the macOS library's tests too
+        // (HkdfGuardPayloadPointTests), so the two hash a salt to the same
+        // point. The second and third need the counter past 0.
+        let mut ascending = [0u8; SALT_LEN];
+        for (i, b) in ascending.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        for (salt, compressed) in [
+            (ascending, "02074508261589a2c703bcb88966769c27f980a528de99cd3dc92d93d3de8fa2a6"),
+            ([0x00; SALT_LEN], "02c68960c82e7e3d5395da61ee0f2024fb5e9ec0e45e2f104e33c65cca87c93620"),
+            ([0xFF; SALT_LEN], "02d31f6c8437eae360104be32527bbd36356c573c3047bc685ebbbde53148c13cb"),
+        ] {
+            let point = payload_ecdh_point(&salt).unwrap();
+            let got: String = point.to_sec1_point(true).as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, compressed, "salt {salt:02x?}");
+        }
     }
 
     #[test]
