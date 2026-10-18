@@ -893,6 +893,27 @@ mod tests {
     }
 
     #[test]
+    fn payload_ecdh_point_known_vectors() {
+        // Computed independently (Python: Euler's criterion on x^3 - 3x + b
+        // mod p) and pinned in the macOS library's tests too
+        // (HkdfGuardPayloadPointTests), so the two hash a salt to the same
+        // point. The second and third need the counter past 0.
+        let mut ascending = [0u8; SALT_LEN];
+        for (i, b) in ascending.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        for (salt, compressed) in [
+            (ascending, "02074508261589a2c703bcb88966769c27f980a528de99cd3dc92d93d3de8fa2a6"),
+            ([0x00; SALT_LEN], "02c68960c82e7e3d5395da61ee0f2024fb5e9ec0e45e2f104e33c65cca87c93620"),
+            ([0xFF; SALT_LEN], "02d31f6c8437eae360104be32527bbd36356c573c3047bc685ebbbde53148c13cb"),
+        ] {
+            let point = payload_ecdh_point(&salt).unwrap();
+            let got: String = point.to_sec1_point(true).as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, compressed, "salt {salt:02x?}");
+        }
+    }
+
+    #[test]
     fn kek_fingerprint_properties() {
         let key1 = SecretKey::generate().public_key();
         let key2 = SecretKey::generate().public_key();
