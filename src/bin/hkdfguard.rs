@@ -202,14 +202,30 @@ fn print_usage() {
     );
 }
 
+// The value after a flag that takes one: present, non-empty, and not
+// starting with "-". Without that last rule a forgotten value swallows the
+// next flag: `wrap -kf --force ...` would write a key file named "--force"
+// and silently drop --force. Flags themselves (-sn, -kf, -g, ...) are
+// unaffected; only what is consumed as a value is checked. No legitimate
+// value starts with "-": service names and groups can't, and a path can be
+// written ./-name. `long_name` is the flag's long form, for the messages.
+fn take_value(arg: &str, long_name: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
+    let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
+    if value.is_empty() {
+        return Err(format!("{long_name} must not be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "{arg} requires a value, but the next argument is {value:?}; a value can't start with \"-\" (write a path like that as ./{value})"
+        ));
+    }
+    Ok(value)
+}
+
 // Parses `--service-name|-sn <value>` when `arg` is that flag; the shared
 // piece of both subcommands' argument loops.
 fn take_service_name(arg: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
-    let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-    if value.is_empty() {
-        return Err("--service-name must not be empty".to_string());
-    }
-    Ok(value)
+    take_value(arg, "--service-name", args)
 }
 
 // Stores a flag's value, refusing a second one rather than letting the last
@@ -296,25 +312,16 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
             }
             "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
             "--key-file-path" | "-kf" => {
-                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-                if value.is_empty() {
-                    return Err("--key-file-path must not be empty".to_string());
-                }
+                let value = take_value(&arg, "--key-file-path", args)?;
                 set_once(&mut key_file_path, "--key-file-path", value)?;
             }
             "--group" | "-g" => {
-                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-                if value.is_empty() {
-                    return Err("--group must not be empty".to_string());
-                }
+                let value = take_value(&arg, "--group", args)?;
                 set_once(&mut group, "--group", value)?;
             }
             "--dek-stdin" => set_source(&mut dek_source, DekSource::Stdin)?,
             "--dek-file" => {
-                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-                if value.is_empty() {
-                    return Err("--dek-file must not be empty".to_string());
-                }
+                let value = take_value(&arg, "--dek-file", args)?;
                 set_source(&mut dek_source, DekSource::File(value))?;
             }
             other => return Err(format!("unrecognized argument for `wrap`: {other}")),
@@ -378,12 +385,15 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
     // (and as the Windows tool requires of its --dek-file): a redirected
     // folder could make the deployment wrap a DEK someone else planted.
     // O_NOFOLLOW below covers the file itself; `require_opened_at` confirms
-    // the descriptor is the file at the spelled path.
+    // the descriptor is the file at the spelled path. Opened through
+    // `spelled`, the path that was checked, never `path` as given: the kernel
+    // would follow a link before a `..` in it into another folder (see
+    // require_real_folder). Messages still show the operator's spelling.
     let spelled = require_real_folder(Path::new(path))?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
-        .open(path)
+        .open(&spelled)
         .map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
                 format!("--dek-file {path} is a symlink; refusing to follow it")
@@ -1485,6 +1495,32 @@ mod tests {
     }
 
     #[test]
+    fn read_dek_file_reads_the_checked_file_not_one_beside_a_link_before_dotdot() {
+        // keys/link -> elsewhere/deep, so to the kernel keys/link/.. is
+        // `elsewhere`, while the folder check resolves it as text to `keys`.
+        // The file read must be the one checked: keys/dek.b64, never
+        // elsewhere/dek.b64.
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let keys = base.join("keys");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("deep")).unwrap();
+        fs::create_dir(&keys).unwrap();
+        symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
+        let checked = STANDARD.encode([0x11u8; DEK_LEN]);
+        let planted = STANDARD.encode([0x22u8; DEK_LEN]);
+        for (folder, text) in [(&keys, &checked), (&elsewhere, &planted)] {
+            fs::write(folder.join("dek.b64"), text).unwrap();
+            fs::set_permissions(folder.join("dek.b64"), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut buf = [0u8; MAX_DEK_INPUT_LEN + 1];
+        let n = read_dek_file(keys.join("link/../dek.b64").to_str().unwrap(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], checked.as_bytes(), "read the file at the checked path, keys/dek.b64");
+    }
+
+    #[test]
     fn secure_delete_never_follows_a_link_before_dotdot_into_another_folder() {
         // keys/link -> elsewhere/deep, so to the kernel keys/link/.. is
         // `elsewhere`, while the folder check resolves it as text to `keys`.
@@ -1714,6 +1750,32 @@ mod tests {
         let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", ""]));
         assert!(err.contains("must not be empty"), "{err}");
         assert!(expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group"])).contains("requires a value"));
+    }
+
+    #[test]
+    fn a_flag_value_starting_with_a_dash_is_refused() {
+        // A forgotten value must not swallow the next flag: `-kf --force`
+        // would otherwise name a key file "--force" and drop --force.
+        for parts in [
+            vec!["prog", "wrap", "-kf", "--force", "-sn", "svc", "--dek-stdin"],
+            vec!["prog", "wrap", "-kf", "k", "-sn", "-g", "--dek-stdin"],
+            vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "-f"],
+            vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-file", "--force"],
+            vec!["prog", "wrap", "-kf", "-", "-sn", "svc", "--dek-stdin"],
+            vec!["prog", "provision", "--service-name", "-h"],
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert!(err.contains("requires a value, but the next argument is"), "{parts:?}: {err}");
+        }
+        // Flags themselves are unaffected, short or long; ./-name is the way
+        // to give a path that starts with "-".
+        match expect_run(argv(&["prog", "wrap", "-kf", "./-k", "-sn", "svc", "--dek-stdin", "-f"])) {
+            Command::Wrap { key_file_path, force, .. } => {
+                assert_eq!(key_file_path, "./-k");
+                assert!(force);
+            }
+            other => panic!("expected Wrap, got {other:?}"),
+        }
     }
 
     #[test]

@@ -69,6 +69,16 @@ environment variable: other processes of the same user can read both
 through
 .IR /proc .
 A single trailing newline on the DEK input is ignored.
+.PP
+Each option may be given once, and an option's value may not start with
+.BR \- :
+.B "wrap \-kf \-\-force"
+is an invalid command line, not a key file named
+.BR \-\-force .
+Write a path that starts with
+.B \-
+as
+.IR ./\-name .
 .SH EXIT STATUS
 .TP
 .B 0

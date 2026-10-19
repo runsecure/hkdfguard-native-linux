@@ -82,6 +82,10 @@ hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 
 Exit status: `0` success, `1` the operation failed, `2` invalid command line.
 
+Each flag may be given once, and a flag's value may not start with `-`:
+`wrap -kf --force ...` is an invalid command line, not a key file named
+`--force`. Write a path that starts with `-` as `./-name`.
+
 **Keep the DEK out of command lines and environment variables.** Other
 processes running as the same user can read both through `/proc`, so the CLI
 doesn't accept the DEK either way.
