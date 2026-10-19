@@ -36,7 +36,7 @@
 //!     --key-file-path|-kf <path> \
 //!     --service-name|-sn <name> \
 //!     (--dek-stdin | --dek-file <path>) \
-//!     [--force|-f]
+//!     [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]
 //! ```
 //!
 //! ## Supplying the DEK
@@ -179,6 +179,9 @@ enum Command {
         force: bool,
         // --group: who besides the owner may read the key file. None: no one.
         group: Option<String>,
+        // --fingerprint: the KEK the operator recorded at provision time.
+        // When set, nothing is written unless the payload was sealed to it.
+        expected_fingerprint: Option<[u8; FINGERPRINT_LEN]>,
     },
     Retire {
         service_name: String,
@@ -201,7 +204,7 @@ fn print_usage() {
         "Usage:\n\
          \x20 {PROGRAM_NAME} provision --service-name|-sn <name>\n\
          \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n\
-         \x20      [--group|-g <name>] [--force|-f]\n\
+         \x20      [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]\n\
          \x20 {PROGRAM_NAME} retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>\n\
          \n\
          provision  ensures a KEK exists for the service, and prints its fingerprint: record\n\
@@ -210,6 +213,8 @@ fn print_usage() {
          wrap       wraps a DEK under the service's existing KEK and writes the payload to\n\
          \x20          --key-file-path, readable by its owner only, or also by --group's\n\
          \x20          members (mode 0640). Fails if the KEK has not been provisioned.\n\
+         \x20          Prints the fingerprint of the KEK it wrapped under; with --fingerprint,\n\
+         \x20          writes nothing unless that is the KEK given.\n\
          retire     permanently deletes the service's KEK, only if its fingerprint is the\n\
          \x20          one given; every DEK wrapped under it becomes unrecoverable. PKCS#11\n\
          \x20          only: a TPM2 KEK is not stored anywhere, so there is nothing to delete.\n\
@@ -372,6 +377,7 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
     let mut dek_source: Option<DekSource> = None;
     let mut force = false;
     let mut group: Option<String> = None;
+    let mut expected_fingerprint: Option<[u8; FINGERPRINT_LEN]> = None;
 
     // Rejects a second DEK source rather than letting the last one win:
     // silently ignoring one of two explicitly-requested inputs is exactly
@@ -402,6 +408,10 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
                 let value = take_value(&arg, "--group", args)?;
                 set_once(&mut group, "--group", value)?;
             }
+            "--fingerprint" | "-fp" => {
+                let value = take_value(&arg, "--fingerprint", args)?;
+                set_once(&mut expected_fingerprint, "--fingerprint", parse_fingerprint_hex(&value)?)?;
+            }
             "--dek-stdin" => set_source(&mut dek_source, DekSource::Stdin)?,
             "--dek-file" => {
                 let value = take_value(&arg, "--dek-file", args)?;
@@ -421,6 +431,7 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
         dek_source,
         force,
         group,
+        expected_fingerprint,
     }))
 }
 
@@ -1125,6 +1136,7 @@ fn run_wrap(
     dek_source: DekSource,
     force: bool,
     group: Option<String>,
+    expected_fingerprint: Option<[u8; FINGERPRINT_LEN]>,
 ) -> Result<(), String> {
     // Before anything else -- reading the DEK, any provider work -- the key
     // file's folder must be a real folder at its spelled location. Every
@@ -1164,6 +1176,28 @@ fn run_wrap(
         // longer secret) form, which is the only thing that survives past
         // this point.
     };
+
+    // The KEK this payload was actually sealed to, as the library embedded
+    // it in the payload it just returned -- not from a separate
+    // hkdfguard_kek_fingerprint call, so there is no window between "which
+    // KEK?" and "wrap under it", and what is checked and printed is exactly
+    // what the file will carry. With --fingerprint, this is the operator's
+    // assertion of which KEK the secret may be committed to: on a mismatch
+    // (the service's KEK replaced, re-provisioned, or on another provider
+    // than expected) nothing is written, and with --force the existing key
+    // file is left as it was.
+    let used_fingerprint = admin::payload_fingerprint(&wrapped)
+        .ok_or("hkdfguard_wrap_dek returned a payload with no readable KEK fingerprint; nothing was written")?;
+    if let Some(expected) = expected_fingerprint {
+        if used_fingerprint != expected {
+            return Err(format!(
+                "fingerprint mismatch for service \"{service_name}\": the service's KEK is {}, not {}; nothing was \
+                 written -- the DEK was NOT committed to that key",
+                hex(&used_fingerprint),
+                hex(&expected)
+            ));
+        }
+    }
 
     // Only now, with a complete wrapped payload in hand, replace the old
     // file. Re-evaluated here rather than trusting the pre-check above, in
@@ -1232,6 +1266,15 @@ fn run_wrap(
         "wrapped key written to {key_file_path} ({} bytes, {access}, service \"{service_name}\")",
         wrapped.len()
     );
+    println!(
+        "fingerprint: {}{}",
+        hex(&used_fingerprint),
+        if expected_fingerprint.is_some() {
+            " (confirmed)"
+        } else {
+            " -- confirm it matches the one recorded when this service was provisioned"
+        }
+    );
     Ok(())
 }
 
@@ -1286,7 +1329,8 @@ fn run(command: Command) -> Result<(), String> {
             dek_source,
             force,
             group,
-        } => run_wrap(key_file_path, service_name, dek_source, force, group),
+            expected_fingerprint,
+        } => run_wrap(key_file_path, service_name, dek_source, force, group, expected_fingerprint),
         Command::Retire { service_name, fingerprint } => run_retire(service_name, fingerprint),
     }
 }
@@ -1847,14 +1891,29 @@ mod tests {
     #[test]
     fn parse_wrap_accepts_stdin_and_file_sources() {
         match expect_run(argv(&["prog", "wrap", "-kf", "key.bin", "-sn", "svc", "--dek-stdin"])) {
-            Command::Wrap { key_file_path, service_name, dek_source, force, group } => {
+            Command::Wrap { key_file_path, service_name, dek_source, force, group, expected_fingerprint } => {
                 assert_eq!(key_file_path, "key.bin");
                 assert_eq!(service_name, "svc");
                 assert_eq!(dek_source, DekSource::Stdin);
                 assert!(!force);
                 assert_eq!(group, None, "--group is optional: owner-only by default");
+                assert_eq!(expected_fingerprint, None, "--fingerprint is optional");
             }
             other => panic!("expected Wrap, got {other:?}"),
+        }
+
+        let fp = "Ab".repeat(32);
+        match expect_run(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-fp", &fp])) {
+            Command::Wrap { expected_fingerprint, .. } => assert_eq!(expected_fingerprint, Some([0xab; 32])),
+            other => panic!("expected Wrap, got {other:?}"),
+        }
+        for (parts, expected) in [
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-fp", "abc"], "exactly 64 hex characters, got 3"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-fp", fp.as_str(), "--fingerprint", fp.as_str()], "give --fingerprint at most once"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--fingerprint", "-f"], "requires a value, but the next argument is"),
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert!(err.contains(expected), "{parts:?}: {err}");
         }
 
         match expect_run(argv(&[
@@ -2062,6 +2121,7 @@ mod tests {
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 true,
                 None,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("provision --service-name"), "must point at the fix: {err}");
@@ -2085,14 +2145,44 @@ mod tests {
 
             run_wrap(
                 key_path.to_str().unwrap().to_string(),
-                service,
+                service.clone(),
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 false,
+                None,
                 None,
             )
             .unwrap();
             assert!(key_path.exists());
             assert_eq!(fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, KEY_FILE_MODE);
+
+            // --fingerprint: the KEK the payload was sealed to must be the
+            // one given, or nothing is written -- not even with --force.
+            let recorded = read_kek_fingerprint(&CString::new(service.as_str()).unwrap()).unwrap();
+            assert_eq!(admin::payload_fingerprint(&fs::read(&key_path).unwrap()), Some(recorded), "the file carries it");
+            let wrap_pinned = |path: &Path, force: bool, fingerprint: [u8; FINGERPRINT_LEN]| {
+                run_wrap(
+                    path.to_str().unwrap().to_string(),
+                    service.clone(),
+                    DekSource::File(dek_path.to_str().unwrap().to_string()),
+                    force,
+                    None,
+                    Some(fingerprint),
+                )
+            };
+            let pinned = dir.path().join("pinned.key");
+            wrap_pinned(&pinned, false, recorded).unwrap();
+            assert_eq!(admin::payload_fingerprint(&fs::read(&pinned).unwrap()), Some(recorded));
+
+            let mut wrong = recorded;
+            wrong[0] ^= 1;
+            let refused = dir.path().join("refused.key");
+            let err = wrap_pinned(&refused, false, wrong).unwrap_err();
+            assert!(err.contains("fingerprint mismatch") && err.contains("nothing was written"), "{err}");
+            assert!(!refused.exists(), "nothing written on a mismatch");
+            let before = fs::read(&pinned).unwrap();
+            let err = wrap_pinned(&pinned, true, wrong).unwrap_err();
+            assert!(err.contains("fingerprint mismatch"), "{err}");
+            assert_eq!(fs::read(&pinned).unwrap(), before, "--force must not cost the existing file on a mismatch");
 
             // --group with a group this process may give (its own), unless
             // that group is itself one --group refuses (running as root).
@@ -2106,6 +2196,7 @@ mod tests {
                     DekSource::File(dek_path.to_str().unwrap().to_string()),
                     false,
                     Some(gid.to_string()),
+                    None,
                 )
                 .unwrap();
                 let meta = fs::metadata(&grouped).unwrap();

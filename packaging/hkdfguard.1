@@ -15,6 +15,8 @@ hkdfguard \- provision a service's HKDFGuard KEK and wrap DEKs under it
 .I name
 .RB ( \-\-dek\-stdin " | " \-\-dek\-file
 .IR path )
+.RB [ \-\-fingerprint | \-fp
+.IR hex ]
 .RB [ \-\-force | \-f ]
 .PP
 .B hkdfguard retire
@@ -41,8 +43,8 @@ deliberately slow.
 Wraps a 32-byte Data Encryption Key (DEK) under the service's existing
 KEK and writes the wrapped payload to
 .IR \-\-key\-file\-path ,
-mode 0600. It never creates a KEK: if none has been provisioned, it fails
-and says to run
+mode 0600, and prints the fingerprint of the KEK it wrapped under. It
+never creates a KEK: if none has been provisioned, it fails and says to run
 .BR provision .
 .TP
 .B retire
@@ -77,11 +79,16 @@ in place and removed, so a failed wrap never destroys it. The overwrite
 cannot guarantee erasure on copy-on-write filesystems or flash storage.
 .TP
 .BR \-\-fingerprint ", " \-fp " \fIhex\fR"
-For
-.BR retire :
-the KEK's fingerprint as
+The KEK's fingerprint as
 .B provision
-printed it, 64 hex characters.
+printed it, 64 hex characters. For
+.BR wrap ,
+optional: nothing is written unless the DEK was wrapped under that KEK,
+and with
+.B \-\-force
+the existing file is left as it was. For
+.BR retire ,
+required: nothing is deleted unless it matches.
 .TP
 .BR \-\-help ", " \-h
 Print usage and exit.
