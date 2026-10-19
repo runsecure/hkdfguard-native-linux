@@ -283,6 +283,79 @@ for build in release debug; do
 done
 echo "release, debug: PKCS#11 unused without pkcs11.module (no SoftHSM2 search, variables ignored)."
 
+section "retire deletes a PKCS#11 KEK only given its fingerprint; TPM2 refuses"
+# The release CLI against the real SoftHSM2 token, configured the way a
+# deployment configures it: root-owned policy naming the module, and the
+# root:ci 0440 PIN file above.
+cat > /etc/hkdfguard/policy.toml <<TOML
+[selection]
+mode = "require"
+provider = "pkcs11"
+
+[pkcs11]
+module = "$SOFTHSM_MODULE"
+pin_file = "/etc/hkdfguard/pkcs11.pin"
+token_label = "hkdfguard-test"
+TOML
+chmod 0644 /etc/hkdfguard/policy.toml
+RETIRE_SERVICE=com.hkdfguard.dockertest.retire
+RETIRE_DIR=$(as_ci mktemp -d)
+as_ci sh -c "umask 077; head -c 32 /dev/urandom > '$RETIRE_DIR/dek'"
+CLI=target/release/hkdfguard
+fingerprint_in() { sed -n 's/^fingerprint: \([0-9a-f]\{64\}\) .*/\1/p' <<<"$1"; }
+
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision on PKCS#11: $OUT" >&2; exit 1; }
+FP=$(fingerprint_in "$OUT")
+[ ${#FP} -eq 64 ] || { echo "FAIL: provision printed no fingerprint: $OUT" >&2; exit 1; }
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1)
+[ "$(fingerprint_in "$OUT")" = "$FP" ] || { echo "FAIL: a second provision reported another fingerprint: $OUT" >&2; exit 1; }
+printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+    | as_ci $CLI wrap -kf "$RETIRE_DIR/wrapped.key" -sn $RETIRE_SERVICE --dek-stdin >/dev/null
+as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$RETIRE_DIR/wrapped.key" $RETIRE_SERVICE "$RETIRE_DIR/dek"
+
+WRONG=$(printf '%064d' 0)
+if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$WRONG" 2>&1); then
+    echo "FAIL: retire with the wrong fingerprint succeeded" >&2; exit 1
+fi
+grep -q "the current KEK is $FP, not $WRONG; nothing was deleted" <<<"$OUT" \
+    || { echo "FAIL: unexpected mismatch message: $OUT" >&2; exit 1; }
+as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$RETIRE_DIR/wrapped.key" $RETIRE_SERVICE "$RETIRE_DIR/dek" \
+    || { echo "FAIL: the KEK stopped working after a refused retire" >&2; exit 1; }
+
+OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1) || { echo "FAIL: retire: $OUT" >&2; exit 1; }
+grep -q "retired KEK for service \"$RETIRE_SERVICE\" (fingerprint $FP, provider PKCS11)" <<<"$OUT" \
+    || { echo "FAIL: unexpected retire output: $OUT" >&2; exit 1; }
+if as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$RETIRE_DIR/wrapped.key" $RETIRE_SERVICE "$RETIRE_DIR/dek" 2>/dev/null; then
+    echo "FAIL: a DEK wrapped under the retired KEK still unwraps" >&2; exit 1
+fi
+if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1); then
+    echo "FAIL: retiring twice succeeded" >&2; exit 1
+fi
+grep -q 'nothing to retire' <<<"$OUT" || { echo "FAIL: unexpected second-retire message: $OUT" >&2; exit 1; }
+
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision after retire: $OUT" >&2; exit 1; }
+FP2=$(fingerprint_in "$OUT")
+[ ${#FP2} -eq 64 ] && [ "$FP2" != "$FP" ] || { echo "FAIL: provision after retire did not make a new KEK: $OUT" >&2; exit 1; }
+as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP2" >/dev/null
+echo "PKCS#11: wrong fingerprint refused, nothing deleted; right one deleted the KEK; its DEKs no longer unwrap; re-provision makes a new KEK."
+
+cat > /etc/hkdfguard/policy.toml <<TOML
+[selection]
+mode = "require"
+provider = "tpm2"
+
+[tpm]
+tcti = "$SWTPM_TCTI"
+TOML
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision on TPM2: $OUT" >&2; exit 1; }
+FP=$(fingerprint_in "$OUT")
+if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1); then
+    echo "FAIL: retire succeeded on TPM2, which stores no key to delete" >&2; exit 1
+fi
+grep -q "TPM2 cannot retire a single service's KEK" <<<"$OUT" || { echo "FAIL: unexpected TPM2 retire message: $OUT" >&2; exit 1; }
+echo "TPM2: retire refused, with the reason."
+rm -rf "$RETIRE_DIR"
+
 unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI TEST_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE \
       HKDFGUARD_EXTERNAL_SECRET_DIR HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT
 rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS"

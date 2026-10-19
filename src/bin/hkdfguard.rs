@@ -1,10 +1,17 @@
 //! CLI tool for setting up a service's persistent KEK and wrapping DEKs
-//! under it. Two subcommands, deliberately separate:
+//! under it, and retiring a KEK. Three subcommands, deliberately separate:
 //!
-//! - `provision` -- ensure a KEK exists for a service. This is the *only*
-//!   place the setup calls (`hkdfguard_kek_exists`, `hkdfguard_create_kek`)
-//!   are made. They are deliberately slow (see the library's setup-call
-//!   latency floor) and meant to run once, at deployment time.
+//! - `provision` -- ensure a KEK exists for a service, and print its
+//!   fingerprint. With `retire`, the only place the setup calls
+//!   (`hkdfguard_kek_exists`, `hkdfguard_create_kek`,
+//!   `hkdfguard_kek_fingerprint`) are made. They are deliberately slow (see
+//!   the library's setup-call latency floor) and meant to run once, at
+//!   deployment time.
+//! - `retire` -- permanently delete a service's KEK, given the fingerprint
+//!   `provision` printed for it. PKCS#11 only (see `admin::retire_kek`); it
+//!   goes through the library's Rust-only admin API, the one deliberate
+//!   exception to the C-ABI-only rule below, so that no application
+//!   linking the library can delete a KEK.
 //! - `wrap` -- wrap a caller-supplied Data Encryption Key (DEK) under the
 //!   service's KEK and write the wrapped payload to a file. It never
 //!   creates a KEK: if none is provisioned, it fails and says to run
@@ -12,7 +19,7 @@
 //!   setup calls, and makes "the KEK is missing" a loud, specific error
 //!   instead of something quietly fixed on the fly.
 //!
-//! Both call into the `hkdfguard` library through its stable C ABI, the
+//! `provision` and `wrap` call into the `hkdfguard` library through its stable C ABI, the
 //! same interface any other-language caller uses -- this tool takes no
 //! shortcut through the library's internal Rust types.
 //!
@@ -22,6 +29,8 @@
 //! Usage:
 //! ```text
 //! hkdfguard provision --service-name|-sn <name>
+//!
+//! hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 //!
 //! hkdfguard wrap \
 //!     --key-file-path|-kf <path> \
@@ -88,8 +97,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroize;
 use hkdfguard::{
-    harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
-    hkdfguard_wrap_dek, status,
+    admin, harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
+    hkdfguard_kek_fingerprint, hkdfguard_wrap_dek, status,
 };
 
 // rw-------: the owning deployment user only. The payload is ciphertext,
@@ -171,7 +180,16 @@ enum Command {
         // --group: who besides the owner may read the key file. None: no one.
         group: Option<String>,
     },
+    Retire {
+        service_name: String,
+        // --fingerprint: the KEK the operator means to delete, as printed
+        // by `provision`. Nothing is deleted unless the KEK matches it.
+        fingerprint: [u8; FINGERPRINT_LEN],
+    },
 }
+
+// A KEK fingerprint: SHA-256 of its public key.
+const FINGERPRINT_LEN: usize = 32;
 
 enum ParseOutcome {
     Run(Command),
@@ -184,12 +202,17 @@ fn print_usage() {
          \x20 {PROGRAM_NAME} provision --service-name|-sn <name>\n\
          \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n\
          \x20      [--group|-g <name>] [--force|-f]\n\
+         \x20 {PROGRAM_NAME} retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>\n\
          \n\
-         provision  ensures a KEK exists for the service. Run once, at deployment time;\n\
-         \x20          this is the only command that makes the (deliberately slow) setup calls.\n\
+         provision  ensures a KEK exists for the service, and prints its fingerprint: record\n\
+         \x20          it. Run once, at deployment time; with retire, the only commands that\n\
+         \x20          make the (deliberately slow) setup calls.\n\
          wrap       wraps a DEK under the service's existing KEK and writes the payload to\n\
          \x20          --key-file-path, readable by its owner only, or also by --group's\n\
          \x20          members (mode 0640). Fails if the KEK has not been provisioned.\n\
+         retire     permanently deletes the service's KEK, only if its fingerprint is the\n\
+         \x20          one given; every DEK wrapped under it becomes unrecoverable. PKCS#11\n\
+         \x20          only: a TPM2 KEK is not stored anywhere, so there is nothing to delete.\n\
          \n\
          The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n\
          from a command-line argument or an environment variable, both of which are\n\
@@ -253,7 +276,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     let mut args = args.skip(1); // skip argv[0]
 
     let subcommand = match args.next() {
-        None => return Err("missing subcommand: expected `provision` or `wrap`".to_string()),
+        None => return Err("missing subcommand: expected `provision`, `wrap` or `retire`".to_string()),
         Some(s) if s == "--help" || s == "-h" || s == "help" => return Ok(ParseOutcome::Help),
         Some(s) => s,
     };
@@ -261,7 +284,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     match subcommand.as_str() {
         "provision" => parse_provision(&mut args),
         "wrap" => parse_wrap(&mut args),
-        other => Err(format!("unknown subcommand {other:?}: expected `provision` or `wrap`")),
+        "retire" => parse_retire(&mut args),
+        other => Err(format!("unknown subcommand {other:?}: expected `provision`, `wrap` or `retire`")),
     }
 }
 
@@ -281,6 +305,65 @@ fn parse_provision(args: &mut impl Iterator<Item = String>) -> Result<ParseOutco
 
     let service_name = service_name.ok_or("provision: missing required --service-name|-sn")?;
     Ok(ParseOutcome::Run(Command::Provision { service_name }))
+}
+
+fn parse_retire(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
+    let mut service_name: Option<String> = None;
+    let mut fingerprint: Option<[u8; FINGERPRINT_LEN]> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(ParseOutcome::Help),
+            "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
+            "--fingerprint" | "-fp" => {
+                let value = take_value(&arg, "--fingerprint", args)?;
+                set_once(&mut fingerprint, "--fingerprint", parse_fingerprint_hex(&value)?)?;
+            }
+            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--force" | "-f" | "--group" | "-g" => {
+                return Err(format!("{arg} is not valid for `retire`; it belongs to `wrap`"))
+            }
+            other => return Err(format!("unrecognized argument for `retire`: {other}")),
+        }
+    }
+
+    let service_name = service_name.ok_or("retire: missing required --service-name|-sn")?;
+    let fingerprint = fingerprint
+        .ok_or("retire: missing required --fingerprint|-fp (the 64-hex-character value printed by provision)")?;
+    Ok(ParseOutcome::Run(Command::Retire { service_name, fingerprint }))
+}
+
+// Exactly 64 hex digits, either case. No separators or prefixes: the value
+// is meant to be pasted from provision's output, and a strict format keeps
+// a truncated paste from ever looking valid.
+fn parse_fingerprint_hex(text: &str) -> Result<[u8; FINGERPRINT_LEN], String> {
+    let digits = text.as_bytes();
+    if digits.len() != FINGERPRINT_LEN * 2 {
+        return Err(format!(
+            "--fingerprint must be exactly {} hex characters, got {}",
+            FINGERPRINT_LEN * 2,
+            digits.len()
+        ));
+    }
+    let nibble = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = [0u8; FINGERPRINT_LEN];
+    for (i, [hi, lo]) in digits.as_chunks::<2>().0.iter().enumerate() {
+        match (nibble(*hi), nibble(*lo)) {
+            (Some(hi), Some(lo)) => out[i] = hi << 4 | lo,
+            _ => return Err("--fingerprint must contain only hex characters (0-9, a-f)".to_string()),
+        }
+    }
+    Ok(out)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
@@ -932,7 +1015,7 @@ fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String
         .map_err(|e| format!("secure delete: failed to sync {}: {e}", path.display()))
 }
 
-// `provision`: the only place the setup calls are made. Always calls
+// `provision`: with `retire`, the only place the setup calls are made. Always calls
 // hkdfguard_create_kek, whether or not the KEK exists, as the Windows tool
 // does: for an existing KEK that call loads it through the provider
 // (`load_kek`) -- on TPM2, deriving the key and checking it against the
@@ -959,12 +1042,78 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
             describe_status(rc)
         ));
     }
+    let fingerprint = read_kek_fingerprint(&service_c).map_err(|rc| {
+        format!(
+            "the KEK for service \"{service_name}\" exists but its fingerprint could not be read: {}",
+            describe_status(rc)
+        )
+    })?;
     if exists == 1 {
         println!("KEK already provisioned for service \"{service_name}\"; verified, nothing to do");
+        println!(
+            "fingerprint: {} -- confirm it matches the one recorded when this service was provisioned",
+            hex(&fingerprint)
+        );
     } else {
         println!("KEK provisioned for service \"{service_name}\"");
+        println!("fingerprint: {} -- record this; retire requires it", hex(&fingerprint));
     }
     Ok(())
+}
+
+// The fingerprint of the KEK `service` resolves to now, through the C ABI;
+// the status code when it can't be read.
+fn read_kek_fingerprint(service: &CString) -> Result<[u8; FINGERPRINT_LEN], c_int> {
+    let mut out = [0u8; FINGERPRINT_LEN];
+    let mut out_len = FINGERPRINT_LEN as c_int;
+    let rc = hkdfguard_kek_fingerprint(service.as_ptr(), out.as_mut_ptr(), &mut out_len);
+    if rc != status::OK {
+        return Err(rc);
+    }
+    if out_len != FINGERPRINT_LEN as c_int {
+        return Err(status::INTERNAL_ERROR);
+    }
+    Ok(out)
+}
+
+// `retire`: deletes the service's KEK for good, through the library's
+// Rust-only admin API (deliberately not in the C ABI, so no application
+// linking the library can call it). The library confirms the fingerprint
+// twice -- against the KEK the service resolves to, and on the exact
+// objects it deletes -- so nothing is deleted on a mismatch, and a KEK
+// that can't be confirmed is never deleted.
+fn run_retire(mut service_name: String, fingerprint: [u8; FINGERPRINT_LEN]) -> Result<(), String> {
+    let service_c = prepare_service(&mut service_name)?;
+    match admin::retire_kek(&service_name, &fingerprint) {
+        Ok(provider) => {
+            println!(
+                "retired KEK for service \"{service_name}\" (fingerprint {}, provider {})",
+                hex(&fingerprint),
+                provider.as_str()
+            );
+            println!("every payload wrapped under it is now permanently unrecoverable");
+            Ok(())
+        }
+        Err(e) if e.status == status::KEK_NOT_FOUND => {
+            Err(format!("no KEK exists for service \"{service_name}\"; nothing to retire"))
+        }
+        Err(e) if e.status == status::KEK_FINGERPRINT_MISMATCH => Err(match read_kek_fingerprint(&service_c) {
+            Ok(current) => format!(
+                "fingerprint mismatch for service \"{service_name}\": the current KEK is {}, not {}; nothing was deleted",
+                hex(&current),
+                hex(&fingerprint)
+            ),
+            Err(_) => format!(
+                "fingerprint mismatch for service \"{service_name}\": the current KEK is not {}; nothing was deleted",
+                hex(&fingerprint)
+            ),
+        }),
+        Err(e) => Err(format!(
+            "could not retire the KEK for service \"{service_name}\": {} ({})",
+            e.message,
+            describe_status(e.status)
+        )),
+    }
 }
 
 // `wrap`: no setup calls. The wrap is completed in memory before the
@@ -1138,6 +1287,7 @@ fn run(command: Command) -> Result<(), String> {
             force,
             group,
         } => run_wrap(key_file_path, service_name, dek_source, force, group),
+        Command::Retire { service_name, fingerprint } => run_retire(service_name, fingerprint),
     }
 }
 
@@ -1750,6 +1900,39 @@ mod tests {
         let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", ""]));
         assert!(err.contains("must not be empty"), "{err}");
         assert!(expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group"])).contains("requires a value"));
+    }
+
+    #[test]
+    fn retire_parses_a_service_and_its_fingerprint() {
+        let fp = "ab".repeat(32);
+        match expect_run(argv(&["prog", "retire", "-sn", "svc", "-fp", &fp])) {
+            Command::Retire { service_name, fingerprint } => {
+                assert_eq!(service_name, "svc");
+                assert_eq!(fingerprint, [0xab; 32]);
+            }
+            other => panic!("expected Retire, got {other:?}"),
+        }
+        match expect_run(argv(&["prog", "retire", "--fingerprint", &"AB".repeat(32), "--service-name", "svc"])) {
+            Command::Retire { fingerprint, .. } => assert_eq!(fingerprint, [0xab; 32], "either case, either order"),
+            other => panic!("expected Retire, got {other:?}"),
+        }
+
+        for (parts, expected) in [
+            (vec!["prog", "retire", "-sn", "svc"], "missing required --fingerprint"),
+            (vec!["prog", "retire", "-fp", fp.as_str()], "missing required --service-name"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", &fp[..63]], "exactly 64 hex characters, got 63"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", "0x1234"], "exactly 64 hex characters"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", fp.as_str(), "-fp", fp.as_str()], "give --fingerprint at most once"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", fp.as_str(), "-kf", "k"], "it belongs to `wrap`"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", fp.as_str(), "--corrupt"], "unrecognized argument for `retire`"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", "--force"], "requires a value, but the next argument is"),
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert!(err.contains(expected), "{parts:?}: {err}");
+        }
+        let bad = format!("{}zz", "ab".repeat(31));
+        assert!(expect_parse_err(argv(&["prog", "retire", "-sn", "svc", "-fp", &bad])).contains("only hex characters"));
+        assert!(expect_parse_err(argv(&["prog", "frobnicate"])).contains("expected `provision`, `wrap` or `retire`"));
     }
 
     #[test]

@@ -241,7 +241,7 @@ the host does about logging. The records use facility `authpriv` and tag
 `hkdfguard`, sent straight to `/dev/log`. On systemd hosts they land in the
 journal (`journalctl -t hkdfguard`); elsewhere in `/var/log/secure` or
 `/var/log/auth.log`. These are the Windows build's Event Log events, with the
-same IDs, meanings and severities, so one set of alerts covers both:
+same IDs, meanings and severities (1004 aside), so one set of alerts covers both:
 
 | ID | Severity | When |
 |---|---|---|
@@ -249,6 +249,7 @@ same IDs, meanings and severities, so one set of alerts covers both:
 | 1001 | warning | A KEK was created on a provider other than the policy's first choice, which was unavailable or declined. |
 | 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | info | A DEK was unwrapped. |
+| 1004 | warning | A KEK was retired (`hkdfguard retire`): deleted for good, after its fingerprint was confirmed. Names the fingerprint. Every DEK wrapped under it can no longer be unwrapped. |
 | 2000 | warning | `KEK_ACCESS_DENIED`. |
 | 2002 | error | `KEK_INVALID`. |
 | 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
@@ -296,8 +297,8 @@ failure record are always written.
 
 ### Setup calls are deliberately slow
 
-`hkdfguard_create_kek` and `hkdfguard_kek_exists` are meant to run once
-per application startup, so each takes **at least one second** of
+`hkdfguard_create_kek`, `hkdfguard_kek_exists` and
+`hkdfguard_kek_fingerprint` are meant to run once per application startup, so each takes **at least one second** of
 wall-clock time whatever its outcome (found, not found, or error), and
 they are serialized with each other across threads. This bounds how fast
 a buggy or hot-looping caller can drive the TPM/HSM (every call is a
@@ -1007,8 +1008,9 @@ wraps it there. This CLI is that step, in two deliberately separate
 commands:
 
 ```sh
-# 1. Once, at deployment time: ensure the service has a KEK. This is the
-#    only command that makes the (deliberately slow) setup calls.
+# 1. Once, at deployment time: ensure the service has a KEK, and print its
+#    fingerprint. With `retire`, the only command that makes the
+#    (deliberately slow) setup calls.
 hkdfguard provision --service-name com.company.orders
 
 # 2. Wrap a DEK under it. Never creates a KEK: if none is provisioned it
@@ -1088,6 +1090,41 @@ so it isn't echoed or kept in the scrollback.
 > The remaining exposure is upstream of this tool: don't put the DEK in an
 > environment variable, and don't pipe it with an `echo` that resolves to
 > `/bin/echo` (argv again). `printf` as a shell builtin is safe.
+
+### Retiring a KEK
+
+`retire` permanently deletes a service's KEK, so that nothing wrapped under
+it can be unwrapped again. It takes the fingerprint `provision` printed for
+that KEK, and deletes nothing unless the service's current KEK has exactly
+that fingerprint:
+
+```sh
+hkdfguard provision -sn com.company.orders
+# KEK provisioned for service "com.company.orders"
+# fingerprint: 3f1c...e09a -- record this; retire requires it
+
+hkdfguard retire -sn com.company.orders -fp 3f1c...e09a   # all 64 hex characters
+```
+
+The fingerprint is checked twice: against the KEK the service resolves to
+(the one every wrap uses), and again on the exact token objects about to be
+deleted. A wrong fingerprint, a missing KEK, or a token holding anything
+other than the one key pair `provision` made (a duplicate, or a pair
+without hkdfguard's protections) deletes nothing. On success it writes audit
+event 1004, naming the fingerprint. Running `provision` afterwards creates
+a new, different KEK.
+
+`retire` exists only in the CLI. It is not part of the C API, so no
+application linking the library can delete a KEK.
+
+What can be retired depends on the provider:
+
+| Provider | `retire` |
+|---|---|
+| PKCS#11 | Deletes the service's key pair from the token. |
+| TPM | Refused. A TPM KEK is not stored anywhere: it is re-derived on every use from the TPM's seed, the derivation secret and the service name, so there is nothing to delete. Replacing the derivation secret changes every service's KEK on the host at once; `tpm.require_pinned_names` with the service's pin removed stops hkdfguard from using one service's KEK, without destroying it. |
+| External secret | Refused: the KEK is the mounted secret. Remove it where it is managed (the Kubernetes Secret, Vault entry, systemd credential). |
+| Ephemeral | Refused: an ephemeral KEK ends with its process. |
 
 ## Configuration
 

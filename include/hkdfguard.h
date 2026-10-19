@@ -194,8 +194,8 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * tag hkdfguard) with the Windows build's event IDs - see README.md,
  * "Audit trail".
  *
- * Deliberately slow: this and hkdfguard_kek_exists are setup calls, meant
- * to run once per application startup, and each takes at least
+ * Deliberately slow: this, hkdfguard_kek_exists and hkdfguard_kek_fingerprint
+ * are setup calls, meant to run once per application startup, and each takes at least
  * `startup_behavior.setup_min_delay_ms` (policy file; default 1000 ms)
  * of wall-clock time whatever its outcome, and they are serialized with
  * each other across threads. Do not call them per request; call once at
@@ -224,6 +224,33 @@ int hkdfguard_create_kek(const char* service);
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
  */
 int hkdfguard_kek_exists(const char* service, int* exists);
+
+/*
+ * Writes the 32-byte fingerprint of the KEK `service` currently resolves
+ * to: SHA-256 of its public key, SEC1-uncompressed (0x04 || X || Y) -- the
+ * same value every payload wrapped under it carries, and that
+ * hkdfguard_unwrap_dek checks. Public-key material, not a secret. Lets an
+ * operator record which KEK a service uses after provisioning (the CLI's
+ * `provision` prints it), and confirm it before retiring it (`retire`
+ * requires it). Never creates a KEK: HKDFGUARD_ERR_KEK_NOT_FOUND if none
+ * exists.
+ *
+ * A setup call, like hkdfguard_kek_exists: whether it finds a KEK answers
+ * the same question, so it is subject to the same startup latency floor
+ * and serialization as hkdfguard_create_kek above. Argument errors and the
+ * size probe return immediately.
+ *
+ * service:  see hkdfguard_wrap_dek below.
+ * out:      receives the 32 bytes on success. May be NULL only for a size
+ *           probe (*out_len == 0).
+ * out_len:  on input, the capacity of `out`. Set to 32 on success, and to
+ *           32 on HKDFGUARD_ERR_BUFFER_TOO_SMALL (capacity under 32;
+ *           nothing written). Untouched on any other return code, as is
+ *           `out`.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int* out_len);
 
 /*
  * Wraps a 32-byte DEK under the persistent KEK identified by `service`.

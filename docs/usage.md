@@ -63,12 +63,17 @@ What `provision` does depends on the provider:
 | External secret | Checks the delivered file and that it holds a valid key: the file itself is the provisioning. |
 | Ephemeral | Refused by the CLI, for `provision` and `wrap` alike: an ephemeral key lives only in the process that creates it, so the application must wrap its own DEKs. |
 
+`provision` also prints the KEK's fingerprint. Record it: `retire` asks
+for it, and a later `provision` prints it again so you can confirm the
+service still has the same KEK.
+
 ## The CLI: `hkdfguard`
 
 ```
 hkdfguard provision --service-name|-sn <name>
 hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
                (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
+hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 ```
 
 | Option | Meaning |
@@ -78,6 +83,7 @@ hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
 | `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600` |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
+| `--fingerprint`, `-fp` | For `retire`: the KEK's fingerprint, as `provision` printed it (64 hex characters) |
 | `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
 
 Exit status: `0` success, `1` the operation failed, `2` invalid command line.
@@ -99,6 +105,11 @@ To generate a new random DEK as base64:
 
 `wrap` never creates a KEK. If the service isn't provisioned, it fails and
 tells you to run `provision`.
+
+`retire` permanently deletes the service's KEK, and with it every DEK
+wrapped under it. It deletes nothing unless the KEK's fingerprint is the
+one given. Only PKCS#11 keys can be retired; a TPM key isn't stored
+anywhere, so there's nothing to delete. See "Retiring a KEK" in the README.
 
 The CLI hardens itself before touching key material (no core dumps, no
 debugger attachment) and refuses to run if it can't. It also tries to lock
