@@ -14,34 +14,35 @@
 //! a hash output, so computing `Z` requires the KEK's private key, which
 //! never leaves the TPM/HSM/secret file.
 //!
-//! This replaced an ECIES-style construction that used a fresh ephemeral
-//! keypair per wrap. That version was forgeable: the KEK's *public* key
-//! is not secret (on a TPM, anyone who can reach the device can
-//! recompute it), and `ECDH(eph_priv, KEK_pub)` equals
-//! `ECDH(KEK_priv, eph_pub)` -- so anyone holding the public key could
-//! derive the wrapping key and mint a payload that unwrapped to a DEK of
-//! their choosing. Binding more context into the AAD or KDF does not fix
-//! that, because the forger controls those inputs too. The ephemeral key
-//! also provided no forward secrecy here, since its public half was
-//! stored in the payload.
+//! An ECIES-style construction (a fresh ephemeral keypair per wrap) would
+//! be forgeable: the KEK's *public* key is not secret (on a TPM, anyone
+//! who can reach the device can recompute it), and `ECDH(eph_priv,
+//! KEK_pub)` equals `ECDH(KEK_priv, eph_pub)` -- so anyone holding the
+//! public key could derive the wrapping key and mint a payload that
+//! unwrapped to a DEK of their choosing. Binding more context into the AAD
+//! or KDF does not fix that, because the forger controls those inputs
+//! too. An ephemeral key would also provide no forward secrecy here, since
+//! its public half would be stored in the payload.
 //!
-//! Only this host can now create a payload, and only this host can open
+//! Only this host can create a payload, and only this host can open
 //! one -- which is exactly the deployment model: DEKs arrive from a build
 //! server and are wrapped locally, and a wrapped payload is never meant
 //! to be produced or read anywhere else.
 //!
 //! ## Why the point is per payload rather than one fixed `H`
 //!
-//! An earlier revision used a single fixed point `H` for every payload.
-//! That made `Z` a constant per service: a single capture of `Z` -- from
-//! a core dump, swap, a debugger attached by the same uid, or the bus of
-//! a discrete TPM -- was enough to open every payload that service had
-//! ever wrapped or would ever wrap, because the only other inputs to the
-//! wrapping key are public. Hashing the salt to the curve instead makes
-//! `Z` unique per payload, so a captured `Z` is worth exactly the one
-//! payload it belongs to. Forgery resistance is unchanged: an attacker
-//! holding `KEK_pub` still cannot compute `KEK_priv · H_salt` for any
-//! salt. The salt is public, so the (non-constant-time) hashing is fine.
+//! A single fixed point `H` for every payload would make `Z` a constant
+//! per service: a single capture of `Z` -- from a core dump, swap, a
+//! debugger attached by the same uid, or the bus of a discrete TPM --
+//! would open every payload that service had ever wrapped or would ever
+//! wrap, because the only other inputs to the wrapping key are public.
+//! Hashing the salt to the curve makes `Z` unique per payload, so a
+//! captured `Z` is worth exactly the one payload it belongs to. Forgery
+//! resistance is unaffected: an attacker holding `KEK_pub` still cannot
+//! compute `KEK_priv · H_salt` for any salt. The salt is public, so the
+//! (non-constant-time) hashing is fine.
+//!
+//! See `docs/why-ecdh.md` for the full rationale.
 //!
 //! ## What is bound
 //!
@@ -56,7 +57,7 @@
 //! [`unwrap`] additionally checks the wrapped payload's embedded KEK
 //! fingerprint (see [`kek_fingerprint`]) against the public key of the KEK
 //! `service` currently resolves to, *before* attempting ECDH/AES-GCM --
-//! see [`crate::error::Error::FingerprintMismatch`].
+//! see [`crate::error::Error::KekFingerprintMismatch`].
 //!
 //! Memory note: the DEK plaintext is kept in stack-allocated `[u8; DEK_LEN]`
 //! buffers for the *entire* wrap/unwrap operation -- we deliberately use
@@ -78,7 +79,7 @@ use sha2::{Digest, Sha256, Sha512}; // `Sha256` for the KEK fingerprint, `Sha512
 use zeroize::{Zeroize, Zeroizing}; // `Zeroize` for explicit scrubbing of stack arrays, `Zeroizing` for auto-scrubbing owned buffers
 
 const HKDF_INFO_PREFIX: &[u8] = b"hkdfguard-wrap-v1:"; // domain-separation prefix; concatenated with the service name as HKDF's "info"
-const TAG_LEN: usize = 16; // AES-GCM's standard 128-bit authentication tag size
+pub(crate) const TAG_LEN: usize = 16; // AES-GCM's standard 128-bit authentication tag size
 #[cfg(test)]
 const UNCOMPRESSED_POINT_LEN: usize = 65; // SEC1 uncompressed P-256 point: 1 tag byte (0x04) + 32-byte X + 32-byte Y
 
@@ -265,7 +266,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     let payload = Payload::from_bytes(wrapped)?; // parse and structurally validate the wire format (ciphertext stays a heap Vec, but it's ciphertext, not a secret)
 
     if payload.ciphertext.len() != DEK_LEN + TAG_LEN {
-        return Err(Error::Crypto("wrapped ciphertext has unexpected length")); // malformed/tampered length; bail out before touching any crypto
+        return Err(Error::Malformed("wrapped ciphertext has unexpected length")); // malformed/tampered length; bail out before touching any crypto
     }
 
     let provider = provider::get_by_type(payload.provider_type)?; // must use the exact provider that originally wrapped this DEK
@@ -275,10 +276,10 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     // was actually wrapped under the KEK `service` resolves to *right now*
     // -- catches a rotated/replaced/wrong KEK with a specific, unambiguous
     // error instead of collapsing into a generic AEAD authentication
-    // failure indistinguishable from tampering (see `Error::FingerprintMismatch`).
+    // failure indistinguishable from tampering (see `Error::KekFingerprintMismatch`).
     let current_fingerprint = kek_fingerprint(&handle.public_key()?);
     if current_fingerprint != payload.fingerprint {
-        return Err(Error::FingerprintMismatch);
+        return Err(Error::KekFingerprintMismatch);
     }
 
     // Must exactly mirror what `wrap` bound: every non-ciphertext byte of
@@ -298,7 +299,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     let (ct_part, tag_part) = payload.ciphertext.split_at(DEK_LEN);
     let mut dek = Zeroizing::new([0u8; DEK_LEN]);
     dek.copy_from_slice(ct_part); // still ciphertext at this point
-    let tag = Tag::try_from(tag_part).map_err(|_| Error::Crypto("wrapped ciphertext has unexpected length"))?;
+    let tag = Tag::try_from(tag_part).map_err(|_| Error::Malformed("wrapped ciphertext has unexpected length"))?;
 
     let cipher = Aes256Gcm::new(aes_key(&wrapping_key));
     let auth_result =
@@ -311,9 +312,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
         // decryption -- scrub it before returning rather than ever
         // handing it back to the caller.
         dek.zeroize();
-        return Err(Error::Crypto(
-            "AES-256-GCM authentication failed (tampered, wrong service, or wrong KEK)",
-        ));
+        return Err(Error::AuthFailed); // tampered, wrong service, or wrong KEK -- PAYLOAD_AUTH_FAILED, not CRYPTO_ERROR
     }
 
     Ok(dek) // genuine plaintext DEK, stack-resident from decryption through to the caller
@@ -393,7 +392,7 @@ mod tests {
     #[serial]
     fn round_trips_through_ephemeral_provider() {
         with_isolated_ephemeral_provider(|| {
-            crate::provider::create_kek("com.company.orders").unwrap(); // wrap no longer creates -- provision the KEK first
+            crate::provider::create_kek("com.company.orders").unwrap(); // wrap never creates -- provision the KEK first
             let dek = [0x42u8; DEK_LEN]; // arbitrary fixed test DEK
             let wrapped = wrap("com.company.orders", &dek).unwrap();
             let recovered = unwrap("com.company.orders", &wrapped).unwrap();
@@ -418,7 +417,7 @@ mod tests {
     #[serial]
     fn wrong_service_fails_to_unwrap() {
         with_isolated_ephemeral_provider(|| {
-            // Both services' KEKs must already exist: unwrap now only ever
+            // Both services' KEKs must already exist: unwrap only ever
             // loads (never creates) the KEK for the service it's given, so
             // for this test to actually exercise the fingerprint mismatch
             // (rather than just "billing has no KEK yet"), billing needs a
@@ -428,10 +427,10 @@ mod tests {
             let dek = [0x11u8; DEK_LEN];
             let wrapped = wrap("com.company.orders", &dek).unwrap();
             let err = unwrap("com.company.billing", &wrapped).unwrap_err(); // deliberately wrong service name
-            // Caught by the fingerprint check now, before AEAD is even
+            // Caught by the fingerprint check, before AEAD is even
             // attempted: billing's KEK has a different public key than
             // orders', so the payload's embedded fingerprint can't match.
-            assert!(matches!(err, Error::FingerprintMismatch));
+            assert!(matches!(err, Error::KekFingerprintMismatch));
         });
     }
 
@@ -450,7 +449,7 @@ mod tests {
             let last_ciphertext_byte = wrapped.len() - FINGERPRINT_LEN - 1;
             wrapped[last_ciphertext_byte] ^= 0x01; // flip one bit in the ciphertext/tag
             let err = unwrap("com.company.orders", &wrapped).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_))); // AEAD authentication must catch the tamper
+            assert!(matches!(err, Error::AuthFailed)); // AEAD authentication must catch the tamper
         });
     }
 
@@ -463,7 +462,7 @@ mod tests {
             let mut wrapped = wrap("com.company.orders", &dek).unwrap();
             wrapped.truncate(wrapped.len() - 5); // chop bytes out of the ciphertext/tag region
             let err = unwrap("com.company.orders", &wrapped).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_))); // must be rejected by the explicit length check, not panic in `split_at`
+            assert!(matches!(err, Error::Malformed(_))); // must be rejected by the explicit length check, not panic in `split_at`
         });
     }
 
@@ -573,8 +572,8 @@ mod tests {
     fn a_captured_shared_secret_opens_only_its_own_payload() {
         // The reason the point is per payload. Assume the worst: an
         // attacker captured the raw ECDH secret Z for one payload (core
-        // dump, swap, discrete-TPM bus). Under a fixed point that Z was
-        // constant per service and opened every payload; now it must be
+        // dump, swap, discrete-TPM bus). Under a fixed point that Z would be
+        // constant per service and open every payload; here it must be
         // useless against any other payload for the same service.
         with_isolated_ephemeral_provider(|| {
             let service = "com.company.capture";
@@ -652,7 +651,7 @@ mod tests {
             "a different shared secret must change the derived key"
         );
 
-        // Salt -- the per-payload separation that replaced the ephemeral key.
+        // Salt -- the per-payload separation.
         let mut other_salt = salt;
         other_salt[0] ^= 0x01;
         assert_ne!(
@@ -662,7 +661,7 @@ mod tests {
         );
 
         // Every single byte of the authenticated header, including the
-        // provider_type tag (#9) and the fingerprint (#10), must reach the
+        // provider_type tag and the fingerprint, must reach the
         // key derivation -- not merely the AEAD's associated data.
         for i in 0..authenticated.len() {
             let mut tampered = authenticated.clone();
@@ -742,9 +741,8 @@ mod tests {
             );
 
             // Same for the provider_type tag, which is byte 1 of the
-            // header -- finding #9. Under the old format this byte steered
-            // which provider unwrapped the payload while being
-            // unauthenticated, so it was attacker-malleable.
+            // header. This byte steers which provider unwraps the payload,
+            // so if it were unauthenticated it would be attacker-malleable.
             let mut tampered_provider_aad = correct_aad.clone();
             tampered_provider_aad[1] ^= 0x01;
             let mut buf = [0u8; DEK_LEN];
@@ -759,12 +757,12 @@ mod tests {
     #[test]
     #[serial]
     fn a_public_key_holder_cannot_forge_a_payload() {
-        // The point of the static-H design (finding #4). Under the old
-        // ephemeral-ECDH protocol an attacker holding only the KEK's
-        // *public* key could compute the same shared secret the provider
-        // would (ECDH(eph_priv, KEK_pub) == ECDH(KEK_priv, eph_pub)),
-        // derive the wrapping key, and mint a payload that unwrapped to a
-        // DEK of their choosing. Now the shared secret is ECDH(KEK_priv,
+        // The point of the hashed-point design. Under an ephemeral-ECDH
+        // protocol an attacker holding only the KEK's *public* key could
+        // compute the same shared secret the provider would
+        // (ECDH(eph_priv, KEK_pub) == ECDH(KEK_priv, eph_pub)), derive the
+        // wrapping key, and mint a payload that unwrapped to a DEK of
+        // their choosing. Here the shared secret is ECDH(KEK_priv,
         // H_salt), so reproducing it needs the KEK's private key or the
         // discrete log of a hash output -- neither of which a public-key
         // holder has.
@@ -783,31 +781,46 @@ mod tests {
             let kek_public = handle.public_key().unwrap();
             let h = payload_ecdh_point(&payload.salt).unwrap();
 
-            // The old attack, attempted: pick an ephemeral scalar, do ECDH
-            // against the KEK's public key, and try to derive the wrapping
-            // key from it.
+            // 1. The attack is real: whenever the host runs ECDH against a
+            // point the attacker chose -- as an ephemeral-key protocol's
+            // unwrap does, against the E in the payload -- the attacker
+            // knows the result from KEK_pub alone. (Without this, the rest
+            // of the test could pass for a broken protocol too.)
             let attacker_scalar = SecretKey::generate();
-            let attacker_z = p256::ecdh::diffie_hellman(
-                attacker_scalar.to_nonzero_scalar(),
-                kek_public.as_affine(),
+            let attacker_point = attacker_scalar.public_key();
+            let attacker_z = p256::ecdh::diffie_hellman(attacker_scalar.to_nonzero_scalar(), kek_public.as_affine());
+            let mut host_z_on_attacker_point = handle.ecdh(&attacker_point).unwrap();
+            assert_eq!(
+                host_z_on_attacker_point.as_slice(),
+                attacker_z.raw_secret_bytes().as_slice(),
+                "ECDH against an attacker-chosen point gives the attacker the shared secret"
             );
+            host_z_on_attacker_point.zeroize();
+
+            // 2. So the protocol must never do that, and doesn't: the only
+            // point unwrap ever uses is a hash of the salt. Recomputed here
+            // independently of `payload_ecdh_point` -- the first counter
+            // whose SHA-256 is a valid x-coordinate, even y -- so it is a
+            // hash output nobody knows the discrete log of, whatever salt
+            // an attacker writes into a payload.
+            let hashed = (0..=u8::MAX)
+                .find_map(|counter| {
+                    let x = Sha256::new().chain_update(PAYLOAD_POINT_DOMAIN).chain_update(payload.salt).chain_update([counter]).finalize();
+                    let mut compressed = [0x02u8; 33];
+                    compressed[1..].copy_from_slice(&x);
+                    PublicKey::from_sec1_bytes(&compressed).ok()
+                })
+                .unwrap();
+            assert_eq!(h, hashed, "unwrap's point is exactly the hash of the payload's salt");
+            assert_ne!(h, attacker_point, "and so never a point the attacker chose");
+
+            // The attacker's best attempt at a wrapping key, then: ECDH of
+            // their own scalar with KEK_pub, which is not what unwrap uses.
             let mut attacker_secret = [0u8; 32];
             attacker_secret.copy_from_slice(attacker_z.raw_secret_bytes().as_slice());
-
             let authenticated = payload.authenticated_bytes();
             let forged_key =
                 derive_wrapping_key(&attacker_secret, service, &payload.salt, &authenticated).unwrap();
-
-            // The genuine key, for comparison.
-            let mut genuine_z = handle.ecdh(&h).unwrap();
-            let genuine_key =
-                derive_wrapping_key(&genuine_z, service, &payload.salt, &authenticated).unwrap();
-            genuine_z.zeroize();
-
-            assert_ne!(
-                *forged_key, *genuine_key,
-                "a KEK-public-key holder must not be able to derive the wrapping key"
-            );
 
             // And concretely: a payload encrypted under the attacker's key
             // does not unwrap, even though every header byte is
@@ -832,7 +845,7 @@ mod tests {
 
             let err = unwrap(service, &forged.to_bytes()).unwrap_err();
             assert!(
-                matches!(err, Error::Crypto(_)),
+                matches!(err, Error::AuthFailed),
                 "a forged payload must fail AEAD authentication, got {err:?}"
             );
 
@@ -892,6 +905,27 @@ mod tests {
         let header = include_str!("../include/hkdfguard.h");
         let expected = format!("#define HKDFGUARD_WRAPPED_MAX_LEN {MAX_WRAPPED_LEN}");
         assert!(header.contains(&expected), "include/hkdfguard.h must contain `{expected}`");
+    }
+
+    #[test]
+    fn payload_ecdh_point_known_vectors() {
+        // Computed independently (Python: Euler's criterion on x^3 - 3x + b
+        // mod p) and pinned in the macOS library's tests too
+        // (HkdfGuardPayloadPointTests), so the two hash a salt to the same
+        // point. The second and third need the counter past 0.
+        let mut ascending = [0u8; SALT_LEN];
+        for (i, b) in ascending.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        for (salt, compressed) in [
+            (ascending, "02074508261589a2c703bcb88966769c27f980a528de99cd3dc92d93d3de8fa2a6"),
+            ([0x00; SALT_LEN], "02c68960c82e7e3d5395da61ee0f2024fb5e9ec0e45e2f104e33c65cca87c93620"),
+            ([0xFF; SALT_LEN], "02d31f6c8437eae360104be32527bbd36356c573c3047bc685ebbbde53148c13cb"),
+        ] {
+            let point = payload_ecdh_point(&salt).unwrap();
+            let got: String = point.to_sec1_point(true).as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, compressed, "salt {salt:02x?}");
+        }
     }
 
     #[test]
@@ -965,9 +999,9 @@ mod tests {
 
             let err = unwrap(service, &wrapped).unwrap_err();
             // Caught by the fingerprint check, before ECDH/AES-GCM is ever
-            // attempted -- not a generic `Error::Crypto`, which is what
-            // this would have looked like before this check existed.
-            assert!(matches!(err, Error::FingerprintMismatch));
+            // attempted -- not a generic `Error::AuthFailed`, which is what
+            // this would look like without that check.
+            assert!(matches!(err, Error::KekFingerprintMismatch));
 
         }
     }
@@ -987,16 +1021,16 @@ mod tests {
             let tampered_bytes = payload.to_bytes();
 
             let err = unwrap("com.company.orders", &tampered_bytes).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_)));
+            assert!(matches!(err, Error::AuthFailed));
         });
     }
 
     #[test]
     #[serial]
     fn tampered_provider_type_fails_to_unwrap() {
-        // Finding #9: the provider tag steers which provider unwraps the
-        // payload, and was previously unauthenticated. Changing it must
-        // now fail rather than being honored.
+        // The provider tag steers which provider unwraps the payload, so
+        // it is authenticated. Changing it must fail rather than being
+        // honored.
         with_isolated_ephemeral_provider(|| {
             crate::provider::create_kek("com.company.orders").unwrap();
             let dek = [0x34u8; DEK_LEN];
@@ -1036,7 +1070,7 @@ mod tests {
             let tampered_bytes = payload.to_bytes();
 
             let err = unwrap("com.company.orders", &tampered_bytes).unwrap_err();
-            assert!(matches!(err, Error::Crypto(_)));
+            assert!(matches!(err, Error::AuthFailed));
         });
     }
 }

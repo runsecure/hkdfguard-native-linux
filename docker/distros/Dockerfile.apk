@@ -1,0 +1,42 @@
+# Alpine Linux test image: musl libc, so the one image here not built on
+# glibc. One of the per-distro images docker/run-distro-tests.sh builds;
+# see docker/README.md. softhsm comes from Alpine's community repository.
+#
+# BASE_IMAGE is always passed by run-distro-tests.sh, pinned by digest
+# there; the default only keeps a bare `docker build` working.
+ARG BASE_IMAGE=alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM ${BASE_IMAGE}
+
+# Rust's musl targets link statically by default (crt-static). A static
+# executable cannot dlopen() a PKCS#11 module, and rustc drops the cdylib
+# (libhkdfguard.so) from a crt-static build altogether, so every build
+# here turns it off. The entrypoint prepends BASE_RUSTFLAGS to the
+# RUSTFLAGS of each cargo invocation, because a RUSTFLAGS variable
+# replaces any target rustflags from configuration rather than adding to
+# them.
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH \
+    BASE_RUSTFLAGS="-C target-feature=-crt-static"
+
+# bash for the entrypoint, shadow for useradd, setpriv for util-linux's
+# setpriv (it replaces BusyBox's, which lacks --reuid), coreutils and
+# findutils so the tools behave as on the glibc images.
+RUN apk add --no-cache \
+        bash \
+        build-base \
+        coreutils \
+        curl \
+        findutils \
+        setpriv \
+        shadow \
+        softhsm
+
+COPY docker/distros/prepare-image.sh /tmp/prepare-image.sh
+RUN sh /tmp/prepare-image.sh && rm /tmp/prepare-image.sh
+ENV SOFTHSM2_CONF=/etc/softhsm2-ci.conf \
+    HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1
+
+WORKDIR /work
+COPY --chown=ci:ci . /work
+ENTRYPOINT ["bash", "docker/distros/entrypoint-distro-test.sh"]

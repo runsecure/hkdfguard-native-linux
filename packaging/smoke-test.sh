@@ -62,7 +62,7 @@ example_policy=/usr/share/hkdfguard/policy.toml.example
     || { echo "$example_policy must be installed, root:root 0644" >&2; exit 1; }
 libdir=$(pkg-config --variable=libdir hkdfguard)
 ls -l "$libdir"/libhkdfguard*
-hkdfguard-v1-initialize --help
+hkdfguard --help
 
 section "external secrets for the test services (root's mount, as a platform's would be)"
 install -d -m 0755 /run/secrets/hkdfguard
@@ -114,10 +114,10 @@ section "CLI provision + wrap, unwrapped through the installed library"
 cc -o "$work/cli_unwrap_check" "$examples/cli_unwrap_check.c" $(pkg-config --cflags --libs hkdfguard)
 install -m 0600 /dev/null "$work/dek.bin"
 head -c 32 /dev/urandom > "$work/dek.bin"
-hkdfguard-v1-initialize provision -sn com.company.cli
+hkdfguard provision -sn com.company.cli
 # base64 reads the DEK from stdin and writes it to a pipe: it never
 # reaches an argument list.
-base64 -w0 < "$work/dek.bin" | hkdfguard-v1-initialize wrap -kf "$work/wrapped.key" -sn com.company.cli --dek-stdin
+base64 -w0 < "$work/dek.bin" | hkdfguard wrap -kf "$work/wrapped.key" -sn com.company.cli --dek-stdin
 "$work/cli_unwrap_check" "$work/wrapped.key" com.company.cli "$work/dek.bin"
 
 section "example policy, copied into place unedited"

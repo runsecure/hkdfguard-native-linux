@@ -138,13 +138,13 @@ set, provisioning an unlisted service fails and prints the exact line to
 add:
 
 ```sh
-sudo hkdfguard-v1-initialize provision -sn com.company.orders
-#   error: ... add this to the policy file, with <service> replaced by the service name ...
+sudo hkdfguard provision -sn com.company.orders
+#   error: ... add this to the policy file and run provision again:
 #     [tpm.pinned_names]
-#     "<service>" = "000b..."
+#     "com.company.orders" = "000b..."
 ```
 
-Add the line (replacing `<service>` with the name), then run `provision`
+Add the line as printed, then run `provision`
 again; it reports "already provisioned". **Create the derivation secret
 before pinning:** the Name depends on it.
 
@@ -227,7 +227,12 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   lockout.
 
 `provision` generates the key pair on the token: non-extractable, usable only
-for key derivation, and labelled with the service name.
+for key derivation, and labelled with the service name. Both halves are
+private objects (`CKA_PRIVATE`), and only private objects are ever looked up,
+so nothing someone creates on the token without the PIN is ever used. A pair
+provisioned before this rule existed has a public half that isn't private: it
+is reported as a private key whose public key is missing; delete both halves
+and run `provision` again (this changes that service's KEK).
 
 ### External secret (file)
 
@@ -415,6 +420,9 @@ minimum_protection = "external"   # exclude providers below this level, whatever
 
 [startup_behavior]
 setup_min_delay_ms = 1000         # minimum duration of create_kek / kek_exists calls; 0 disables, max 60000
+
+[audit]
+unwrap_success = true             # false: no audit record for a successful unwrap (README "Audit trail")
 
 [tpm]
 tcti = "device:/dev/tpmrm0"

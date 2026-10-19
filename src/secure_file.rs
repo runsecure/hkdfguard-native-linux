@@ -80,7 +80,11 @@ pub struct FileRequirements {
 /// descriptor's own metadata. Only ever returns `ErrorKind::NotFound` when
 /// the file genuinely doesn't exist; a file that exists but fails a check
 /// is reported as `PermissionDenied` or `InvalidData`, so callers can tell
-/// "absent" apart from "present but untrustworthy".
+/// "absent" apart from "present but untrustworthy". A refusal by one of
+/// these checks never carries a `raw_os_error`, while the kernel refusing
+/// the open itself (`EACCES`, `ELOOP`, ...) always does, so callers can
+/// also tell "the OS said no" apart from "the file failed a trust check"
+/// (`key_file` reports them as different status codes).
 pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
     // O_NONBLOCK: opening a FIFO with no writer would otherwise block in
     // open(2) itself -- before the descriptor could be checked -- hanging
@@ -121,6 +125,22 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
 /// from a directory vanishing mid-walk, is `PermissionDenied` -- never
 /// `NotFound`, which callers reserve for "the file isn't there".
 pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
+    dir_chain(dir, owner, false)
+}
+
+/// [`check_dir_chain`] for the directory holding a file that already
+/// exists and whose own ownership the caller checks on the opened
+/// descriptor: here `dir` itself may also be sticky (e.g. `/tmp`). In a
+/// sticky directory nobody but the entry's owner (or the directory's) can
+/// rename, replace, or delete it, and the entry's owner is checked -- so
+/// the only thing stickiness doesn't protect, a file being *created* under
+/// the name before its rightful owner does, is caught by that owner check.
+/// Not for files whose absence is meaningful (see [`check_location`]).
+pub fn check_dir_chain_for_existing_file(dir: &Path, owner: Owner) -> io::Result<()> {
+    dir_chain(dir, owner, true)
+}
+
+fn dir_chain(dir: &Path, owner: Owner, sticky_dir_itself_ok: bool) -> io::Result<()> {
     for (i, d) in dir.ancestors().enumerate() {
         let fail = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display()));
         let meta = std::fs::metadata(d).map_err(|e| fail(e.to_string()))?;
@@ -131,13 +151,51 @@ pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
 
         let mode = meta.mode();
         let writable = mode & FORBID_GROUP_OTHER_WRITE != 0;
-        let protected_by_sticky = i > 0 && mode & STICKY != 0;
+        let protected_by_sticky = (i > 0 || sticky_dir_itself_ok) && mode & STICKY != 0;
         if writable && !protected_by_sticky && !on_read_only_mount(d) {
             return Err(fail(format!(
                 "writable by group or others (mode {:o}), so its entries can be replaced",
                 mode & 0o7777
             )));
         }
+    }
+    Ok(())
+}
+
+/// Confirms the descriptor `open` returned is the file that was resolved
+/// and checked: on Linux, by reading its path back from
+/// `<proc>/self/fd/<n>` and checking it is `within` (pass the resolved file
+/// itself to require exactly that file); where that isn't possible (`/proc`
+/// not mounted or masked, as in some minimal containers and sandboxes, or a
+/// non-Linux build), by comparing the descriptor's device and inode with
+/// the resolved path's -- just as conclusive, so neither case is weaker.
+/// Every failure is `PermissionDenied` -- never `NotFound`, which callers
+/// reserve for "the file isn't there".
+pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: &Path) -> io::Result<()> {
+    let denied = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, what);
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(opened) = std::fs::read_link(proc_root.join(format!("self/fd/{}", file.as_raw_fd()))) {
+            if !opened.starts_with(within) {
+                return Err(denied(format!(
+                    "opened descriptor refers to {}, outside {}",
+                    opened.display(),
+                    within.display()
+                )));
+            }
+            return Ok(());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (within, proc_root);
+
+    let opened = file.metadata().map_err(|e| denied(format!("could not stat the opened file: {e}")))?;
+    let resolved = std::fs::symlink_metadata(target_real)
+        .map_err(|e| denied(format!("{} changed after it was opened: {e}", target_real.display())))?;
+    if (opened.dev(), opened.ino()) != (resolved.dev(), resolved.ino()) {
+        return Err(denied(format!("{} was replaced between resolution and open", target_real.display())));
     }
     Ok(())
 }
@@ -222,6 +280,27 @@ pub fn check_owner_and_mode(meta: &Metadata, owner: Option<Owner>, forbidden_mod
         ));
     }
     Ok(())
+}
+
+/// What identifies one version of a credential file (the PKCS#11 PIN, the
+/// TPM owner password). A change to any of these means an operator touched
+/// the file, which clears a latched authentication failure: see
+/// `pkcs11::PIN_LATCHES` and `tpm2::OWNER_AUTH`.
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) len: u64,
+    pub(crate) mtime: (i64, i64),
+}
+
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11")), allow(dead_code))]
+impl FileIdentity {
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let m = std::fs::metadata(path).ok()?;
+        Some(FileIdentity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()) })
+    }
 }
 
 /// A byte buffer for secret file contents that is guaranteed to be zeroed
@@ -397,6 +476,38 @@ mod tests {
         chmod(&outer, 0o777);
         assert!(check_dir_chain(&inner, Owner::RootOrCurrentUser).is_err(), "anyone could rename `inner` away");
         chmod(&outer, 0o700);
+    }
+
+    #[test]
+    fn verify_opened_with_the_file_as_its_own_boundary_requires_that_exact_file() {
+        // How hkdfguard_open_file uses it: `within` is the resolved file
+        // itself, so even a sibling in the same directory is a mismatch --
+        // through /proc and, where /proc is missing, by device and inode.
+        let dir = private_tempdir();
+        let d = std::fs::canonicalize(dir.path()).unwrap();
+        let (a, b) = (d.join("a.key"), d.join("b.key"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let file_a = File::open(&a).unwrap();
+        for proc_root in [Path::new("/proc"), Path::new("/nonexistent-hkdfguard-proc")] {
+            verify_opened(&file_a, &a, &a, proc_root).unwrap_or_else(|e| panic!("{}: {e}", proc_root.display()));
+            let err = verify_opened(&file_a, &b, &b, proc_root).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{}", proc_root.display());
+        }
+    }
+
+    #[test]
+    fn existing_file_variant_also_accepts_a_sticky_dir_itself() {
+        let base = crate::secure_file::private_tempdir();
+        let dir = std::fs::canonicalize(base.path()).unwrap();
+        chmod(&dir, 0o1777);
+        assert!(check_dir_chain(&dir, Owner::RootOrCurrentUser).is_err(), "the general check still refuses it");
+        check_dir_chain_for_existing_file(&dir, Owner::RootOrCurrentUser).expect("sticky: entries can't be renamed by others");
+        for mode in [0o777, 0o770] {
+            chmod(&dir, mode);
+            assert!(check_dir_chain_for_existing_file(&dir, Owner::RootOrCurrentUser).is_err(), "mode {mode:o} without sticky");
+        }
+        chmod(&dir, 0o700);
     }
 
     #[test]

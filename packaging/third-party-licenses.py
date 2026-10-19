@@ -78,7 +78,7 @@ def main():
     with open(sys.argv[1], "w", encoding="utf-8") as out:
         out.write("Third-party software compiled into HKDFGuard\n"
                   "============================================\n\n"
-                  "The HKDFGuard library and hkdfguard-v1-initialize statically link the\n"
+                  "The HKDFGuard library and the hkdfguard command statically link the\n"
                   "Rust crates below. Each is distributed under the license(s) shown,\n"
                   "followed by the license and notice files from that crate's sources.\n")
         for pkg in pkgs:

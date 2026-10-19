@@ -25,7 +25,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK (CLI)
 License:        MPL-2.0 AND %{linked_licenses}
-URL:            https://github.com/torinblair/KeyProtectionCore-Linux
+URL:            https://github.com/runsecure/hkdfguard-native-linux
 Source0:        %{name}-%{version}.tar.gz
 
 # tss-esapi-sys ships pregenerated bindings for these Linux targets only.
@@ -51,7 +51,7 @@ HKDF-SHA512 and AES-256-GCM.}
 
 %description %{common_description}
 
-This package contains hkdfguard-v1-initialize, which provisions a
+This package contains the hkdfguard command, which provisions a
 service's KEK and wraps DEKs under it at deployment time.
 
 %package -n %{libpkg}
@@ -104,15 +104,15 @@ python3 packaging/third-party-licenses.py target/THIRD-PARTY-LICENSES.txt
 
 %install
 # The library goes in under its SONAME (see build.rs), not Cargo's name.
-install -D -m 0755 target/release/libhkdfguard_v1.so %{buildroot}%{_libdir}/libhkdfguard.so.1
+install -D -m 0755 target/release/libhkdfguard.so %{buildroot}%{_libdir}/libhkdfguard.so.1
 ln -s libhkdfguard.so.1 %{buildroot}%{_libdir}/libhkdfguard.so
-install -D -m 0644 target/release/libhkdfguard_v1.a %{buildroot}%{_libdir}/libhkdfguard.a
+install -D -m 0644 target/release/libhkdfguard.a %{buildroot}%{_libdir}/libhkdfguard.a
 install -D -m 0644 include/hkdfguard.h %{buildroot}%{_includedir}/hkdfguard.h
 install -d %{buildroot}%{_libdir}/pkgconfig
 sed -e 's|@LIBDIR@|%{_libdir}|' -e 's|@VERSION@|%{version}|' \
     packaging/hkdfguard.pc.in > %{buildroot}%{_libdir}/pkgconfig/hkdfguard.pc
-install -D -m 0755 target/release/hkdfguard-v1-initialize %{buildroot}%{_bindir}/hkdfguard-v1-initialize
-install -D -m 0644 packaging/hkdfguard-v1-initialize.1 %{buildroot}%{_mandir}/man1/hkdfguard-v1-initialize.1
+install -D -m 0755 target/release/hkdfguard %{buildroot}%{_bindir}/hkdfguard
+install -D -m 0644 packaging/hkdfguard.1 %{buildroot}%{_mandir}/man1/hkdfguard.1
 install -d -m 0755 %{buildroot}%{_sysconfdir}/hkdfguard
 install -D -m 0644 packaging/policy.toml.example %{buildroot}%{_datadir}/hkdfguard/policy.toml.example
 
@@ -127,8 +127,8 @@ cargo test --locked --offline --all-features
 
 %files
 %license LICENSE
-%{_bindir}/hkdfguard-v1-initialize
-%{_mandir}/man1/hkdfguard-v1-initialize.1*
+%{_bindir}/hkdfguard
+%{_mandir}/man1/hkdfguard.1*
 
 %files -n %{libpkg}
 %license LICENSE target/THIRD-PARTY-LICENSES.txt

@@ -1,22 +1,22 @@
 /*
- * Verifies that a wrapped-key file produced by the hkdfguard-v1-initialize
+ * Verifies that a wrapped-key file produced by the hkdfguard
  * CLI tool (which links this crate's Rust code statically, as an rlib)
- * unwraps cleanly through libhkdfguard_v1.so loaded
+ * unwraps cleanly through libhkdfguard.so loaded
  * dynamically here -- proving the wrapped payload's wire format is truly
  * consumer-independent, not an artifact of both sides sharing one binary.
  *
  * Usage: cli_unwrap_check <wrapped-file> <service> <expected-dek-file>
- *   <wrapped-file>       output of `hkdfguard-v1-initialize`
+ *   <wrapped-file>       output of `hkdfguard wrap`
  *   <service>            the exact --service-name the CLI wrapped it under
  *   <expected-dek-file>  the original 32 raw DEK bytes given to the CLI
- *                         (before base64-encoding for --dek)
+ *                         (before base64-encoding for --dek-stdin/--dek-file)
  *
  * Build (after `cargo build --release` and
- *   `ln -sf libhkdfguard_v1.so ../target/release/libhkdfguard.so.1`,
+ *   `ln -sf libhkdfguard.so ../target/release/libhkdfguard.so.1`,
  *   the library's SONAME; with the packages installed, use
  *   `pkg-config --cflags --libs hkdfguard` instead):
  *   cc -I../include cli_unwrap_check.c -L../target/release \
- *       -lhkdfguard_v1 -o cli_unwrap_check
+ *       -lhkdfguard -o cli_unwrap_check
  *   LD_LIBRARY_PATH=../target/release ./cli_unwrap_check \
  *       <wrapped-file> <service> <expected-dek-file>
  */
@@ -45,10 +45,13 @@ int main(int argc, char** argv) {
     const char* service = argv[2];
     const char* expected_dek_path = argv[3];
 
-    uint8_t wrapped[1024];
-    long wrapped_len = read_file(wrapped_path, wrapped, (long)sizeof(wrapped));
-    if (wrapped_len <= 0) {
-        fprintf(stderr, "failed to read wrapped file %s\n", wrapped_path);
+    /* Read the key file the way an application should: the library checks
+     * it is a complete, well-formed wrapped DEK before handing it over. */
+    uint8_t wrapped[HKDFGUARD_WRAPPED_MAX_LEN];
+    int wrapped_len = (int)sizeof(wrapped);
+    int rc = hkdfguard_open_file(wrapped_path, wrapped, &wrapped_len);
+    if (rc != HKDFGUARD_OK) {
+        fprintf(stderr, "hkdfguard_open_file(%s) failed: %d\n", wrapped_path, rc);
         return 1;
     }
 
@@ -59,19 +62,38 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* The expected-DEK file is a plaintext key: hkdfguard_open_file must
+     * refuse it as one, leave nothing of it in the buffer, and leave
+     * *out_len as the caller set it (as on every failure but
+     * BUFFER_TOO_SMALL). */
+    uint8_t probe[HKDFGUARD_WRAPPED_MAX_LEN];
+    memset(probe, 0xAA, sizeof(probe));
+    int probe_len = (int)sizeof(probe);
+    rc = hkdfguard_open_file(expected_dek_path, probe, &probe_len);
+    int probe_zeroed = 1;
+    for (size_t i = 0; i < sizeof(probe); ++i) {
+        probe_zeroed &= probe[i] == 0;
+    }
+    if (rc != HKDFGUARD_ERR_FILE_PLAINTEXT_KEY || probe_len != (int)sizeof(probe) || !probe_zeroed) {
+        fprintf(stderr, "hkdfguard_open_file on a raw DEK returned %d (len %d, buffer %s), expected %d (len %d, zeroed)\n",
+                rc, probe_len, probe_zeroed ? "zeroed" : "not zeroed", HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                (int)sizeof(probe));
+        return 1;
+    }
+
     uint8_t recovered[HKDFGUARD_DEK_LEN];
     int recovered_len = sizeof(recovered);
-    int rc = hkdfguard_unwrap_dek(service, wrapped, (int)wrapped_len, recovered, &recovered_len);
+    rc = hkdfguard_unwrap_dek(service, wrapped, wrapped_len, recovered, &recovered_len);
     if (rc != HKDFGUARD_OK) {
         fprintf(stderr, "hkdfguard_unwrap_dek failed: %d\n", rc);
         return 1;
     }
 
     if (recovered_len != HKDFGUARD_DEK_LEN || memcmp(recovered, expected_dek, HKDFGUARD_DEK_LEN) != 0) {
-        fprintf(stderr, "unwrapped DEK does not match the original --dek input\n");
+        fprintf(stderr, "unwrapped DEK does not match the original DEK given to the CLI\n");
         return 1;
     }
 
-    printf("CLI-wrapped key unwraps cleanly via libhkdfguard_v1.so (service \"%s\")\n", service);
+    printf("CLI-wrapped key unwraps cleanly via libhkdfguard.so (service \"%s\")\n", service);
     return 0;
 }

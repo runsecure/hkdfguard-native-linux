@@ -2,7 +2,7 @@
 //! dumpable flag), so it gets its own test binary -- its own process --
 //! rather than running inside the shared unit-test process.
 
-use hkdfguard_v1::{hkdfguard_harden_process, status};
+use hkdfguard::{harden_flags, hkdfguard_harden_process, hkdfguard_harden_process_with_flags, status};
 
 // Only this user can write to it, whatever the umask: the library refuses
 // to trust a policy or secret mount in a group-writable directory.
@@ -14,8 +14,20 @@ fn private_tempdir() -> tempfile::TempDir {
 
 #[test]
 fn hardening_takes_effect_and_the_library_still_works_afterwards() {
+    // Unknown flag bits are refused before anything is changed, so a flag a
+    // newer caller relies on is never silently ignored.
+    let unknown = !harden_flags::ALL;
+    assert_eq!(hkdfguard_harden_process_with_flags(unknown), status::INVALID_ARGUMENT);
+    assert_eq!(hkdfguard_harden_process_with_flags(0x8000_0000), status::INVALID_ARGUMENT);
+
     assert_eq!(hkdfguard_harden_process(), status::OK);
     assert_eq!(hkdfguard_harden_process(), status::OK, "must be idempotent");
+    // On Linux the strict flag is satisfied by PR_SET_DUMPABLE alone.
+    assert_eq!(hkdfguard_harden_process_with_flags(0), status::OK);
+    assert_eq!(
+        hkdfguard_harden_process_with_flags(harden_flags::REQUIRE_PROTECTED_SIGNATURE),
+        status::OK
+    );
 
     let mut limit = libc::rlimit { rlim_cur: 1, rlim_max: 1 };
     // SAFETY: getrlimit writes into a valid rlimit.
@@ -37,7 +49,7 @@ fn hardening_takes_effect_and_the_library_still_works_afterwards() {
         use std::ffi::CString;
         use std::os::raw::c_int;
         use std::os::unix::fs::PermissionsExt;
-        use hkdfguard_v1::{hkdfguard_unwrap_dek, hkdfguard_wrap_dek};
+        use hkdfguard::{hkdfguard_unwrap_dek, hkdfguard_wrap_dek};
         use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
         // A non-dumpable process loses some /proc/<pid> access. The

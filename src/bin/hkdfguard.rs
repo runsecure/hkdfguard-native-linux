@@ -21,9 +21,9 @@
 //!
 //! Usage:
 //! ```text
-//! hkdfguard-v1-initialize provision --service-name|-sn <name>
+//! hkdfguard provision --service-name|-sn <name>
 //!
-//! hkdfguard-v1-initialize wrap \
+//! hkdfguard wrap \
 //!     --key-file-path|-kf <path> \
 //!     --service-name|-sn <name> \
 //!     (--dek-stdin | --dek-file <path>) \
@@ -44,10 +44,10 @@
 //!
 //! ```text
 //! # stdin -- printf is a shell builtin, so nothing reaches argv
-//! printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap -kf key.bin -sn svc --dek-stdin
+//! printf '%s' "$DEK_B64" | hkdfguard wrap -kf key.bin -sn svc --dek-stdin
 //!
 //! # file -- e.g. a Kubernetes/Vault secret mount or a systemd credential
-//! hkdfguard-v1-initialize wrap -kf key.bin -sn svc --dek-file "$CREDENTIALS_DIRECTORY/dek"
+//! hkdfguard wrap -kf key.bin -sn svc --dek-file "$CREDENTIALS_DIRECTORY/dek"
 //! ```
 //!
 //! A `--dek-file` must be a regular file, must not be a symlink, must be
@@ -62,9 +62,14 @@
 //!
 //! ## Overwriting
 //!
+//! The key file's folder must be a real folder at the path spelled: no
+//! symbolic link anywhere above the file (see [`require_real_folder`]),
+//! checked before the DEK is read and again on the open descriptor.
+//!
 //! When `--force` replaces an existing file at `--key-file-path`, the wrap
 //! is completed in memory *first*, and only then is the old file securely
-//! overwritten in place and removed (see [`secure_delete`]). A wrap that
+//! overwritten in place and removed (see [`secure_delete`]); a file with
+//! more than one hard link is refused. A wrap that
 //! fails -- no KEK provisioned, provider unavailable, bad DEK input --
 //! therefore never destroys the key file that was already there. The
 //! secure overwrite is a best-effort measure against a plain read of the
@@ -72,17 +77,19 @@
 //! filesystems (e.g. btrfs, ZFS), or on flash storage doing wear-leveling
 //! remaps, where the original blocks may still exist elsewhere.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64ct::{Base64, Encoding as _};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::raw::c_int;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroize;
-use hkdfguard_v1::{
-    hkdfguard_create_kek, hkdfguard_harden_process, hkdfguard_kek_exists, hkdfguard_wrap_dek, status,
+use hkdfguard::{
+    harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
+    hkdfguard_wrap_dek, status,
 };
 
 // rw-------: the owning deployment user only. The payload is ciphertext,
@@ -90,13 +97,24 @@ use hkdfguard_v1::{
 // member, on a TPM host) can unwrap it, so group read is not the default.
 // A deployment that wants a group to read it grants that deliberately.
 const KEY_FILE_MODE: u32 = 0o600;
+// With --group: rw-r-----, the owner plus that one group, read-only. The
+// Windows tool's --group grants the same (owner read/write, the group read).
+const KEY_FILE_GROUP_MODE: u32 = 0o640;
+
+// Groups --group refuses: each covers essentially every account on a
+// typical host, or the host's administrators or log readers -- granting one
+// read access is no narrower than world-readable for this purpose. Matched
+// by resolved gid, so a numeric gid can't dodge the list. gid 0 and the
+// overflow gid 65534 are refused whatever their names. The Windows tool
+// refuses its own equivalents (Everyone, Users, Authenticated Users, ...).
+const OVER_BROAD_GROUPS: &[&str] = &["root", "users", "nogroup", "nobody", "wheel", "sudo", "adm", "staff"];
 
 // Number of (all-zero pass, random pass) rounds `secure_delete` runs before
 // removing the file -- 2 passes per round, so this yields 8 total
 // overwrites as specified.
 const SECURE_DELETE_ROUNDS: usize = 4;
 
-const PROGRAM_NAME: &str = "hkdfguard-v1-initialize";
+const PROGRAM_NAME: &str = "hkdfguard";
 const DEK_LEN: usize = 32;
 // Mirrors the library's own cap (see cstr_to_service in src/lib.rs) so this
 // tool can give a specific, immediate error instead of relying on the
@@ -118,6 +136,19 @@ const MAX_DECODED_LEN: usize = MAX_DEK_INPUT_LEN / 4 * 3;
 // Mode bits that must be clear on a --dek-file: no access at all for
 // group or others.
 const FORBID_GROUP_OTHER_ACCESS: u32 = 0o077;
+// Any DEK input that isn't strict, padded, standard base64 -- the Windows
+// tool's wording. Deliberately fixed: it names no character, offset or bit
+// pattern, so a mistyped DEK never puts part of itself into a log.
+const INVALID_BASE64_DEK_MESSAGE: &str =
+    "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)";
+// Refusing to read the DEK from an interactive terminal -- the Windows
+// tool's wording.
+const TERMINAL_DEK_MESSAGE: &str = "refusing to read the DEK from an interactive terminal, where it would be \
+                                    echoed and kept in the scrollback; pipe it in instead, e.g. \
+                                    printf '%s' \"$DEK_B64\" | hkdfguard wrap ... --dek-stdin";
+// Refusing UTF-16 DEK input -- the Windows tool's wording.
+const UTF16_DEK_MESSAGE: &str = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text \
+                                 (in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)";
 
 // Where the base64 DEK is read from. Never argv, never the environment --
 // see this file's header comment.
@@ -137,6 +168,8 @@ enum Command {
         service_name: String,
         dek_source: DekSource,
         force: bool,
+        // --group: who besides the owner may read the key file. None: no one.
+        group: Option<String>,
     },
 }
 
@@ -149,12 +182,14 @@ fn print_usage() {
     eprintln!(
         "Usage:\n\
          \x20 {PROGRAM_NAME} provision --service-name|-sn <name>\n\
-         \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>) [--force|-f]\n\
+         \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n\
+         \x20      [--group|-g <name>] [--force|-f]\n\
          \n\
          provision  ensures a KEK exists for the service. Run once, at deployment time;\n\
          \x20          this is the only command that makes the (deliberately slow) setup calls.\n\
          wrap       wraps a DEK under the service's existing KEK and writes the payload to\n\
-         \x20          --key-file-path. Fails if the KEK has not been provisioned.\n\
+         \x20          --key-file-path, readable by its owner only, or also by --group's\n\
+         \x20          members (mode 0640). Fails if the KEK has not been provisioned.\n\
          \n\
          The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n\
          from a command-line argument or an environment variable, both of which are\n\
@@ -177,6 +212,27 @@ fn take_service_name(arg: &str, args: &mut impl Iterator<Item = String>) -> Resu
     Ok(value)
 }
 
+// Stores a flag's value, refusing a second one rather than letting the last
+// win: `-kf a.key ... -kf b.key` is ambiguous about which file the operator
+// meant, and silently picking one is how the wrong key file gets written or
+// the wrong service's KEK gets used. `flag` is the flag's long name.
+fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("give {flag} at most once"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+// The command line as UTF-8 strings, or the (1-based) position of the
+// first argument that isn't valid UTF-8 -- reported as a usage error
+// rather than the panic `std::env::args()` raises.
+fn utf8_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.enumerate()
+        .map(|(i, a)| a.into_string().map_err(|_| format!("argument {i} is not valid UTF-8")))
+        .collect()
+}
+
 fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
     let mut args = args.skip(1); // skip argv[0]
 
@@ -189,9 +245,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     match subcommand.as_str() {
         "provision" => parse_provision(&mut args),
         "wrap" => parse_wrap(&mut args),
-        other if !other.starts_with('-') && (other.contains('/') || other.ends_with(".key") || other.ends_with(".bin")) => Err(format!(
-            "unknown subcommand {other:?}. The key file path is no longer positional: use `wrap --key-file-path|-kf {other}`"
-        )),
         other => Err(format!("unknown subcommand {other:?}: expected `provision` or `wrap`")),
     }
 }
@@ -202,8 +255,8 @@ fn parse_provision(args: &mut impl Iterator<Item = String>) -> Result<ParseOutco
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
-            "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
-            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--dek" | "-d" | "--force" | "-f" => {
+            "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
+            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--force" | "-f" | "--group" | "-g" => {
                 return Err(format!("{arg} is not valid for `provision`; it belongs to `wrap`"))
             }
             other => return Err(format!("unrecognized argument for `provision`: {other}")),
@@ -219,6 +272,7 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
     let mut service_name: Option<String> = None;
     let mut dek_source: Option<DekSource> = None;
     let mut force = false;
+    let mut group: Option<String> = None;
 
     // Rejects a second DEK source rather than letting the last one win:
     // silently ignoring one of two explicitly-requested inputs is exactly
@@ -234,14 +288,26 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
-            "--force" | "-f" => force = true,
-            "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
+            "--force" | "-f" => {
+                if force {
+                    return Err("give --force at most once".to_string());
+                }
+                force = true;
+            }
+            "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
             "--key-file-path" | "-kf" => {
                 let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
                 if value.is_empty() {
                     return Err("--key-file-path must not be empty".to_string());
                 }
-                key_file_path = Some(value);
+                set_once(&mut key_file_path, "--key-file-path", value)?;
+            }
+            "--group" | "-g" => {
+                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
+                if value.is_empty() {
+                    return Err("--group must not be empty".to_string());
+                }
+                set_once(&mut group, "--group", value)?;
             }
             "--dek-stdin" => set_source(&mut dek_source, DekSource::Stdin)?,
             "--dek-file" => {
@@ -250,22 +316,6 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
                     return Err("--dek-file must not be empty".to_string());
                 }
                 set_source(&mut dek_source, DekSource::File(value))?;
-            }
-            // Removed rather than deprecated: accepting the DEK on argv
-            // exposes it via /proc/<pid>/cmdline, so leaving it in place
-            // "for compatibility" would just preserve the vulnerability.
-            // A clear error beats a silent "unrecognized argument".
-            "--dek" | "-d" => {
-                return Err(
-                    "--dek is no longer supported: the DEK would be visible to other processes \
-                     via /proc/<pid>/cmdline. Use --dek-stdin or --dek-file instead."
-                        .to_string(),
-                )
-            }
-            other if !other.starts_with('-') => {
-                return Err(format!(
-                    "unexpected positional argument {other:?}: the key file path is given as --key-file-path|-kf"
-                ))
             }
             other => return Err(format!("unrecognized argument for `wrap`: {other}")),
         }
@@ -280,6 +330,7 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
         service_name,
         dek_source,
         force,
+        group,
     }))
 }
 
@@ -306,6 +357,11 @@ fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN
         }
     }
     if filled > MAX_DEK_INPUT_LEN {
+        // UTF-16 doubles the text, so it is over the limit long before
+        // decode_dek could say why: name it here instead.
+        if buf.starts_with(b"\xFF\xFE") || buf.starts_with(b"\xFE\xFF") {
+            return Err(UTF16_DEK_MESSAGE.to_string());
+        }
         return Err(format!(
             "{what} is longer than {MAX_DEK_INPUT_LEN} bytes; expected base64 of a {DEK_LEN}-byte DEK"
         ));
@@ -318,6 +374,12 @@ fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN
 // ownership/permission checks made against the *opened descriptor* rather
 // than the path, so nothing can be swapped between the check and the read.
 fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<usize, String> {
+    // No symbolic link in the folders above it either, as for the key file
+    // (and as the Windows tool requires of its --dek-file): a redirected
+    // folder could make the deployment wrap a DEK someone else planted.
+    // O_NOFOLLOW below covers the file itself; `require_opened_at` confirms
+    // the descriptor is the file at the spelled path.
+    let spelled = require_real_folder(Path::new(path))?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
@@ -329,6 +391,7 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
                 format!("failed to open --dek-file {path}: {e}")
             }
         })?;
+    require_opened_at(&file, Path::new(path), &spelled)?;
 
     let meta = file
         .metadata()
@@ -359,12 +422,23 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
 
 // Decodes the base64 DEK text, tolerating exactly one trailing newline
 // (optionally CRLF) so a file written by `printf '%s\n'` or an editor
-// still works. Only base64 is accepted: raw 32-byte input fails to decode
-// with a clear error rather than being silently misinterpreted.
+// still works, and a leading UTF-8 byte-order mark, which some Windows
+// tools (PowerShell, .NET) prepend; a UTF-16 byte-order mark is refused as
+// such, since the fix is on the sending side. Then strict standard base64
+// (the `+/` alphabet, canonical padding, zero unused bits): no other
+// whitespace anywhere. Decoded with base64ct, in constant time with respect
+// to the secret text, and any failure reported with one fixed message. The Windows tool applies these rules exactly, so the
+// same input is accepted or refused on both. Only base64 is accepted: raw
+// 32-byte input fails to decode with a clear error rather than being
+// silently misinterpreted.
 //
 // Decodes into `out` (the caller's `DekScratch`), never into a fresh
 // allocation, and returns the DEK as a slice of it.
 fn decode_dek<'a>(text: &[u8], out: &'a mut [u8; MAX_DECODED_LEN]) -> Result<&'a [u8], String> {
+    let text = text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(text);
+    if text.starts_with(b"\xFF\xFE") || text.starts_with(b"\xFE\xFF") {
+        return Err(UTF16_DEK_MESSAGE.to_string());
+    }
     let trimmed = match text.strip_suffix(b"\n") {
         Some(t) => t.strip_suffix(b"\r").unwrap_or(t),
         None => text,
@@ -373,9 +447,9 @@ fn decode_dek<'a>(text: &[u8], out: &'a mut [u8; MAX_DECODED_LEN]) -> Result<&'a
         return Err("the DEK input is empty".to_string());
     }
 
-    let len = STANDARD
-        .decode_slice(trimmed, out)
-        .map_err(|e| format!("the DEK input is not valid base64: {e}"))?;
+    // Constant time over the secret text (base64ct: no data-dependent branch
+    // or table lookup), and the error carries no input data either way.
+    let len = Base64::decode(trimmed, out).map_err(|_| INVALID_BASE64_DEK_MESSAGE.to_string())?.len();
     if len != DEK_LEN {
         return Err(format!("the DEK must decode to exactly {DEK_LEN} bytes, got {len}"));
     }
@@ -439,9 +513,20 @@ impl Drop for DekScratch {
 fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [u8], String> {
     let len = match source {
         DekSource::Stdin => {
-            let stdin = std::io::stdin();
-            let mut locked = stdin.lock();
-            read_bounded(&mut locked, "the DEK on stdin", &mut scratch.text)?
+            // A DEK typed or pasted at a terminal is echoed and stays in the
+            // scrollback: refuse a terminal outright rather than read it.
+            // SAFETY: isatty takes a descriptor number and only inspects it.
+            if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+                return Err(TERMINAL_DEK_MESSAGE.to_string());
+            }
+            // Straight from descriptor 0, never through `std::io::stdin()`:
+            // that is a BufReader whose 8 KiB heap buffer would receive the
+            // DEK first and keep it, unwiped and unlocked, for the life of
+            // the process. ManuallyDrop: the File must not close stdin.
+            // SAFETY: descriptor 0 stays open for the process's lifetime,
+            // and nothing else in this program reads it.
+            let mut fd0 = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDIN_FILENO) });
+            read_bounded(&mut *fd0, "the DEK on stdin", &mut scratch.text)?
         }
         DekSource::File(path) => read_dek_file(path, &mut scratch.text)?,
     };
@@ -451,21 +536,46 @@ fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [
 }
 
 // Maps a library status code to a human-readable description, for a
-// clearer error message than a bare integer.
+// clearer error message than a bare integer. Covers every code the Linux
+// library can return (the shared table's Windows/macOS-only codes, and
+// KEK_ACCESS_DENIED/KEK_INVALID, which Linux never returns, fall through
+// to "unknown"). Only the message depends on this: the tool's own exit
+// codes don't.
 fn describe_status(code: c_int) -> String {
     match code {
         status::INVALID_ARGUMENT => "invalid argument (bad DEK length, etc.)".to_string(),
+        status::BUFFER_TOO_SMALL => "the output buffer was too small".to_string(),
         status::PROVIDER_UNAVAILABLE => "no KEK provider is available on this host".to_string(),
         status::PROVIDER_ERROR => "the selected KEK provider failed".to_string(),
         status::CRYPTO_ERROR => "a cryptographic operation failed".to_string(),
         status::INTERNAL_ERROR => "an internal error occurred in the hkdfguard library".to_string(),
         status::INVALID_SERVICE_NAME => "the service name is missing, empty, too long, or contains an invalid character".to_string(),
-        status::KEK_NOT_FOUND => "no KEK exists yet for this service".to_string(),
-        status::FINGERPRINT_MISMATCH => {
+        status::POLICY_INVALID => {
+            "the hkdfguard policy file is invalid or can't be trusted (see the library's log for why)".to_string()
+        }
+        status::PAYLOAD_MALFORMED => "the wrapped payload is malformed".to_string(),
+        status::PAYLOAD_AUTH_FAILED => {
+            "the wrapped payload failed authentication (tampered, wrong service, or wrong KEK)".to_string()
+        }
+        status::PAYLOAD_UNSUPPORTED => "the wrapped payload's version is not supported".to_string(),
+        status::KEK_FINGERPRINT_MISMATCH => {
             "the wrapped payload's KEK fingerprint does not match the current KEK for this service".to_string()
         }
+        status::KEK_NOT_FOUND => "no KEK exists yet for this service".to_string(),
         status::PROCESS_HARDENING_FAILED => {
             "could not disable core dumps / ptrace access for this process".to_string()
+        }
+        status::FILE_NOT_FOUND => "the key file, or a directory in its path, does not exist".to_string(),
+        status::FILE_ACCESS_DENIED => "permission to open the key file was denied".to_string(),
+        status::FILE_IO => "the key file is not a regular file, or reading it failed".to_string(),
+        status::FILE_TOO_SHORT => "the key file is shorter than a wrapped DEK".to_string(),
+        status::FILE_TOO_LONG => "the key file is longer than a wrapped DEK".to_string(),
+        status::FILE_PLAINTEXT_KEY => {
+            "the key file looks like an UNWRAPPED DEK; treat it as a key exposure".to_string()
+        }
+        status::FILE_MALFORMED => "the key file is not a well-formed wrapped DEK".to_string(),
+        status::FILE_UNTRUSTED => {
+            "the key file, or a directory in its path, is owned by another user or writable by group/others".to_string()
         }
         other => format!("unknown status code {other}"),
     }
@@ -548,11 +658,166 @@ fn prepare_service(service_name: &mut str) -> Result<CString, String> {
     CString::new(&*service_name).map_err(|_| "the service name must not contain a NUL byte".to_string())
 }
 
+// Looks a group up by name, or by gid when `spec` is all digits, returning
+// its gid and name. `None` if no such group exists.
+fn lookup_group(spec: &str) -> Result<Option<(libc::gid_t, String)>, String> {
+    lookup_group_from(spec, GROUP_LOOKUP_INITIAL_BUF)
+}
+
+// getgr*_r need room for the whole entry, member list included, and report
+// ERANGE when it doesn't fit -- routine for a large directory (LDAP, AD)
+// group. Start here and double on ERANGE, up to GROUP_LOOKUP_MAX_BUF.
+const GROUP_LOOKUP_INITIAL_BUF: usize = 16 * 1024;
+const GROUP_LOOKUP_MAX_BUF: usize = 1024 * 1024;
+
+fn lookup_group_from(spec: &str, initial_buf: usize) -> Result<Option<(libc::gid_t, String)>, String> {
+    let by_gid = !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit());
+    let gid: libc::gid_t = if by_gid { spec.parse().map_err(|_| format!("--group {spec} is not a valid gid"))? } else { 0 };
+    let name = if by_gid { None } else { Some(CString::new(spec).map_err(|_| "--group must not contain a NUL byte".to_string())?) };
+
+    let mut size = initial_buf.max(1);
+    loop {
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let mut buf = vec![0u8; size];
+        let rc = match &name {
+            // SAFETY: every pointer is to a live, correctly sized local.
+            None => unsafe { libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) },
+            // SAFETY: as above; `name` is NUL-terminated.
+            Some(name) => unsafe { libc::getgrnam_r(name.as_ptr(), &mut grp, buf.as_mut_ptr().cast(), buf.len(), &mut result) },
+        };
+        if rc == libc::ERANGE && size < GROUP_LOOKUP_MAX_BUF {
+            size = (size * 2).min(GROUP_LOOKUP_MAX_BUF);
+            continue;
+        }
+        if rc != 0 {
+            return Err(format!("could not look up group {spec}: {}", std::io::Error::from_raw_os_error(rc)));
+        }
+        if result.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: getgr*_r set gr_name to a NUL-terminated string inside `buf`.
+        let found = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }.to_string_lossy().into_owned();
+        return Ok(Some((grp.gr_gid, found)));
+    }
+}
+
+// Resolves --group to the gid the key file is given, refusing a group that
+// doesn't exist or is over-broad (see OVER_BROAD_GROUPS). Done before the
+// DEK is read or any provider reached, so a bad --group costs nothing.
+fn resolve_key_file_group(spec: &str) -> Result<(libc::gid_t, String), String> {
+    let (gid, name) = lookup_group(spec)?.ok_or_else(|| format!("--group \"{spec}\" does not name a group on this host"))?;
+    // Fails closed: if a listed group can't be looked up, whether it is this
+    // gid can't be ruled out, so --group is refused rather than allowed.
+    let mut listed = false;
+    for broad in OVER_BROAD_GROUPS {
+        if *broad == name {
+            listed = true;
+            break;
+        }
+        match lookup_group(broad) {
+            Ok(Some((g, _))) if g == gid => {
+                listed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!(
+                    "--group \"{spec}\": can't confirm it isn't the over-broad group \"{broad}\" ({e}); refusing"
+                ))
+            }
+        }
+    }
+    if gid == 0 || gid == 65534 || listed {
+        return Err(format!(
+            "--group \"{spec}\" ({name}, gid {gid}) is an over-broad group (it covers essentially every account, or the \
+             host's administrators); name a dedicated group for the service that unwraps this key"
+        ));
+    }
+    Ok((gid, name))
+}
+
 // Whether anything at all occupies `path` -- including a dangling symlink,
 // which `Path::exists` (it follows links) reports as absent, and which the
 // `create_new` below would then fail on with a misleading "already exists".
 fn path_is_taken(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+// The absolute path `path` spells, relative paths resolved against the
+// current directory and `.`/`..` resolved lexically -- no link followed.
+// What every check below compares the real location against: anything
+// that differs means a link redirected the path.
+fn spelled_absolute(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path).map_err(|e| format!("failed to resolve {}: {e}", path.display()))?;
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir => out.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => out.push(name),
+            Component::Prefix(_) => return Err(format!("{} is not a Unix path", path.display())),
+        }
+    }
+    Ok(out)
+}
+
+// The folder the key file is named in must be a real folder at the place
+// spelled: no symbolic link anywhere in it. `create_new` and `O_NOFOLLOW`
+// only guard the last component, so without this a symlinked folder above
+// the key file is followed silently -- and whoever can plant one where the
+// operator writes could redirect an (often root) `wrap --force` into
+// overwriting and deleting a file in another folder. Refused, not
+// tolerated, as the Windows tool refuses junctions and links above the
+// path: there is no legitimate reason for a key file to be reached through
+// one. Spell the real path instead (`/run`, not `/var/run`).
+//
+// Returns the checked path, and callers must use *that* for every
+// filesystem call that follows -- never `path` itself. The check resolves
+// `..` as text, but the kernel follows a symbolic link before applying a
+// `..` after it: `keys/link/../k` is checked as `keys/k`, yet handed to the
+// kernel it names `k` beside wherever `link` points. The returned path has
+// no `..` left, so the kernel reaches exactly the folder that was checked.
+fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
+    let spelled = spelled_absolute(path)?;
+    let folder = spelled.parent().ok_or_else(|| format!("{} has no parent folder", path.display()))?;
+    let real = fs::canonicalize(folder).map_err(|e| format!("failed to resolve the folder of {}: {e}", path.display()))?;
+    if real != folder {
+        return Err(format!(
+            "{}'s folder {} resolves through a symbolic link to {}; the path must be a real path with \
+             no links in it",
+            path.display(),
+            folder.display(),
+            real.display()
+        ));
+    }
+    Ok(spelled)
+}
+
+// After an open: `file` must be the file at `spelled` (see
+// `require_real_folder`) -- nothing was swapped between the folder check
+// and the open. Judged from the descriptor: where the kernel says it is
+// (/proc/self/fd), and its device and inode against what the spelled path
+// names now. Without /proc only the second applies.
+fn require_opened_at(file: &File, path: &Path, spelled: &Path) -> Result<(), String> {
+    if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+        if actual != spelled {
+            return Err(format!(
+                "{} was opened at {} instead; refusing to use it (a folder in its path changed)",
+                path.display(),
+                actual.display()
+            ));
+        }
+    }
+    let opened = file.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    let named = fs::symlink_metadata(spelled).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+        return Err(format!("{} was moved or replaced while it was being opened; refusing to use it", path.display()));
+    }
+    Ok(())
 }
 
 // Largest existing file `--force` will overwrite. A wrapped key is a few
@@ -569,13 +834,18 @@ const MAX_REPLACEABLE_KEY_FILE_LEN: u64 = 64 * 1024;
 // Only ever a regular file, and only the one at `path` itself: a symlink
 // there is refused rather than followed (following it would overwrite
 // whatever it points at -- any file this user can write), as are a FIFO
-// (which would block the open forever), a directory, and a device. The
-// descriptor is opened `O_NOFOLLOW|O_NONBLOCK` and re-checked against what
-// was examined, so nothing swapped in between gets overwritten either.
+// (which would block the open forever), a directory, and a device. So is a
+// file with more than one name (hard links): the overwrite passes write
+// the file itself, so they would also destroy the contents at its other
+// name -- any file someone could link into the key's folder. The Windows
+// tool refuses the same. The descriptor is opened `O_NOFOLLOW|O_NONBLOCK`
+// and re-checked against what was examined, and against where `path`
+// spells (`require_opened_at`), so nothing swapped in between gets
+// overwritten either.
 //
 // If the file can't be opened for writing (EACCES/EPERM -- this tool
 // doesn't own it), the overwrite passes are skipped entirely and this falls
-// back to a plain `remove_file`, per explicit product direction: destroying
+// back to a plain `remove_file`: destroying
 // the old bytes first is worth attempting, but not worth failing the whole
 // command over when this process isn't even allowed to write to the file
 // it's about to replace -- matches this project's macOS/Windows tools.
@@ -585,23 +855,35 @@ fn secure_delete(path: &Path) -> Result<(), String> {
         if !meta.file_type().is_file() {
             return Err(refuse("is not a regular file (a symlink, directory, FIFO, or device)"));
         }
+        if meta.nlink() != 1 {
+            return Err(refuse(&format!(
+                "has {} hard links; the key file must have exactly one name, so that overwriting it cannot alter a \
+                 file at some other path",
+                meta.nlink()
+            )));
+        }
         if meta.len() > MAX_REPLACEABLE_KEY_FILE_LEN {
             return Err(refuse(&format!("is {} bytes, far larger than any wrapped key", meta.len())));
         }
         Ok(meta.len() as usize)
     };
 
-    let examined = fs::symlink_metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    // Every stat, open and remove below goes through `spelled`, the path
+    // require_real_folder checked -- never `path` as given, which the kernel
+    // could resolve into another folder (see require_real_folder).
+    let spelled = require_real_folder(path)?;
+    let examined = fs::symlink_metadata(&spelled).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
     check(&examined)?;
 
     let mut file = match OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
+        .open(&spelled)
     {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return fs::remove_file(path).map_err(|e| {
+            // Checked above: a regular file with one name, in a real folder.
+            return fs::remove_file(&spelled).map_err(|e| {
                 format!("failed to remove {} after permission-denied secure delete: {e}", path.display())
             });
         }
@@ -612,6 +894,7 @@ fn secure_delete(path: &Path) -> Result<(), String> {
     if (opened.dev(), opened.ino()) != (examined.dev(), examined.ino()) {
         return Err(refuse("was replaced while it was being examined"));
     }
+    require_opened_at(&file, path, &spelled)?;
     let len = check(&opened)?;
 
     let mut buf = vec![0u8; len];
@@ -624,7 +907,7 @@ fn secure_delete(path: &Path) -> Result<(), String> {
     }
 
     drop(file);
-    fs::remove_file(path).map_err(|e| format!("failed to remove {} after secure delete: {e}", path.display()))
+    fs::remove_file(&spelled).map_err(|e| format!("failed to remove {} after secure delete: {e}", path.display()))
 }
 
 // Rewinds to the start of `file` and writes `buf` (the same length as the
@@ -639,9 +922,16 @@ fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String
         .map_err(|e| format!("secure delete: failed to sync {}: {e}", path.display()))
 }
 
-// `provision`: the only place the setup calls are made. Checks first so
-// the outcome can be reported precisely -- "already provisioned" versus
-// "provisioned now" -- and so an existing KEK is never touched.
+// `provision`: the only place the setup calls are made. Always calls
+// hkdfguard_create_kek, whether or not the KEK exists, as the Windows tool
+// does: for an existing KEK that call loads it through the provider
+// (`load_kek`) -- on TPM2, deriving the key and checking it against the
+// pinned Name; on PKCS#11, finding the key pair on the token -- so a key
+// that exists in policy but not on the provider, or doesn't match its pin,
+// fails here at deployment rather than at the first wrap. kek_exists alone
+// can't tell: on TPM2 it only consults the policy. kek_exists is still
+// asked first, only to report the outcome precisely -- "provisioned" versus
+// "already provisioned". Neither call changes an existing KEK.
 fn run_provision(mut service_name: String) -> Result<(), String> {
     let service_c = prepare_service(&mut service_name)?;
 
@@ -650,31 +940,41 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
     if rc != status::OK {
         return Err(format!("hkdfguard_kek_exists failed: {}", describe_status(rc)));
     }
-    if exists == 1 {
-        println!("KEK already provisioned for service \"{service_name}\"; nothing to do");
-        return Ok(());
-    }
 
     let rc = hkdfguard_create_kek(service_c.as_ptr());
     if rc != status::OK {
-        // The library keeps service names out of its log, so where it asks
-        // for one (a `<service>` placeholder in a policy entry to add), the
-        // name is given here.
         return Err(format!(
             "hkdfguard_create_kek failed for service \"{service_name}\": {} (see the messages above for the \
-             provider's reason; where they show <service>, use \"{service_name}\")",
+             provider's reason)",
             describe_status(rc)
         ));
     }
-    println!("KEK provisioned for service \"{service_name}\"");
+    if exists == 1 {
+        println!("KEK already provisioned for service \"{service_name}\"; verified, nothing to do");
+    } else {
+        println!("KEK provisioned for service \"{service_name}\"");
+    }
     Ok(())
 }
 
 // `wrap`: no setup calls. The wrap is completed in memory before the
 // existing key file (if any) is touched, so a failure -- most likely "no
 // KEK provisioned" -- never costs the caller the key file they had.
-fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSource, force: bool) -> Result<(), String> {
-    let path = Path::new(&key_file_path);
+fn run_wrap(
+    key_file_path: String,
+    mut service_name: String,
+    dek_source: DekSource,
+    force: bool,
+    group: Option<String>,
+) -> Result<(), String> {
+    // Before anything else -- reading the DEK, any provider work -- the key
+    // file's folder must be a real folder at its spelled location. Every
+    // filesystem call below then uses the path that check returns, never
+    // `key_file_path` as given (see require_real_folder); messages still
+    // show the operator's spelling. Checked again, with the open
+    // descriptor, when the file is replaced and created below.
+    let checked = require_real_folder(Path::new(&key_file_path))?;
+    let path = checked.as_path();
 
     // Fast, friendly pre-check: fail before reading the DEK or touching
     // the provider if the output path obviously already exists and --force
@@ -684,6 +984,7 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
     if path_is_taken(path) && !force {
         return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
     }
+    let group = group.as_deref().map(resolve_key_file_group).transpose()?;
 
     let service_c = prepare_service(&mut service_name)?;
 
@@ -724,11 +1025,12 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
     // this runs, `path` is always either brand new or was just deleted by
     // `secure_delete` above, so `set_permissions` below is defense-in-depth
     // against the umask, not strictly required.
+    let spelled = require_real_folder(path)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(KEY_FILE_MODE)
-        .open(&key_file_path)
+        .open(path)
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 format!("{key_file_path} already exists; pass --force|-f to overwrite")
@@ -736,16 +1038,84 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
                 format!("failed to open {key_file_path}: {e}")
             }
         })?;
-    file.write_all(&wrapped)
-        .map_err(|e| format!("failed to write {key_file_path}: {e}"))?;
-    file.set_permissions(fs::Permissions::from_mode(KEY_FILE_MODE))
-        .map_err(|e| format!("failed to set permissions on {key_file_path}: {e}"))?;
+    // The file just created must be at the spelled path. If a folder was
+    // swapped for a link after the check above, nothing is written: the
+    // (still empty) file is removed from wherever it actually landed.
+    if let Err(e) = require_opened_at(&file, path, &spelled) {
+        if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+            remove_created_file(&actual, &file);
+        }
+        return Err(e);
+    }
+    // --group: the file goes to that group on the open descriptor before a
+    // byte is written, so it never holds the payload under any other group.
+    // It is still 0600 here; the mode widens to 0640 only below, after the
+    // group is right. A non-root caller can only give groups it belongs to:
+    // the kernel's rule, reported plainly, and the empty file removed.
+    if let Some((gid, name)) = &group {
+        // SAFETY: a valid open descriptor; uid -1 leaves the owner as it is.
+        if unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, *gid) } != 0 {
+            let e = std::io::Error::last_os_error();
+            remove_created_file(path, &file);
+            return Err(format!(
+                "could not give {key_file_path} to group \"{name}\": {e} (only root, or a member of the group, can)"
+            ));
+        }
+    }
+    let mode = if group.is_some() { KEY_FILE_GROUP_MODE } else { KEY_FILE_MODE };
+    finish_key_file(&mut file, path, &key_file_path, &wrapped, mode)?;
 
+    let access = match &group {
+        Some((_, name)) => format!("owner read/write + {name} read-only"),
+        None => "owner read/write".to_string(),
+    };
     println!(
-        "wrapped key written to {key_file_path} ({} bytes, service \"{service_name}\")",
+        "wrapped key written to {key_file_path} ({} bytes, {access}, service \"{service_name}\")",
         wrapped.len()
     );
     Ok(())
+}
+
+// Removes the key file this run created -- but only if `path` still names
+// that very file: the same device and inode as the open descriptor. Linux
+// can't unlink through a descriptor, so this is the nearest thing to it; a
+// file someone renamed into place after the fact is left alone. Best
+// effort: it only ever runs on a path that is already failing.
+fn remove_created_file(path: &Path, file: &File) {
+    let (Ok(opened), Ok(named)) = (file.metadata(), fs::symlink_metadata(path)) else {
+        return;
+    };
+    if (opened.dev(), opened.ino()) == (named.dev(), named.ino()) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+// Writes the payload into the key file just created, gives it its final
+// mode, and flushes the file and then its folder to storage, so a reported
+// success survives a crash. On any failure the file is removed (see
+// remove_created_file): a failed wrap never leaves an empty or truncated key
+// file behind, for the next `wrap` to call "already exists" or a service to
+// read as malformed. `shown` is the path as the operator spelled it, for
+// messages.
+fn finish_key_file(file: &mut File, path: &Path, shown: &str, wrapped: &[u8], mode: u32) -> Result<(), String> {
+    let result = (|| {
+        file.write_all(wrapped).map_err(|e| format!("failed to write {shown}: {e}"))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("failed to set permissions on {shown}: {e}"))?;
+        file.sync_all().map_err(|e| format!("failed to flush {shown} to storage: {e}"))?;
+        sync_parent_folder(path).map_err(|e| format!("failed to flush the folder of {shown} to storage: {e}"))
+    })();
+    if result.is_err() {
+        remove_created_file(path, file);
+    }
+    result
+}
+
+// fsync on the folder, so the key file's directory entry -- not just its
+// contents -- is on storage.
+fn sync_parent_folder(path: &Path) -> std::io::Result<()> {
+    let folder = path.parent().ok_or_else(|| std::io::Error::other("the key file has no parent folder"))?;
+    File::open(folder)?.sync_all()
 }
 
 fn run(command: Command) -> Result<(), String> {
@@ -756,7 +1126,8 @@ fn run(command: Command) -> Result<(), String> {
             service_name,
             dek_source,
             force,
-        } => run_wrap(key_file_path, service_name, dek_source, force),
+            group,
+        } => run_wrap(key_file_path, service_name, dek_source, force, group),
     }
 }
 
@@ -859,8 +1230,11 @@ fn main() -> ExitCode {
     }
     // Before anything is read: this process holds a plaintext DEK, so it
     // must not be dumpable or debuggable by other processes of the same
-    // user. Refuse to run rather than handle a DEK unprotected.
-    let rc = hkdfguard_harden_process();
+    // user. Refuse to run rather than handle a DEK unprotected. The strict
+    // flag, as the Windows tool passes: on Linux it adds no check
+    // (PR_SET_DUMPABLE 0 already bars same-user ptrace), but the three
+    // tools should ask for the same thing.
+    let rc = hkdfguard_harden_process_with_flags(harden_flags::REQUIRE_PROTECTED_SIGNATURE);
     if rc != status::OK {
         eprintln!("error: {}; refusing to handle key material", describe_status(rc));
         return ExitCode::FAILURE;
@@ -869,7 +1243,8 @@ fn main() -> ExitCode {
         eprintln!("error: {e}; refusing to handle key material");
         return ExitCode::FAILURE;
     }
-    match parse_args(std::env::args()) {
+    let parsed = utf8_args(std::env::args_os()).and_then(|args| parse_args(args.into_iter()));
+    match parsed {
         Ok(ParseOutcome::Help) => {
             print_usage();
             ExitCode::SUCCESS
@@ -892,8 +1267,40 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serial_test::serial;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn every_status_the_linux_library_returns_is_described() {
+        for code in [
+            status::INVALID_ARGUMENT,
+            status::BUFFER_TOO_SMALL,
+            status::PROVIDER_UNAVAILABLE,
+            status::PROVIDER_ERROR,
+            status::CRYPTO_ERROR,
+            status::INTERNAL_ERROR,
+            status::INVALID_SERVICE_NAME,
+            status::POLICY_INVALID,
+            status::PAYLOAD_MALFORMED,
+            status::PAYLOAD_AUTH_FAILED,
+            status::PAYLOAD_UNSUPPORTED,
+            status::KEK_FINGERPRINT_MISMATCH,
+            status::KEK_NOT_FOUND,
+            status::PROCESS_HARDENING_FAILED,
+            status::FILE_NOT_FOUND,
+            status::FILE_ACCESS_DENIED,
+            status::FILE_IO,
+            status::FILE_TOO_SHORT,
+            status::FILE_TOO_LONG,
+            status::FILE_PLAINTEXT_KEY,
+            status::FILE_MALFORMED,
+            status::FILE_UNTRUSTED,
+        ] {
+            assert!(!describe_status(code).starts_with("unknown"), "status {code} has no description");
+        }
+        assert_eq!(describe_status(status::MAC_KEYCHAIN_READ_FAILED), "unknown status code -100");
+    }
 
     // Only this user can write to it, whatever the umask: the library refuses
     // to trust a policy or secret mount in a group-writable directory.
@@ -923,10 +1330,9 @@ mod tests {
     // `secure_delete`'s multi-pass overwrite content isn't observable from
     // outside the function by the time it returns (the file is gone by
     // then) -- what's directly testable here is its documented end state:
-    // the file no longer exists. (An inode-number check was tried as a
-    // stronger signal in this crate's CLI integration tests, but dropped:
-    // some filesystems reuse a just-freed inode immediately for a new
-    // file, which made that check flaky rather than meaningful.)
+    // the file no longer exists. (An inode-number check would not be a
+    // reliable stronger signal: some filesystems reuse a just-freed inode
+    // immediately for a new file.)
     #[test]
     fn secure_delete_removes_the_file() {
         let file = NamedTempFile::new().unwrap();
@@ -1004,6 +1410,172 @@ mod tests {
     }
 
     #[test]
+    fn secure_delete_refuses_a_hard_linked_file_and_leaves_both_names_intact() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        fs::write(&key, b"payload").unwrap();
+        let other = base.join("elsewhere.dat");
+        fs::hard_link(&key, &other).unwrap();
+        let err = secure_delete(&key).unwrap_err();
+        assert!(err.contains("2 hard links"), "{err}");
+        assert_eq!(fs::read(&other).unwrap(), b"payload", "the other name's contents are untouched");
+        assert!(key.exists(), "the key file itself is left in place");
+    }
+
+    #[test]
+    fn spelled_absolute_resolves_dots_lexically() {
+        assert_eq!(spelled_absolute(Path::new("/a/./b/../c/key")).unwrap(), PathBuf::from("/a/c/key"));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(spelled_absolute(Path::new("key")).unwrap(), cwd.join("key"));
+    }
+
+    #[test]
+    fn require_real_folder_refuses_a_symlinked_folder_anywhere_above_the_file() {
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        let link = base.join("link");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(require_real_folder(&real.join("k")).unwrap(), real.join("k"));
+        assert!(require_real_folder(&real.join("sub/../k")).is_ok(), "`..` resolved lexically is fine");
+
+        let err = require_real_folder(&link.join("k")).unwrap_err();
+        assert!(err.contains("symbolic link") && err.contains(real.to_str().unwrap()), "{err}");
+        let err = require_real_folder(&link.join("sub/k")).unwrap_err();
+        assert!(err.contains("symbolic link"), "a link further up is refused too: {err}");
+    }
+
+    #[test]
+    fn secure_delete_refuses_a_file_reached_through_a_symlinked_folder() {
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("victim.key"), b"not yours").unwrap();
+        symlink(&real, base.join("link")).unwrap();
+        let err = secure_delete(&base.join("link/victim.key")).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(fs::read(real.join("victim.key")).unwrap(), b"not yours");
+    }
+
+    #[test]
+    fn read_dek_file_refuses_a_file_reached_through_a_symlinked_folder() {
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("dek.b64"), valid_b64()).unwrap();
+        fs::set_permissions(real.join("dek.b64"), fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&real, base.join("link")).unwrap();
+        let mut buf = [0u8; MAX_DEK_INPUT_LEN + 1];
+        let err = read_dek_file(base.join("link/dek.b64").to_str().unwrap(), &mut buf).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        // The real path reads.
+        assert!(read_dek_file(real.join("dek.b64").to_str().unwrap(), &mut buf).is_ok());
+    }
+
+    #[test]
+    fn secure_delete_never_follows_a_link_before_dotdot_into_another_folder() {
+        // keys/link -> elsewhere/deep, so to the kernel keys/link/.. is
+        // `elsewhere`, while the folder check resolves it as text to `keys`.
+        // The file in `elsewhere` is read-only, so opening it for writing
+        // fails and secure_delete takes its plain-remove fallback -- which
+        // must act on the checked path (keys/victim.key, absent) and leave
+        // elsewhere/victim.key alone.
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let keys = base.join("keys");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("deep")).unwrap();
+        fs::create_dir(&keys).unwrap();
+        symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
+        let victim = elsewhere.join("victim.key");
+        fs::write(&victim, b"someone else's file").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let err = secure_delete(&keys.join("link/../victim.key")).unwrap_err();
+        assert!(err.contains("failed to stat"), "nothing at the checked path keys/victim.key: {err}");
+        assert_eq!(fs::read(&victim).unwrap(), b"someone else's file", "the file in the other folder is untouched");
+    }
+
+    #[test]
+    fn remove_created_file_removes_only_the_file_it_created() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        fs::write(&key, b"").unwrap();
+        let file = File::open(&key).unwrap();
+
+        // Renamed away and another file put at the name: that one stays.
+        fs::rename(&key, base.join("moved.key")).unwrap();
+        fs::write(&key, b"someone else's file").unwrap();
+        remove_created_file(&key, &file);
+        assert_eq!(fs::read(&key).unwrap(), b"someone else's file", "a file renamed into place is left alone");
+
+        // Still the same file at the name: removed.
+        let moved = base.join("moved.key");
+        remove_created_file(&moved, &file);
+        assert!(!moved.exists(), "the created file itself is removed");
+    }
+
+    #[test]
+    fn finish_key_file_writes_flushes_and_sets_the_mode() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(KEY_FILE_MODE).open(&key).unwrap();
+        finish_key_file(&mut file, &key, "wrapped.key", b"payload", KEY_FILE_GROUP_MODE).unwrap();
+        assert_eq!(fs::read(&key).unwrap(), b"payload");
+        assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, KEY_FILE_GROUP_MODE);
+    }
+
+    #[test]
+    fn finish_key_file_removes_the_file_when_writing_fails() {
+        // A descriptor opened read-only: write_all fails, as a full disk or
+        // an I/O error would make it. No empty key file may be left behind.
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("wrapped.key");
+        fs::write(&key, b"").unwrap();
+        let mut read_only = File::open(&key).unwrap();
+        let err = finish_key_file(&mut read_only, &key, "wrapped.key", b"payload", KEY_FILE_MODE).unwrap_err();
+        assert!(err.contains("failed to write wrapped.key"), "{err}");
+        assert!(!key.exists(), "the failed key file is removed");
+    }
+
+    #[test]
+    fn lookup_group_grows_its_buffer_until_the_entry_fits() {
+        // Starting from a 1-byte buffer forces ERANGE on any real entry; the
+        // retry must still find this process's own group, by gid and name.
+        // SAFETY: no arguments, cannot fail.
+        let gid = unsafe { libc::getegid() };
+        let (found_gid, name) = lookup_group_from(&gid.to_string(), 1).unwrap().expect("own group by gid");
+        assert_eq!(found_gid, gid);
+        assert_eq!(lookup_group_from(&name, 1).unwrap(), Some((gid, name.clone())), "and by name");
+        assert_eq!(lookup_group_from(&gid.to_string(), 1).unwrap(), lookup_group(&gid.to_string()).unwrap());
+    }
+
+    #[test]
+    fn require_opened_at_accepts_the_file_at_its_spelled_path() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key = base.join("k");
+        fs::write(&key, b"x").unwrap();
+        let file = File::open(&key).unwrap();
+        assert!(require_opened_at(&file, &key, &key).is_ok());
+        let other = base.join("other");
+        fs::write(&other, b"y").unwrap();
+        assert!(require_opened_at(&file, &key, &other).is_err(), "opened somewhere other than spelled");
+    }
+
+    #[test]
     fn validate_service_charset_accepts_alphanumerics_and_dots() {
         assert!(validate_service_charset("com.example.orders").is_ok());
         assert!(validate_service_charset("Service123.42").is_ok());
@@ -1048,22 +1620,6 @@ mod tests {
     }
 
     #[test]
-    fn old_positional_key_file_form_is_rejected_with_a_pointer_to_the_new_flag() {
-        // The pre-subcommand invocation put the key file first. It must
-        // fail -- and say what to do instead -- rather than being read as
-        // a subcommand name.
-        let err = expect_parse_err(argv(&["prog", "key.bin", "-sn", "svc", "--dek-stdin"]));
-        assert!(err.contains("--key-file-path"), "{err}");
-
-        let err = expect_parse_err(argv(&["prog", "/var/lib/app/wrapped", "-sn", "svc", "--dek-stdin"]));
-        assert!(err.contains("--key-file-path"), "{err}");
-
-        // And a stray positional inside `wrap` is refused the same way.
-        let err = expect_parse_err(argv(&["prog", "wrap", "key.bin", "-sn", "svc", "--dek-stdin"]));
-        assert!(err.contains("--key-file-path"), "{err}");
-    }
-
-    #[test]
     fn parse_provision() {
         assert_eq!(
             expect_run(argv(&["prog", "provision", "--service-name", "svc"])),
@@ -1088,6 +1644,8 @@ mod tests {
             vec!["--dek-stdin"],
             vec!["--dek-file", "/x"],
             vec!["--force"],
+            vec!["--group", "g"],
+            vec!["-g", "g"],
         ] {
             let mut a = vec!["prog", "provision", "-sn", "svc"];
             a.extend(flag.iter());
@@ -1099,11 +1657,12 @@ mod tests {
     #[test]
     fn parse_wrap_accepts_stdin_and_file_sources() {
         match expect_run(argv(&["prog", "wrap", "-kf", "key.bin", "-sn", "svc", "--dek-stdin"])) {
-            Command::Wrap { key_file_path, service_name, dek_source, force } => {
+            Command::Wrap { key_file_path, service_name, dek_source, force, group } => {
                 assert_eq!(key_file_path, "key.bin");
                 assert_eq!(service_name, "svc");
                 assert_eq!(dek_source, DekSource::Stdin);
                 assert!(!force);
+                assert_eq!(group, None, "--group is optional: owner-only by default");
             }
             other => panic!("expected Wrap, got {other:?}"),
         }
@@ -1137,14 +1696,70 @@ mod tests {
     }
 
     #[test]
-    fn parse_wrap_rejects_the_removed_dek_flag_with_an_explanation() {
-        for flag in ["--dek", "-d"] {
-            let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", flag, "AAAA"]));
-            assert!(
-                err.contains("cmdline") && err.contains("--dek-stdin"),
-                "the error must explain why and point at the replacement, got: {err}"
-            );
+    fn parse_wrap_takes_an_optional_group_once() {
+        match expect_run(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", "orders"])) {
+            Command::Wrap { group, .. } => assert_eq!(group.as_deref(), Some("orders")),
+            other => panic!("expected Wrap, got {other:?}"),
         }
+        match expect_run(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "orders"])) {
+            Command::Wrap { group, .. } => assert_eq!(group.as_deref(), Some("orders")),
+            other => panic!("expected Wrap, got {other:?}"),
+        }
+        let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "a", "-g", "b"]));
+        assert!(err.contains("at most once"), "{err}");
+        let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", ""]));
+        assert!(err.contains("must not be empty"), "{err}");
+        assert!(expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group"])).contains("requires a value"));
+    }
+
+    #[test]
+    fn every_repeated_flag_is_refused_rather_than_the_last_winning() {
+        for (parts, flag) in [
+            (vec!["prog", "wrap", "-kf", "a", "-kf", "b", "-sn", "svc", "--dek-stdin"], "--key-file-path"),
+            (vec!["prog", "wrap", "--key-file-path", "a", "-kf", "a", "-sn", "svc", "--dek-stdin"], "--key-file-path"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "a", "--service-name", "b", "--dek-stdin"], "--service-name"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-f", "--force"], "--force"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "a", "--group", "a"], "--group"),
+            (vec!["prog", "provision", "-sn", "a", "-sn", "a"], "--service-name"),
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert_eq!(err, format!("give {flag} at most once"), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_argument_is_a_usage_error_not_a_panic() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let args = vec![
+            OsString::from("prog"),
+            OsString::from("wrap"),
+            OsString::from("-kf"),
+            OsString::from_vec(vec![b'k', 0xff, b'y']),
+        ];
+        assert_eq!(utf8_args(args.into_iter()).unwrap_err(), "argument 3 is not valid UTF-8");
+        let ok = utf8_args(["prog", "provision"].into_iter().map(OsString::from)).unwrap();
+        assert_eq!(ok, ["prog", "provision"]);
+    }
+
+    #[test]
+    fn over_broad_and_unknown_groups_are_refused() {
+        for spec in ["root", "0", "65534"] {
+            let err = resolve_key_file_group(spec).unwrap_err();
+            assert!(err.contains("over-broad") || err.contains("does not name a group"), "{spec}: {err}");
+        }
+        assert!(resolve_key_file_group("root").unwrap_err().contains("over-broad"));
+        assert!(resolve_key_file_group("0").unwrap_err().contains("over-broad"), "by gid as well as by name");
+        // Any of the listed names that exists on this host is refused, by
+        // name and by its gid.
+        for broad in OVER_BROAD_GROUPS {
+            if let Ok(Some((gid, _))) = lookup_group(broad) {
+                assert!(resolve_key_file_group(broad).unwrap_err().contains("over-broad"), "{broad}");
+                assert!(resolve_key_file_group(&gid.to_string()).unwrap_err().contains("over-broad"), "{broad} as {gid}");
+            }
+        }
+        let err = resolve_key_file_group("hkdfguard-no-such-group-xyz").unwrap_err();
+        assert!(err.contains("does not name a group"), "{err}");
     }
 
     // ---- provision / wrap against the real library, in-process ----
@@ -1197,6 +1812,7 @@ mod tests {
                 "com.hkdfguard.clitest.neverprovisioned".to_string(),
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 true,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("provision --service-name"), "must point at the fix: {err}");
@@ -1223,10 +1839,32 @@ mod tests {
                 service,
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 false,
+                None,
             )
             .unwrap();
             assert!(key_path.exists());
             assert_eq!(fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, KEY_FILE_MODE);
+
+            // --group with a group this process may give (its own), unless
+            // that group is itself one --group refuses (running as root).
+            // SAFETY: no arguments, cannot fail.
+            let gid = unsafe { libc::getegid() };
+            if resolve_key_file_group(&gid.to_string()).is_ok() {
+                let grouped = dir.path().join("grouped.key");
+                run_wrap(
+                    grouped.to_str().unwrap().to_string(),
+                    "com.hkdfguard.clitest.roundtrip".to_string(),
+                    DekSource::File(dek_path.to_str().unwrap().to_string()),
+                    false,
+                    Some(gid.to_string()),
+                )
+                .unwrap();
+                let meta = fs::metadata(&grouped).unwrap();
+                assert_eq!(meta.permissions().mode() & 0o777, KEY_FILE_GROUP_MODE, "owner rw, group r");
+                assert_eq!(meta.gid(), gid, "given to the --group group");
+            } else {
+                eprintln!("skipping the --group round trip: this process's own group is one --group refuses");
+            }
         });
     }
 
@@ -1259,6 +1897,58 @@ mod tests {
         assert!(decode_dek(STANDARD.encode([0u8; 33]).as_bytes()).is_err(), "33 bytes");
         // Raw 32 bytes is not accepted as a silent alternative encoding.
         assert!(decode_dek(&[0x5au8; DEK_LEN]).is_err(), "raw bytes must not decode");
+        // The Windows tool's rules, case for case (tests/test_cli.ps1 12b2).
+        let b64 = valid_b64();
+        assert!(decode_dek(format!(" {b64}").as_bytes()).is_err(), "a leading space");
+        assert!(decode_dek(format!("{}\n{}", &b64[..20], &b64[20..]).as_bytes()).is_err(), "a line break inside");
+        assert!(decode_dek(format!("{} {}", &b64[..20], &b64[20..]).as_bytes()).is_err(), "a space inside");
+        assert!(decode_dek(b64.trim_end_matches('=').as_bytes()).is_err(), "missing padding");
+        let zeros = STANDARD.encode([0u8; DEK_LEN]);
+        assert!(decode_dek(format!("{}B=", &zeros[..42]).as_bytes()).is_err(), "non-zero bits before the padding");
+        let mut mixed = vec![0xFBu8, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF];
+        mixed.extend(1..=26u8);
+        let standard = STANDARD.encode(&mixed);
+        assert!(standard.contains('+') && standard.contains('/'));
+        assert_eq!(decode_dek(standard.as_bytes()).unwrap(), &mixed[..], "the '+' and '/' characters");
+        assert!(decode_dek(standard.replace('+', "-").replace('/', "_").as_bytes()).is_err(), "the URL-safe alphabet");
+    }
+
+    #[test]
+    fn decode_dek_reports_every_malformed_input_with_one_fixed_message() {
+        // No character, offset or bit pattern of the input reaches the
+        // message -- a mistyped DEK never puts part of itself into a log.
+        let b64 = valid_b64();
+        let zeros = STANDARD.encode([0u8; DEK_LEN]);
+        let mut mixed = vec![0xFBu8, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF];
+        mixed.extend(1..=26u8);
+        let url_safe = STANDARD.encode(&mixed).replace('+', "-").replace('/', "_");
+        let cases = [
+            format!(" {b64}"),
+            format!("{} {}", &b64[..20], &b64[20..]),
+            b64.trim_end_matches('=').to_string(),
+            format!("{}B=", &zeros[..42]),
+            format!("{b64}\n\n"),
+            url_safe,
+            "not base64!!".to_string(),
+        ];
+        let mut out = [0u8; MAX_DECODED_LEN];
+        for case in cases {
+            let err = decode_dek(case.as_bytes(), &mut out).unwrap_err();
+            assert_eq!(err, INVALID_BASE64_DEK_MESSAGE, "for {case:?}");
+        }
+    }
+
+    #[test]
+    fn decode_dek_skips_a_utf8_bom_and_refuses_utf16() {
+        let b64 = valid_b64();
+        let mut out = [0u8; MAX_DECODED_LEN];
+        let with_bom = [b"\xEF\xBB\xBF".as_slice(), b64.as_bytes(), b"\r\n"].concat();
+        assert_eq!(decode_dek(&with_bom, &mut out).unwrap(), [0x5au8; DEK_LEN]);
+        for bom in [b"\xFF\xFE".as_slice(), b"\xFE\xFF".as_slice()] {
+            let utf16 = [bom, b64.as_bytes()].concat();
+            let err = decode_dek(&utf16, &mut out).unwrap_err();
+            assert!(err.contains("UTF-16"), "{err}");
+        }
     }
 
     #[test]
@@ -1269,6 +1959,12 @@ mod tests {
 
         let at_limit = vec![b'A'; MAX_DEK_INPUT_LEN];
         assert_eq!(read_bounded(&mut at_limit.as_slice(), "test", &mut buf).unwrap(), MAX_DEK_INPUT_LEN);
+
+        // UTF-16 base64 of a DEK is 90 bytes: over the limit, and named as
+        // UTF-16 rather than as merely too long.
+        let utf16: Vec<u8> = [0xFFu8, 0xFE].into_iter().chain(valid_b64().bytes().flat_map(|b| [b, 0])).collect();
+        let err = read_bounded(&mut utf16.as_slice(), "stdin", &mut buf).unwrap_err();
+        assert!(err.contains("UTF-16"), "{err}");
     }
 
     // ---- memory locking decision ----

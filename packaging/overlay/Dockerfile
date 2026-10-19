@@ -4,7 +4,7 @@
 #   COPY --from=ghcr.io/runsecure/hkdfguard-overlay:<version> / /
 #
 #   /usr/lib/<multiarch>/libhkdfguard.so.1
-#   /usr/bin/hkdfguard-v1-initialize
+#   /usr/bin/hkdfguard
 #
 # They are taken from the libhkdfguard1 and hkdfguard .deb packages that
 # packaging/build-packages.sh builds and tests -- the same bytes, not a
@@ -39,7 +39,7 @@ RUN set -eu; \
         dpkg-deb --extract "$pkg" /unpacked; \
     done; \
     lib=$(cd /unpacked && echo usr/lib/*-linux-gnu/libhkdfguard.so.1); \
-    for f in "$lib" usr/bin/hkdfguard-v1-initialize; do \
+    for f in "$lib" usr/bin/hkdfguard; do \
         [ -f "/unpacked/$f" ] || { echo "not in the packages: $f" >&2; exit 1; }; \
         install -d -m 0755 "/overlay/$(dirname "$f")"; \
         cp -a "/unpacked/$f" "/overlay/$f"; \

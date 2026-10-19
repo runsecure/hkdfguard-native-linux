@@ -42,8 +42,8 @@
 //!   `..data/` directory, and refusing that would refuse the most common
 //!   delivery mechanism outright -- but only while the resolution stays
 //!   within the mount directory. A link that leads anywhere else is
-//!   refused. That keeps the property the old blanket symlink ban was
-//!   after (nothing in the mount can redirect a read to an arbitrary host
+//!   refused. That keeps the property a blanket symlink ban would
+//!   give (nothing in the mount can redirect a read to an arbitrary host
 //!   path) without breaking the platform that needs symlinks.
 //!
 //! All checks are made on the opened descriptor, and the resolved path is
@@ -133,10 +133,10 @@ impl KekHandle for ExternalSecretHandle {
         &self.key_id
     }
 
-    fn ecdh(&self, peer_public_key: &PublicKey) -> Result<SharedSecret> {
+    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
         let shared = p256::ecdh::diffie_hellman(
             self.secret_key.to_nonzero_scalar(), // our private scalar
-            peer_public_key.as_affine(),         // the payload's hashed point H_salt (see crypto.rs)
+            point.as_affine(),         // the payload's hashed point H_salt (see crypto.rs)
         );
         let mut out = [0u8; 32];
         out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared secret's raw bytes
@@ -258,7 +258,7 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
 /// `O_NOFOLLOW` closes the race between resolution and open: a link
 /// swapped in for the final component in that window fails with `ELOOP`
 /// instead of being followed. The opened descriptor is then confirmed to be
-/// the resolved file (see [`verify_opened`]), which also covers an
+/// the resolved file (see [`crate::secure_file::verify_opened`]), which also covers an
 /// intermediate directory being swapped. (Doing that requires write access
 /// to a directory between `/` and the file, which
 /// [`crate::secure_file::check_dir_chain`] has already confined to root and
@@ -305,44 +305,8 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
         }
     })?;
 
-    verify_opened(&file, &target_real, &mount_real, Path::new("/proc"))?;
+    crate::secure_file::verify_opened(&file, &target_real, &mount_real, Path::new("/proc"))?;
     Ok(file)
-}
-
-/// Confirms the descriptor `open` returned is the file that was resolved
-/// and checked: on Linux, by reading its path back from
-/// `<proc>/self/fd/<n>` and re-checking containment; where that isn't
-/// possible (`/proc` not mounted or masked, as in some minimal containers
-/// and sandboxes, or a non-Linux build), by comparing the descriptor's
-/// device and inode with the resolved path's. Every failure is
-/// `PermissionDenied` -- never `NotFound`, which would read as "not
-/// provisioned".
-fn verify_opened(file: &File, target_real: &Path, mount_real: &Path, proc_root: &Path) -> std::io::Result<()> {
-    use std::io::{Error as IoError, ErrorKind};
-    use std::os::unix::fs::MetadataExt;
-
-    let denied = |what: String| IoError::new(ErrorKind::PermissionDenied, what);
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        if let Ok(opened) = std::fs::read_link(proc_root.join(format!("self/fd/{}", file.as_raw_fd()))) {
-            if !opened.starts_with(mount_real) {
-                return Err(denied(format!("opened descriptor refers to {}, outside the secret mount", opened.display())));
-            }
-            return Ok(());
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (mount_real, proc_root);
-
-    let opened = file.metadata().map_err(|e| denied(format!("could not stat the opened secret: {e}")))?;
-    let resolved = std::fs::symlink_metadata(target_real)
-        .map_err(|e| denied(format!("{} changed after it was opened: {e}", target_real.display())))?;
-    if (opened.dev(), opened.ino()) != (resolved.dev(), resolved.ino()) {
-        return Err(denied(format!("{} was replaced between resolution and open", target_real.display())));
-    }
-    Ok(())
 }
 
 // Accepts a 32-byte raw scalar, a PKCS#8 DER key, or a SEC1 DER
@@ -411,7 +375,7 @@ mod tests {
 
     // Writes a secret file the way a correctly configured platform would:
     // owner-only. `std::fs::write` alone inherits the umask (usually
-    // 0644), which the provider now refuses.
+    // 0644), which the provider refuses.
     fn provision(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, bytes.as_ref()).unwrap();
@@ -566,13 +530,13 @@ mod tests {
         let b = provision(&mount_real, "b", [2u8; 32]);
 
         let file_a = File::open(&a).unwrap();
-        verify_opened(&file_a, &a, &mount_real, &no_proc).expect("the opened file is the resolved one");
+        crate::secure_file::verify_opened(&file_a, &a, &mount_real, &no_proc).expect("the opened file is the resolved one");
 
-        let err = verify_opened(&file_a, &b, &mount_real, &no_proc).unwrap_err();
+        let err = crate::secure_file::verify_opened(&file_a, &b, &mount_real, &no_proc).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "a mismatch is a refusal");
 
         std::fs::remove_file(&a).unwrap();
-        let err = verify_opened(&file_a, &a, &mount_real, &no_proc).unwrap_err();
+        let err = crate::secure_file::verify_opened(&file_a, &a, &mount_real, &no_proc).unwrap_err();
         assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "must never read as 'not provisioned'");
     }
 
@@ -715,12 +679,12 @@ mod tests {
             provision(dir, "com.company.orders", der.as_bytes()); // "provision" it as a mounted file
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let eph = SecretKey::generate(); // stand-in peer key
+            let peer_key = SecretKey::generate(); // stand-in peer key
             let expected = p256::ecdh::diffie_hellman(
                 secret_key.to_nonzero_scalar(),
-                eph.public_key().as_affine(),
+                peer_key.public_key().as_affine(),
             ); // compute the expected shared secret directly, independent of the provider
-            let actual = handle.ecdh(&eph.public_key()).unwrap();
+            let actual = handle.ecdh(&peer_key.public_key()).unwrap();
             assert_eq!(actual.as_slice(), expected.raw_secret_bytes().as_slice()); // provider's result must match
         });
     }
@@ -733,12 +697,12 @@ mod tests {
             provision(dir, "com.company.orders", secret_key.to_bytes()); // provision as raw 32-byte scalar this time
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let eph = SecretKey::generate();
+            let peer_key = SecretKey::generate();
             let expected = p256::ecdh::diffie_hellman(
                 secret_key.to_nonzero_scalar(),
-                eph.public_key().as_affine(),
+                peer_key.public_key().as_affine(),
             );
-            let actual = handle.ecdh(&eph.public_key()).unwrap();
+            let actual = handle.ecdh(&peer_key.public_key()).unwrap();
             assert_eq!(actual.as_slice(), expected.raw_secret_bytes().as_slice());
             // Since we provisioned the file ourselves, we independently
             // know the exact key -- `public_key()` must report that same

@@ -1,0 +1,33 @@
+# RHEL-family distribution test image (AlmaLinux, Amazon Linux 2023). One
+# of the per-distro images docker/run-distro-tests.sh builds; see
+# docker/README.md. softhsm comes from each distribution's own default
+# repositories (AppStream on AlmaLinux, the core repo on Amazon Linux).
+#
+# BASE_IMAGE is always passed by run-distro-tests.sh, pinned by digest
+# there; the default only keeps a bare `docker build` working.
+ARG BASE_IMAGE=almalinux:10@sha256:838c2fafefb1a8a0d7f8cdbc3b0551c2a2b1eb0cd87aad6d62aecadb18311f1b
+FROM ${BASE_IMAGE}
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH
+
+# The base images ship curl-minimal, which provides `curl`; installing the
+# full curl package would conflict with it, so only add one if missing.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        findutils \
+        gcc \
+        shadow-utils \
+        softhsm \
+        util-linux \
+    && { command -v curl >/dev/null || dnf install -y --setopt=install_weak_deps=False curl; } \
+    && dnf clean all
+
+COPY docker/distros/prepare-image.sh /tmp/prepare-image.sh
+RUN sh /tmp/prepare-image.sh && rm /tmp/prepare-image.sh
+ENV SOFTHSM2_CONF=/etc/softhsm2-ci.conf \
+    HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1
+
+WORKDIR /work
+COPY --chown=ci:ci . /work
+ENTRYPOINT ["bash", "docker/distros/entrypoint-distro-test.sh"]

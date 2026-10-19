@@ -122,11 +122,11 @@ ci_file "$SECRET_MOUNT/com.company.orders"; head -c 32 /dev/urandom > "$SECRET_M
 as_ci cargo build --release
 # The .so's SONAME is libhkdfguard.so.1 (build.rs): what programs linked
 # against it look for at run time.
-as_ci ln -sf libhkdfguard_v1.so target/release/libhkdfguard.so.1
-as_ci cc -I include examples/wrap_unwrap.c -L target/release -lhkdfguard_v1 -o /tmp/wrap_unwrap
+as_ci ln -sf libhkdfguard.so target/release/libhkdfguard.so.1
+as_ci cc -I include examples/wrap_unwrap.c -L target/release -lhkdfguard -o /tmp/wrap_unwrap
 as_ci env LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
 
-section "hkdfguard-v1-initialize CLI output unwraps via libhkdfguard_v1.so"
+section "hkdfguard CLI output unwraps via libhkdfguard.so"
 # The CLI links this crate's Rust code statically (an rlib), so this proves
 # the wrapped payload it writes is genuinely consumer-independent -- a
 # *different*, dynamically-linked consumer (this C program, against the
@@ -147,21 +147,21 @@ WRAPPED_FILE=$(as_ci mktemp)
 # `provision` is the only command that makes the (deliberately slow) setup
 # calls. For external-secret the mounted file *is* the provisioning, so
 # this reports "already provisioned" -- and must still exit 0.
-as_ci target/release/hkdfguard-v1-initialize provision --service-name "$CLISO_SERVICE"
+as_ci target/release/hkdfguard provision --service-name "$CLISO_SERVICE"
 
 # The DEK goes in on stdin, never on the command line: argv is readable by
 # any process of the same user through /proc/<pid>/cmdline. `printf` is a
 # shell builtin, so the base64 never becomes a child process's argv either.
 # This is also the invocation a real deployment pipeline should use.
 DEK_B64=$(base64 -w0 < "$DEK_FILE")
-printf '%s' "$DEK_B64" | as_ci target/release/hkdfguard-v1-initialize wrap \
+printf '%s' "$DEK_B64" | as_ci target/release/hkdfguard wrap \
     --key-file-path "$WRAPPED_FILE" \
     --service-name "$CLISO_SERVICE" \
     --dek-stdin \
     --force
 unset DEK_B64
 
-as_ci cc -I include examples/cli_unwrap_check.c -L target/release -lhkdfguard_v1 -o /tmp/cli_unwrap_check
+as_ci cc -I include examples/cli_unwrap_check.c -L target/release -lhkdfguard -o /tmp/cli_unwrap_check
 as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "$CLISO_SERVICE" "$DEK_FILE"
 
 # And the --dek-file path, which is what a secret mount or a systemd
@@ -169,24 +169,17 @@ as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "
 WRAPPED_FILE2=$(as_ci mktemp)
 DEK_B64_FILE=$(as_ci mktemp)
 base64 -w0 < "$DEK_FILE" | ci_write "$DEK_B64_FILE"
-as_ci target/release/hkdfguard-v1-initialize wrap \
+as_ci target/release/hkdfguard wrap \
     --key-file-path "$WRAPPED_FILE2" \
     --service-name "$CLISO_SERVICE" \
     --dek-file "$DEK_B64_FILE" \
     --force
 as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE2" "$CLISO_SERVICE" "$DEK_FILE"
 
-# The retired argv form must be refused outright, not silently accepted.
-if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard-v1-initialize wrap \
-        --key-file-path "$(mktemp -u)" --service-name "$CLISO_SERVICE" --dek AAAA 2>/dev/null; then
-    echo "FAIL: --dek was accepted; it must be rejected" >&2
-    exit 1
-fi
-
 # `wrap` never provisions: with nothing mounted for this service it must
 # fail and point at `provision`, rather than quietly creating a KEK.
 UNPROVISIONED_OUT=$(mktemp -u)
-if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard-v1-initialize wrap \
+if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard wrap \
         --key-file-path "$UNPROVISIONED_OUT" --service-name com.hkdfguard.dockertest.unprovisioned --dek-stdin 2>/tmp/unprov.err; then
     echo "FAIL: wrap succeeded for a service with no provisioned KEK" >&2
     exit 1
@@ -203,10 +196,9 @@ section "builds that ship take configuration only from /etc/hkdfguard/policy.tom
 # Release builds, and plain debug builds -- anything not made with
 # `--cfg hkdfguard_test_paths` -- must take every security setting from the
 # root-owned policy, never the environment. Install a real policy reaching
-# swtpm through `tpm.tcti`, then set every variable that ever redirected
-# configuration (HKDFGUARD_POLICY_FILE, and the retired TCTI, derivation-
-# secret, secret-mount and PKCS#11 ones) to values that would break anything
-# that read them. Both shipped-style builds must ignore them and work; the
+# swtpm through `tpm.tcti`, then set HKDFGUARD_POLICY_FILE and environment
+# variables naming a TCTI, derivation secret, secret mount and PKCS#11
+# module to values that would break anything that read them. Both shipped-style builds must ignore them and work; the
 # test build's CLI, as a control, must follow HKDFGUARD_POLICY_FILE to the
 # malformed policy and fail -- proving this check would catch a build that
 # honored it.
@@ -241,19 +233,19 @@ export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE" HKDFGUARD_PKCS11_PIN_FILE="$HAR
 
 as_ci env LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
 for build in release debug; do
-    OUT=$(as_ci target/$build/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.shipped 2>&1) \
+    OUT=$(as_ci target/$build/hkdfguard provision --service-name com.hkdfguard.dockertest.shipped 2>&1) \
         || { echo "FAIL: the $build CLI did not take its configuration from /etc/hkdfguard: $OUT" >&2; exit 1; }
     grep -q "HKDFGUARD_POLICY_FILE is set but ignored" <<<"$OUT" \
         || { echo "FAIL: the $build CLI did not warn that HKDFGUARD_POLICY_FILE was ignored: $OUT" >&2; exit 1; }
     echo "$build: provisioned on the TPM named by /etc/hkdfguard/policy.toml; every override ignored."
 done
-if as_ci "$TEST_BIN"/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.shipped >/dev/null 2>&1; then
+if as_ci "$TEST_BIN"/hkdfguard provision --service-name com.hkdfguard.dockertest.shipped >/dev/null 2>&1; then
     echo "FAIL: control: the test-build CLI should have read the malformed HKDFGUARD_POLICY_FILE and failed" >&2; exit 1
 fi
 echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE and failed, as designed."
 
 # External secret: the policy names no directory, so the standard mount is
-# used; the retired variable pointing nowhere changes nothing.
+# used; HKDFGUARD_EXTERNAL_SECRET_DIR pointing nowhere changes nothing.
 cat > /etc/hkdfguard/policy.toml <<'TOML'
 [selection]
 mode = "require"
@@ -263,7 +255,7 @@ mkdir -p /run/secrets/hkdfguard
 ci_file /run/secrets/hkdfguard/com.hkdfguard.dockertest.extsecret
 head -c 32 /dev/urandom > /run/secrets/hkdfguard/com.hkdfguard.dockertest.extsecret
 for build in release debug; do
-    OUT=$(as_ci target/$build/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.extsecret 2>&1) \
+    OUT=$(as_ci target/$build/hkdfguard provision --service-name com.hkdfguard.dockertest.extsecret 2>&1) \
         || { echo "FAIL: the $build CLI did not use the standard secret mount: $OUT" >&2; exit 1; }
     grep -q 'already provisioned' <<<"$OUT" \
         || { echo "FAIL: the $build CLI should have found the KEK in the standard mount: $OUT" >&2; exit 1; }
@@ -272,7 +264,7 @@ echo "release, debug: external-secret used the standard mount; HKDFGUARD_EXTERNA
 rm -rf /run/secrets/hkdfguard
 
 # PKCS#11: SoftHSM2 is installed, with an initialized token and a valid PIN
-# at the default PIN path, and the retired variables point at all of it --
+# at the default PIN path, and HKDFGUARD_PKCS11_* point at all of it --
 # but the policy names no module. Neither build may use PKCS#11 (no default
 # module search, variables ignored).
 cat > /etc/hkdfguard/policy.toml <<'TOML'
@@ -283,7 +275,7 @@ TOML
 install -o root -g ci -m 0440 /dev/null /etc/hkdfguard/pkcs11.pin
 printf '1234\n' > /etc/hkdfguard/pkcs11.pin
 for build in release debug; do
-    if OUT=$(as_ci target/$build/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.pkcs11 2>&1); then
+    if OUT=$(as_ci target/$build/hkdfguard provision --service-name com.hkdfguard.dockertest.pkcs11 2>&1); then
         echo "FAIL: the $build CLI used PKCS#11 with no pkcs11.module in policy: $OUT" >&2; exit 1
     fi
     grep -q 'no KEK provider is available' <<<"$OUT" \
@@ -295,14 +287,14 @@ unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI TEST_TCTI HKDFGUARD_TPM_DERIVATI
       HKDFGUARD_EXTERNAL_SECRET_DIR HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT
 rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS"
 
-section "hkdfguard-v1-initialize locks its memory when it can"
+section "hkdfguard locks its memory when it can"
 # docker/run-tests.sh and CI grant CAP_IPC_LOCK, so the CLI must take the
 # mlockall path; it exits non-zero if that fails, so a clean exit with no
 # skip warning means memory really was locked. Without the capability the
 # skip path must warn instead. This one runs as root: dropping to ci
 # drops CAP_IPC_LOCK with it.
 CAP_EFF=$((16#$(awk '/^CapEff:/{print $2}' /proc/self/status)))
-CLI_STDERR=$(target/release/hkdfguard-v1-initialize --help 2>&1 >/dev/null) \
+CLI_STDERR=$(target/release/hkdfguard --help 2>&1 >/dev/null) \
     || { echo "FAIL: CLI exited non-zero at startup: $CLI_STDERR" >&2; exit 1; }
 if (( (CAP_EFF >> 14) & 1 )); then
     if grep -q 'memory not locked' <<<"$CLI_STDERR"; then

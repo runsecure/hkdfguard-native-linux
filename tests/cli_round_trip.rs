@@ -1,5 +1,5 @@
-//! Integration test for the `hkdfguard-v1-initialize` CLI tool
-//! (`src/bin/hkdfguard-v1-initialize.rs`): runs it as a real, separate
+//! Integration test for the `hkdfguard` CLI tool
+//! (`src/bin/hkdfguard.rs`): runs it as a real, separate
 //! process -- `provision` and then `wrap` -- then loads this crate as a
 //! library (in *this* process) and confirms `hkdfguard_unwrap_dek`
 //! recovers exactly the DEK that was fed to it. The DEK goes in on stdin
@@ -41,7 +41,7 @@ use std::process::{Command, Output, Stdio};
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir()
 }
-use hkdfguard_v1::{hkdfguard_unwrap_dek, status};
+use hkdfguard::{hkdfguard_open_file, hkdfguard_unwrap_dek, status};
 use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
@@ -85,19 +85,19 @@ fn with_provisioned_external_secret<F: FnOnce()>(service: &str, f: F) {
 }
 
 fn cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_hkdfguard-v1-initialize"))
+    Command::new(env!("CARGO_BIN_EXE_hkdfguard"))
 }
 
-// `hkdfguard-v1-initialize provision --service-name <service>`
+// `hkdfguard provision --service-name <service>`
 fn run_provision(service: &str) -> Output {
     cli()
         .arg("provision")
         .args(["--service-name", service])
         .output()
-        .expect("failed to run hkdfguard-v1-initialize provision")
+        .expect("failed to run hkdfguard provision")
 }
 
-// `hkdfguard-v1-initialize wrap --key-file-path <path> --service-name
+// `hkdfguard wrap --key-file-path <path> --service-name
 // <service> --dek-stdin [extra]`, with the base64 DEK written to the
 // subprocess's stdin -- how a deployment pipeline is expected to supply it.
 fn run_wrap_stdin(key_path: &Path, service: &str, dek: &[u8; 32], extra_args: &[&str]) -> Output {
@@ -112,7 +112,7 @@ fn run_wrap_stdin(key_path: &Path, service: &str, dek: &[u8; 32], extra_args: &[
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn hkdfguard-v1-initialize wrap");
+        .expect("failed to spawn hkdfguard wrap");
     // A CLI that refuses before reading stdin (e.g. an existing key file
     // without --force) may already have exited, closing the pipe: that is
     // a BrokenPipe here, not a test failure. The caller judges the outcome
@@ -123,7 +123,7 @@ fn run_wrap_stdin(key_path: &Path, service: &str, dek: &[u8; 32], extra_args: &[
         Err(e) => panic!("failed to write the DEK to the CLI's stdin: {e}"),
     }
     drop(child.stdin.take()); // close stdin so the child sees EOF
-    child.wait_with_output().expect("failed to run hkdfguard-v1-initialize wrap")
+    child.wait_with_output().expect("failed to run hkdfguard wrap")
 }
 
 fn unwrap_via_library(service: &str, wrapped: &[u8]) -> (c_int, [u8; 32]) {
@@ -158,8 +158,9 @@ fn cli_provision_then_wrap_unwraps_to_original_input() {
         let provisioned = run_provision("com.example.orders");
         assert!(provisioned.status.success(), "provision failed: {}", stderr_of(&provisioned));
         assert!(
-            String::from_utf8_lossy(&provisioned.stdout).contains("already provisioned"),
-            "external-secret must report the mounted file as already provisioned"
+            String::from_utf8_lossy(&provisioned.stdout).contains("already provisioned")
+                && String::from_utf8_lossy(&provisioned.stdout).contains("verified"),
+            "external-secret must report the mounted file as already provisioned, and verified"
         );
 
         let output = run_wrap_stdin(&key_path, "com.example.orders", &original_dek, &[]);
@@ -200,7 +201,7 @@ fn cli_force_overwrite_secure_deletes_then_rewraps() {
         // The file on disk must now unwrap to the *second* DEK, not the first.
         // (Whether the overwrite actually delete-and-recreated the file
         // rather than truncating it in place is covered separately by the
-        // secure_delete unit tests in src/bin/hkdfguard-v1-initialize.rs --
+        // secure_delete unit tests in src/bin/hkdfguard.rs --
         // inode number isn't a reliable signal for that here, since some
         // filesystems immediately reuse a just-freed inode for a new file.)
         let wrapped = fs::read(&key_path).unwrap();
@@ -208,6 +209,152 @@ fn cli_force_overwrite_secure_deletes_then_rewraps() {
         assert_eq!(rc, status::OK);
         assert_eq!(recovered, second_dek, "file must contain the second wrap, not the first");
     });
+}
+
+#[test]
+#[serial]
+fn cli_refuses_a_key_path_through_a_symlinked_folder() {
+    // Refused before the DEK is read or any provider reached, so no
+    // external secret is needed.
+    let dir = tempdir().unwrap();
+    let base = fs::canonicalize(dir.path()).unwrap();
+    let real = base.join("real");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+
+    let output = run_wrap_stdin(&base.join("link/wrapped.key"), "com.example.linked", &[0x42u8; 32], &[]);
+    assert!(!output.status.success(), "a key path through a symlinked folder must be refused");
+    assert!(stderr_of(&output).contains("symbolic link"), "says why: {}", stderr_of(&output));
+    assert!(!real.join("wrapped.key").exists(), "nothing is created in the folder the link points at");
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_wrap_writes_where_the_path_was_checked_not_where_a_link_before_dotdot_leads() {
+    // keys/link -> elsewhere/deep: the kernel would resolve keys/link/.. to
+    // `elsewhere`. The folder check resolves `..` as text, to `keys`, and the
+    // CLI must then write exactly there.
+    with_provisioned_external_secret("com.example.dotdot", || {
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let keys = base.join("keys");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("deep")).unwrap();
+        fs::create_dir(&keys).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
+
+        let output = run_wrap_stdin(&keys.join("link/../wrapped.key"), "com.example.dotdot", &[7u8; 32], &[]);
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        assert!(keys.join("wrapped.key").exists(), "written in the checked folder");
+        assert!(!elsewhere.join("wrapped.key").exists(), "nothing written where the link leads");
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_force_refuses_a_hard_linked_key_file() {
+    with_provisioned_external_secret("com.example.hardlink", || {
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let key_path = base.join("wrapped.key");
+        let first = run_wrap_stdin(&key_path, "com.example.hardlink", &[1u8; 32], &[]);
+        assert!(first.status.success(), "initial wrap: {}", stderr_of(&first));
+        let original = fs::read(&key_path).unwrap();
+
+        // A second name for the key file, as someone able to link into the
+        // folder could make; overwriting the key would destroy it too.
+        let other = base.join("someone-elses.dat");
+        fs::hard_link(&key_path, &other).unwrap();
+        let forced = run_wrap_stdin(&key_path, "com.example.hardlink", &[2u8; 32], &["--force"]);
+        assert!(!forced.status.success(), "--force onto a hard-linked key file must be refused");
+        assert!(stderr_of(&forced).contains("hard links"), "says why: {}", stderr_of(&forced));
+        assert_eq!(fs::read(&other).unwrap(), original, "the other name's contents are untouched");
+        assert_eq!(fs::read(&key_path).unwrap(), original, "the key file is untouched");
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_group_makes_the_key_file_group_readable_and_it_still_opens() {
+    use std::os::unix::fs::MetadataExt;
+    with_provisioned_external_secret("com.example.grouped", || {
+        let dir = tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+
+        // Without --group: owner-only.
+        let plain = base.join("plain.key");
+        let out = run_wrap_stdin(&plain, "com.example.grouped", &[3u8; 32], &[]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        assert_eq!(fs::metadata(&plain).unwrap().mode() & 0o777, 0o600);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("owner read/write,"), "{}", String::from_utf8_lossy(&out.stdout));
+
+        // With --group (this process's own group, which it may give):
+        // 0640, that group, and the library still opens and unwraps it.
+        // SAFETY: no arguments, cannot fail.
+        let gid = unsafe { libc::getegid() };
+        if gid == 0 {
+            eprintln!("skipping: running as root, whose group --group refuses");
+            return;
+        }
+        let grouped = base.join("grouped.key");
+        let out = run_wrap_stdin(&grouped, "com.example.grouped", &[4u8; 32], &["--group", &gid.to_string()]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        let meta = fs::metadata(&grouped).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o640, "owner rw, group r");
+        assert_eq!(meta.gid(), gid);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("read-only"), "{}", String::from_utf8_lossy(&out.stdout));
+        let (rc, wrapped) = open_via_library(&grouped);
+        assert_eq!(rc, status::OK, "a group-readable key file is trusted (it is ciphertext)");
+        let (rc, recovered) = unwrap_via_library("com.example.grouped", &wrapped);
+        assert_eq!((rc, recovered), (status::OK, [4u8; 32]));
+
+        // An over-broad group is refused before anything is written.
+        let broad = base.join("broad.key");
+        let out = run_wrap_stdin(&broad, "com.example.grouped", &[5u8; 32], &["--group", "root"]);
+        assert!(!out.status.success());
+        assert!(stderr_of(&out).contains("over-broad"), "{}", stderr_of(&out));
+        assert!(!broad.exists(), "nothing written");
+    });
+}
+
+#[test]
+#[serial]
+fn cli_refuses_to_read_the_dek_from_a_terminal() {
+    // A real pseudo-terminal as stdin: what an operator typing or pasting
+    // the DEK would give the CLI. Refused before anything is read, so no
+    // provider is needed and nothing is written.
+    use std::os::fd::FromRawFd;
+    let (mut controller, mut device) = (-1, -1);
+    // SAFETY: openpty writes two descriptors into the given ints; the rest are optional (NULL).
+    let rc = unsafe {
+        libc::openpty(&mut controller, &mut device, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+    };
+    if rc != 0 {
+        eprintln!("skipping: no pseudo-terminal available ({})", std::io::Error::last_os_error());
+        return;
+    }
+    // SAFETY: both descriptors were just returned by openpty and are owned here.
+    let (controller, device) = unsafe { (std::fs::File::from_raw_fd(controller), std::fs::File::from_raw_fd(device)) };
+
+    let dir = tempdir().unwrap();
+    let key_path = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+    let output = cli()
+        .arg("wrap")
+        .args(["--key-file-path", key_path.to_str().unwrap()])
+        .args(["--service-name", "com.example.terminal"])
+        .arg("--dek-stdin")
+        .stdin(Stdio::from(device))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run hkdfguard wrap");
+    drop(controller);
+    assert!(!output.status.success(), "reading the DEK from a terminal must be refused");
+    assert!(stderr_of(&output).contains("interactive terminal"), "says why: {}", stderr_of(&output));
+    assert!(!key_path.exists(), "nothing written");
 }
 
 #[test]
@@ -274,7 +421,7 @@ fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
 #[test]
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
-fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
+fn cli_accepts_the_dek_from_a_file_and_refuses_a_loose_one() {
     with_provisioned_external_secret("com.example.fileinput", || {
         let original_dek = [0x7Bu8; 32];
         let out_dir = tempdir().unwrap();
@@ -293,7 +440,7 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .args(["--service-name", "com.example.fileinput"])
             .args(["--dek-file", dek_path.to_str().unwrap()])
             .output()
-            .expect("failed to run hkdfguard-v1-initialize");
+            .expect("failed to run hkdfguard");
         assert!(output.status.success(), "--dek-file should succeed: {}", stderr_of(&output));
 
         // Round-trips through the library, exactly as the stdin path does.
@@ -313,32 +460,67 @@ fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
             .args(["--service-name", "com.example.fileinput"])
             .args(["--dek-file", loose_path.to_str().unwrap()])
             .output()
-            .expect("failed to run hkdfguard-v1-initialize");
+            .expect("failed to run hkdfguard");
         assert!(!output.status.success(), "a group-readable DEK file must be refused");
         assert!(!loose_key_path.exists(), "nothing should have been written");
+    });
+}
 
-        // The retired argv form is rejected outright, with an error that
-        // says why.
-        let argv_key_path = out_dir.path().join("argv.key");
-        let output = cli()
-            .arg("wrap")
-            .args(["--key-file-path", argv_key_path.to_str().unwrap()])
-            .args(["--service-name", "com.example.fileinput"])
-            .args(["--dek", &STANDARD.encode(original_dek)])
-            .output()
-            .expect("failed to run hkdfguard-v1-initialize");
-        assert!(!output.status.success(), "--dek must no longer be accepted");
-        assert!(stderr_of(&output).contains("cmdline"), "error should explain the exposure");
-        assert!(!argv_key_path.exists(), "nothing should have been written");
+// Reads `path` through the library's own key-file reader, as an
+// application would at startup.
+fn open_via_library(path: &Path) -> (c_int, Vec<u8>) {
+    let path = CString::new(path.to_str().unwrap()).unwrap();
+    let mut out = vec![0u8; 276]; // HKDFGUARD_WRAPPED_MAX_LEN
+    let mut out_len = out.len() as c_int;
+    let rc = hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), &mut out_len);
+    out.truncate(out_len.max(0) as usize);
+    (rc, out)
+}
 
-        // And the pre-subcommand positional form fails with a pointer to
-        // --key-file-path, rather than being misread as a subcommand.
-        let output = cli()
-            .arg(key_path.to_str().unwrap())
-            .args(["--service-name", "com.example.fileinput", "--dek-stdin"])
-            .output()
-            .expect("failed to run hkdfguard-v1-initialize");
-        assert!(!output.status.success());
-        assert!(stderr_of(&output).contains("--key-file-path"), "must point at the new flag");
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_key_file_opens_through_the_library_and_its_dek_input_is_refused() {
+    with_provisioned_external_secret("com.example.openfile", || {
+        let original_dek = [0x3Cu8; 32];
+        let out_dir = tempdir().unwrap();
+        let key_path = out_dir.path().join("wrapped.key");
+        let output = run_wrap_stdin(&key_path, "com.example.openfile", &original_dek, &[]);
+        assert!(output.status.success(), "wrap failed: {}", stderr_of(&output));
+
+        // The file the CLI wrote, read by hkdfguard_open_file: byte for
+        // byte what is on disk, and it unwraps to the original DEK.
+        let (rc, wrapped) = open_via_library(&key_path);
+        assert_eq!(rc, status::OK, "hkdfguard_open_file failed with status {rc}");
+        assert_eq!(wrapped, fs::read(&key_path).unwrap());
+        let (rc, recovered) = unwrap_via_library("com.example.openfile", &wrapped);
+        assert_eq!(rc, status::OK);
+        assert_eq!(recovered, original_dek);
+
+        // The likeliest mix-up: pointing the application at the CLI's DEK
+        // *input* file instead of its output. That is the plaintext key.
+        let dek_path = out_dir.path().join("dek.b64");
+        fs::write(&dek_path, format!("{}\n", STANDARD.encode(original_dek))).unwrap();
+        fs::set_permissions(&dek_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(open_via_library(&dek_path).0, status::FILE_PLAINTEXT_KEY);
+
+        // A truncated or extended copy of the key file.
+        let full = fs::read(&key_path).unwrap();
+        let copy = out_dir.path().join("copy.key");
+        fs::write(&copy, &full[..full.len() - 1]).unwrap();
+        // Owner-only, like the CLI's own key file: under a umask of 002 the
+        // copy would be group-writable and refused as FILE_UNTRUSTED before
+        // its length is judged. (The rewrite below keeps this mode.)
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(open_via_library(&copy).0, status::FILE_TOO_SHORT);
+        fs::write(&copy, [&full[..], b"\n".as_slice()].concat()).unwrap();
+        assert_eq!(open_via_library(&copy).0, status::FILE_TOO_LONG);
+
+        // The CLI's 0600 key file, loosened so another group member could
+        // replace it: refused, until the mode is restored.
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(open_via_library(&key_path).0, status::FILE_UNTRUSTED);
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(open_via_library(&key_path).0, status::OK);
     });
 }

@@ -8,8 +8,10 @@
 //! unwind across it -- see [`hkdfguard_wrap_dek`], [`hkdfguard_unwrap_dek`],
 //! and [`hkdfguard_generate_and_wrap_dek`].
 
+mod audit; // the audit trail: syslog (authpriv) records, the Windows build's Event Log events
 mod crypto; // ECDH -> HKDF -> AES-GCM protocol
 mod error; // internal error type + public status codes
+mod key_file; // reading and checking a wrapped-DEK key file (hkdfguard_open_file)
 mod payload; // wrapped-payload wire format
 mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.toml)
 mod provider; // provider trait + selection chain
@@ -17,7 +19,7 @@ mod secure_file; // hardened, check-then-read-safe file access + self-wiping Sec
 
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
-use std::os::raw::{c_char, c_int}; // C-ABI-compatible integer/char types
+use std::os::raw::{c_char, c_int, c_uint}; // C-ABI-compatible integer/char types
 use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
 use std::sync::atomic::{AtomicU32, Ordering}; // per-process count of setup calls, for the misuse warning
 use std::sync::Mutex; // serializes setup calls (see `gated_setup`)
@@ -90,6 +92,7 @@ fn gated_setup<T>(f: impl FnOnce() -> T) -> T {
              connection plus at least {} ms",
             floor.as_millis()
         );
+        audit::setup_calls_exceeded(SETUP_CALLS_WARN_AT, floor.as_millis());
     }
 
     if let Some(remaining) = floor.checked_sub(entered.elapsed()) {
@@ -146,11 +149,11 @@ pub extern "C" fn hkdfguard_wrap_dek(
     // here and converted into a normal error code instead of unwinding
     // into the C caller (which would be undefined behavior).
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wrap_impl(service, dek, dek_len, out, out_len)
+        wrap_impl(audit::Op::Wrap, service, dek, dek_len, out, out_len)
     })) {
         Ok(code) => code, // normal path: whatever status code `wrap_impl` returned
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_wrap_dek boundary");
+            report_caught_panic("hkdfguard_wrap_dek", Some((audit::Op::Wrap, service)));
             status::INTERNAL_ERROR // a panic means a bug in this crate, not a normal failure
         }
     }
@@ -163,7 +166,9 @@ pub extern "C" fn hkdfguard_wrap_dek(
 /// - `service`: must match the value passed to `hkdfguard_wrap_dek` when
 ///   this payload was produced (case-insensitively -- see that function's
 ///   doc comment); any other mismatch is indistinguishable from tampering
-///   and yields [`status::CRYPTO_ERROR`]. An invalid service string (see
+///   and yields [`status::PAYLOAD_AUTH_FAILED`] (or, when the other
+///   service's KEK differs, [`status::KEK_FINGERPRINT_MISMATCH`] first).
+///   An invalid service string (see
 ///   `hkdfguard_wrap_dek`'s doc comment) yields
 ///   [`status::INVALID_SERVICE_NAME`].
 /// - `wrapped` / `wrapped_len`: the wrapped payload bytes.
@@ -197,10 +202,33 @@ pub extern "C" fn hkdfguard_unwrap_dek(
     })) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_unwrap_dek boundary");
-            zero_caller_buffer(out, capacity);
+            zero_caller_buffer(out, capacity); // first: the reporting below runs host code
+            report_caught_panic("hkdfguard_unwrap_dek", Some((audit::Op::Unwrap, service)));
             status::INTERNAL_ERROR
         }
+    }
+}
+
+// Audits a panic caught at an ABI boundary as INTERNAL_ERROR (event
+// 2005), as the Windows build audits anything that escapes. Only when the
+// service name is valid: an invalid one is a caller mistake, never audited.
+// Logs, and where `audit_as` names an operation audits, a panic caught at
+// an ABI boundary. Called after the boundary's own cleanup (zeroing the
+// caller's buffer), and inside a catch_unwind of its own: the logger is the
+// host application's, and a panic out of it here would unwind across
+// `extern "C"` and abort the process.
+fn report_caught_panic(boundary: &str, audit_as: Option<(audit::Op, *const c_char)>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        log::error!("hkdfguard: internal panic caught at {boundary} boundary");
+        if let Some((op, service)) = audit_as {
+            audit_internal_error(op, service);
+        }
+    }));
+}
+
+fn audit_internal_error(op: audit::Op, service: *const c_char) {
+    if let Ok(service) = cstr_to_service(service) {
+        audit::operation_failed(op, &service, status::INTERNAL_ERROR);
     }
 }
 
@@ -246,7 +274,7 @@ pub extern "C" fn hkdfguard_create_kek(service: *const c_char) -> c_int {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| create_kek_impl(service))) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_create_kek boundary");
+            report_caught_panic("hkdfguard_create_kek", Some((audit::Op::CreateKek, service)));
             status::INTERNAL_ERROR
         }
     }
@@ -273,7 +301,7 @@ pub extern "C" fn hkdfguard_kek_exists(service: *const c_char, exists: *mut c_in
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kek_exists_impl(service, exists))) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_kek_exists boundary");
+            report_caught_panic("hkdfguard_kek_exists", Some((audit::Op::KekExists, service)));
             status::INTERNAL_ERROR
         }
     }
@@ -309,7 +337,7 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
     })) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_generate_and_wrap_dek boundary");
+            report_caught_panic("hkdfguard_generate_and_wrap_dek", Some((audit::Op::GenerateAndWrap, service)));
             status::INTERNAL_ERROR
         }
     }
@@ -333,21 +361,63 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
 /// again) and `prctl(PR_SET_DUMPABLE, 0)`. Other platforms: only the core
 /// limit. Idempotent.
 ///
+/// Same as [`hkdfguard_harden_process_with_flags`] with no flags.
+///
 /// # Returns
 /// [`status::OK`], or [`status::PROCESS_HARDENING_FAILED`] if either step
 /// failed (logged with the OS error). Never throws/unwinds.
 #[no_mangle]
 pub extern "C" fn hkdfguard_harden_process() -> c_int {
-    match std::panic::catch_unwind(harden_process_impl) {
+    hkdfguard_harden_process_with_flags(0)
+}
+
+/// Flags for [`hkdfguard_harden_process_with_flags`]. Shared by every
+/// platform's C ABI: a flag has the same bit everywhere, and every platform
+/// accepts every flag defined here.
+pub mod harden_flags {
+    /// Fail with `PROCESS_HARDENING_FAILED` unless no other process of the
+    /// same user can attach a debugger to, or inject code into, this
+    /// process. On macOS that depends on the host executable's code
+    /// signature (Hardened Runtime, no `get-task-allow`), which the library
+    /// can only check, not change, so without this flag a weak signature
+    /// is only logged. On Linux `PR_SET_DUMPABLE` already guarantees it
+    /// whatever the binary, so the flag adds no further check.
+    pub const REQUIRE_PROTECTED_SIGNATURE: u32 = 0x1;
+
+    /// Every flag this build knows. Any other bit is refused, so a flag
+    /// added later is never silently ignored by an older library.
+    pub const ALL: u32 = REQUIRE_PROTECTED_SIGNATURE;
+}
+
+/// [`hkdfguard_harden_process`], with `flags` (a bitwise OR of
+/// [`harden_flags`] constants, or 0) choosing how strict it is. See
+/// [`harden_flags::REQUIRE_PROTECTED_SIGNATURE`].
+///
+/// # Returns
+/// [`status::OK`]; [`status::INVALID_ARGUMENT`] if `flags` has a bit not
+/// in [`harden_flags::ALL`], before anything is changed; or
+/// [`status::PROCESS_HARDENING_FAILED`] if a step failed (logged with the
+/// OS error). Never throws/unwinds.
+#[no_mangle]
+pub extern "C" fn hkdfguard_harden_process_with_flags(flags: c_uint) -> c_int {
+    match std::panic::catch_unwind(|| harden_process_impl(flags)) {
         Ok(code) => code,
         Err(_) => {
-            log::error!("hkdfguard: internal panic caught at hkdfguard_harden_process boundary");
+            report_caught_panic("hkdfguard_harden_process", None);
             status::INTERNAL_ERROR
         }
     }
 }
 
-fn harden_process_impl() -> c_int {
+fn harden_process_impl(flags: c_uint) -> c_int {
+    if flags & !harden_flags::ALL != 0 {
+        log::error!("hkdfguard: hkdfguard_harden_process_with_flags: unknown flag bits {:#x}", flags & !harden_flags::ALL);
+        return status::INVALID_ARGUMENT;
+    }
+    // REQUIRE_PROTECTED_SIGNATURE needs nothing more here: on Linux the
+    // non-dumpable flag below is what stops same-user debuggers, and it is
+    // applied (or this fails) either way.
+
     let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: setrlimit reads a valid, fully initialized rlimit.
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
@@ -390,10 +460,13 @@ fn generate_and_wrap_impl(
     let mut dek = zeroize::Zeroizing::new([0u8; crypto::DEK_LEN]); // scrubbed on drop, panic included
     if getrandom::fill(&mut dek[..]).is_err() {
         log::error!("hkdfguard: the OS random number generator failed; no DEK generated");
-        return status::INTERNAL_ERROR;
+        if let Ok(service) = cstr_to_service(service) {
+            audit::operation_failed(audit::Op::GenerateAndWrap, &service, status::CRYPTO_ERROR);
+        }
+        return status::CRYPTO_ERROR; // an RNG failure, like wrap's own (see crypto::wrap)
     }
 
-    let code = wrap_impl(service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
+    let code = wrap_impl(audit::Op::GenerateAndWrap, service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
     dek.zeroize(); // our local copy of the freshly generated DEK is no longer needed; scrub it now
     code
 }
@@ -440,7 +513,7 @@ fn cstr_to_service(ptr: *const c_char) -> Result<String, c_int> {
     }
     // SAFETY: the loop above established that `len` bytes starting at `ptr`
     // are readable and non-NUL.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
     let s = std::str::from_utf8(bytes).map_err(|_| status::INVALID_SERVICE_NAME)?; // reject non-UTF-8 byte sequences
     if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
         return Err(status::INVALID_SERVICE_NAME); // only ASCII alphanumeric characters and '.' are allowed
@@ -476,11 +549,24 @@ fn create_kek_impl(service: *const c_char) -> c_int {
     };
 
     let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
-    gated_setup(|| match provider::create_kek(&service_str) {
-        Ok(_) => status::OK,
-        Err(e) => {
-            log::error!("hkdfguard: create_kek failed for service (redacted): {e}"); // never log the service name or key material
-            e.status_code()
+    gated_setup(|| {
+        // Asked first, so the audit trail records a KEK being *created*
+        // (1000/1001), not every idempotent re-run. If the question itself
+        // fails, the create below reports the real error.
+        let existed = provider::kek_exists(&service_str).unwrap_or(false);
+        match provider::create_kek(&service_str) {
+            Ok((provider, _handle)) => {
+                if !existed {
+                    audit::kek_created(&service_str, provider.provider_type(), provider::preferred_type());
+                }
+                status::OK
+            }
+            Err(e) => {
+                log::error!("hkdfguard: create_kek failed for service \"{service_str}\": {e}"); // never key material
+                let code = e.status_code();
+                audit::operation_failed(audit::Op::CreateKek, &service_str, code);
+                code
+            }
         }
     })
 }
@@ -506,8 +592,10 @@ fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
             status::OK
         }
         Err(e) => {
-            log::error!("hkdfguard: kek_exists failed for service (redacted): {e}");
-            e.status_code()
+            log::error!("hkdfguard: kek_exists failed for service \"{service_str}\": {e}");
+            let code = e.status_code();
+            audit::operation_failed(audit::Op::KekExists, &service_str, code);
+            code
         }
     })
 }
@@ -516,6 +604,7 @@ fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
 // `catch_unwind` wrapper above. Returns a plain status code; never panics
 // intentionally (validates everything before touching unsafe pointers).
 fn wrap_impl(
+    op: audit::Op, // Wrap or GenerateAndWrap, for the audit trail
     service: *const c_char,
     dek: *const u8,
     dek_len: c_int,
@@ -568,8 +657,10 @@ fn wrap_impl(
     let wrapped = match result {
         Ok(w) => w,
         Err(e) => {
-            log::error!("hkdfguard: wrap failed for service (redacted): {e}"); // logs only the error description, never key material
-            return e.status_code();
+            log::error!("hkdfguard: wrap failed for service \"{service_str}\": {e}"); // logs only the error description, never key material
+            let code = e.status_code();
+            audit::operation_failed(op, &service_str, code);
+            return code;
         }
     };
 
@@ -588,6 +679,9 @@ fn wrap_impl(
         ptr::copy_nonoverlapping(wrapped.as_ptr(), out, wrapped.len()); // copy the wrapped payload into the caller's buffer
         *out_len = wrapped.len() as c_int; // tell the caller exactly how many bytes were written
     }
+    // Who wrapped, for which service, under which KEK, and a hash of the
+    // exact payload handed back (public bytes only -- see `audit`).
+    audit::dek_operation(op, &service_str, &wrapped);
     status::OK
 }
 
@@ -647,19 +741,162 @@ fn unwrap_impl(
     let mut dek = match crypto::unwrap(&service_str, wrapped_slice) {
         Ok(dek) => dek, // recovered plaintext DEK, in a self-zeroizing local
         Err(e) => {
-            log::error!("hkdfguard: unwrap failed for service (redacted): {e}"); // log the reason, never the key material
+            log::error!("hkdfguard: unwrap failed for service \"{service_str}\": {e}"); // log the reason, never the key material
             zero_out_buffer();
-            return e.status_code();
+            let code = e.status_code();
+            audit::operation_failed(audit::Op::Unwrap, &service_str, code);
+            return code;
         }
     };
 
+    // Unless policy turns it off (audit.unwrap_success = false): who
+    // unwrapped, and the same payload hash its wrap record carries. Before
+    // the DEK is written: `out` may be the caller's `wrapped` buffer, and
+    // the record must hash the payload, never the DEK written over it.
+    // `wrapped_slice` is not read again after this.
+    if policy::audit_unwrap_success() {
+        audit::dek_operation(audit::Op::Unwrap, &service_str, wrapped_slice);
+    }
+
     // SAFETY: out is non-null and, per caller contract, writable for at
-    // least `capacity` >= DEK_LEN bytes.
+    // least `capacity` >= DEK_LEN bytes. `dek` is our own copy, so the two
+    // never overlap even when `out` is the caller's `wrapped` buffer.
     unsafe {
         ptr::copy_nonoverlapping(dek.as_ptr(), out, crypto::DEK_LEN); // hand the recovered DEK to the caller
         *out_len = crypto::DEK_LEN as c_int; // always exactly 32 on success
     }
     dek.zeroize(); // our local copy has served its purpose; scrub it now rather than waiting for scope exit
+    status::OK
+}
+
+/// Reads a wrapped-key file into `out`, exactly as stored, after checking
+/// it is a complete, well-formed wrapped DEK -- see [`key_file`] for the
+/// checks. Never unwraps and never reaches a provider.
+///
+/// # Parameters
+/// - `path`: NUL-terminated path, at most `PATH_MAX` bytes including the
+///   terminator. Need not be UTF-8 (Linux paths are bytes).
+/// - `out` / `out_len`: on input, `*out_len` is the capacity of `out`. On
+///   success, the file's bytes are in `out` and `*out_len` is their count.
+///   On [`status::BUFFER_TOO_SMALL`], `*out_len` is a capacity to retry
+///   with. On every other failure `*out_len` is left unchanged, as with
+///   [`hkdfguard_wrap_dek`] and [`hkdfguard_unwrap_dek`]. On any failure,
+///   every byte of the declared capacity is zeroed -- unless `out_len` is
+///   NULL.
+///
+/// # Returns
+/// One of the status codes in [`status`]. Never throws/unwinds.
+///
+/// # Safety
+/// `path` must be a readable C string pointer. `out_len` must be a valid,
+/// readable and writable pointer to an `int`. `out` must be writable for
+/// at least `*out_len` bytes, unless null (in which case `*out_len` must be
+/// 0).
+#[no_mangle]
+pub extern "C" fn hkdfguard_open_file(path: *const c_char, out: *mut u8, out_len: *mut c_int) -> c_int {
+    let capacity = declared_capacity(out_len);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_file_impl(path, out, out_len, capacity))) {
+        Ok(code) => code,
+        Err(_) => {
+            zero_caller_buffer(out, capacity); // first: the reporting below runs host code
+            report_caught_panic("hkdfguard_open_file", None);
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+// Longest `path` hkdfguard_open_file accepts, terminator included: Linux's
+// PATH_MAX, which no path the kernel would open can exceed.
+const MAX_PATH_BYTES: usize = libc::PATH_MAX as usize;
+
+// Reads a NUL-terminated path from `ptr`, scanning at most MAX_PATH_BYTES
+// bytes for the terminator -- the same bounded scan as `cstr_to_service`,
+// so an unterminated buffer is refused instead of over-read.
+fn cstr_to_path(ptr: *const c_char) -> Result<std::path::PathBuf, c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    if ptr.is_null() {
+        return Err(status::INVALID_ARGUMENT);
+    }
+    let mut len = 0usize;
+    loop {
+        if len >= MAX_PATH_BYTES {
+            return Err(status::INVALID_ARGUMENT); // no NUL within PATH_MAX bytes
+        }
+        // SAFETY: caller contract guarantees a readable, NUL-terminated
+        // string; the loop stops at the first NUL and never reads past
+        // MAX_PATH_BYTES bytes.
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 {
+        return Err(status::INVALID_ARGUMENT);
+    }
+    // SAFETY: the loop above established that `len` bytes at `ptr` are readable.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+// The actual logic behind `hkdfguard_open_file`, running inside the
+// `catch_unwind` wrapper above.
+fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capacity: c_int) -> c_int {
+    if out_len.is_null() {
+        return status::INVALID_ARGUMENT; // no declared capacity, so nothing can be safely zeroed
+    }
+    // Every failure zeroes the declared buffer and leaves *out_len as the
+    // caller set it, as wrap and unwrap do; only BUFFER_TOO_SMALL (`too_small`)
+    // reports a size through it.
+    let fail = |code: c_int| {
+        zero_caller_buffer(out, capacity);
+        code
+    };
+    let too_small = |needed: c_int| {
+        zero_caller_buffer(out, capacity);
+        // SAFETY: out_len is non-null (checked above).
+        unsafe { *out_len = needed };
+        status::BUFFER_TOO_SMALL
+    };
+
+    if capacity < 0 {
+        return fail(status::INVALID_ARGUMENT);
+    }
+    let path = match cstr_to_path(path) {
+        Ok(p) => p,
+        Err(code) => return fail(code),
+    };
+    // Too small for any payload (including the 0 of a size probe):
+    // answered without opening the file, as hkdfguard_wrap_dek does.
+    if (capacity as usize) < crypto::MIN_WRAPPED_LEN {
+        return too_small(crypto::MAX_WRAPPED_LEN as c_int);
+    }
+    if out.is_null() {
+        return fail(status::INVALID_ARGUMENT); // a declared capacity with nowhere to write
+    }
+
+    let wrapped = match key_file::read(&path) {
+        Ok(contents) => contents, // wiped when it drops at the end of this function
+        Err(e) => {
+            log::error!("hkdfguard: hkdfguard_open_file refused key file {}: {}", path.display(), e.describe());
+            let code = e.status_code();
+            // The one open_file failure that is audited: a possible key
+            // exposure an administrator needs to hear about (event 2006).
+            if code == status::FILE_PLAINTEXT_KEY {
+                audit::plaintext_key_file(&path);
+            }
+            return fail(code);
+        }
+    };
+    let len = wrapped.as_slice().len(); // at most MAX_WRAPPED_LEN, so it fits a c_int
+    if len > capacity as usize {
+        return too_small(len as c_int);
+    }
+    // SAFETY: out is non-null and, per caller contract, writable for
+    // `capacity` >= len bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(wrapped.as_slice().as_ptr(), out, len);
+        *out_len = len as c_int;
+    }
     status::OK
 }
 
@@ -671,8 +908,7 @@ mod ffi_tests {
     use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
     // Disables the external-secret provider so tests deterministically
     // land on Ephemeral -- the only provider left reachable once
-    // external-secret is unavailable, with no persisted-to-disk
-    // software-backed fallback in between.
+    // external-secret is unavailable.
     fn with_isolated_ephemeral_provider<F: FnOnce()>(f: F) {
         // Ephemeral is only reachable through an explicit policy opt-in
         // (see provider::allowed_chain), so write one.
@@ -681,7 +917,7 @@ mod ffi_tests {
     }
 
     // Calls the real hkdfguard_create_kek FFI entry point and asserts it
-    // succeeded -- wrap/generate_and_wrap now only ever load an existing
+    // succeeded -- wrap/generate_and_wrap only ever load an existing
     // KEK, so every test below that wraps something must provision it
     // first, exactly as a real caller would.
     fn create_kek_for_test(service: &CString) {
@@ -826,6 +1062,40 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    fn unwrap_in_place_recovers_the_dek_and_audits_the_payload_not_the_dek() {
+        // One buffer as both `wrapped` and `out`: the DEK lands in it, and
+        // the audit record hashes the payload that was there before.
+        use sha2::{Digest, Sha256};
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.unwrapinplace").unwrap();
+            create_kek_for_test(&service);
+            let dek = [0x6Bu8; 32];
+            let mut buf = [0u8; crypto::MAX_WRAPPED_LEN];
+            let mut len = buf.len() as c_int;
+            assert_eq!(hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, buf.as_mut_ptr(), &mut len), status::OK);
+            let wrapped_hash: String = Sha256::digest(&buf[..len as usize]).iter().map(|b| format!("{b:02x}")).collect();
+            let dek_prefixed_hash: String = {
+                let mut aliased = buf[..len as usize].to_vec();
+                aliased[..32].copy_from_slice(&dek);
+                Sha256::digest(&aliased).iter().map(|b| format!("{b:02x}")).collect()
+            };
+
+            let mut out_len = buf.len() as c_int;
+            let ptr = buf.as_mut_ptr();
+            let rc = hkdfguard_unwrap_dek(service.as_ptr(), ptr, len, ptr, &mut out_len);
+            assert_eq!(rc, status::OK);
+            assert_eq!(out_len, 32);
+            assert_eq!(buf[..32], dek, "the DEK is written into the shared buffer");
+
+            let records = audit::captured_containing("service=\"com.company.unwrapinplace\"");
+            let unwrap_record = records.iter().find(|r| r.contains("op=hkdfguard_unwrap_dek")).expect("an unwrap record");
+            assert!(unwrap_record.contains(&wrapped_hash), "the record hashes the payload: {unwrap_record}");
+            assert!(!unwrap_record.contains(&dek_prefixed_hash), "never the DEK written over it");
+        });
+    }
+
+    #[test]
+    #[serial]
     fn ffi_round_trip() {
         with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap(); // NUL-terminated, as the C ABI requires
@@ -855,6 +1125,49 @@ mod ffi_tests {
             assert_eq!(rc, status::OK);
             assert_eq!(out_len, 32);
             assert_eq!(out, dek); // must recover exactly the original DEK
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn unwrap_reports_each_kind_of_bad_payload_with_its_own_code() {
+        // Structurally broken, an unknown version, and well-formed but
+        // tampered are three different problems for the caller, so each has
+        // its own status code rather than all collapsing into CRYPTO_ERROR.
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders").unwrap();
+            create_kek_for_test(&service);
+            let dek = [0x5Au8; 32];
+            let mut wrapped_buf = [0u8; 512];
+            let mut wrapped_len: c_int = wrapped_buf.len() as c_int;
+            let rc = hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, wrapped_buf.as_mut_ptr(), &mut wrapped_len);
+            assert_eq!(rc, status::OK);
+            let wrapped = wrapped_buf[..wrapped_len as usize].to_vec();
+
+            let unwrap = |bytes: &[u8]| {
+                let mut out = [0xAAu8; 32];
+                let mut out_len: c_int = out.len() as c_int;
+                let rc = hkdfguard_unwrap_dek(service.as_ptr(), bytes.as_ptr(), bytes.len() as c_int, out.as_mut_ptr(), &mut out_len);
+                assert_eq!(out, [0u8; 32], "output buffer must be zeroed on failure");
+                rc
+            };
+
+            assert_eq!(unwrap(&wrapped[..wrapped.len() - 1]), status::PAYLOAD_MALFORMED, "truncated");
+            let mut trailing = wrapped.clone();
+            trailing.push(0);
+            assert_eq!(unwrap(&trailing), status::PAYLOAD_MALFORMED, "trailing bytes");
+            let mut bad_provider = wrapped.clone();
+            bad_provider[1] = 0xFF; // byte 1 is the provider tag
+            assert_eq!(unwrap(&bad_provider), status::PAYLOAD_MALFORMED, "unknown provider type");
+
+            let mut bad_version = wrapped.clone();
+            bad_version[0] = payload::VERSION + 1; // byte 0 is the version
+            assert_eq!(unwrap(&bad_version), status::PAYLOAD_UNSUPPORTED, "unknown version");
+
+            let mut tampered = wrapped.clone();
+            let last_ciphertext_byte = tampered.len() - payload::FINGERPRINT_LEN - 1; // inside the tag, before the fingerprint
+            tampered[last_ciphertext_byte] ^= 0x01;
+            assert_eq!(unwrap(&tampered), status::PAYLOAD_AUTH_FAILED, "tampered tag");
         });
     }
 
@@ -896,7 +1209,7 @@ mod ffi_tests {
     #[serial]
     fn generate_and_wrap_produces_independent_deks() {
         // Each call sources its own fresh CSPRNG randomness for the DEK
-        // itself, not just a fresh nonce/ephemeral key -- this is the
+        // itself, not just a fresh salt/nonce -- this is the
         // check that actually distinguishes "generates a new DEK" from
         // "wraps a fixed/reused buffer."
         with_isolated_ephemeral_provider(|| {
@@ -1021,7 +1334,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len,
             );
-            assert_ne!(rc, status::OK); // must fail, since `garbage` isn't a valid payload
+            assert_eq!(rc, status::PAYLOAD_UNSUPPORTED); // must fail, since `garbage` isn't a valid payload (its version byte is 0)
             assert_eq!(out, [0u8; 32], "output buffer must be zeroed on failure"); // and the buffer must be scrubbed regardless
         });
     }
@@ -1349,7 +1662,7 @@ mod ffi_tests {
             );
             assert_eq!(out, dek);
 
-            // 128-byte service name (the new maximum)
+            // 128-byte service name (the maximum)
             let svc128 = CString::new("s".repeat(128)).unwrap();
             create_kek_for_test(&svc128);
             let mut wrapped2 = [0u8; 512];
@@ -1441,7 +1754,7 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn service_name_with_single_interior_and_trailing_dots_is_still_accepted() {
-        // The new rules only forbid a leading dot and consecutive dots;
+        // The dot rules only forbid a leading dot and consecutive dots;
         // ordinary dotted names (and a single trailing dot) are unaffected.
         with_isolated_ephemeral_provider(|| {
             for ok in ["com.example.dottest", "a.b.c.d", "x", "com.example.trailing."] {
@@ -1602,20 +1915,19 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::FINGERPRINT_MISMATCH);
-        assert_eq!(rc, -16, "must match macOS's HKDFGuardStatus.fingerprintMismatch");
+        assert_eq!(rc, status::KEK_FINGERPRINT_MISMATCH);
+        assert_eq!(rc, -16, "pinned by the status table shared with Windows and macOS");
         assert_eq!(out, [0u8; 32], "output buffer must still be zeroed on failure");
 
     }
 
     #[test]
     fn unterminated_service_buffer_is_rejected_without_over_reading() {
-        // Finding #13. A buffer of MAX_SERVICE_LEN + 1 non-NUL bytes and
-        // *no* terminator at all. The old `CStr::from_ptr` would have read
-        // past the end of this array looking for a zero byte; the bounded
-        // scan reads exactly the 129 bytes that exist, finds no NUL, and
-        // rejects. Under the old code this test would be undefined
-        // behavior, which is precisely the regression it guards against.
+        // A buffer of MAX_SERVICE_LEN + 1 non-NUL bytes and *no*
+        // terminator at all. `CStr::from_ptr` would read past the end of
+        // this array looking for a zero byte; the bounded scan reads
+        // exactly the 129 bytes that exist, finds no NUL, and rejects.
+        // An unbounded scan would make this test undefined behavior.
         let unterminated = [b'a'; MAX_SERVICE_LEN + 1];
         let rc = hkdfguard_create_kek(unterminated.as_ptr() as *const c_char);
         assert_eq!(rc, status::INVALID_SERVICE_NAME);
@@ -1655,5 +1967,355 @@ mod ffi_tests {
             hkdfguard_kek_exists(service.as_ptr(), std::ptr::null_mut()),
             status::INVALID_ARGUMENT
         );
+    }
+
+    // ---- hkdfguard_open_file ----
+
+    // Writes `contents` owner-only into a fresh private directory, as the
+    // CLI writes a key file; the directory is returned to keep it alive.
+    fn key_file_with(contents: &[u8]) -> (tempfile::TempDir, CString) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = secure_file::private_tempdir();
+        let path = dir.path().join("wrapped.key");
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, CString::new(path.into_os_string().into_encoded_bytes()).unwrap())
+    }
+
+    // A real payload, from the real wrap entry point.
+    fn wrapped_for_test(service: &CString, dek: &[u8; 32]) -> Vec<u8> {
+        create_kek_for_test(service);
+        let mut buf = [0u8; crypto::MAX_WRAPPED_LEN];
+        let mut len = buf.len() as c_int;
+        assert_eq!(hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, buf.as_mut_ptr(), &mut len), status::OK);
+        buf[..len as usize].to_vec()
+    }
+
+    // Calls hkdfguard_open_file with a buffer of `capacity` bytes, prefilled
+    // with 0xAA so a failure's zeroing is visible.
+    fn open_file(path: &CString, capacity: usize) -> (c_int, Vec<u8>, c_int) {
+        let mut out = vec![0xAAu8; capacity];
+        let mut out_len = capacity as c_int;
+        let rc = hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), &mut out_len);
+        (rc, out, out_len)
+    }
+
+    fn sample_wrapped_bytes() -> Vec<u8> {
+        payload::Payload {
+            provider_type: provider::ProviderType::Ephemeral,
+            key_id: b"ephemeral:com.company.orders".to_vec(),
+            salt: [1; payload::SALT_LEN],
+            nonce: [2; payload::NONCE_LEN],
+            ciphertext: vec![3; crypto::DEK_LEN + crypto::TAG_LEN],
+            fingerprint: [4; payload::FINGERPRINT_LEN],
+        }
+        .to_bytes()
+    }
+
+    #[test]
+    #[serial]
+    fn open_file_then_unwrap_recovers_the_dek() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders.openfile").unwrap();
+            let dek = [0x5Cu8; 32];
+            let wrapped = wrapped_for_test(&service, &dek);
+            let (_dir, path) = key_file_with(&wrapped);
+
+            let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+            assert_eq!(rc, status::OK);
+            assert_eq!(out_len as usize, wrapped.len(), "out_len is the number of bytes read");
+            assert_eq!(&out[..wrapped.len()], &wrapped[..], "the file's bytes, exactly as stored");
+            assert!(out[wrapped.len()..].iter().all(|&b| b == 0xAA), "nothing written past the payload");
+
+            let mut recovered = [0u8; 32];
+            let mut recovered_len: c_int = 32;
+            let rc = hkdfguard_unwrap_dek(service.as_ptr(), out.as_ptr(), out_len, recovered.as_mut_ptr(), &mut recovered_len);
+            assert_eq!(rc, status::OK);
+            assert_eq!(recovered, dek);
+        });
+    }
+
+    #[test]
+    fn open_file_accepts_an_exact_size_buffer() {
+        let bytes = sample_wrapped_bytes();
+        let (_dir, path) = key_file_with(&bytes);
+        let (rc, out, out_len) = open_file(&path, bytes.len());
+        assert_eq!(rc, status::OK);
+        assert_eq!(out_len as usize, bytes.len());
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn open_file_reports_each_refusal_and_zeroes_the_buffer() {
+        let valid = sample_wrapped_bytes();
+        let mut long = valid.clone();
+        long.push(0);
+        let mut bad_version = valid.clone();
+        bad_version[0] = 2;
+        let b64_dek = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([9u8; 32]) + "\n"
+        };
+        let cases: [(&str, Vec<u8>, c_int); 8] = [
+            ("empty", vec![], status::FILE_TOO_SHORT),
+            ("truncated", valid[..valid.len() - 1].to_vec(), status::FILE_TOO_SHORT),
+            ("appended", long, status::FILE_TOO_LONG),
+            ("oversized", vec![0u8; crypto::MAX_WRAPPED_LEN + 1], status::FILE_TOO_LONG),
+            ("bad version", bad_version, status::FILE_MALFORMED),
+            ("raw DEK", vec![9u8; 32], status::FILE_PLAINTEXT_KEY),
+            ("base64 DEK", b64_dek.into_bytes(), status::FILE_PLAINTEXT_KEY),
+            ("garbage", vec![0xEEu8; 200], status::FILE_MALFORMED),
+        ];
+        for (name, contents, expected) in cases {
+            let (_dir, path) = key_file_with(&contents);
+            let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+            assert_eq!(rc, expected, "{name}");
+            assert_eq!(out_len, crypto::MAX_WRAPPED_LEN as c_int, "{name}: *out_len left as the caller set it");
+            assert!(out.iter().all(|&b| b == 0), "{name}: the whole buffer is zeroed");
+        }
+    }
+
+    #[test]
+    fn open_file_reports_why_a_file_could_not_be_opened() {
+        let dir = secure_file::private_tempdir();
+        let missing = CString::new(dir.path().join("absent.key").into_os_string().into_encoded_bytes()).unwrap();
+        let (rc, out, out_len) = open_file(&missing, crypto::MAX_WRAPPED_LEN);
+        assert_eq!((rc, out_len), (status::FILE_NOT_FOUND, crypto::MAX_WRAPPED_LEN as c_int));
+        assert!(out.iter().all(|&b| b == 0));
+
+        let directory = CString::new(dir.path().as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(open_file(&directory, crypto::MAX_WRAPPED_LEN).0, status::FILE_IO);
+
+        if !secure_file::skip_as_root() {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, path) = key_file_with(&sample_wrapped_bytes());
+            std::fs::set_permissions(dir.path().join("wrapped.key"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(open_file(&path, crypto::MAX_WRAPPED_LEN).0, status::FILE_ACCESS_DENIED);
+        }
+    }
+
+    #[test]
+    fn open_file_refuses_a_key_file_someone_else_could_have_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let bytes = sample_wrapped_bytes();
+        let (dir, path) = key_file_with(&bytes);
+        let file = dir.path().join("wrapped.key");
+        for mode in [0o660, 0o606] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+            assert_eq!((rc, out_len), (status::FILE_UNTRUSTED, crypto::MAX_WRAPPED_LEN as c_int), "mode {mode:o}");
+            assert!(out.iter().all(|&b| b == 0), "mode {mode:o}: nothing of the file is handed over");
+        }
+        // Read-only for others is fine: the contents are ciphertext.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!(rc, status::OK);
+        assert_eq!(&out[..out_len as usize], &bytes[..]);
+
+        // A 0600 file in a directory others can write: they could rename
+        // their own file over it.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!((rc, out_len), (status::FILE_UNTRUSTED, crypto::MAX_WRAPPED_LEN as c_int), "writable directory");
+        assert!(out.iter().all(|&b| b == 0));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn open_file_too_small_for_any_payload_answers_without_opening_the_file() {
+        // A nonexistent path, so reaching the file would be FILE_NOT_FOUND.
+        let missing = CString::new("/nonexistent-hkdfguard-open-file-test/wrapped.key").unwrap();
+        for capacity in [0usize, 1, crypto::MIN_WRAPPED_LEN - 1] {
+            let (rc, out, out_len) = open_file(&missing, capacity);
+            assert_eq!(rc, status::BUFFER_TOO_SMALL, "capacity {capacity}");
+            assert_eq!(out_len as usize, crypto::MAX_WRAPPED_LEN, "a size that always fits");
+            assert!(out.iter().all(|&b| b == 0));
+        }
+        // The size probe: NULL out with a capacity of 0.
+        let mut out_len: c_int = 0;
+        assert_eq!(hkdfguard_open_file(missing.as_ptr(), ptr::null_mut(), &mut out_len), status::BUFFER_TOO_SMALL);
+        assert_eq!(out_len as usize, crypto::MAX_WRAPPED_LEN);
+    }
+
+    #[test]
+    fn open_file_buffer_shorter_than_the_file_reports_its_exact_length() {
+        let bytes = sample_wrapped_bytes();
+        let (_dir, path) = key_file_with(&bytes);
+        let (rc, out, out_len) = open_file(&path, bytes.len() - 1);
+        assert_eq!(rc, status::BUFFER_TOO_SMALL);
+        assert_eq!(out_len as usize, bytes.len());
+        assert!(out.iter().all(|&b| b == 0), "nothing of the file is left in a too-small buffer");
+    }
+
+    #[test]
+    fn open_file_invalid_arguments() {
+        let bytes = sample_wrapped_bytes();
+        let (_dir, path) = key_file_with(&bytes);
+        let mut out = [0xAAu8; crypto::MAX_WRAPPED_LEN];
+
+        // NULL out_len: nothing to report through, nothing written.
+        assert_eq!(hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), ptr::null_mut()), status::INVALID_ARGUMENT);
+        assert!(out.iter().all(|&b| b == 0xAA), "no declared capacity, so `out` is untouched");
+
+        // NULL path, empty path.
+        let empty = CString::new("").unwrap();
+        for p in [ptr::null(), empty.as_ptr()] {
+            let mut out_len = out.len() as c_int;
+            assert_eq!(hkdfguard_open_file(p, out.as_mut_ptr(), &mut out_len), status::INVALID_ARGUMENT);
+            assert_eq!(out_len, out.len() as c_int, "*out_len left unchanged");
+        }
+
+        // Negative capacity.
+        let mut out_len: c_int = -1;
+        assert_eq!(hkdfguard_open_file(path.as_ptr(), out.as_mut_ptr(), &mut out_len), status::INVALID_ARGUMENT);
+        assert_eq!(out_len, -1, "*out_len left unchanged");
+
+        // NULL out with a positive capacity.
+        let mut out_len = out.len() as c_int;
+        assert_eq!(hkdfguard_open_file(path.as_ptr(), ptr::null_mut(), &mut out_len), status::INVALID_ARGUMENT);
+        assert_eq!(out_len, out.len() as c_int, "*out_len left unchanged");
+    }
+
+    #[test]
+    fn open_file_unterminated_path_is_rejected_without_over_reading() {
+        // Exactly MAX_PATH_BYTES non-NUL bytes and no terminator: the scan
+        // must stop at the end of this buffer rather than run past it.
+        let unterminated = vec![b'a'; MAX_PATH_BYTES];
+        let mut out = [0u8; crypto::MAX_WRAPPED_LEN];
+        let mut out_len = out.len() as c_int;
+        let rc = hkdfguard_open_file(unterminated.as_ptr() as *const c_char, out.as_mut_ptr(), &mut out_len);
+        assert_eq!(rc, status::INVALID_ARGUMENT);
+
+        // One byte shorter, terminated, is a path (here, a missing one).
+        let mut at_limit = vec![b'a'; MAX_PATH_BYTES];
+        at_limit[MAX_PATH_BYTES - 1] = 0;
+        assert!(cstr_to_path(at_limit.as_ptr() as *const c_char).is_ok());
+    }
+
+    #[test]
+    fn open_file_accepts_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = sample_wrapped_bytes();
+        let dir = secure_file::private_tempdir();
+        let name = std::ffi::OsStr::from_bytes(b"wrapped-\xFF.key");
+        let file = dir.path().join(name);
+        std::fs::write(&file, &bytes).unwrap();
+        // Owner-only, as key_file_with sets it: under a umask of 002 the file
+        // would be group-writable and refused as FILE_UNTRUSTED.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let path = CString::new(file.into_os_string().into_encoded_bytes()).unwrap();
+        let (rc, out, out_len) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!(rc, status::OK);
+        assert_eq!(&out[..out_len as usize], &bytes[..]);
+    }
+
+    // ---- the audit trail (see `audit`; records are captured in memory in test builds) ----
+
+    #[test]
+    #[serial]
+    fn create_wrap_and_unwrap_are_audited_with_the_service_and_one_payload_hash() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.audit.trail").unwrap();
+            create_kek_for_test(&service);
+            let created = audit::captured_containing("service=\"com.company.audit.trail\"");
+            // The test policy prefers external-secret, which isn't set up
+            // here, so the KEK lands on Ephemeral: a fallback (1001).
+            assert!(
+                created.iter().any(|r| r.starts_with("<84>")
+                    && r.contains("event=1001 op=hkdfguard_create_kek")
+                    && r.contains("provider=EPHEMERAL preferred=EXTERNAL_SECRET")),
+                "creating the KEK off the first choice is audited as a fallback: {created:?}"
+            );
+            // A second create finds it: no second creation record.
+            create_kek_for_test(&service);
+            let again = audit::captured_containing("service=\"com.company.audit.trail\"");
+            assert_eq!(
+                again.iter().filter(|r| r.contains("event=1000 ") || r.contains("event=1001 ")).count(),
+                1,
+                "only a real creation is audited"
+            );
+
+            let wrapped = wrapped_for_test(&service, &[7u8; 32]);
+            let mut out = [0u8; 32];
+            let mut out_len = out.len() as c_int;
+            assert_eq!(
+                hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped.len() as c_int, out.as_mut_ptr(), &mut out_len),
+                status::OK
+            );
+
+            use sha2::{Digest, Sha256};
+            let hash: String = Sha256::digest(&wrapped).iter().map(|b| format!("{b:02x}")).collect();
+            let records = audit::captured_containing(&hash);
+            assert!(records.iter().any(|r| r.contains("event=1002 op=hkdfguard_wrap_dek result=OK service=\"com.company.audit.trail\"")), "{records:?}");
+            assert!(records.iter().any(|r| r.contains("event=1003 op=hkdfguard_unwrap_dek result=OK service=\"com.company.audit.trail\"")), "{records:?}");
+            assert!(records.iter().all(|r| r.contains("kek_fingerprint=") && r.contains(" uid=")), "{records:?}");
+
+            // A tampered payload: the failed unwrap is audited (2003).
+            let mut tampered = wrapped.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 1;
+            let mut out_len = out.len() as c_int;
+            assert_ne!(
+                hkdfguard_unwrap_dek(service.as_ptr(), tampered.as_ptr(), tampered.len() as c_int, out.as_mut_ptr(), &mut out_len),
+                status::OK
+            );
+            let failures = audit::captured_containing("op=hkdfguard_unwrap_dek result=");
+            assert!(failures.iter().any(|r| r.contains("event=2003 ") && r.contains("service=\"com.company.audit.trail\"")), "{failures:?}");
+
+            // A caller mistake is not.
+            let before = audit::captured_containing("com.company.audit.trail").len();
+            let mut tiny = [0u8; 1];
+            let mut tiny_len = 1;
+            assert_eq!(
+                hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped.len() as c_int, tiny.as_mut_ptr(), &mut tiny_len),
+                status::BUFFER_TOO_SMALL
+            );
+            assert_eq!(audit::captured_containing("com.company.audit.trail").len(), before);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn audit_unwrap_success_false_silences_only_the_unwrap_success_record() {
+        let _policy = crate::policy::test_support::TestPolicy::write(
+            "preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[audit]\nunwrap_success = false\n",
+        );
+        let service = CString::new("com.company.audit.quiet").unwrap();
+        create_kek_for_test(&service);
+        let wrapped = wrapped_for_test(&service, &[9u8; 32]);
+        let mut out = [0u8; 32];
+        let mut out_len = out.len() as c_int;
+        assert_eq!(
+            hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped.len() as c_int, out.as_mut_ptr(), &mut out_len),
+            status::OK
+        );
+        let records = audit::captured_containing("service=\"com.company.audit.quiet\"");
+        assert!(records.iter().any(|r| r.contains("event=1002 ")), "wrap is still audited: {records:?}");
+        assert!(!records.iter().any(|r| r.contains("event=1003 ")), "unwrap success is not: {records:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn an_audit_section_with_a_non_boolean_is_an_invalid_policy() {
+        let _policy = crate::policy::test_support::TestPolicy::write(
+            "preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[audit]\nunwrap_success = 0\n",
+        );
+        assert!(matches!(crate::policy::load(), Some(Err(_))));
+        assert!(crate::policy::audit_unwrap_success(), "a broken policy keeps unwrap auditing on");
+    }
+
+    #[test]
+    #[serial]
+    fn a_plaintext_key_file_is_audited_with_its_path() {
+        let (_dir, path) = key_file_with(&[9u8; 32]);
+        let (rc, _, _) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+        assert_eq!(rc, status::FILE_PLAINTEXT_KEY);
+        let shown = path.to_str().unwrap();
+        let records = audit::captured_containing(shown);
+        assert!(records.iter().any(|r| r.contains("event=2006 op=hkdfguard_open_file")), "{records:?}");
     }
 }
