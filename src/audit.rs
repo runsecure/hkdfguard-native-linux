@@ -451,7 +451,12 @@ mod tests {
 
     #[test]
     fn send_to_delivers_one_datagram_and_never_blocks_or_fails() {
-        let dir = crate::secure_file::private_tempdir();
+        // Not `private_tempdir`: nothing here goes through the library's
+        // trust checks, and a socket path must fit in sun_path (108 bytes),
+        // which the test root under a deep build directory (rpmbuild's
+        // BUILD/<name>-build/<name>/target/tmp/...) can exceed. The system
+        // temp dir is short; `tempdir` makes a 0700 directory in it.
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.sock");
         let receiver = UnixDatagram::bind(&path).unwrap();
         let record = frame(Severity::Info, "event=1002 op=hkdfguard_wrap_dek msg=\"x\"");
