@@ -23,9 +23,16 @@ if key=$(readlink -f "$MOUNT/$SERVICE"); then
     echo "== key file: $key $(stat -c '%a %U:%G' "$key" 2>&1)"
 fi
 
-# Key files go in a private directory under /tmp: /tmp is sticky and
-# root-owned, so it passes hkdfguard_open_file's directory checks.
-work=$(mktemp -d /tmp/hk.XXXXXX)
+# Key files go in this uid's private directory, which the image creates
+# (docker/k8s/Dockerfile) -- not under /tmp: the library refuses a key file
+# anywhere under a sticky, world-writable directory, and `hkdfguard wrap`
+# refuses to write one there.
+keys_root=/var/lib/hkdfguard-test/$(id -u)
+if [ ! -d "$keys_root" ]; then
+    echo "RESULT: no private key directory $keys_root for uid $(id -u) in this image (see docker/k8s/Dockerfile)"
+    exit 0
+fi
+work=$(mktemp -d "$keys_root/hk.XXXXXX")
 
 # wrap_and_check <name>: wrap a fresh DEK into $work/<name>.key and unwrap
 # it through the library. Prints the failing step's output on failure.

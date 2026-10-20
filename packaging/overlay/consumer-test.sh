@@ -18,7 +18,11 @@ section() { printf '\n\033[1;36m== %s ==\033[0m\n' "$1"; }
 
 [ $# -eq 1 ] || { echo "usage: $0 plain|dev" >&2; exit 2; }
 mode=$1
-work=$(mktemp -d)
+# Root's own private directory, not /tmp: the library refuses a key file
+# anywhere under a sticky, world-writable directory, and `hkdfguard wrap`
+# refuses to write one there. / and /root are root's and not writable by
+# anyone else.
+work=$(mktemp -d /root/hkdfguard-consumer.XXXXXX)
 multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || gcc -print-multiarch)
 libdir=/usr/lib/$multiarch
 

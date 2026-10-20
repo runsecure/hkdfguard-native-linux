@@ -6,6 +6,10 @@
 //! The library must read this test's own policy, which only a
 //! `--cfg hkdfguard_test_paths` build does (the test scripts set it).
 
+// A private temp root, not the sticky /tmp (see src/test_tmp.rs).
+#[path = "../src/test_tmp.rs"]
+mod test_tmp;
+
 #[test]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn creating_an_ephemeral_key_hardens_the_process_and_locks_the_key_away() {
@@ -21,7 +25,7 @@ fn creating_an_ephemeral_key_hardens_the_process_and_locks_the_key_away() {
         return;
     }
 
-    let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+    let dir = test_tmp::private_tempdir();
     let policy = dir.path().join("policy.toml");
     std::fs::write(&policy, "[selection]\nmode = \"require\"\nprovider = \"ephemeral\"\n").unwrap();
     std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();

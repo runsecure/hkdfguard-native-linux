@@ -59,7 +59,21 @@ digits and dots; it must not start with a dot or contain "..".
 .BR \-\-key\-file\-path ", " \-kf " \fIpath\fR"
 Where
 .B wrap
-writes the wrapped payload.
+writes the wrapped payload. Its folder must be a real folder (no
+symbolic link anywhere above the file), and neither that folder nor any
+folder above it up to
+.I /
+may be writable by group or others \(em sticky folders such as
+.IR /tmp ,
+.I /var/tmp
+and
+.I /dev/shm
+included. The library refuses to read a key file under such a folder
+.RB ( HKDFGUARD_ERR_FILE_UNTRUSTED ),
+so
+.B wrap
+refuses to write one there, before the DEK is read. Only the folders'
+modes are checked, not who owns them.
 .TP
 .B \-\-dek\-stdin
 Read the DEK, base64 of exactly 32 bytes, from standard input.

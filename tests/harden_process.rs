@@ -4,12 +4,16 @@
 
 use hkdfguard::{harden_flags, hkdfguard_harden_process, hkdfguard_harden_process_with_flags, status};
 
-// Only this user can write to it, whatever the umask: the library refuses
-// to trust a policy or secret mount in a group-writable directory.
+// Only this user can write to it, whatever the umask, and not under the
+// sticky /tmp: the library refuses to trust a policy or secret mount in a
+// group-writable directory (see src/test_tmp.rs).
+#[cfg(hkdfguard_test_paths)]
+#[path = "../src/test_tmp.rs"]
+mod test_tmp;
+
 #[cfg(hkdfguard_test_paths)]
 fn private_tempdir() -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
-    tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+    test_tmp::private_tempdir()
 }
 
 #[test]

@@ -73,7 +73,13 @@
 //!
 //! The key file's folder must be a real folder at the path spelled: no
 //! symbolic link anywhere above the file (see [`require_real_folder`]),
-//! checked before the DEK is read and again on the open descriptor.
+//! checked before the DEK is read and again on the open descriptor. Nor
+//! may that folder, or any folder above it up to `/`, be writable by group
+//! or others -- sticky folders such as `/tmp`, `/var/tmp` and `/dev/shm`
+//! included (see [`require_unshared_folder`]): the library refuses to read
+//! a key file under one, so `wrap` refuses to write it there, also before
+//! the DEK is read. Only the folders' modes are checked, not who owns them:
+//! `wrap` may run as root into a folder the application's account owns.
 //!
 //! When `--force` replaces an existing file at `--key-file-path`, the wrap
 //! is completed in memory *first*, and only then is the old file securely
@@ -668,7 +674,8 @@ fn describe_status(code: c_int) -> String {
         }
         status::FILE_MALFORMED => "the key file is not a well-formed wrapped DEK".to_string(),
         status::FILE_UNTRUSTED => {
-            "the key file, or a directory in its path, is owned by another user or writable by group/others".to_string()
+            "the key file, or a directory in its path, is owned by another user or writable by group/others              (sticky /tmp-style directories included)"
+                .to_string()
         }
         other => format!("unknown status code {other}"),
     }
@@ -888,6 +895,56 @@ fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(spelled)
+}
+
+// `wrap` only: the key file's folder, and every folder above it up to `/`,
+// must not be writable by group or others -- sticky (`/tmp`, `/var/tmp`,
+// `/dev/shm`) included. The library refuses to read a key file under any
+// such folder (HKDFGUARD_ERR_FILE_UNTRUSTED), so writing one there would
+// only hand the application a file it can never open; better to say so
+// before the DEK is read or a provider is touched. `spelled` is what
+// `require_real_folder` returned, so its folder is the real one and every
+// ancestor is too.
+//
+// Mode only, not ownership: `wrap` often runs as root into a folder owned
+// by the application's account, which the library -- running as that
+// account -- accepts, while the library's ownership rule (root or the
+// reading process's own user) depends on who reads the file, which this
+// tool cannot know. As in the library, a folder on a read-only mount is
+// not writable whatever its mode bits say (nothing can be written there
+// anyway, so the create below fails on its own).
+fn require_unshared_folder(path: &Path, spelled: &Path) -> Result<(), String> {
+    let folder = spelled.parent().ok_or_else(|| format!("{} has no parent folder", path.display()))?;
+    for dir in folder.ancestors() {
+        let meta = fs::metadata(dir).map_err(|e| format!("failed to check folder {}: {e}", dir.display()))?;
+        let mode = meta.mode() & 0o7777;
+        if mode & 0o022 == 0 || on_read_only_mount(dir) {
+            continue;
+        }
+        let which = if dir == folder { "the key file's folder" } else { "a folder above the key file" };
+        let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
+        return Err(format!(
+            "{which}, {}, is writable by group or others (mode {mode:o}){sticky}; the library would refuse to \
+             read a key file at {} (HKDFGUARD_ERR_FILE_UNTRUSTED), because someone else could replace it. \
+             Write the key file into a folder that only its owner (or root) can write to, all the way up to /",
+            dir.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn on_read_only_mount(dir: &Path) -> bool {
+    let Ok(c_path) = CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: c_path is a valid NUL-terminated string; `st` is a properly
+    // sized out-parameter that statvfs fully initializes on success.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    st.f_flag & libc::ST_RDONLY != 0
 }
 
 // After an open: `file` must be the file at `spelled` (see
@@ -1134,6 +1191,10 @@ fn run_wrap(
     // descriptor, when the file is replaced and created below.
     let checked = require_real_folder(Path::new(&key_file_path))?;
     let path = checked.as_path();
+    // And not in a folder (or under one) that group or others can write
+    // to, sticky /tmp included: the library would refuse to read the key
+    // file there, so refuse to write it (see require_unshared_folder).
+    require_unshared_folder(Path::new(&key_file_path), path)?;
 
     // Fast, friendly pre-check: fail before reading the DEK or touching
     // the provider if the output path obviously already exists and --force
@@ -1429,6 +1490,10 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
+#[path = "../test_tmp.rs"]
+mod test_tmp;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -1466,10 +1531,12 @@ mod tests {
         assert_eq!(describe_status(status::MAC_KEYCHAIN_READ_FAILED), "unknown status code -100");
     }
 
-    // Only this user can write to it, whatever the umask: the library refuses
-    // to trust a policy or secret mount in a group-writable directory.
+    // Only this user can write to it, whatever the umask, and not under the
+    // sticky /tmp: the library refuses to trust a policy or secret mount in a
+    // group-writable directory, and a key file under any shared one -- which
+    // `wrap` therefore refuses to write. See src/test_tmp.rs.
     fn private_tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+        test_tmp::private_tempdir()
     }
 
     fn argv(parts: &[&str]) -> impl Iterator<Item = String> {
@@ -1499,7 +1566,7 @@ mod tests {
     // immediately for a new file.)
     #[test]
     fn secure_delete_removes_the_file() {
-        let file = NamedTempFile::new().unwrap();
+        let file = NamedTempFile::new_in(test_tmp::root()).unwrap();
         fs::write(file.path(), b"sensitive content to be wiped").unwrap();
         assert!(file.path().exists());
 
@@ -1510,7 +1577,7 @@ mod tests {
 
     #[test]
     fn secure_delete_handles_an_empty_file() {
-        let file = NamedTempFile::new().unwrap(); // created empty
+        let file = NamedTempFile::new_in(test_tmp::root()).unwrap(); // created empty
         secure_delete(file.path()).unwrap();
         assert!(!file.path().exists());
     }
@@ -1566,7 +1633,7 @@ mod tests {
 
     #[test]
     fn secure_delete_fails_cleanly_on_a_missing_file() {
-        let file = NamedTempFile::new().unwrap();
+        let file = NamedTempFile::new_in(test_tmp::root()).unwrap();
         let path = file.path().to_path_buf();
         drop(file);
         fs::remove_file(&path).ok();
@@ -1611,6 +1678,98 @@ mod tests {
         assert!(err.contains("symbolic link") && err.contains(real.to_str().unwrap()), "{err}");
         let err = require_real_folder(&link.join("sub/k")).unwrap_err();
         assert!(err.contains("symbolic link"), "a link further up is refused too: {err}");
+    }
+
+    #[test]
+    fn require_unshared_folder_refuses_group_other_or_sticky_writable_folders_at_any_level() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let outer = base.join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let chmod = |p: &Path, mode: u32| fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        chmod(&outer, 0o755);
+        chmod(&inner, 0o700);
+        let key = inner.join("wrapped.key");
+        require_unshared_folder(&key, &key).expect("0700 under 0755 under a private root");
+        chmod(&inner, 0o755);
+        require_unshared_folder(&key, &key).expect("0755: others may read, not write");
+
+        for mode in [0o775, 0o757, 0o777, 0o1777, 0o1770] {
+            chmod(&inner, mode);
+            let err = require_unshared_folder(&key, &key).unwrap_err();
+            assert!(err.contains("the key file's folder") && err.contains(&format!("mode {mode:o}")), "{err}");
+            assert!(err.contains("library would refuse"), "{err}");
+            assert_eq!(err.contains("sticky"), mode & 0o1000 != 0, "{err}");
+        }
+        chmod(&inner, 0o700);
+        for mode in [0o1777, 0o777, 0o770] {
+            chmod(&outer, mode);
+            let err = require_unshared_folder(&key, &key).unwrap_err();
+            assert!(err.contains("a folder above the key file") && err.contains(outer.to_str().unwrap()), "{err}");
+        }
+        chmod(&outer, 0o755);
+    }
+
+    #[test]
+    fn require_unshared_folder_checks_mode_only_not_who_owns_the_folder() {
+        // `/` is root's, and (as a non-root test run) not this user's: the
+        // library running as the application's account would accept a key
+        // file there, so wrap must not refuse it for its owner.
+        require_unshared_folder(Path::new("/wrapped.key"), Path::new("/wrapped.key")).expect("root-owned 0755");
+
+        // Owned by another non-root user: only root can arrange that.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let theirs = base.join("app-owned");
+        fs::create_dir(&theirs).unwrap();
+        std::os::unix::fs::chown(&theirs, Some(65534), Some(65534)).unwrap();
+        for mode in [0o700, 0o755] {
+            fs::set_permissions(&theirs, fs::Permissions::from_mode(mode)).unwrap();
+            let key = theirs.join("wrapped.key");
+            require_unshared_folder(&key, &key).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+        }
+    }
+
+    #[test]
+    fn wrap_refuses_a_shared_folder_before_reading_the_dek() {
+        // The --dek-file does not exist: reaching it would fail with a DEK
+        // error, so the folder error proves the DEK was never read.
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let shared = base.join("shared");
+        fs::create_dir(&shared).unwrap();
+        let missing_dek = base.join("no-such-dek").to_str().unwrap().to_string();
+        for mode in [0o1777, 0o770] {
+            fs::set_permissions(&shared, fs::Permissions::from_mode(mode)).unwrap();
+            let key = shared.join("wrapped.key");
+            let err = run_wrap(
+                key.to_str().unwrap().to_string(),
+                "com.hkdfguard.clitest.shared".to_string(),
+                DekSource::File(missing_dek.clone()),
+                false,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("writable by group or others") && !err.contains("--dek-file"), "{err}");
+            assert!(!key.exists(), "nothing created");
+        }
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A private folder gets past the check, to the DEK.
+        let err = run_wrap(
+            shared.join("wrapped.key").to_str().unwrap().to_string(),
+            "com.hkdfguard.clitest.shared".to_string(),
+            DekSource::File(missing_dek),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("--dek-file"), "{err}");
     }
 
     #[test]

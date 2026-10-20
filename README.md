@@ -667,6 +667,15 @@ cargo test --features tpm2 -- --ignored     # needs a TPM or swtpm, on Linux
 cargo test --features pkcs11 -- --ignored   # needs SoftHSM2 or another PKCS#11 module
 ```
 
+The tests make their temp directories under `<target>/tmp/hkdfguard-tests`
+(mode `0700`), not under `/tmp`: the library refuses key files anywhere
+under a sticky, world-writable directory. Every directory above it must be
+owned by root or you and not group/other-writable; the tests clear group
+and other write on what they own inside the target directory, and stop
+with a message naming any other offending directory (a checkout in a shared
+folder, or one made under a `002` umask). Set `HKDFGUARD_TEST_TMPDIR` to
+another private directory to use that instead.
+
 ### Testing on a native Linux TPM (Intel PTT / AMD fTPM / discrete)
 
 Docker proves the code against `swtpm`. This repo's maintainers have run
@@ -1059,6 +1068,17 @@ writes can't redirect a `wrap --force` into another folder. Spell the real
 path (`/run/...`, not `/var/run/...`). This is checked before the DEK is
 read, and again on the open file before anything is overwritten or written.
 
+Nor may the key file's folder, or any folder above it up to `/`, be
+writable by group or others -- **sticky folders such as `/tmp`, `/var/tmp`
+and `/dev/shm` included**, however private the folder inside them. The
+library refuses to read a key file under such a folder
+(`HKDFGUARD_ERR_FILE_UNTRUSTED`, `-39`), so `wrap` refuses to write one
+there, before the DEK is read or a provider is reached, naming the folder
+and its mode. Only the folders' modes are checked, not who owns them: `wrap`
+often runs as root into a folder the application's account owns, which the
+library, running as that account, accepts. Put key files somewhere like
+`/var/lib/<app>/` (mode `0700` or `0755`, owned by the application or root).
+
 The key file is written `0600`, owned by whoever runs the command. It is
 ciphertext, but anyone who can read it *and* reach the provider — on a TPM
 host, any member of `tss` — can unwrap it, so nothing beyond its owner is
@@ -1346,6 +1366,16 @@ its default.
   the service's own uid can't rewrite (or delete) them. Secret contents are read into a single fixed
   allocation that is never grown (so no partially-filled buffer is ever
   freed un-wiped) and zeroed on every exit path.
+- **Key files are never trusted under a shared directory.**
+  `hkdfguard_open_file` requires the key file and every directory that
+  decides what its path names, up to `/`, to be owned by root or the
+  calling user and not writable by group or others -- with no exception
+  for sticky directories, so nothing under `/tmp`, `/var/tmp` or
+  `/dev/shm` is accepted, however private the directory beneath (read-only
+  mounts, such as a Kubernetes Secret volume, excepted). The CLI's `wrap`
+  refuses to write a key file where it would be refused. (The policy, PIN,
+  derivation-secret, PKCS#11 module and external-secret checks still
+  accept a sticky *ancestor*.)
 - **Service names can never name a file outside their mount.** The C ABI
   rejects a `service` that starts with `.` or contains `..`, and the
   external-secret provider enforces the same rule again where the name

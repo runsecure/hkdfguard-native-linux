@@ -33,10 +33,16 @@
 //!   checks apply to the file they resolve to. The same holds for the
 //!   directories that decide what the path names -- the opened file's own
 //!   and the one the path names it in, each up to `/`: owned by root or
-//!   this user, and not writable by group or others unless sticky
-//!   (`/tmp`-style). Otherwise someone else could rename a file of their
-//!   choosing over the key, or retarget a symlink to one. (The OS itself
-//!   refusing to open the file -- e.g. `EACCES` -- is the separate
+//!   this user, and not writable by group or others -- **sticky or not, at
+//!   any level** (see [`secure_file::check_dir_chain_strict`]). Otherwise
+//!   someone else could rename a file of their choosing over the key, or
+//!   retarget a symlink to one. So a key file anywhere under `/tmp`,
+//!   `/var/tmp`, `/dev/shm` or any other sticky, world-writable directory
+//!   is refused, however private the directories beneath it: a key file
+//!   belongs in a directory only its owner (or root) can write to, all the
+//!   way up. The one exception is a read-only mount -- a Kubernetes Secret
+//!   or ConfigMap volume is `1777` but nobody can write to it. (The OS
+//!   itself refusing to open the file -- e.g. `EACCES` -- is the separate
 //!   [`KeyFileError::AccessDenied`].)
 
 use crate::crypto::{DEK_LEN, MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN, TAG_LEN};
@@ -56,7 +62,8 @@ pub enum KeyFileError {
     /// a directory in its path), e.g. `EACCES`.
     AccessDenied,
     /// The file, or a directory deciding what its path names, is owned by
-    /// another user or is writable by group or others -- or the file was
+    /// another user or is writable by group or others (sticky or not, so
+    /// anywhere under `/tmp` included) -- or the file was
     /// swapped between being checked and being opened -- so someone else
     /// could have replaced its contents.
     Untrusted,
@@ -93,7 +100,7 @@ impl KeyFileError {
             KeyFileError::AccessDenied => "this process may not open the file",
             KeyFileError::Untrusted => {
                 "the file or a directory deciding what its path names is owned by another user or writable by \
-                 group/others, so someone else could have replaced it"
+                 group/others (sticky /tmp-style directories included), so someone else could have replaced it"
             }
             KeyFileError::Io => "not a regular file, or reading it failed",
             KeyFileError::TooShort => "the file is shorter than a wrapped DEK, or than its header declares",
@@ -174,11 +181,14 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
 }
 
 // The directories that decide what `path` names must be as trustworthy as
-// the file: owned by root or this user, and not writable by group or others
-// (sticky, `/tmp`-style, is fine -- see
-// `secure_file::check_dir_chain_for_existing_file`). Otherwise someone else
-// could rename a file of their choosing over the key, or retarget a symlink
-// to one, and the file checks alone would pass on whatever they put there.
+// the file: owned by root or this user, and not writable by group or others,
+// sticky or not (`secure_file::check_dir_chain_strict`). Otherwise someone
+// else could rename a file of their choosing over the key, or retarget a
+// symlink to one, and the file checks alone would pass on whatever they put
+// there. Sticky (`/tmp`-style) directories are not trusted anywhere in the
+// chain: a key file has no business in a directory every local user can
+// create entries in, and refusing it there outright leaves nothing resting
+// on the owner checks of everything beneath.
 //
 // Two directories are checked, each up to `/`: the resolved file's own --
 // where the file actually read sits, which `read` confirms after the open --
@@ -189,7 +199,7 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
 // this user, in trusted directories) -- never to one they wrote.
 fn check_location(path: &Path, target_real: &Path) -> Result<(), KeyFileError> {
     let check = |dir: &Path| {
-        secure_file::check_dir_chain_for_existing_file(dir, Owner::RootOrCurrentUser)
+        secure_file::check_dir_chain_strict(dir, Owner::RootOrCurrentUser)
             .map_err(|_| KeyFileError::Untrusted)
     };
     // Only `/` has no parent, and `/` is a directory, not a key file.
@@ -769,22 +779,68 @@ mod tests {
     }
 
     #[test]
-    fn writable_directory_holding_the_key_is_refused_but_sticky_is_fine() {
+    fn writable_directory_holding_the_key_is_refused_sticky_or_not() {
         let base = secure_file::private_tempdir();
         let dir = base.path().join("keys");
         std::fs::create_dir(&dir).unwrap();
         let path = write(&dir, "wrapped.key", &valid());
 
-        chmod(&dir, 0o700);
-        assert!(read(&path).is_ok());
+        for mode in [0o700, 0o750, 0o755] {
+            chmod(&dir, mode);
+            assert!(read(&path).is_ok(), "dir mode {mode:o}: nobody else can write");
+        }
         for mode in [0o770, 0o707, 0o777] {
             chmod(&dir, mode);
             assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted), "dir mode {mode:o}: the key could be renamed over");
         }
-        // Sticky: only the file's owner (checked) can rename or replace it.
-        chmod(&dir, 0o1777);
-        assert!(read(&path).is_ok(), "a sticky /tmp-style directory protects an existing, owner-checked file");
+        // Sticky, /tmp-style: not trusted for a key file either.
+        for mode in [0o1777, 0o1770, 0o1733] {
+            chmod(&dir, mode);
+            assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted), "dir mode {mode:o}: a sticky shared directory");
+        }
         chmod(&dir, 0o700);
+    }
+
+    #[test]
+    fn key_under_a_sticky_ancestor_is_refused() {
+        // A private 0700 directory inside a /tmp-style one: the layout of
+        // `mktemp -d` under /tmp. Refused, however private the directory
+        // holding the key.
+        let base = secure_file::private_tempdir();
+        let shared = base.path().join("shared");
+        let private = shared.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        chmod(&private, 0o700);
+        let path = write(&private, "wrapped.key", &valid());
+        chmod(&shared, 0o700);
+        assert!(read(&path).is_ok());
+
+        chmod(&shared, 0o1777);
+        assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted), "a sticky ancestor is not trusted");
+        // Reached through a symlink from a trusted directory: the resolved
+        // file's chain is what is read, so still refused.
+        let link = base.path().join("current.key");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read(&link).err(), Some(KeyFileError::Untrusted), "the target sits under a sticky ancestor");
+        chmod(&shared, 0o700);
+        assert!(read(&link).is_ok());
+    }
+
+    #[test]
+    fn key_in_the_system_temp_dir_is_refused() {
+        // `mktemp -d`'s layout, for real: a 0700 directory under the system
+        // temp dir (normally /tmp, 1777). Nothing to show if TMPDIR points
+        // somewhere private.
+        let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+        let shared = dir.path().ancestors().skip(1).any(|d| {
+            std::fs::metadata(d).map(|m| m.permissions().mode() & 0o022 != 0).unwrap_or(false)
+        });
+        if !shared {
+            eprintln!("skipping: {} has no group/other-writable ancestor", dir.path().display());
+            return;
+        }
+        let path = write(dir.path(), "wrapped.key", &valid());
+        assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted));
     }
 
     #[test]

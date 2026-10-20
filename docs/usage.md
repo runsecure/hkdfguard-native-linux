@@ -79,7 +79,7 @@ hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 | Option | Meaning |
 |---|---|
 | `--service-name`, `-sn` | The service whose KEK is used |
-| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file. |
+| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file, and no folder above it, up to `/`, may be writable by group or others -- sticky folders such as `/tmp` included, since `hkdfguard_open_file` refuses a key file there (`-39`). Checked before the DEK is read; only the folders' modes are checked, not who owns them. |
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
 | `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600` |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
@@ -176,7 +176,7 @@ warning (`memory not locked as a whole`).
 | -36 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
 | -37 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
 | -38 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
-| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write; a sticky directory such as `/tmp` is fine |
+| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write, all the way up to `/`. Sticky directories are **not** trusted: a key file anywhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory is refused, however private the directories beneath it (a read-only mount, such as a Kubernetes Secret volume, is fine) |
 
 The numbers are the same in the Windows and macOS builds of this library,
 which share one status table. `hkdfguard.h` also defines the codes only

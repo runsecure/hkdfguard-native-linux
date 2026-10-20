@@ -22,10 +22,17 @@ as_ci() { setpriv --reuid=ci --regid=ci --init-groups env HOME=/home/ci USER=ci 
 # Creates an empty owner-only file belonging to `ci` (a secret, a DEK);
 # writing into it afterwards, as root, keeps that owner and mode.
 ci_file() { install -o ci -g ci -m 0600 /dev/null "$1"; }
-# Writes stdin into a file `ci` owns in /tmp, as ci. Root can't: with
-# fs.protected_regular=2 (a host kernel setting, which containers share)
-# even root may not open another user's file in a sticky directory.
+# Writes stdin into a file `ci` owns, as ci. Root can't if the file is in
+# a sticky directory such as /tmp: with fs.protected_regular=2 (a host
+# kernel setting, which containers share) even root may not open another
+# user's file there.
 ci_write() { as_ci sh -c 'cat > "$1"' sh "$1"; }
+# Key files (and the DEKs cli_unwrap_check probes with hkdfguard_open_file)
+# live here, never under /tmp: the library refuses a key file anywhere
+# under a sticky, world-writable directory, and the CLI refuses to write
+# one there. /work is ci's own (docker/Dockerfile) and / is root's, both
+# 0755, so this 0700 directory passes the strict check all the way up.
+KEYS=$(as_ci mktemp -d /work/keys.XXXXXX)
 
 section "cargo build (default features: external-secret, ephemeral)"
 as_ci cargo build
@@ -140,9 +147,9 @@ section "hkdfguard CLI output unwraps via libhkdfguard.so"
 CLISO_SERVICE=com.hkdfguard.dockertest.cliso
 ci_file "$SECRET_MOUNT/$CLISO_SERVICE"; head -c 32 /dev/urandom > "$SECRET_MOUNT/$CLISO_SERVICE"
 
-DEK_FILE=$(as_ci mktemp)
+DEK_FILE=$(as_ci mktemp -p "$KEYS")
 head -c 32 /dev/urandom | ci_write "$DEK_FILE"
-WRAPPED_FILE=$(as_ci mktemp)
+WRAPPED_FILE=$(as_ci mktemp -p "$KEYS")
 
 # `provision` is the only command that makes the (deliberately slow) setup
 # calls. For external-secret the mounted file *is* the provisioning, so
@@ -166,8 +173,8 @@ as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "
 
 # And the --dek-file path, which is what a secret mount or a systemd
 # credential provides. Mode 0600 or the CLI refuses it.
-WRAPPED_FILE2=$(as_ci mktemp)
-DEK_B64_FILE=$(as_ci mktemp)
+WRAPPED_FILE2=$(as_ci mktemp -p "$KEYS")
+DEK_B64_FILE=$(as_ci mktemp -p "$KEYS")
 base64 -w0 < "$DEK_FILE" | ci_write "$DEK_B64_FILE"
 as_ci target/release/hkdfguard wrap \
     --key-file-path "$WRAPPED_FILE2" \
@@ -178,7 +185,7 @@ as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE2" 
 
 # `wrap` never provisions: with nothing mounted for this service it must
 # fail and point at `provision`, rather than quietly creating a KEK.
-UNPROVISIONED_OUT=$(mktemp -u)
+UNPROVISIONED_OUT="$KEYS/unprovisioned.key"
 if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard wrap \
         --key-file-path "$UNPROVISIONED_OUT" --service-name com.hkdfguard.dockertest.unprovisioned --dek-stdin 2>/tmp/unprov.err; then
     echo "FAIL: wrap succeeded for a service with no provisioned KEK" >&2
@@ -188,6 +195,23 @@ grep -q 'provision --service-name com.hkdfguard.dockertest.unprovisioned' /tmp/u
     || { echo "FAIL: wrap's error did not point at the provision command:" >&2; cat /tmp/unprov.err >&2; exit 1; }
 [ ! -e "$UNPROVISIONED_OUT" ] || { echo "FAIL: a failed wrap wrote an output file" >&2; exit 1; }
 echo "--dek correctly rejected; unprovisioned wrap correctly refused; stdin and --dek-file both round-tripped."
+
+# A key file under /tmp -- even in a private mktemp -d directory there --
+# is refused: by the CLI before it reads the DEK, and by the library when
+# one is put there anyway.
+TMP_KEYS=$(as_ci mktemp -d)
+if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard wrap         --key-file-path "$TMP_KEYS/wrapped.key" --service-name "$CLISO_SERVICE" --dek-stdin 2>"$KEYS/tmp.err"; then
+    echo "FAIL: wrap wrote a key file under /tmp" >&2; exit 1
+fi
+grep -q 'sticky, like /tmp' "$KEYS/tmp.err" && grep -q 'the library would refuse to read a key file' "$KEYS/tmp.err"     || { echo "FAIL: unexpected refusal for a key file under /tmp:" >&2; cat "$KEYS/tmp.err" >&2; exit 1; }
+[ ! -e "$TMP_KEYS/wrapped.key" ] || { echo "FAIL: a refused wrap wrote a key file under /tmp" >&2; exit 1; }
+as_ci cp "$WRAPPED_FILE" "$TMP_KEYS/wrapped.key"
+if as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$TMP_KEYS/wrapped.key" "$CLISO_SERVICE" "$DEK_FILE" 2>"$KEYS/tmp.err"; then
+    echo "FAIL: hkdfguard_open_file accepted a key file under /tmp" >&2; exit 1
+fi
+grep -q -- '-39' "$KEYS/tmp.err" || { echo "FAIL: expected HKDFGUARD_ERR_FILE_UNTRUSTED (-39):" >&2; cat "$KEYS/tmp.err" >&2; exit 1; }
+rm -rf "$TMP_KEYS"
+echo "a key file under /tmp: wrap refuses to write it, hkdfguard_open_file refuses to read it (-39)."
 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
 rm -rf "$SECRET_MOUNT"
@@ -299,7 +323,7 @@ token_label = "hkdfguard-test"
 TOML
 chmod 0644 /etc/hkdfguard/policy.toml
 RETIRE_SERVICE=com.hkdfguard.dockertest.retire
-RETIRE_DIR=$(as_ci mktemp -d)
+RETIRE_DIR=$(as_ci mktemp -d -p "$KEYS")
 as_ci sh -c "umask 077; head -c 32 /dev/urandom > '$RETIRE_DIR/dek'"
 CLI=target/release/hkdfguard
 fingerprint_in() { sed -n 's/^fingerprint: \([0-9a-f]\{64\}\) .*/\1/p' <<<"$1"; }
@@ -358,7 +382,7 @@ rm -rf "$RETIRE_DIR"
 
 unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI TEST_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE \
       HKDFGUARD_EXTERNAL_SECRET_DIR HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT
-rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS"
+rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS" "$KEYS"
 
 section "hkdfguard locks its memory when it can"
 # docker/run-tests.sh and CI grant CAP_IPC_LOCK, so the CLI must take the

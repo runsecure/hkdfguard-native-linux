@@ -60,6 +60,11 @@
 #                                If unset, the script creates one: in its temp
 #                                dir for a full run, and in the state dir for
 #                                `reboot`, where capture and verify must share it.
+#   HKDFGUARD_TEST_TMPDIR        where the temp dir goes (default:
+#                                $XDG_RUNTIME_DIR, else ~/.cache). Never /tmp:
+#                                the library refuses key files under a sticky,
+#                                world-writable directory, so it and every
+#                                directory above it must be private.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -95,8 +100,34 @@ if [ -n "$SOFTHSM_MODULE" ]; then
     HAVE_SOFTHSM=1
 fi
 
-WORK=$(mktemp -d)
+# Fails, naming the directory, unless $1 and every directory above it is
+# owned by root or this user and writable by nobody else -- sticky ones
+# (/tmp) included: the rule hkdfguard_open_file applies to key files, which
+# this script writes into $WORK and $STATE.
+require_private_chain() { # require_private_chain <dir> <what to set instead>
+    local d=$1 perm owner
+    while :; do
+        perm=$(stat -Lc '%a' "$d"); owner=$(stat -Lc '%u' "$d")
+        if (( 8#$perm & 8#022 )) || { [ "$owner" != 0 ] && [ "$owner" != "$(id -u)" ]; }; then
+            echo "$d is $(stat -Lc '%U:%G %a' "$d"): the library refuses key files under a directory another user could write to (sticky ones like /tmp included)." >&2
+            echo "Run 'chmod go-w $d', or set $2 to a private directory." >&2
+            exit 1
+        fi
+        [ "$d" != / ] || break
+        d=$(dirname "$d")
+    done
+}
+
+# Scratch space for policies, secrets and key files: never under /tmp,
+# where the library refuses key files. $XDG_RUNTIME_DIR (/run/user/<uid>,
+# 0700) where there is one, else ~/.cache. The cargo tests' own temp root
+# goes inside it too (HKDFGUARD_TEST_TMPDIR).
+WORK_PARENT=${HKDFGUARD_TEST_TMPDIR:-${XDG_RUNTIME_DIR:-$HOME/.cache}}
+( umask 077; mkdir -p "$WORK_PARENT" )
+require_private_chain "$WORK_PARENT" HKDFGUARD_TEST_TMPDIR
+WORK=$(mktemp -d "$WORK_PARENT/hkdfguard-native-test.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
+export HKDFGUARD_TEST_TMPDIR="$WORK/cargo-tests"
 
 # Test builds only, in their own target dir; see the note at the top.
 export RUSTFLAGS="--cfg hkdfguard_test_paths"
@@ -199,23 +230,15 @@ if [ "$MODE" = "reboot" ]; then
         exit 0
     fi
 
-    # The derivation secret lives in $STATE, and the library refuses a
-    # secret under any directory another user could write to -- which
-    # surfaces only as "TPM context not available". Under a umask of 002
+    # The derivation secret and the wrapped key live in $STATE, and the
+    # library refuses a secret under any directory another user could write
+    # to -- which surfaces only as "TPM context not available" -- and a key
+    # file under one even if it is sticky (/tmp). Under a umask of 002
     # (Ubuntu's default) `mkdir -p` would create such parents itself, so
     # create them private, and name an existing open one instead of
     # letting the run fail obscurely.
     ( umask 077; mkdir -p "$STATE" )
-    d="$STATE"
-    while [ "$d" != / ]; do
-        perm=$(stat -Lc '%a' "$d")
-        if (( 8#$perm & 8#022 )) && ! (( 8#$perm & 8#1000 )); then
-            echo "$d is $(stat -Lc '%U:%G %a' "$d"): the library refuses a derivation secret under a group- or other-writable directory." >&2
-            echo "Run 'chmod go-w $d', or set HKDFGUARD_NATIVE_TEST_STATE to a private directory." >&2
-            exit 1
-        fi
-        d=$(dirname "$d")
-    done
+    require_private_chain "$STATE" HKDFGUARD_NATIVE_TEST_STATE
 
     section "build (--features tpm2)"
     cargo build --features tpm2

@@ -8,6 +8,7 @@
 - [Fingerprint mismatch (-16)](#fingerprint-mismatch--16)
 - [Unwrap fails authentication (-11)](#unwrap-fails-authentication--11)
 - [Unwrap says the payload is malformed or unsupported (-10, -12)](#unwrap-says-the-payload-is-malformed-or-unsupported--10--12)
+- [The key file is refused as untrusted (-39)](#the-key-file-is-refused-as-untrusted--39)
 - [Other problems](#other-problems)
 
 ## First: find out why
@@ -180,6 +181,28 @@ before unwrap is called.
 `HKDFGUARD_ERR_CRYPTO_ERROR` (-5) is for a cryptographic step
 failing for another reason, such as the OS random number generator; it never
 means the payload itself is bad.
+
+## The key file is refused as untrusted (-39)
+
+`HKDFGUARD_ERR_FILE_UNTRUSTED` from `hkdfguard_open_file` means someone
+other than root or the reading process's user could have replaced the key
+file: the file, or a directory above it (or above a symlink to it), is owned
+by another user or is writable by group or others. Find which with
+`namei -l <path>` (and `namei -l "$(readlink -f <path>)"`).
+
+| Cause | Fix |
+|---|---|
+| The file is group- or other-writable | `chmod 0600` (or `0640`/`0644`: read access is fine, it is ciphertext) |
+| The file, or a directory above it, is owned by another non-root user | Own it by the service's user or by root |
+| A directory above it is group- or other-writable | `chmod go-w <directory>`, or move the key file |
+| The key file is under `/tmp`, `/var/tmp`, `/dev/shm` or another **sticky**, world-writable directory, even inside a private `mktemp -d` directory there | Move it to a directory only the service or root can write, all the way up to `/` (for example `/var/lib/<app>/`, `0700` or `0755`). Sticky directories are never trusted for key files. |
+
+`hkdfguard wrap` applies the same mode rule to its `--key-file-path` up
+front, before the DEK is read, and stops with
+`... is writable by group or others (mode ...); the library would refuse to read a key file at ...`
+rather than write a key file the application could never open. It checks
+modes only, not owners, since it often runs as root into a folder the
+service's account owns.
 
 ## Other problems
 
