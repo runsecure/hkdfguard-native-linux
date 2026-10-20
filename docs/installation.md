@@ -155,8 +155,12 @@ at the paths the Ubuntu 24.04 packages use, for copying into your own image:
 
 ```
 /usr/lib/<multiarch>/libhkdfguard.so.1
+/usr/lib/<multiarch>/libhkdfguard.so.1.sigstore.json
 /usr/bin/hkdfguard
 ```
+
+The `.sigstore.json` file is the Sigstore build-provenance bundle for that
+exact library file, so the deployed copy can be verified where it sits.
 
 | Image | Policy |
 |---|---|
@@ -189,6 +193,15 @@ Things to know:
   ```sh
   gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
       --repo runsecure/hkdfguard-native-linux
+  ```
+
+- **Verify the deployed library** against the bundle beside it:
+
+  ```sh
+  lib=/usr/lib/x86_64-linux-gnu/libhkdfguard.so.1
+  gh attestation verify "$lib" --bundle "$lib.sigstore.json" \
+      --repo runsecure/hkdfguard-native-linux \
+      --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
   ```
 
 ## Building from source

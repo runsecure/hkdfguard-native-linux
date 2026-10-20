@@ -903,12 +903,15 @@ install them to, for copying into another image
 
 ```
 /usr/lib/<multiarch>/libhkdfguard.so.1
+/usr/lib/<multiarch>/libhkdfguard.so.1.sigstore.json
 /usr/bin/hkdfguard
 ```
 
 They are taken from the tested `libhkdfguard1` and `hkdfguard` packages,
-not rebuilt; nothing else from the packages is copied.
-`packaging/build-overlay.sh` fails if the image holds anything more. About
+not rebuilt; nothing else from the packages is copied. The
+`.sigstore.json` file is the release workflow's Sigstore build-provenance
+bundle for that exact library file (see below); only released images have
+it. `packaging/build-overlay.sh` fails if the image holds anything more. About
 6 MB, for `linux/amd64` and `linux/arm64`.
 
 | Tag | Policy |
@@ -954,6 +957,23 @@ with Sigstore. To verify one:
 ```sh
 gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
     --repo runsecure/hkdfguard-native-linux
+```
+
+Before building the images, the same job attests the library file each
+one holds and puts that bundle beside it, failing the release unless the
+bundle verifies the file. The deployed library, in your image or after
+copying it out, then verifies against its own bundle:
+
+```sh
+lib=/usr/lib/x86_64-linux-gnu/libhkdfguard.so.1
+gh attestation verify "$lib" --bundle "$lib.sigstore.json" \
+    --repo runsecure/hkdfguard-native-linux \
+    --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
+# or, with cosign 2.4+:
+cosign verify-blob-attestation --new-bundle-format --bundle "$lib.sigstore.json" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/runsecure/hkdfguard-native-linux/\.github/workflows/release\.yml@refs/tags/v' \
+    --type slsaprovenance1 "$lib"
 ```
 
 To build and test locally, from `dist/packages/ubuntu24.04-<arch>/`
