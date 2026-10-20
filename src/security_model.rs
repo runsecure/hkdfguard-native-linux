@@ -165,6 +165,19 @@ impl Trust {
         (uid, name, gid)
     }
 
+    /// Test-only: whether this process's euid is a deployer through the
+    /// packages' own group ([`DEPLOYERS_GROUP`]), by its member list or as
+    /// its primary group -- the deployers production trusts with no policy
+    /// file. True for `ci` in docker/Dockerfile's image, which adds it.
+    #[cfg(test)]
+    pub(crate) fn this_user_is_packaged_deployer_for_tests() -> bool {
+        let (_, name, primary_gid) = Self::this_user_for_tests();
+        match lookup_group(DEPLOYERS_GROUP).unwrap() {
+            Some(group) => group.gid == primary_gid || group.members.contains(&name),
+            None => false,
+        }
+    }
+
     /// Test-only: a production trust with these deployer groups (gid, member
     /// names), unvetted, for this process's euid.
     #[cfg(test)]

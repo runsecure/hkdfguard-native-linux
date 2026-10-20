@@ -2839,13 +2839,17 @@ mod ffi_tests {
     #[serial]
     fn security_model_reports_production_by_default_and_developer_when_set() {
         let _none = policy::test_support::TestPolicy::absent();
-        let is_root = (euid() == 0) as c_int;
-        assert_eq!(security_model_now(), (status::OK, 0, is_root), "no policy file: production");
+        // Production trusts root and deployers, and with no deployer_groups
+        // the only deployers are hkdfguard-deployers' members -- which the
+        // account running this may be (docker/Dockerfile's `ci` is).
+        let production_trusted =
+            (euid() == 0 || security_model::Trust::this_user_is_packaged_deployer_for_tests()) as c_int;
+        assert_eq!(security_model_now(), (status::OK, 0, production_trusted), "no policy file: production");
         drop(_none);
         let _dev = developer_policy();
         assert_eq!(security_model_now(), (status::OK, 1, 1), "developer: this account's files are trusted");
         let _prod = policy::test_support::TestPolicy::write("security_model = \"production\"\n");
-        assert_eq!(security_model_now(), (status::OK, 0, is_root));
+        assert_eq!(security_model_now(), (status::OK, 0, production_trusted));
     }
 
     #[test]
