@@ -55,6 +55,67 @@ Without network access to GitHub, add
 the file was built by this repository's release workflow from the tagged
 commit.
 
+**With cosign instead of the GitHub CLI**
+
+[cosign](https://docs.sigstore.dev/cosign/) checks the same bundle and needs
+no GitHub account. Name the exact workflow and tag the file must have been
+signed by:
+
+```sh
+v=0.9.0
+cosign verify-blob-attestation --new-bundle-format \
+    --bundle "hkdfguard-$v.sigstore.json" \
+    --type https://slsa.dev/provenance/v1 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity "https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v$v" \
+    "hkdfguard-$v-ubuntu24.04-amd64.tar.gz"
+```
+
+`--new-bundle-format` is needed with cosign 2.x (2.4 or newer) and is the
+default from 3.0. cosign fetches Sigstore's trust root when it runs, so it
+needs network access to Sigstore, though not to GitHub.
+
+**In a Docker build**
+
+To install from a release inside a Dockerfile, verify in a separate stage
+so nothing unverified reaches the final image. The cosign image has no
+shell, so copy its binary into one that does:
+
+```dockerfile
+# Pin both by digest.
+ARG COSIGN=ghcr.io/sigstore/cosign/cosign:<version>@sha256:<digest>
+ARG UBUNTU=ubuntu:24.04@sha256:<digest>
+
+FROM ${COSIGN} AS cosign
+
+FROM ${UBUNTU} AS verify
+ARG HKDFGUARD_VERSION=0.9.0
+ARG TARGETARCH
+COPY --from=cosign /ko-app/cosign /usr/local/bin/cosign
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl
+WORKDIR /dl
+RUN set -eu; \
+    v=$HKDFGUARD_VERSION; \
+    base=https://github.com/runsecure/hkdfguard-native-linux/releases/download/v$v; \
+    tgz=hkdfguard-$v-ubuntu24.04-$TARGETARCH.tar.gz; \
+    curl -fsSL -O "$base/$tgz" -O "$base/hkdfguard-$v.sigstore.json"; \
+    cosign verify-blob-attestation --new-bundle-format \
+        --bundle "hkdfguard-$v.sigstore.json" \
+        --type https://slsa.dev/provenance/v1 \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        --certificate-identity "https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v$v" \
+        "$tgz"; \
+    mkdir pkgs; \
+    tar -xzf "$tgz" -C pkgs --strip-components=1
+
+FROM ${UBUNTU}
+COPY --from=verify /dl/pkgs/ /tmp/hkdfguard/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        /tmp/hkdfguard/libhkdfguard1_*.deb /tmp/hkdfguard/hkdfguard_*.deb \
+    && rm -rf /tmp/hkdfguard /var/lib/apt/lists/*
+```
+
 ## Packages (.deb and .rpm)
 
 The release tarball for your distribution holds these packages:
@@ -194,6 +255,26 @@ Things to know:
   gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
       --repo runsecure/hkdfguard-native-linux
   ```
+
+  Each image is also signed with cosign. To check that signature with
+  cosign 3.0 or newer, resolve the tag to a digest, verify the digest, and
+  build from that digest so the image you verified is the image you copy
+  from:
+
+  ```sh
+  v=0.9.0
+  image=ghcr.io/runsecure/hkdfguard-overlay
+  digest=$(docker buildx imagetools inspect "$image:$v" --format '{{json .Manifest.Digest}}' | tr -d '"')
+  cosign verify "$image@$digest" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity "https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v$v"
+  docker build --build-arg HKDFGUARD_OVERLAY="$image@$digest" .
+  ```
+
+  with `ARG HKDFGUARD_OVERLAY` and `COPY --from=${HKDFGUARD_OVERLAY} / /`
+  in the Dockerfile. Do this in your build: an admission controller (the
+  sigstore policy-controller, Kyverno) only sees your finished image, not
+  the overlay copied into it.
 
 - **Verify the deployed library** against the bundle beside it:
 

@@ -890,6 +890,21 @@ proves the file was built by this repository's release workflow, from the
 commit and tag the attestation names; it says nothing about whether that
 code is correct.
 
+Or with cosign (2.4+), which needs no GitHub account, naming the exact
+workflow and tag:
+
+```sh
+cosign verify-blob-attestation --new-bundle-format \
+    --bundle hkdfguard-0.9.0.sigstore.json \
+    --type https://slsa.dev/provenance/v1 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0 \
+    hkdfguard_0.9.0-1_amd64.deb
+```
+
+[docs/installation.md](docs/installation.md#download-and-verify) has a
+Dockerfile that verifies a release this way before installing it.
+
 The attestations prove provenance; they do not make the packages
 installable from a signed apt, dnf or zypper repository. Those check GPG
 signatures on repository metadata, which these releases do not provide.
@@ -951,13 +966,21 @@ COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.0 / /
   outlive the container.
 
 The release workflow's `overlay` job builds both architectures from the
-packages the build workflow tested, pushes them, and attests each image
-with Sigstore. To verify one:
+packages the build workflow tested, pushes them, attests each image with
+Sigstore, and signs each with cosign (keyless, as the release workflow;
+the job fails unless the signature then verifies). To verify one:
 
 ```sh
 gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
     --repo runsecure/hkdfguard-native-linux
+# or the cosign signature, with cosign 3.0+:
+cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0
 ```
+
+In a build, verify the image's digest and copy from that digest, not the
+tag; see [docs/installation.md](docs/installation.md).
 
 Before building the images, the same job attests the library file each
 one holds and puts that bundle beside it, failing the release unless the
@@ -1498,7 +1521,7 @@ build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1
 debian/                      Debian packaging (dpkg-buildpackage)
 .github/
   workflows/build.yml        CI: lint, cargo deny, test matrix, packages, binaries
-  workflows/release.yml      v* tags: build, attest (Sigstore), draft release, overlay images
+  workflows/release.yml      v* tags: build, attest (Sigstore), draft release, signed overlay images
   dependabot.yml             Weekly updates to the pinned action SHAs
 packaging/
   build-packages.sh          Builds and smoke-tests the .deb and .rpm packages

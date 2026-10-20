@@ -3,8 +3,8 @@
 # their build provenance with Sigstore, and opens a draft GitHub release
 # holding them. Publishing the draft is a maintainer's decision. The
 # `overlay` job pushes the FROM-scratch overlay images
-# (packaging/overlay/Dockerfile) to ghcr.io and attests them; unlike the
-# release, those are live as soon as the job runs. Each overlay also carries
+# (packaging/overlay/Dockerfile) to ghcr.io, attests them and signs them
+# with cosign; unlike the release, those are live as soon as the job runs. Each overlay also carries
 # a Sigstore bundle attesting its library file, beside the library.
 #
 # Attestations are signed through the public-good Sigstore instance (this
@@ -186,3 +186,26 @@ jobs:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.overlay-dev-digest }}
           push-to-registry: true
+
+      # A cosign signature too, alongside the provenance attestations: the
+      # form most image-verification tooling (`cosign verify`, Kyverno, the
+      # sigstore policy-controller) checks with no attestation-specific setup.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless, with this job's OIDC identity, by digest so a moved tag can't
+      # be what gets signed. Then verified as a consumer would check it, so
+      # an unverifiable signature fails the release.
+      - name: Sign both images with cosign
+        env:
+          IMAGE: ${{ steps.push.outputs.image }}
+          OVERLAY_DIGEST: ${{ steps.push.outputs.overlay-digest }}
+          OVERLAY_DEV_DIGEST: ${{ steps.push.outputs.overlay-dev-digest }}
+        run: |
+          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF"
+          for digest in "$OVERLAY_DIGEST" "$OVERLAY_DEV_DIGEST"; do
+            cosign sign --yes "$IMAGE@$digest"
+            cosign verify "$IMAGE@$digest" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$identity" > /dev/null
+            echo "signed and verified $IMAGE@$digest"
+          done
