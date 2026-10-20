@@ -7,27 +7,190 @@
 //! Consequence (logged as a warning when the chain serves a call from it,
 //! in `provider::walk_chain`): a process restart makes every DEK wrapped
 //! under an ephemeral KEK permanently unrecoverable.
+//!
+//! ## How the key is protected
+//!
+//! The key exists only in this process's memory, so this provider protects
+//! that memory as far as a library can:
+//!
+//! - **The process is hardened before the first key is created** (core
+//!   dumps off, and on Linux non-dumpable, which also stops same-user
+//!   `ptrace` and `/proc/<pid>/mem` -- see `hkdfguard_harden_process`).
+//!   Creating a key fails if that can't be done. It is re-applied on every
+//!   key creation, since the kernel clears the non-dumpable flag when the
+//!   process changes credentials.
+//! - **The private scalars live in dedicated pages**, mapped once and never
+//!   moved or freed: locked into RAM where `RLIMIT_MEMLOCK` allows it (so
+//!   they are never written to swap), and excluded from core dumps. Only
+//!   the service-name index lives on the ordinary heap, and service names
+//!   are not secret.
+//! - **Copies are wiped:** each call's `SecretKey` zeroes itself on drop,
+//!   and ECDH wipes its scalar (see `provider::software_ecdh`).
+//!
+//! Root, or a process with `CAP_SYS_PTRACE`, can still read the key: no
+//! software-only key is protected from them.
+//!
+//! An ephemeral key can only ever be used by the process that created it,
+//! so the `hkdfguard` CLI turns this provider off for itself
+//! ([`refuse_in_this_process`]): a key it created would be gone when it
+//! exits, and nothing it wrapped could ever be unwrapped.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // the traits/types this module implements
 use p256::{PublicKey, SecretKey}; // P-256 key types from RustCrypto's `p256` crate
 use p256::elliptic_curve::Generate; // `SecretKey::try_generate`, from the OS CSPRNG
-use std::collections::HashMap; // in-memory service -> key table
-use std::sync::{Arc, Mutex, OnceLock}; // guards the table so concurrent calls don't race
+use std::collections::HashMap; // service name -> slot index
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock}; // guards the store so concurrent calls don't race
+use zeroize::Zeroize as _;
 
-static PROCESS_KEYS: OnceLock<Arc<Mutex<HashMap<String, SecretKey>>>> = OnceLock::new();
+const KEY_LEN: usize = 32; // a P-256 private scalar
+
+static PROCESS_KEYS: OnceLock<Arc<Mutex<KeyStore>>> = OnceLock::new();
+
+/// Set by [`refuse_in_this_process`].
+static REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Makes this provider refuse every `load_kek` in this process from now on
+/// (see the module docs). `kek_exists` still answers "no", so a policy that
+/// lists a persistent provider ahead of this one keeps working.
+pub fn refuse_in_this_process() {
+    REFUSED.store(true, Ordering::SeqCst);
+}
+
+/// One page of anonymous memory holding up to `len / KEY_LEN` private
+/// scalars. Mapped once, never moved and never unmapped, so no copy of a
+/// key is ever left behind by a reallocation.
+struct KeyPage {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: a `KeyPage` is only ever reached through the store's mutex.
+unsafe impl Send for KeyPage {}
+
+impl KeyPage {
+    fn new() -> Result<Self> {
+        // SAFETY: sysconf takes only a name constant.
+        let len = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096).max(KEY_LEN);
+        // SAFETY: an anonymous private mapping with no address hint; the
+        // result is checked against MAP_FAILED before use.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(Error::Provider(format!(
+                "could not map memory for ephemeral keys (mmap): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `base..base+len` is the mapping just created.
+            if unsafe { libc::madvise(base, len, libc::MADV_DONTDUMP) } != 0 {
+                crate::provider::log_once(
+                    log::Level::Warn,
+                    format!(
+                        "hkdfguard: could not exclude ephemeral key memory from core dumps (madvise: {}); \
+                         core dumps are disabled for the process instead",
+                        std::io::Error::last_os_error()
+                    ),
+                );
+            }
+        }
+        // SAFETY: as above.
+        if unsafe { libc::mlock(base, len) } != 0 {
+            crate::provider::log_once(
+                log::Level::Warn,
+                format!(
+                    "hkdfguard: could not lock ephemeral key memory into RAM (mlock: {}); it could be written \
+                     to swap. Raise RLIMIT_MEMLOCK (e.g. LimitMEMLOCK= in the systemd unit) to allow it",
+                    std::io::Error::last_os_error()
+                ),
+            );
+        }
+        Ok(KeyPage { base: base.cast(), len })
+    }
+
+    fn slots(&self) -> usize {
+        self.len / KEY_LEN
+    }
+
+    fn slot(&mut self, i: usize) -> &mut [u8; KEY_LEN] {
+        assert!(i < self.slots());
+        // SAFETY: `i` is in range, the page is readable and writable for
+        // the life of the process, and `&mut self` (behind the store's
+        // mutex) makes this the only reference.
+        unsafe { &mut *self.base.add(i * KEY_LEN).cast::<[u8; KEY_LEN]>() }
+    }
+}
+
+/// Every ephemeral key in this process.
+#[derive(Default)]
+struct KeyStore {
+    index: HashMap<String, usize>, // service name -> slot number across `pages`
+    pages: Vec<KeyPage>,
+    used: usize,
+}
+
+impl KeyStore {
+    fn slot(&mut self, n: usize) -> &mut [u8; KEY_LEN] {
+        let per_page = self.pages[0].slots();
+        self.pages[n / per_page].slot(n % per_page)
+    }
+
+    fn load(&mut self, service: &str) -> Option<Result<SecretKey>> {
+        let n = *self.index.get(service)?;
+        Some(SecretKey::from_slice(&self.slot(n)[..]).map_err(|_| Error::Provider("an ephemeral key was corrupted".into())))
+    }
+
+    /// Generates and stores a key for `service`, which has none yet.
+    fn create(&mut self, service: &str) -> Result<SecretKey> {
+        // A key is only ever created in a hardened process.
+        if crate::harden_process_impl(0) != crate::status::OK {
+            return Err(Error::Provider(
+                "refusing to create an ephemeral key: the process could not be hardened \
+                 (core dumps off, non-dumpable) to protect it -- see the message above"
+                    .into(),
+            ));
+        }
+        crate::provider::log_once(
+            log::Level::Warn,
+            "hkdfguard: this process now holds an ephemeral KEK, so core dumps are disabled and it is \
+             marked non-dumpable (debuggers can no longer attach)"
+                .to_string(),
+        );
+
+        if self.pages.is_empty() || self.used == self.pages.len() * self.pages[0].slots() {
+            self.pages.push(KeyPage::new()?);
+        }
+        let key = SecretKey::try_generate().map_err(|_| Error::Provider("the OS random number generator failed".into()))?;
+        let n = self.used;
+        let mut bytes = key.to_bytes();
+        self.slot(n).copy_from_slice(&bytes);
+        bytes.as_mut_slice().zeroize();
+        self.used += 1;
+        self.index.insert(service.to_string(), n);
+        Ok(key)
+    }
+}
 
 // Holds one P-256 private key per service name, entirely in process
 // memory. Nothing here is ever written to disk.
 pub struct EphemeralProvider {
-    keys: Arc<Mutex<HashMap<String, SecretKey>>>, // service name -> that service's persistent-for-this-process KEK
+    keys: Arc<Mutex<KeyStore>>,
 }
 
 impl EphemeralProvider {
     pub fn new() -> Self {
-        let keys = PROCESS_KEYS
-            .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
-            .clone();
+        let keys = PROCESS_KEYS.get_or_init(|| Arc::new(Mutex::new(KeyStore::default()))).clone();
         EphemeralProvider { keys }
     }
 }
@@ -38,8 +201,8 @@ impl Default for EphemeralProvider {
     }
 }
 
-// The handle type this provider hands back from `load_kek`; holds a clone
-// of the in-memory secret key long enough to perform one ECDH.
+// The handle type this provider hands back from `load_kek`; holds a copy
+// of the service's key (zeroed on drop) for the duration of one call.
 struct EphemeralHandle {
     key_id: Vec<u8>,       // diagnostic-only tag, embedded in the wrapped payload
     secret_key: SecretKey, // the actual private key material for this service
@@ -51,15 +214,7 @@ impl KekHandle for EphemeralHandle {
     }
 
     fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
-        // Standard P-256 ECDH: combine our private scalar with the
-        // payload's point to get the shared secret.
-        let shared = p256::ecdh::diffie_hellman(
-            self.secret_key.to_nonzero_scalar(), // our persistent (for this process) private scalar
-            point.as_affine(),     // the payload's point
-        );
-        let mut out = [0u8; 32]; // fixed-size buffer to hold the 32-byte shared secret
-        out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared X-coordinate bytes in
-        Ok(SharedSecret::new(out)) // wrap in the zeroizing `SharedSecret` alias before returning
+        Ok(crate::provider::software_ecdh(&self.secret_key, point))
     }
 
     fn public_key(&self) -> Result<PublicKey> {
@@ -82,27 +237,30 @@ impl KekProvider for EphemeralProvider {
             .keys
             .lock()
             .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?;
-        Ok(keys.contains_key(service))
+        Ok(keys.index.contains_key(service))
     }
 
     fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
+        if REFUSED.load(Ordering::SeqCst) {
+            return Err(Error::Provider(
+                "ephemeral keys exist only inside the process that creates them, so a key created here would \
+                 be gone when this command exits and could never unwrap anything for the application. Wrap \
+                 DEKs from the application itself (e.g. hkdfguard_generate_and_wrap_dek), or configure a \
+                 persistent provider"
+                    .into(),
+            ));
+        }
         let mut keys = self
             .keys
-            .lock() // acquire the mutex; blocks if another call is using the map right now
+            .lock() // acquire the mutex; blocks if another call is using the store right now
             .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?; // a prior panic while holding the lock would poison it
 
-        let secret_key = if let Some(existing) = keys.get(service) {
-            existing.clone()
-        } else {
-            if !create_if_missing {
-                return Err(Error::KeyNotProvisioned(
-                    "no ephemeral KEK created yet for this service",
-                ));
+        let secret_key = match keys.load(service) {
+            Some(existing) => existing?,
+            None if !create_if_missing => {
+                return Err(Error::KeyNotProvisioned("no ephemeral KEK created yet for this service"));
             }
-            let fresh = SecretKey::try_generate() // a brand-new random key, only since none exists yet
-                .map_err(|_| Error::Provider("the OS random number generator failed".into()))?;
-            keys.insert(service.to_string(), fresh.clone());
-            fresh
+            None => keys.create(service)?, // a brand-new random key, only since none exists yet
         }; // lock released once this block ends, before returning
 
         // key_id is a stable-per-process, non-secret tag derived from the
@@ -201,6 +359,19 @@ mod tests {
         let s1 = h1.ecdh(&peer).unwrap();
         let s2 = h2.ecdh(&peer).unwrap();
         assert_ne!(*s1, *s2); // different services must never share a KEK, so the secrets must differ
+    }
+
+    #[test]
+    fn keys_beyond_one_page_stay_distinct_and_stable() {
+        let provider = EphemeralProvider::new();
+        let peer = SecretKey::generate().public_key();
+        // More than one page's worth, so the store has to map a second page.
+        let services: Vec<String> = (0..300).map(|i| format!("com.company.paging-test-{i}")).collect();
+        let first: Vec<_> = services.iter().map(|s| *provider.load_kek(s, true).unwrap().ecdh(&peer).unwrap()).collect();
+        let again: Vec<_> = services.iter().map(|s| *provider.load_kek(s, false).unwrap().ecdh(&peer).unwrap()).collect();
+        assert_eq!(first, again, "every key must survive the store growing");
+        let distinct: std::collections::HashSet<_> = first.iter().collect();
+        assert_eq!(distinct.len(), services.len());
     }
 
     #[test]

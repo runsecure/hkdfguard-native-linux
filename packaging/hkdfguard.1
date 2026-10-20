@@ -15,7 +15,15 @@ hkdfguard \- provision a service's HKDFGuard KEK and wrap DEKs under it
 .I name
 .RB ( \-\-dek\-stdin " | " \-\-dek\-file
 .IR path )
+.RB [ \-\-fingerprint | \-fp
+.IR hex ]
 .RB [ \-\-force | \-f ]
+.PP
+.B hkdfguard retire
+.BR \-\-service\-name | \-sn
+.I name
+.BR \-\-fingerprint | \-fp
+.I hex
 .SH DESCRIPTION
 .B hkdfguard
 sets up and uses the persistent, per-service Key Encryption Key (KEK) of
@@ -24,17 +32,26 @@ host has and that policy allows: a TPM 2.0, a PKCS#11 token, or an
 external secret file.
 .TP
 .B provision
-Ensures a KEK exists for the service, creating one if it does not.
-Run it once, at deployment time. It is the only command that makes the
-library's setup calls, which are deliberately slow.
+Ensures a KEK exists for the service, creating one if it does not, and
+prints its fingerprint: record it.
+Run it once, at deployment time. With
+.BR retire ,
+it is the only command that makes the library's setup calls, which are
+deliberately slow.
 .TP
 .B wrap
 Wraps a 32-byte Data Encryption Key (DEK) under the service's existing
 KEK and writes the wrapped payload to
 .IR \-\-key\-file\-path ,
-mode 0600. It never creates a KEK: if none has been provisioned, it fails
-and says to run
+mode 0600, and prints the fingerprint of the KEK it wrapped under. It
+never creates a KEK: if none has been provisioned, it fails and says to run
 .BR provision .
+.TP
+.B retire
+Permanently deletes the service's KEK, only if its fingerprint is the one
+given; every DEK wrapped under it can no longer be unwrapped. PKCS#11
+only: a TPM KEK is re-derived on demand and not stored, so there is
+nothing to delete.
 .SH OPTIONS
 .TP
 .BR \-\-service\-name ", " \-sn " \fIname\fR"
@@ -44,7 +61,21 @@ digits and dots; it must not start with a dot or contain "..".
 .BR \-\-key\-file\-path ", " \-kf " \fIpath\fR"
 Where
 .B wrap
-writes the wrapped payload.
+writes the wrapped payload. Its folder must be a real folder (no
+symbolic link anywhere above the file), and neither that folder nor any
+folder above it up to
+.I /
+may be writable by group or others \(em sticky folders such as
+.IR /tmp ,
+.I /var/tmp
+and
+.I /dev/shm
+included. The library refuses to read a key file under such a folder
+.RB ( HKDFGUARD_ERR_FILE_UNTRUSTED ),
+so
+.B wrap
+refuses to write one there, before the DEK is read. Only the folders'
+modes are checked, not who owns them.
 .TP
 .B \-\-dek\-stdin
 Read the DEK, base64 of exactly 32 bytes, from standard input.
@@ -52,7 +83,13 @@ Read the DEK, base64 of exactly 32 bytes, from standard input.
 .BI \-\-dek\-file " path"
 Read the DEK, base64 of exactly 32 bytes, from a file. The file must be a
 regular file, not a symlink, owned by root or by the invoking user, with
-no group or other access (mode 0400 or 0600).
+no group or other access (mode 0400 or 0600). Its folder, and every folder
+above it up to
+.IR / ,
+must be a real folder owned by root or the invoking user and not writable
+by group or others \(em sticky folders such as
+.I /tmp
+included, unless on a read-only mount.
 .TP
 .BR \-\-force ", " \-f
 Replace an existing
@@ -60,6 +97,18 @@ Replace an existing
 The new payload is produced first; only then is the old file overwritten
 in place and removed, so a failed wrap never destroys it. The overwrite
 cannot guarantee erasure on copy-on-write filesystems or flash storage.
+.TP
+.BR \-\-fingerprint ", " \-fp " \fIhex\fR"
+The KEK's fingerprint as
+.B provision
+printed it, 64 hex characters. For
+.BR wrap ,
+optional: nothing is written unless the DEK was wrapped under that KEK,
+and with
+.B \-\-force
+the existing file is left as it was. For
+.BR retire ,
+required: nothing is deleted unless it matches.
 .TP
 .BR \-\-help ", " \-h
 Print usage and exit.
@@ -69,6 +118,16 @@ environment variable: other processes of the same user can read both
 through
 .IR /proc .
 A single trailing newline on the DEK input is ignored.
+.PP
+Each option may be given once, and an option's value may not start with
+.BR \- :
+.B "wrap \-kf \-\-force"
+is an invalid command line, not a key file named
+.BR \-\-force .
+Write a path that starts with
+.B \-
+as
+.IR ./\-name .
 .SH EXIT STATUS
 .TP
 .B 0
@@ -85,7 +144,17 @@ Invalid command line.
 .I /etc/hkdfguard/policy.toml
 Administrative policy: which providers may be used, and their
 configuration. Optional. When present it must be owned by root and not
-writable by group or others.
+writable by group or others, and so must every directory above it up to
+.IR / ,
+sticky ones such as
+.I /tmp
+included. The same holds for every file it names: nothing the library
+reads is trusted anywhere under
+.IR /tmp ,
+.I /var/tmp
+or
+.IR /dev/shm ;
+only a read-only mount is exempt.
 .TP
 .I /usr/share/hkdfguard/policy.toml.example
 Annotated example policy, every setting commented out at its default.
@@ -105,6 +174,7 @@ printf '%s' "$DEK_B64" | hkdfguard wrap \e
     \-kf /var/lib/app/key.bin \-sn com.company.orders \-\-dek\-stdin
 hkdfguard wrap \-kf /var/lib/app/key.bin \e
     \-sn com.company.orders \-\-dek\-file "$CREDENTIALS_DIRECTORY/dek"
+hkdfguard retire \-sn com.company.orders \-fp <fingerprint from provision>
 .fi
 .PP
 .B printf

@@ -61,26 +61,37 @@ What `provision` does depends on the provider:
 | TPM | Derives the key on demand, so it reports "already provisioned", after deriving it and checking any pinned Name. With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
 | PKCS#11 | Generates the key pair on the token, once; later runs find it there and report "already provisioned". |
 | External secret | Checks the delivered file and that it holds a valid key: the file itself is the provisioning. |
-| Ephemeral | Creates a key that lives only in that one process (so `provision` from the CLI is pointless for it). |
+| Ephemeral | Refused by the CLI, for `provision` and `wrap` alike: an ephemeral key lives only in the process that creates it, so the application must wrap its own DEKs. |
+
+`provision` also prints the KEK's fingerprint. Record it: `retire` asks
+for it, and a later `provision` prints it again so you can confirm the
+service still has the same KEK.
 
 ## The CLI: `hkdfguard`
 
 ```
 hkdfguard provision --service-name|-sn <name>
 hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
-               (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
+               (--dek-stdin | --dek-file <path>) [--group|-g <name>]
+               [--fingerprint|-fp <64 hex chars>] [--force|-f]
+hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 ```
 
 | Option | Meaning |
 |---|---|
 | `--service-name`, `-sn` | The service whose KEK is used |
-| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file. |
+| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file, and no folder above it, up to `/`, may be writable by group or others -- sticky folders such as `/tmp` included, since `hkdfguard_open_file` refuses a key file there (`-39`). Checked before the DEK is read; only the folders' modes are checked, not who owns them. |
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
-| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600` |
+| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600`, in a folder that -- with every folder above it, up to `/` -- is owned by root or you and not writable by group or others, sticky folders such as `/tmp` included (a read-only mount is exempt) |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
+| `--fingerprint`, `-fp` | The KEK's fingerprint, as `provision` printed it (64 hex characters). For `wrap`: nothing is written unless the DEK was wrapped under that KEK. For `retire`: required; nothing is deleted unless it matches. |
 | `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
 
 Exit status: `0` success, `1` the operation failed, `2` invalid command line.
+
+Each flag may be given once, and a flag's value may not start with `-`:
+`wrap -kf --force ...` is an invalid command line, not a key file named
+`--force`. Write a path that starts with `-` as `./-name`.
 
 **Keep the DEK out of command lines and environment variables.** Other
 processes running as the same user can read both through `/proc`, so the CLI
@@ -95,6 +106,18 @@ To generate a new random DEK as base64:
 
 `wrap` never creates a KEK. If the service isn't provisioned, it fails and
 tells you to run `provision`.
+
+`wrap` prints the fingerprint of the KEK it actually wrapped under, read
+from the payload it is about to write. Pass `--fingerprint` with the value
+`provision` printed and it checks this for you: if the service's KEK is not
+that one (replaced, re-provisioned, or on a different provider than you
+expected), nothing is written and the DEK is not committed to that key.
+With `--force`, the existing key file is left as it was.
+
+`retire` permanently deletes the service's KEK, and with it every DEK
+wrapped under it. It deletes nothing unless the KEK's fingerprint is the
+one given. Only PKCS#11 keys can be retired; a TPM key isn't stored
+anywhere, so there's nothing to delete. See "Retiring a KEK" in the README.
 
 The CLI hardens itself before touching key material (no core dumps, no
 debugger attachment) and refuses to run if it can't. It also tries to lock
@@ -161,7 +184,7 @@ warning (`memory not locked as a whole`).
 | -36 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
 | -37 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
 | -38 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
-| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write; a sticky directory such as `/tmp` is fine |
+| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write, all the way up to `/`. Sticky directories are **not** trusted -- for key files or anything else the library reads: a key file anywhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory is refused, however private the directories beneath it (a read-only mount, such as a Kubernetes Secret volume, is fine) |
 
 The numbers are the same in the Windows and macOS builds of this library,
 which share one status table. `hkdfguard.h` also defines the codes only

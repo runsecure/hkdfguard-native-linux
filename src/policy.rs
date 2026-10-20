@@ -898,7 +898,10 @@ const POLICY_FILE_REQUIREMENTS: crate::secure_file::FileRequirements = crate::se
 ///   read (permission denied, it's a directory, an I/O error), is owned by
 ///   someone untrusted or writable by group/others, is too large, isn't
 ///   UTF-8, or is malformed or self-contradictory; or the directory it
-///   lives in (or would live in) is one someone untrusted could change.
+///   lives in (or would live in), or any directory above it, is one
+///   someone untrusted could change: owned by someone else, or writable by
+///   group or others -- sticky (`/tmp`-style) or not -- unless it is on a
+///   read-only mount (see [`crate::secure_file::check_dir_chain`]).
 ///   This **fails closed**: every wrap/unwrap/create/exists call fails
 ///   rather than falling back to the unrestricted default. Making the file
 ///   unreadable, or deleting it, must never be a way to switch policy off.
@@ -2142,6 +2145,38 @@ mod tests {
         let _policy = TestPolicy::at(&path);
         let absent = load();
         assert!(absent.is_none(), "in a trusted directory, a missing policy is just no policy");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_fails_closed_under_a_sticky_ancestor_present_or_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        // A private 0700 directory inside a /tmp-style (1777) one: others
+        // can create entries beside it, so neither the policy nor its
+        // absence can be trusted there, however private the directory.
+        let base = crate::secure_file::private_tempdir();
+        let private = base.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = private.join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
+        {
+            let _policy = TestPolicy::at(&path);
+            assert!(matches!(load(), Some(Ok(_))), "a private chain is fine");
+        }
+
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        for present in [true, false] {
+            if !present {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let _policy = TestPolicy::at(&path);
+            match load() {
+                Some(Err(Error::Policy(msg))) => assert!(msg.contains("sticky"), "present={present}: says why: {msg}"),
+                other => panic!("present={present}: expected Some(Err(Error::Policy(..sticky..))), got {other:?}"),
+            }
+        }
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

@@ -21,7 +21,11 @@ section() { printf '\n\033[1;36m== %s ==\033[0m\n' "$1"; }
 [ $# -eq 2 ] || { echo "usage: $0 <package-dir> <examples-dir>" >&2; exit 2; }
 pkgs=$1
 examples=$2
-work=$(mktemp -d)
+# Root's own private directory, not /tmp: the library refuses a key file
+# anywhere under a sticky, world-writable directory, and `hkdfguard wrap`
+# refuses to write one there. / and /root are root's and not writable by
+# anyone else.
+work=$(mktemp -d /root/hkdfguard-smoke.XXXXXX)
 
 # The RPMs to install, by glob rather than find: Amazon Linux's base image
 # has no findutils, and a failed $(find) would silently install nothing.

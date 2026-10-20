@@ -35,11 +35,17 @@ use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-// Only this user can write to it, whatever the umask: the library refuses
-// to trust a policy or secret mount in a group-writable directory, and
-// `tempfile::tempdir()` creates `0777 & !umask`.
+// Only this user can write to it, whatever the umask, and not under the
+// sticky /tmp: the library refuses a policy, a secret, or a key file in or
+// under any directory others can write to, sticky or not -- so `wrap`
+// refuses to write a key file there, and --dek-file to read one.
+// `tempfile::tempdir()` creates `0777 & !umask` under /tmp. See
+// src/test_tmp.rs.
+#[path = "../src/test_tmp.rs"]
+mod test_tmp;
+
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir()
+    Ok(test_tmp::private_tempdir())
 }
 use hkdfguard::{hkdfguard_open_file, hkdfguard_unwrap_dek, status};
 use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
@@ -320,6 +326,95 @@ fn cli_group_makes_the_key_file_group_readable_and_it_still_opens() {
     });
 }
 
+// `wrap -kf <path> --dek-file <dek>`, no stdin.
+fn run_wrap_dek_file(key_path: &Path, service: &str, dek_file: &Path) -> Output {
+    cli()
+        .arg("wrap")
+        .args(["--key-file-path", key_path.to_str().unwrap()])
+        .args(["--service-name", service])
+        .args(["--dek-file", dek_file.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hkdfguard wrap")
+}
+
+#[test]
+#[serial]
+fn cli_refuses_a_shared_key_folder_up_front() {
+    // A key file the library would refuse to open (FILE_UNTRUSTED) is not
+    // written in the first place: a folder anyone else can write to --
+    // sticky /tmp-style or plain group/other-writable, the folder itself
+    // or one above it -- is refused before the DEK is read or a provider
+    // reached. The --dek-file does not exist, so reaching it would fail
+    // with a DEK error instead, and no KEK is provisioned for the service.
+    let dir = tempdir().unwrap();
+    let base = fs::canonicalize(dir.path()).unwrap();
+    let missing_dek = base.join("no-such-dek.b64");
+    let outer = base.join("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    let chmod = |p: &Path, mode: u32| fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+    chmod(&outer, 0o755);
+    chmod(&inner, 0o700);
+    let key_path = inner.join("wrapped.key");
+
+    let cases: [(&Path, u32, bool); 4] =
+        [(&inner, 0o1777, true), (&inner, 0o770, false), (&outer, 0o1777, true), (&outer, 0o777, false)];
+    for (folder, mode, sticky) in cases {
+        chmod(folder, mode);
+        let output = run_wrap_dek_file(&key_path, "com.example.sharedfolder", &missing_dek);
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "{} mode {mode:o} must be refused: {stderr}", folder.display());
+        assert!(
+            stderr.contains(&format!("{}, is writable by group or others (mode {mode:o})", folder.display()))
+                && stderr.contains("the library would refuse to read a key file"),
+            "names the folder, its mode and why: {stderr}"
+        );
+        assert_eq!(stderr.contains("sticky"), sticky, "{stderr}");
+        assert!(!stderr.contains("--dek-file") && !stderr.contains("provision"), "refused before the DEK or a provider: {stderr}");
+        assert!(!key_path.exists(), "nothing is created");
+        chmod(folder, if folder == outer.as_path() { 0o755 } else { 0o700 });
+    }
+
+    // The same folder, private again, gets past the check -- to the DEK.
+    let output = run_wrap_dek_file(&key_path, "com.example.sharedfolder", &missing_dek);
+    assert!(stderr_of(&output).contains("--dek-file"), "{}", stderr_of(&output));
+}
+
+#[test]
+#[serial]
+fn cli_checks_the_key_folder_mode_not_its_owner() {
+    // wrap often runs as root into a folder the application's account
+    // owns. Only the mode is checked: a folder owned by someone else that
+    // nobody else can write to gets past the check (to the missing DEK
+    // file here). As a non-root run, `/` is such a folder (root's, 0755);
+    // as root, a 0700 and a 0755 folder owned by `nobody`.
+    let dir = tempdir().unwrap();
+    let base = fs::canonicalize(dir.path()).unwrap();
+    let missing_dek = base.join("no-such-dek.b64");
+    let mut folders = vec![];
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        for mode in [0o700, 0o755] {
+            let theirs = base.join(format!("app-owned-{mode:o}"));
+            fs::create_dir(&theirs).unwrap();
+            fs::set_permissions(&theirs, fs::Permissions::from_mode(mode)).unwrap();
+            std::os::unix::fs::chown(&theirs, Some(65534), Some(65534)).unwrap();
+            folders.push(theirs);
+        }
+    } else {
+        folders.push(Path::new("/").to_path_buf());
+    }
+    for folder in folders {
+        let key_path = folder.join("hkdfguard-test-never-written.key");
+        let output = run_wrap_dek_file(&key_path, "com.example.otherowner", &missing_dek);
+        let stderr = stderr_of(&output);
+        assert!(!output.status.success());
+        assert!(stderr.contains("--dek-file") && !stderr.contains("writable by group"), "{}: {stderr}", folder.display());
+        assert!(!key_path.exists());
+    }
+}
+
 #[test]
 #[serial]
 fn cli_refuses_to_read_the_dek_from_a_terminal() {
@@ -416,6 +511,41 @@ fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
     let provisioned = run_provision("com.example.unprovisioned");
     assert!(!provisioned.status.success(), "provision must fail when no provider can create a KEK");
     });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_refuses_ephemeral_keys_with_an_explanation() {
+    // An ephemeral key would live only inside the CLI process: provision
+    // would "succeed" with a key gone on exit, and wrap would write a
+    // payload nothing could unwrap. Both must refuse and say why, whether
+    // ephemeral is required or reached as a fallback.
+    let empty_mount = tempdir().unwrap();
+    let policies = [
+        "[selection]\nmode = \"require\"\nprovider = \"ephemeral\"\n".to_string(),
+        format!(
+            "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"{}\"\n",
+            empty_mount.path().display()
+        ),
+    ];
+    for policy in &policies {
+        with_policy(policy, || {
+            let provisioned = run_provision("com.example.ephemeral");
+            assert!(!provisioned.status.success(), "provision must refuse an ephemeral KEK under {policy:?}");
+            let stderr = stderr_of(&provisioned);
+            assert!(stderr.contains("exist only inside the process"), "provision must explain why: {stderr}");
+
+            let out_dir = tempdir().unwrap();
+            let key_path = out_dir.path().join("wrapped.key");
+            fs::write(&key_path, b"the key file that was already here").unwrap();
+            let wrapped = run_wrap_stdin(&key_path, "com.example.ephemeral", &[0x42u8; 32], &["--force"]);
+            assert!(!wrapped.status.success(), "wrap must refuse an ephemeral KEK under {policy:?}");
+            let stderr = stderr_of(&wrapped);
+            assert!(stderr.contains("exist only inside the process"), "wrap must explain why: {stderr}");
+            assert_eq!(fs::read(&key_path).unwrap(), b"the key file that was already here");
+        });
+    }
 }
 
 #[test]

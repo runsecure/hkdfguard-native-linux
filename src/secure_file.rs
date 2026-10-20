@@ -110,38 +110,32 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
 
 /// Checks that nobody `owner` doesn't cover can rename, replace, or delete
 /// anything beneath `dir`: `dir` and every ancestor up to `/` must be a
-/// directory owned per `owner`. `dir` itself must not be writable by group
-/// or others. An ancestor may be, if it is sticky (`/tmp`-style): the
-/// kernel then lets only an entry's owner or the directory's owner rename
-/// or remove it, and the entry beneath was itself just checked. Write bits
-/// are ignored on a read-only mount (e.g. a Kubernetes Secret or ConfigMap
-/// volume, which is `1777` but mounted read-only).
+/// directory owned per `owner` and not writable by group or others --
+/// **sticky or not**. So nothing under `/tmp`, `/var/tmp`, `/dev/shm` or any
+/// other shared, world-writable directory passes, at any depth, however
+/// private the directories beneath it: anything this crate trusts belongs
+/// in a directory only its owner (or root) can write to, all the way up.
+/// (The sticky bit would stop other users renaming or deleting entries they
+/// don't own, but they could still create entries there, and its protection
+/// would rest on the owner checks of everything beneath -- one mistake there
+/// is enough.)
 ///
-/// With the target file's own ownership also checked, this means nobody
-/// untrusted can swap the path between this check and a later open or
-/// `dlopen` of it by path.
+/// The one exception: write bits are ignored on a read-only mount. A
+/// Kubernetes Secret or ConfigMap volume is `1777` but mounted read-only,
+/// so nobody can write to it.
+///
+/// Applied, through [`check_location`] or directly, to every file this
+/// crate reads: key files (`key_file::read`, behind `hkdfguard_open_file`),
+/// the policy file, external-secret mounts, the PKCS#11 module and PIN
+/// file, and the TPM derivation secret and owner-authorization file. With
+/// the target file's own ownership also checked, nobody untrusted can swap
+/// the path between this check and a later open or `dlopen` of it by path.
 ///
 /// `dir` must be canonical (no symlinks). Every failure, including one
 /// from a directory vanishing mid-walk, is `PermissionDenied` -- never
 /// `NotFound`, which callers reserve for "the file isn't there".
 pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
-    dir_chain(dir, owner, false)
-}
-
-/// [`check_dir_chain`] for the directory holding a file that already
-/// exists and whose own ownership the caller checks on the opened
-/// descriptor: here `dir` itself may also be sticky (e.g. `/tmp`). In a
-/// sticky directory nobody but the entry's owner (or the directory's) can
-/// rename, replace, or delete it, and the entry's owner is checked -- so
-/// the only thing stickiness doesn't protect, a file being *created* under
-/// the name before its rightful owner does, is caught by that owner check.
-/// Not for files whose absence is meaningful (see [`check_location`]).
-pub fn check_dir_chain_for_existing_file(dir: &Path, owner: Owner) -> io::Result<()> {
-    dir_chain(dir, owner, true)
-}
-
-fn dir_chain(dir: &Path, owner: Owner, sticky_dir_itself_ok: bool) -> io::Result<()> {
-    for (i, d) in dir.ancestors().enumerate() {
+    for d in dir.ancestors() {
         let fail = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display()));
         let meta = std::fs::metadata(d).map_err(|e| fail(e.to_string()))?;
         if !meta.is_dir() {
@@ -150,11 +144,10 @@ fn dir_chain(dir: &Path, owner: Owner, sticky_dir_itself_ok: bool) -> io::Result
         check_owner_and_mode(&meta, Some(owner), 0).map_err(|e| fail(e.to_string()))?;
 
         let mode = meta.mode();
-        let writable = mode & FORBID_GROUP_OTHER_WRITE != 0;
-        let protected_by_sticky = (i > 0 || sticky_dir_itself_ok) && mode & STICKY != 0;
-        if writable && !protected_by_sticky && !on_read_only_mount(d) {
+        if mode & FORBID_GROUP_OTHER_WRITE != 0 && !on_read_only_mount(d) {
+            let sticky = if mode & STICKY != 0 { "; sticky, like /tmp, which is not enough" } else { "" };
             return Err(fail(format!(
-                "writable by group or others (mode {:o}), so its entries can be replaced",
+                "writable by group or others (mode {:o}{sticky}), so entries could be created or replaced in it",
                 mode & 0o7777
             )));
         }
@@ -369,16 +362,14 @@ pub(crate) fn write_world_readable_for_tests(path: &std::path::Path, contents: i
 }
 
 /// Test-only: a temp directory nobody but this user can write to, whatever
-/// the umask. `tempfile::tempdir()` creates `0777 & !umask`, which under a
-/// `002` umask is group-writable -- a directory [`check_dir_chain`] rightly
-/// refuses to trust a policy or secret in.
+/// the umask, under the trusted test temp root (see `src/test_tmp.rs`), not
+/// the system temp dir. `tempfile::tempdir()` creates `0777 & !umask` under
+/// `/tmp`: under a `002` umask that is group-writable, and `/tmp` itself is
+/// sticky and world-writable -- both of which [`check_dir_chain`] refuses,
+/// at any depth, for every file this crate reads.
 #[cfg(test)]
 pub(crate) fn private_tempdir() -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
-    tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .unwrap()
+    crate::test_tmp::private_tempdir()
 }
 
 /// Test-only: whether a test that can only run as a non-root user should
@@ -408,7 +399,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_file_with(contents: &[u8], mode: u32) -> tempfile::NamedTempFile {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut f = tempfile::NamedTempFile::new_in(crate::test_tmp::root()).unwrap();
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(mode)).unwrap();
@@ -463,19 +454,26 @@ mod tests {
     }
 
     #[test]
-    fn dir_chain_allows_a_sticky_ancestor_but_not_a_plain_writable_one() {
+    fn dir_chain_refuses_a_sticky_ancestor_as_well_as_a_plain_writable_one() {
+        // A private 0700 directory inside a /tmp-style one: the layout of
+        // `mktemp -d` under /tmp. Refused, however private the directory.
         let base = crate::secure_file::private_tempdir();
         let outer = std::fs::canonicalize(base.path()).unwrap();
         let inner = outer.join("inner");
         std::fs::create_dir(&inner).unwrap();
         chmod(&inner, 0o700);
+        check_dir_chain(&inner, Owner::RootOrCurrentUser).expect("a private chain passes");
 
-        chmod(&outer, 0o1777);
-        check_dir_chain(&inner, Owner::RootOrCurrentUser).expect("sticky: nobody else can rename `inner`");
-
-        chmod(&outer, 0o777);
-        assert!(check_dir_chain(&inner, Owner::RootOrCurrentUser).is_err(), "anyone could rename `inner` away");
+        for (mode, sticky) in [(0o1777, true), (0o1770, true), (0o1733, true), (0o777, false), (0o770, false)] {
+            chmod(&outer, mode);
+            let err = check_dir_chain(&inner, Owner::RootOrCurrentUser).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "mode {mode:o}");
+            let msg = err.to_string();
+            assert!(msg.contains(&outer.display().to_string()), "names the directory: {msg}");
+            assert_eq!(msg.contains("sticky, like /tmp, which is not enough"), sticky, "says why: {msg}");
+        }
         chmod(&outer, 0o700);
+        check_dir_chain(&inner, Owner::RootOrCurrentUser).unwrap();
     }
 
     #[test]
@@ -497,17 +495,34 @@ mod tests {
     }
 
     #[test]
-    fn existing_file_variant_also_accepts_a_sticky_dir_itself() {
+    fn dir_chain_refuses_a_sticky_dir_itself() {
         let base = crate::secure_file::private_tempdir();
         let dir = std::fs::canonicalize(base.path()).unwrap();
-        chmod(&dir, 0o1777);
-        assert!(check_dir_chain(&dir, Owner::RootOrCurrentUser).is_err(), "the general check still refuses it");
-        check_dir_chain_for_existing_file(&dir, Owner::RootOrCurrentUser).expect("sticky: entries can't be renamed by others");
-        for mode in [0o777, 0o770] {
+        for mode in [0o1777, 0o1770, 0o1707] {
             chmod(&dir, mode);
-            assert!(check_dir_chain_for_existing_file(&dir, Owner::RootOrCurrentUser).is_err(), "mode {mode:o} without sticky");
+            let err = check_dir_chain(&dir, Owner::RootOrCurrentUser).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "mode {mode:o}");
+            assert!(err.to_string().contains("sticky"), "says why: {err}");
         }
         chmod(&dir, 0o700);
+    }
+
+    #[test]
+    fn dir_chain_refuses_the_system_temp_dir() {
+        // Wherever the system temp dir is (/tmp, normally 1777), a private
+        // directory under it is still refused -- unless TMPDIR
+        // points somewhere private, in which case there is nothing to show.
+        let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let shared = dir.ancestors().skip(1).any(|d| {
+            std::fs::metadata(d).map(|m| m.mode() & FORBID_GROUP_OTHER_WRITE != 0).unwrap_or(false)
+                && !on_read_only_mount(d)
+        });
+        if !shared {
+            eprintln!("skipping: {} has no group/other-writable ancestor", dir.display());
+            return;
+        }
+        assert!(check_dir_chain(&dir, Owner::RootOrCurrentUser).is_err());
     }
 
     #[test]
@@ -545,6 +560,30 @@ mod tests {
         chmod(shared.path(), 0o777);
         assert!(check_location(&link, Owner::RootOrCurrentUser).is_err(), "the target's directory is writable by others");
         chmod(shared.path(), 0o700);
+    }
+
+    #[test]
+    fn location_under_a_sticky_ancestor_is_refused_present_or_absent() {
+        // The policy, PIN, derivation secret and owner password all go
+        // through check_location: a private directory under a /tmp-style
+        // one is no place for any of them, whether or not the file exists.
+        let base = crate::secure_file::private_tempdir();
+        let inner = base.path().join("private");
+        std::fs::create_dir(&inner).unwrap();
+        chmod(&inner, 0o700);
+        let present = inner.join("policy.toml");
+        std::fs::write(&present, b"x").unwrap();
+        let absent = inner.join("not-yet").join("policy.toml");
+        check_location(&present, Owner::RootOrCurrentUser).unwrap();
+        check_location(&absent, Owner::RootOrCurrentUser).unwrap();
+
+        chmod(base.path(), 0o1777);
+        for path in [&present, &absent] {
+            let err = check_location(path, Owner::RootOrCurrentUser).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{}", path.display());
+            assert!(err.to_string().contains("sticky"), "says why: {err}");
+        }
+        chmod(base.path(), 0o700);
     }
 
     #[test]

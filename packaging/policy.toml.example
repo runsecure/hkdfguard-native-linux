@@ -15,7 +15,11 @@
 # for every setting.
 #
 # The policy must be owned by root and not writable by group or others, and
-# so must /etc/hkdfguard and every directory above it. A file that exists
+# so must /etc/hkdfguard and every directory above it -- sticky ones such as
+# /tmp included: nothing the library reads (this file, the secrets, PIN and
+# module it names) may live anywhere under /tmp, /var/tmp or /dev/shm. Only
+# a read-only mount (a Kubernetes Secret or ConfigMap volume) is exempt.
+# A file that exists
 # but is wrongly owned, too broadly writable or malformed makes every
 # operation fail closed; only a missing file means "no policy". Unknown
 # keys are rejected, so a typo fails loudly rather than being ignored.
@@ -86,7 +90,10 @@ mode = "prefer"
 #"com.company.orders" = "000b<64 hex chars>"
 
 [external_secret]
-# Directory holding one KEK file per service, named after the service.
+# Directory holding one KEK file per service, named after the service. It,
+# and every directory above it, must be owned by root or the service's user
+# and not writable by group or others (so never under /tmp), unless it is a
+# read-only mount such as a Kubernetes Secret volume.
 # When set, the only place looked. Unset: the first of these that exists:
 #   /var/run/secrets/hkdfguard, /run/secrets/hkdfguard,
 #   /vault/secrets/hkdfguard, /mnt/secrets-store/hkdfguard
@@ -95,7 +102,7 @@ mode = "prefer"
 [pkcs11]
 # PKCS#11 is used only when `module` is set: there is no default module.
 # The module and every directory above it must be root-owned and not
-# writable by group or others.
+# writable by group or others (sticky ones such as /tmp included).
 #module = "/usr/lib/vendor/libhsm-pkcs11.so"
 # User PIN file: root-owned, mode 0400 (or 0440 with the service's group).
 #pin_file = "/etc/hkdfguard/pkcs11.pin"

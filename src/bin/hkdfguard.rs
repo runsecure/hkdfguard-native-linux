@@ -1,10 +1,17 @@
 //! CLI tool for setting up a service's persistent KEK and wrapping DEKs
-//! under it. Two subcommands, deliberately separate:
+//! under it, and retiring a KEK. Three subcommands, deliberately separate:
 //!
-//! - `provision` -- ensure a KEK exists for a service. This is the *only*
-//!   place the setup calls (`hkdfguard_kek_exists`, `hkdfguard_create_kek`)
-//!   are made. They are deliberately slow (see the library's setup-call
-//!   latency floor) and meant to run once, at deployment time.
+//! - `provision` -- ensure a KEK exists for a service, and print its
+//!   fingerprint. With `retire`, the only place the setup calls
+//!   (`hkdfguard_kek_exists`, `hkdfguard_create_kek`,
+//!   `hkdfguard_kek_fingerprint`) are made. They are deliberately slow (see
+//!   the library's setup-call latency floor) and meant to run once, at
+//!   deployment time.
+//! - `retire` -- permanently delete a service's KEK, given the fingerprint
+//!   `provision` printed for it. PKCS#11 only (see `admin::retire_kek`); it
+//!   goes through the library's Rust-only admin API, the one deliberate
+//!   exception to the C-ABI-only rule below, so that no application
+//!   linking the library can delete a KEK.
 //! - `wrap` -- wrap a caller-supplied Data Encryption Key (DEK) under the
 //!   service's KEK and write the wrapped payload to a file. It never
 //!   creates a KEK: if none is provisioned, it fails and says to run
@@ -12,7 +19,7 @@
 //!   setup calls, and makes "the KEK is missing" a loud, specific error
 //!   instead of something quietly fixed on the fly.
 //!
-//! Both call into the `hkdfguard` library through its stable C ABI, the
+//! `provision` and `wrap` call into the `hkdfguard` library through its stable C ABI, the
 //! same interface any other-language caller uses -- this tool takes no
 //! shortcut through the library's internal Rust types.
 //!
@@ -23,11 +30,13 @@
 //! ```text
 //! hkdfguard provision --service-name|-sn <name>
 //!
+//! hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
+//!
 //! hkdfguard wrap \
 //!     --key-file-path|-kf <path> \
 //!     --service-name|-sn <name> \
 //!     (--dek-stdin | --dek-file <path>) \
-//!     [--force|-f]
+//!     [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]
 //! ```
 //!
 //! ## Supplying the DEK
@@ -52,7 +61,11 @@
 //!
 //! A `--dek-file` must be a regular file, must not be a symlink, must be
 //! owned by root or by this process's user, and must grant no access to
-//! group or others (e.g. mode `0400`/`0600`). A single trailing newline
+//! group or others (e.g. mode `0400`/`0600`). Its folder, and every folder
+//! above it up to `/`, must be a real folder (no symbolic links), owned by
+//! root or this process's user, and not writable by group or others --
+//! sticky ones such as `/tmp` included -- unless it is on a read-only mount
+//! (see [`require_private_dek_folder`]). A single trailing newline
 //! (optionally CRLF) is ignored on both paths.
 //!
 //! What this tool cannot fix: if the *caller* puts the DEK in an
@@ -64,7 +77,13 @@
 //!
 //! The key file's folder must be a real folder at the path spelled: no
 //! symbolic link anywhere above the file (see [`require_real_folder`]),
-//! checked before the DEK is read and again on the open descriptor.
+//! checked before the DEK is read and again on the open descriptor. Nor
+//! may that folder, or any folder above it up to `/`, be writable by group
+//! or others -- sticky folders such as `/tmp`, `/var/tmp` and `/dev/shm`
+//! included (see [`require_unshared_folder`]): the library refuses to read
+//! a key file under one, so `wrap` refuses to write it there, also before
+//! the DEK is read. Only the folders' modes are checked, not who owns them:
+//! `wrap` may run as root into a folder the application's account owns.
 //!
 //! When `--force` replaces an existing file at `--key-file-path`, the wrap
 //! is completed in memory *first*, and only then is the old file securely
@@ -88,8 +107,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroize;
 use hkdfguard::{
-    harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
-    hkdfguard_wrap_dek, status,
+    admin, harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
+    hkdfguard_kek_fingerprint, hkdfguard_wrap_dek, status,
 };
 
 // rw-------: the owning deployment user only. The payload is ciphertext,
@@ -170,8 +189,20 @@ enum Command {
         force: bool,
         // --group: who besides the owner may read the key file. None: no one.
         group: Option<String>,
+        // --fingerprint: the KEK the operator recorded at provision time.
+        // When set, nothing is written unless the payload was sealed to it.
+        expected_fingerprint: Option<[u8; FINGERPRINT_LEN]>,
+    },
+    Retire {
+        service_name: String,
+        // --fingerprint: the KEK the operator means to delete, as printed
+        // by `provision`. Nothing is deleted unless the KEK matches it.
+        fingerprint: [u8; FINGERPRINT_LEN],
     },
 }
+
+// A KEK fingerprint: SHA-256 of its public key.
+const FINGERPRINT_LEN: usize = 32;
 
 enum ParseOutcome {
     Run(Command),
@@ -183,13 +214,20 @@ fn print_usage() {
         "Usage:\n\
          \x20 {PROGRAM_NAME} provision --service-name|-sn <name>\n\
          \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n\
-         \x20      [--group|-g <name>] [--force|-f]\n\
+         \x20      [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]\n\
+         \x20 {PROGRAM_NAME} retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>\n\
          \n\
-         provision  ensures a KEK exists for the service. Run once, at deployment time;\n\
-         \x20          this is the only command that makes the (deliberately slow) setup calls.\n\
+         provision  ensures a KEK exists for the service, and prints its fingerprint: record\n\
+         \x20          it. Run once, at deployment time; with retire, the only commands that\n\
+         \x20          make the (deliberately slow) setup calls.\n\
          wrap       wraps a DEK under the service's existing KEK and writes the payload to\n\
          \x20          --key-file-path, readable by its owner only, or also by --group's\n\
          \x20          members (mode 0640). Fails if the KEK has not been provisioned.\n\
+         \x20          Prints the fingerprint of the KEK it wrapped under; with --fingerprint,\n\
+         \x20          writes nothing unless that is the KEK given.\n\
+         retire     permanently deletes the service's KEK, only if its fingerprint is the\n\
+         \x20          one given; every DEK wrapped under it becomes unrecoverable. PKCS#11\n\
+         \x20          only: a TPM2 KEK is not stored anywhere, so there is nothing to delete.\n\
          \n\
          The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n\
          from a command-line argument or an environment variable, both of which are\n\
@@ -202,14 +240,30 @@ fn print_usage() {
     );
 }
 
+// The value after a flag that takes one: present, non-empty, and not
+// starting with "-". Without that last rule a forgotten value swallows the
+// next flag: `wrap -kf --force ...` would write a key file named "--force"
+// and silently drop --force. Flags themselves (-sn, -kf, -g, ...) are
+// unaffected; only what is consumed as a value is checked. No legitimate
+// value starts with "-": service names and groups can't, and a path can be
+// written ./-name. `long_name` is the flag's long form, for the messages.
+fn take_value(arg: &str, long_name: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
+    let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
+    if value.is_empty() {
+        return Err(format!("{long_name} must not be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "{arg} requires a value, but the next argument is {value:?}; a value can't start with \"-\" (write a path like that as ./{value})"
+        ));
+    }
+    Ok(value)
+}
+
 // Parses `--service-name|-sn <value>` when `arg` is that flag; the shared
 // piece of both subcommands' argument loops.
 fn take_service_name(arg: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
-    let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-    if value.is_empty() {
-        return Err("--service-name must not be empty".to_string());
-    }
-    Ok(value)
+    take_value(arg, "--service-name", args)
 }
 
 // Stores a flag's value, refusing a second one rather than letting the last
@@ -237,7 +291,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     let mut args = args.skip(1); // skip argv[0]
 
     let subcommand = match args.next() {
-        None => return Err("missing subcommand: expected `provision` or `wrap`".to_string()),
+        None => return Err("missing subcommand: expected `provision`, `wrap` or `retire`".to_string()),
         Some(s) if s == "--help" || s == "-h" || s == "help" => return Ok(ParseOutcome::Help),
         Some(s) => s,
     };
@@ -245,7 +299,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     match subcommand.as_str() {
         "provision" => parse_provision(&mut args),
         "wrap" => parse_wrap(&mut args),
-        other => Err(format!("unknown subcommand {other:?}: expected `provision` or `wrap`")),
+        "retire" => parse_retire(&mut args),
+        other => Err(format!("unknown subcommand {other:?}: expected `provision`, `wrap` or `retire`")),
     }
 }
 
@@ -267,12 +322,72 @@ fn parse_provision(args: &mut impl Iterator<Item = String>) -> Result<ParseOutco
     Ok(ParseOutcome::Run(Command::Provision { service_name }))
 }
 
+fn parse_retire(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
+    let mut service_name: Option<String> = None;
+    let mut fingerprint: Option<[u8; FINGERPRINT_LEN]> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(ParseOutcome::Help),
+            "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
+            "--fingerprint" | "-fp" => {
+                let value = take_value(&arg, "--fingerprint", args)?;
+                set_once(&mut fingerprint, "--fingerprint", parse_fingerprint_hex(&value)?)?;
+            }
+            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--force" | "-f" | "--group" | "-g" => {
+                return Err(format!("{arg} is not valid for `retire`; it belongs to `wrap`"))
+            }
+            other => return Err(format!("unrecognized argument for `retire`: {other}")),
+        }
+    }
+
+    let service_name = service_name.ok_or("retire: missing required --service-name|-sn")?;
+    let fingerprint = fingerprint
+        .ok_or("retire: missing required --fingerprint|-fp (the 64-hex-character value printed by provision)")?;
+    Ok(ParseOutcome::Run(Command::Retire { service_name, fingerprint }))
+}
+
+// Exactly 64 hex digits, either case. No separators or prefixes: the value
+// is meant to be pasted from provision's output, and a strict format keeps
+// a truncated paste from ever looking valid.
+fn parse_fingerprint_hex(text: &str) -> Result<[u8; FINGERPRINT_LEN], String> {
+    let digits = text.as_bytes();
+    if digits.len() != FINGERPRINT_LEN * 2 {
+        return Err(format!(
+            "--fingerprint must be exactly {} hex characters, got {}",
+            FINGERPRINT_LEN * 2,
+            digits.len()
+        ));
+    }
+    let nibble = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = [0u8; FINGERPRINT_LEN];
+    for (i, [hi, lo]) in digits.as_chunks::<2>().0.iter().enumerate() {
+        match (nibble(*hi), nibble(*lo)) {
+            (Some(hi), Some(lo)) => out[i] = hi << 4 | lo,
+            _ => return Err("--fingerprint must contain only hex characters (0-9, a-f)".to_string()),
+        }
+    }
+    Ok(out)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
     let mut key_file_path: Option<String> = None;
     let mut service_name: Option<String> = None;
     let mut dek_source: Option<DekSource> = None;
     let mut force = false;
     let mut group: Option<String> = None;
+    let mut expected_fingerprint: Option<[u8; FINGERPRINT_LEN]> = None;
 
     // Rejects a second DEK source rather than letting the last one win:
     // silently ignoring one of two explicitly-requested inputs is exactly
@@ -296,25 +411,20 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
             }
             "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
             "--key-file-path" | "-kf" => {
-                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-                if value.is_empty() {
-                    return Err("--key-file-path must not be empty".to_string());
-                }
+                let value = take_value(&arg, "--key-file-path", args)?;
                 set_once(&mut key_file_path, "--key-file-path", value)?;
             }
             "--group" | "-g" => {
-                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-                if value.is_empty() {
-                    return Err("--group must not be empty".to_string());
-                }
+                let value = take_value(&arg, "--group", args)?;
                 set_once(&mut group, "--group", value)?;
+            }
+            "--fingerprint" | "-fp" => {
+                let value = take_value(&arg, "--fingerprint", args)?;
+                set_once(&mut expected_fingerprint, "--fingerprint", parse_fingerprint_hex(&value)?)?;
             }
             "--dek-stdin" => set_source(&mut dek_source, DekSource::Stdin)?,
             "--dek-file" => {
-                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-                if value.is_empty() {
-                    return Err("--dek-file must not be empty".to_string());
-                }
+                let value = take_value(&arg, "--dek-file", args)?;
                 set_source(&mut dek_source, DekSource::File(value))?;
             }
             other => return Err(format!("unrecognized argument for `wrap`: {other}")),
@@ -331,6 +441,7 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
         dek_source,
         force,
         group,
+        expected_fingerprint,
     }))
 }
 
@@ -378,12 +489,16 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
     // (and as the Windows tool requires of its --dek-file): a redirected
     // folder could make the deployment wrap a DEK someone else planted.
     // O_NOFOLLOW below covers the file itself; `require_opened_at` confirms
-    // the descriptor is the file at the spelled path.
+    // the descriptor is the file at the spelled path. Opened through
+    // `spelled`, the path that was checked, never `path` as given: the kernel
+    // would follow a link before a `..` in it into another folder (see
+    // require_real_folder). Messages still show the operator's spelling.
     let spelled = require_real_folder(Path::new(path))?;
+    require_private_dek_folder(path, &spelled)?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
-        .open(path)
+        .open(&spelled)
         .map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
                 format!("--dek-file {path} is a symlink; refusing to follow it")
@@ -575,7 +690,8 @@ fn describe_status(code: c_int) -> String {
         }
         status::FILE_MALFORMED => "the key file is not a well-formed wrapped DEK".to_string(),
         status::FILE_UNTRUSTED => {
-            "the key file, or a directory in its path, is owned by another user or writable by group/others".to_string()
+            "the key file, or a directory in its path, is owned by another user or writable by group/others              (sticky /tmp-style directories included)"
+                .to_string()
         }
         other => format!("unknown status code {other}"),
     }
@@ -797,6 +913,93 @@ fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
     Ok(spelled)
 }
 
+// `wrap` only: the key file's folder, and every folder above it up to `/`,
+// must not be writable by group or others -- sticky (`/tmp`, `/var/tmp`,
+// `/dev/shm`) included. The library refuses to read a key file under any
+// such folder (HKDFGUARD_ERR_FILE_UNTRUSTED), so writing one there would
+// only hand the application a file it can never open; better to say so
+// before the DEK is read or a provider is touched. `spelled` is what
+// `require_real_folder` returned, so its folder is the real one and every
+// ancestor is too.
+//
+// Mode only, not ownership: `wrap` often runs as root into a folder owned
+// by the application's account, which the library -- running as that
+// account -- accepts, while the library's ownership rule (root or the
+// reading process's own user) depends on who reads the file, which this
+// tool cannot know. As in the library, a folder on a read-only mount is
+// not writable whatever its mode bits say (nothing can be written there
+// anyway, so the create below fails on its own).
+fn require_unshared_folder(path: &Path, spelled: &Path) -> Result<(), String> {
+    let folder = spelled.parent().ok_or_else(|| format!("{} has no parent folder", path.display()))?;
+    for dir in folder.ancestors() {
+        let meta = fs::metadata(dir).map_err(|e| format!("failed to check folder {}: {e}", dir.display()))?;
+        let mode = meta.mode() & 0o7777;
+        if mode & 0o022 == 0 || on_read_only_mount(dir) {
+            continue;
+        }
+        let which = if dir == folder { "the key file's folder" } else { "a folder above the key file" };
+        let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
+        return Err(format!(
+            "{which}, {}, is writable by group or others (mode {mode:o}){sticky}; the library would refuse to \
+             read a key file at {} (HKDFGUARD_ERR_FILE_UNTRUSTED), because someone else could replace it. \
+             Write the key file into a folder that only its owner (or root) can write to, all the way up to /",
+            dir.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+// --dek-file only: the DEK file's folder, and every folder above it up to
+// `/`, is held to the rule the library applies to every file it reads:
+// owned by root or this process's user, and not writable by group or
+// others -- sticky (`/tmp`, `/var/tmp`, `/dev/shm`) or not. Otherwise
+// someone else could put a DEK of their choosing at the path, and the
+// application would end up encrypting under a key they know. As in the
+// library, a folder on a read-only mount is exempt: a Kubernetes Secret
+// volume is `1777` but nobody can write to it. `spelled` is what
+// `require_real_folder` returned, so its folder is the real one.
+fn require_private_dek_folder(path: &str, spelled: &Path) -> Result<(), String> {
+    let folder = spelled.parent().ok_or_else(|| format!("--dek-file {path} has no parent folder"))?;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    for dir in folder.ancestors() {
+        let meta = fs::metadata(dir).map_err(|e| format!("failed to check --dek-file {path}'s folder {}: {e}", dir.display()))?;
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(format!(
+                "--dek-file {path}: folder {} is owned by uid {}, which is neither root nor this process's user, \
+                 so someone else could replace the DEK file",
+                dir.display(),
+                meta.uid()
+            ));
+        }
+        let mode = meta.mode() & 0o7777;
+        if mode & 0o022 == 0 || on_read_only_mount(dir) {
+            continue;
+        }
+        let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
+        return Err(format!(
+            "--dek-file {path}: folder {} is writable by group or others (mode {mode:o}){sticky}, so someone else \
+             could replace the DEK file. Keep it in a folder only its owner (or root) can write to, all the way up to /",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn on_read_only_mount(dir: &Path) -> bool {
+    let Ok(c_path) = CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: c_path is a valid NUL-terminated string; `st` is a properly
+    // sized out-parameter that statvfs fully initializes on success.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    st.f_flag & libc::ST_RDONLY != 0
+}
+
 // After an open: `file` must be the file at `spelled` (see
 // `require_real_folder`) -- nothing was swapped between the folder check
 // and the open. Judged from the descriptor: where the kernel says it is
@@ -922,7 +1125,7 @@ fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String
         .map_err(|e| format!("secure delete: failed to sync {}: {e}", path.display()))
 }
 
-// `provision`: the only place the setup calls are made. Always calls
+// `provision`: with `retire`, the only place the setup calls are made. Always calls
 // hkdfguard_create_kek, whether or not the KEK exists, as the Windows tool
 // does: for an existing KEK that call loads it through the provider
 // (`load_kek`) -- on TPM2, deriving the key and checking it against the
@@ -949,12 +1152,78 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
             describe_status(rc)
         ));
     }
+    let fingerprint = read_kek_fingerprint(&service_c).map_err(|rc| {
+        format!(
+            "the KEK for service \"{service_name}\" exists but its fingerprint could not be read: {}",
+            describe_status(rc)
+        )
+    })?;
     if exists == 1 {
         println!("KEK already provisioned for service \"{service_name}\"; verified, nothing to do");
+        println!(
+            "fingerprint: {} -- confirm it matches the one recorded when this service was provisioned",
+            hex(&fingerprint)
+        );
     } else {
         println!("KEK provisioned for service \"{service_name}\"");
+        println!("fingerprint: {} -- record this; retire requires it", hex(&fingerprint));
     }
     Ok(())
+}
+
+// The fingerprint of the KEK `service` resolves to now, through the C ABI;
+// the status code when it can't be read.
+fn read_kek_fingerprint(service: &CString) -> Result<[u8; FINGERPRINT_LEN], c_int> {
+    let mut out = [0u8; FINGERPRINT_LEN];
+    let mut out_len = FINGERPRINT_LEN as c_int;
+    let rc = hkdfguard_kek_fingerprint(service.as_ptr(), out.as_mut_ptr(), &mut out_len);
+    if rc != status::OK {
+        return Err(rc);
+    }
+    if out_len != FINGERPRINT_LEN as c_int {
+        return Err(status::INTERNAL_ERROR);
+    }
+    Ok(out)
+}
+
+// `retire`: deletes the service's KEK for good, through the library's
+// Rust-only admin API (deliberately not in the C ABI, so no application
+// linking the library can call it). The library confirms the fingerprint
+// twice -- against the KEK the service resolves to, and on the exact
+// objects it deletes -- so nothing is deleted on a mismatch, and a KEK
+// that can't be confirmed is never deleted.
+fn run_retire(mut service_name: String, fingerprint: [u8; FINGERPRINT_LEN]) -> Result<(), String> {
+    let service_c = prepare_service(&mut service_name)?;
+    match admin::retire_kek(&service_name, &fingerprint) {
+        Ok(provider) => {
+            println!(
+                "retired KEK for service \"{service_name}\" (fingerprint {}, provider {})",
+                hex(&fingerprint),
+                provider.as_str()
+            );
+            println!("every payload wrapped under it is now permanently unrecoverable");
+            Ok(())
+        }
+        Err(e) if e.status == status::KEK_NOT_FOUND => {
+            Err(format!("no KEK exists for service \"{service_name}\"; nothing to retire"))
+        }
+        Err(e) if e.status == status::KEK_FINGERPRINT_MISMATCH => Err(match read_kek_fingerprint(&service_c) {
+            Ok(current) => format!(
+                "fingerprint mismatch for service \"{service_name}\": the current KEK is {}, not {}; nothing was deleted",
+                hex(&current),
+                hex(&fingerprint)
+            ),
+            Err(_) => format!(
+                "fingerprint mismatch for service \"{service_name}\": the current KEK is not {}; nothing was deleted",
+                hex(&fingerprint)
+            ),
+        }),
+        Err(e) => Err(format!(
+            "could not retire the KEK for service \"{service_name}\": {} ({})",
+            e.message,
+            describe_status(e.status)
+        )),
+    }
 }
 
 // `wrap`: no setup calls. The wrap is completed in memory before the
@@ -966,6 +1235,7 @@ fn run_wrap(
     dek_source: DekSource,
     force: bool,
     group: Option<String>,
+    expected_fingerprint: Option<[u8; FINGERPRINT_LEN]>,
 ) -> Result<(), String> {
     // Before anything else -- reading the DEK, any provider work -- the key
     // file's folder must be a real folder at its spelled location. Every
@@ -975,6 +1245,10 @@ fn run_wrap(
     // descriptor, when the file is replaced and created below.
     let checked = require_real_folder(Path::new(&key_file_path))?;
     let path = checked.as_path();
+    // And not in a folder (or under one) that group or others can write
+    // to, sticky /tmp included: the library would refuse to read the key
+    // file there, so refuse to write it (see require_unshared_folder).
+    require_unshared_folder(Path::new(&key_file_path), path)?;
 
     // Fast, friendly pre-check: fail before reading the DEK or touching
     // the provider if the output path obviously already exists and --force
@@ -1005,6 +1279,28 @@ fn run_wrap(
         // longer secret) form, which is the only thing that survives past
         // this point.
     };
+
+    // The KEK this payload was actually sealed to, as the library embedded
+    // it in the payload it just returned -- not from a separate
+    // hkdfguard_kek_fingerprint call, so there is no window between "which
+    // KEK?" and "wrap under it", and what is checked and printed is exactly
+    // what the file will carry. With --fingerprint, this is the operator's
+    // assertion of which KEK the secret may be committed to: on a mismatch
+    // (the service's KEK replaced, re-provisioned, or on another provider
+    // than expected) nothing is written, and with --force the existing key
+    // file is left as it was.
+    let used_fingerprint = admin::payload_fingerprint(&wrapped)
+        .ok_or("hkdfguard_wrap_dek returned a payload with no readable KEK fingerprint; nothing was written")?;
+    if let Some(expected) = expected_fingerprint {
+        if used_fingerprint != expected {
+            return Err(format!(
+                "fingerprint mismatch for service \"{service_name}\": the service's KEK is {}, not {}; nothing was \
+                 written -- the DEK was NOT committed to that key",
+                hex(&used_fingerprint),
+                hex(&expected)
+            ));
+        }
+    }
 
     // Only now, with a complete wrapped payload in hand, replace the old
     // file. Re-evaluated here rather than trusting the pre-check above, in
@@ -1073,6 +1369,15 @@ fn run_wrap(
         "wrapped key written to {key_file_path} ({} bytes, {access}, service \"{service_name}\")",
         wrapped.len()
     );
+    println!(
+        "fingerprint: {}{}",
+        hex(&used_fingerprint),
+        if expected_fingerprint.is_some() {
+            " (confirmed)"
+        } else {
+            " -- confirm it matches the one recorded when this service was provisioned"
+        }
+    );
     Ok(())
 }
 
@@ -1127,7 +1432,9 @@ fn run(command: Command) -> Result<(), String> {
             dek_source,
             force,
             group,
-        } => run_wrap(key_file_path, service_name, dek_source, force, group),
+            expected_fingerprint,
+        } => run_wrap(key_file_path, service_name, dek_source, force, group, expected_fingerprint),
+        Command::Retire { service_name, fingerprint } => run_retire(service_name, fingerprint),
     }
 }
 
@@ -1243,6 +1550,10 @@ fn main() -> ExitCode {
         eprintln!("error: {e}; refusing to handle key material");
         return ExitCode::FAILURE;
     }
+    // An ephemeral KEK would exist only in this process: `provision` would
+    // create one that vanishes on exit, and `wrap` would produce a payload
+    // nothing could ever unwrap. The library refuses it with an explanation.
+    hkdfguard::refuse_ephemeral_keys_in_this_process();
     let parsed = utf8_args(std::env::args_os()).and_then(|args| parse_args(args.into_iter()));
     match parsed {
         Ok(ParseOutcome::Help) => {
@@ -1263,6 +1574,10 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../test_tmp.rs"]
+mod test_tmp;
 
 #[cfg(test)]
 mod tests {
@@ -1302,10 +1617,13 @@ mod tests {
         assert_eq!(describe_status(status::MAC_KEYCHAIN_READ_FAILED), "unknown status code -100");
     }
 
-    // Only this user can write to it, whatever the umask: the library refuses
-    // to trust a policy or secret mount in a group-writable directory.
+    // Only this user can write to it, whatever the umask, and not under the
+    // sticky /tmp: the library refuses a policy, a secret, or a key file in
+    // or under any directory others can write to, sticky or not -- so
+    // `wrap` refuses to write a key file there, and --dek-file to read one.
+    // See src/test_tmp.rs.
     fn private_tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+        test_tmp::private_tempdir()
     }
 
     fn argv(parts: &[&str]) -> impl Iterator<Item = String> {
@@ -1335,7 +1653,7 @@ mod tests {
     // immediately for a new file.)
     #[test]
     fn secure_delete_removes_the_file() {
-        let file = NamedTempFile::new().unwrap();
+        let file = NamedTempFile::new_in(test_tmp::root()).unwrap();
         fs::write(file.path(), b"sensitive content to be wiped").unwrap();
         assert!(file.path().exists());
 
@@ -1346,7 +1664,7 @@ mod tests {
 
     #[test]
     fn secure_delete_handles_an_empty_file() {
-        let file = NamedTempFile::new().unwrap(); // created empty
+        let file = NamedTempFile::new_in(test_tmp::root()).unwrap(); // created empty
         secure_delete(file.path()).unwrap();
         assert!(!file.path().exists());
     }
@@ -1402,7 +1720,7 @@ mod tests {
 
     #[test]
     fn secure_delete_fails_cleanly_on_a_missing_file() {
-        let file = NamedTempFile::new().unwrap();
+        let file = NamedTempFile::new_in(test_tmp::root()).unwrap();
         let path = file.path().to_path_buf();
         drop(file);
         fs::remove_file(&path).ok();
@@ -1450,6 +1768,100 @@ mod tests {
     }
 
     #[test]
+    fn require_unshared_folder_refuses_group_other_or_sticky_writable_folders_at_any_level() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let outer = base.join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let chmod = |p: &Path, mode: u32| fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        chmod(&outer, 0o755);
+        chmod(&inner, 0o700);
+        let key = inner.join("wrapped.key");
+        require_unshared_folder(&key, &key).expect("0700 under 0755 under a private root");
+        chmod(&inner, 0o755);
+        require_unshared_folder(&key, &key).expect("0755: others may read, not write");
+
+        for mode in [0o775, 0o757, 0o777, 0o1777, 0o1770] {
+            chmod(&inner, mode);
+            let err = require_unshared_folder(&key, &key).unwrap_err();
+            assert!(err.contains("the key file's folder") && err.contains(&format!("mode {mode:o}")), "{err}");
+            assert!(err.contains("library would refuse"), "{err}");
+            assert_eq!(err.contains("sticky"), mode & 0o1000 != 0, "{err}");
+        }
+        chmod(&inner, 0o700);
+        for mode in [0o1777, 0o777, 0o770] {
+            chmod(&outer, mode);
+            let err = require_unshared_folder(&key, &key).unwrap_err();
+            assert!(err.contains("a folder above the key file") && err.contains(outer.to_str().unwrap()), "{err}");
+        }
+        chmod(&outer, 0o755);
+    }
+
+    #[test]
+    fn require_unshared_folder_checks_mode_only_not_who_owns_the_folder() {
+        // `/` is root's, and (as a non-root test run) not this user's: the
+        // library running as the application's account would accept a key
+        // file there, so wrap must not refuse it for its owner.
+        require_unshared_folder(Path::new("/wrapped.key"), Path::new("/wrapped.key")).expect("root-owned 0755");
+
+        // Owned by another non-root user: only root can arrange that.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let theirs = base.join("app-owned");
+        fs::create_dir(&theirs).unwrap();
+        std::os::unix::fs::chown(&theirs, Some(65534), Some(65534)).unwrap();
+        for mode in [0o700, 0o755] {
+            fs::set_permissions(&theirs, fs::Permissions::from_mode(mode)).unwrap();
+            let key = theirs.join("wrapped.key");
+            require_unshared_folder(&key, &key).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+        }
+    }
+
+    #[test]
+    fn wrap_refuses_a_shared_folder_before_reading_the_dek() {
+        // The --dek-file does not exist: reaching it would fail with a DEK
+        // error, so the folder error proves the DEK was never read.
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let shared = base.join("shared");
+        fs::create_dir(&shared).unwrap();
+        let missing_dek = base.join("no-such-dek").to_str().unwrap().to_string();
+        for mode in [0o1777, 0o770] {
+            fs::set_permissions(&shared, fs::Permissions::from_mode(mode)).unwrap();
+            let key = shared.join("wrapped.key");
+            let err = run_wrap(
+                key.to_str().unwrap().to_string(),
+                "com.hkdfguard.clitest.shared".to_string(),
+                DekSource::File(missing_dek.clone()),
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("writable by group or others") && !err.contains("--dek-file"), "{err}");
+            assert!(!key.exists(), "nothing created");
+        }
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A private folder gets past the check, to the DEK.
+        let err = run_wrap(
+            shared.join("wrapped.key").to_str().unwrap().to_string(),
+            "com.hkdfguard.clitest.shared".to_string(),
+            DekSource::File(missing_dek),
+            false,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("--dek-file"), "{err}");
+    }
+
+    #[test]
     fn secure_delete_refuses_a_file_reached_through_a_symlinked_folder() {
         use std::os::unix::fs::symlink;
         let dir = private_tempdir();
@@ -1461,6 +1873,35 @@ mod tests {
         let err = secure_delete(&base.join("link/victim.key")).unwrap_err();
         assert!(err.contains("symbolic link"), "{err}");
         assert_eq!(fs::read(real.join("victim.key")).unwrap(), b"not yours");
+    }
+
+    #[test]
+    fn read_dek_file_refuses_a_shared_folder_sticky_or_not_at_any_level() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let outer = base.join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        for d in [&outer, &inner] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let dek = inner.join("dek.b64");
+        fs::write(&dek, valid_b64()).unwrap();
+        fs::set_permissions(&dek, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut buf = [0u8; MAX_DEK_INPUT_LEN + 1];
+        assert!(read_dek_file(dek.to_str().unwrap(), &mut buf).is_ok(), "a private chain reads");
+
+        // The folder itself, or one above it: a /tmp-style sticky folder is
+        // refused like a plainly shared one, and the message says which.
+        let cases = [(&inner, 0o1777, true), (&inner, 0o770, false), (&outer, 0o1777, true), (&outer, 0o777, false)];
+        for (folder, mode, sticky) in cases {
+            fs::set_permissions(folder, fs::Permissions::from_mode(mode)).unwrap();
+            let err = read_dek_file(dek.to_str().unwrap(), &mut buf).unwrap_err();
+            assert!(err.contains("writable by group or others") && err.contains(&folder.display().to_string()), "{err}");
+            assert_eq!(err.contains("sticky, like /tmp"), sticky, "{err}");
+            fs::set_permissions(folder, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(read_dek_file(dek.to_str().unwrap(), &mut buf).is_ok());
     }
 
     #[test]
@@ -1478,6 +1919,32 @@ mod tests {
         assert!(err.contains("symbolic link"), "{err}");
         // The real path reads.
         assert!(read_dek_file(real.join("dek.b64").to_str().unwrap(), &mut buf).is_ok());
+    }
+
+    #[test]
+    fn read_dek_file_reads_the_checked_file_not_one_beside_a_link_before_dotdot() {
+        // keys/link -> elsewhere/deep, so to the kernel keys/link/.. is
+        // `elsewhere`, while the folder check resolves it as text to `keys`.
+        // The file read must be the one checked: keys/dek.b64, never
+        // elsewhere/dek.b64.
+        use std::os::unix::fs::symlink;
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let keys = base.join("keys");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("deep")).unwrap();
+        fs::create_dir(&keys).unwrap();
+        symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
+        let checked = STANDARD.encode([0x11u8; DEK_LEN]);
+        let planted = STANDARD.encode([0x22u8; DEK_LEN]);
+        for (folder, text) in [(&keys, &checked), (&elsewhere, &planted)] {
+            fs::write(folder.join("dek.b64"), text).unwrap();
+            fs::set_permissions(folder.join("dek.b64"), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut buf = [0u8; MAX_DEK_INPUT_LEN + 1];
+        let n = read_dek_file(keys.join("link/../dek.b64").to_str().unwrap(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], checked.as_bytes(), "read the file at the checked path, keys/dek.b64");
     }
 
     #[test]
@@ -1657,14 +2124,29 @@ mod tests {
     #[test]
     fn parse_wrap_accepts_stdin_and_file_sources() {
         match expect_run(argv(&["prog", "wrap", "-kf", "key.bin", "-sn", "svc", "--dek-stdin"])) {
-            Command::Wrap { key_file_path, service_name, dek_source, force, group } => {
+            Command::Wrap { key_file_path, service_name, dek_source, force, group, expected_fingerprint } => {
                 assert_eq!(key_file_path, "key.bin");
                 assert_eq!(service_name, "svc");
                 assert_eq!(dek_source, DekSource::Stdin);
                 assert!(!force);
                 assert_eq!(group, None, "--group is optional: owner-only by default");
+                assert_eq!(expected_fingerprint, None, "--fingerprint is optional");
             }
             other => panic!("expected Wrap, got {other:?}"),
+        }
+
+        let fp = "Ab".repeat(32);
+        match expect_run(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-fp", &fp])) {
+            Command::Wrap { expected_fingerprint, .. } => assert_eq!(expected_fingerprint, Some([0xab; 32])),
+            other => panic!("expected Wrap, got {other:?}"),
+        }
+        for (parts, expected) in [
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-fp", "abc"], "exactly 64 hex characters, got 3"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-fp", fp.as_str(), "--fingerprint", fp.as_str()], "give --fingerprint at most once"),
+            (vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--fingerprint", "-f"], "requires a value, but the next argument is"),
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert!(err.contains(expected), "{parts:?}: {err}");
         }
 
         match expect_run(argv(&[
@@ -1710,6 +2192,65 @@ mod tests {
         let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", ""]));
         assert!(err.contains("must not be empty"), "{err}");
         assert!(expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group"])).contains("requires a value"));
+    }
+
+    #[test]
+    fn retire_parses_a_service_and_its_fingerprint() {
+        let fp = "ab".repeat(32);
+        match expect_run(argv(&["prog", "retire", "-sn", "svc", "-fp", &fp])) {
+            Command::Retire { service_name, fingerprint } => {
+                assert_eq!(service_name, "svc");
+                assert_eq!(fingerprint, [0xab; 32]);
+            }
+            other => panic!("expected Retire, got {other:?}"),
+        }
+        match expect_run(argv(&["prog", "retire", "--fingerprint", &"AB".repeat(32), "--service-name", "svc"])) {
+            Command::Retire { fingerprint, .. } => assert_eq!(fingerprint, [0xab; 32], "either case, either order"),
+            other => panic!("expected Retire, got {other:?}"),
+        }
+
+        for (parts, expected) in [
+            (vec!["prog", "retire", "-sn", "svc"], "missing required --fingerprint"),
+            (vec!["prog", "retire", "-fp", fp.as_str()], "missing required --service-name"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", &fp[..63]], "exactly 64 hex characters, got 63"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", "0x1234"], "exactly 64 hex characters"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", fp.as_str(), "-fp", fp.as_str()], "give --fingerprint at most once"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", fp.as_str(), "-kf", "k"], "it belongs to `wrap`"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", fp.as_str(), "--corrupt"], "unrecognized argument for `retire`"),
+            (vec!["prog", "retire", "-sn", "svc", "-fp", "--force"], "requires a value, but the next argument is"),
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert!(err.contains(expected), "{parts:?}: {err}");
+        }
+        let bad = format!("{}zz", "ab".repeat(31));
+        assert!(expect_parse_err(argv(&["prog", "retire", "-sn", "svc", "-fp", &bad])).contains("only hex characters"));
+        assert!(expect_parse_err(argv(&["prog", "frobnicate"])).contains("expected `provision`, `wrap` or `retire`"));
+    }
+
+    #[test]
+    fn a_flag_value_starting_with_a_dash_is_refused() {
+        // A forgotten value must not swallow the next flag: `-kf --force`
+        // would otherwise name a key file "--force" and drop --force.
+        for parts in [
+            vec!["prog", "wrap", "-kf", "--force", "-sn", "svc", "--dek-stdin"],
+            vec!["prog", "wrap", "-kf", "k", "-sn", "-g", "--dek-stdin"],
+            vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "-g", "-f"],
+            vec!["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-file", "--force"],
+            vec!["prog", "wrap", "-kf", "-", "-sn", "svc", "--dek-stdin"],
+            vec!["prog", "provision", "--service-name", "-h"],
+        ] {
+            let err = expect_parse_err(argv(&parts));
+            assert!(err.contains("requires a value, but the next argument is"), "{parts:?}: {err}");
+        }
+        // Flags themselves are unaffected, short or long; ./-name is the way
+        // to give a path that starts with "-".
+        match expect_run(argv(&["prog", "wrap", "-kf", "./-k", "-sn", "svc", "--dek-stdin", "-f"])) {
+            Command::Wrap { key_file_path, force, .. } => {
+                assert_eq!(key_file_path, "./-k");
+                assert!(force);
+            }
+            other => panic!("expected Wrap, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1813,6 +2354,7 @@ mod tests {
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 true,
                 None,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("provision --service-name"), "must point at the fix: {err}");
@@ -1836,14 +2378,44 @@ mod tests {
 
             run_wrap(
                 key_path.to_str().unwrap().to_string(),
-                service,
+                service.clone(),
                 DekSource::File(dek_path.to_str().unwrap().to_string()),
                 false,
+                None,
                 None,
             )
             .unwrap();
             assert!(key_path.exists());
             assert_eq!(fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, KEY_FILE_MODE);
+
+            // --fingerprint: the KEK the payload was sealed to must be the
+            // one given, or nothing is written -- not even with --force.
+            let recorded = read_kek_fingerprint(&CString::new(service.as_str()).unwrap()).unwrap();
+            assert_eq!(admin::payload_fingerprint(&fs::read(&key_path).unwrap()), Some(recorded), "the file carries it");
+            let wrap_pinned = |path: &Path, force: bool, fingerprint: [u8; FINGERPRINT_LEN]| {
+                run_wrap(
+                    path.to_str().unwrap().to_string(),
+                    service.clone(),
+                    DekSource::File(dek_path.to_str().unwrap().to_string()),
+                    force,
+                    None,
+                    Some(fingerprint),
+                )
+            };
+            let pinned = dir.path().join("pinned.key");
+            wrap_pinned(&pinned, false, recorded).unwrap();
+            assert_eq!(admin::payload_fingerprint(&fs::read(&pinned).unwrap()), Some(recorded));
+
+            let mut wrong = recorded;
+            wrong[0] ^= 1;
+            let refused = dir.path().join("refused.key");
+            let err = wrap_pinned(&refused, false, wrong).unwrap_err();
+            assert!(err.contains("fingerprint mismatch") && err.contains("nothing was written"), "{err}");
+            assert!(!refused.exists(), "nothing written on a mismatch");
+            let before = fs::read(&pinned).unwrap();
+            let err = wrap_pinned(&pinned, true, wrong).unwrap_err();
+            assert!(err.contains("fingerprint mismatch"), "{err}");
+            assert_eq!(fs::read(&pinned).unwrap(), before, "--force must not cost the existing file on a mismatch");
 
             // --group with a group this process may give (its own), unless
             // that group is itself one --group refuses (running as root).
@@ -1857,6 +2429,7 @@ mod tests {
                     DekSource::File(dek_path.to_str().unwrap().to_string()),
                     false,
                     Some(gid.to_string()),
+                    None,
                 )
                 .unwrap();
                 let meta = fs::metadata(&grouped).unwrap();

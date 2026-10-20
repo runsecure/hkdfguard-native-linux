@@ -1785,6 +1785,48 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_secret_or_owner_password_under_a_sticky_ancestor_is_refused_present_or_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = |p: &std::path::Path, mode: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        // A private 0700 directory inside a /tmp-style (1777) one: the
+        // layout of `mktemp -d` under /tmp.
+        let base = crate::secure_file::private_tempdir();
+        let private = base.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        chmod(&private, 0o700);
+        let secret = private.join("tpm.derivation-secret");
+        let owner_auth = private.join("owner.auth");
+        for f in [&secret, &owner_auth] {
+            std::fs::write(f, b"secret").unwrap();
+            chmod(f, 0o600);
+        }
+        assert!(with_secret_path(&secret, read_derivation_secret).unwrap().is_some(), "a private chain is fine");
+        assert!(read_owner_auth(&owner_auth).is_ok(), "a private chain is fine");
+
+        chmod(base.path(), 0o1777);
+        match with_secret_path(&secret, read_derivation_secret) {
+            Err(Error::Provider(msg)) => assert!(msg.contains("sticky"), "says why: {msg}"),
+            other => panic!("a secret under a sticky ancestor must be refused, got {:?}", other.map(|v| v.is_some())),
+        }
+        match read_owner_auth(&owner_auth) {
+            Err(Error::Provider(msg)) => assert!(msg.contains("sticky"), "says why: {msg}"),
+            Err(other) => panic!("expected Provider(..sticky..), got {other:?}"),
+            Ok(_) => panic!("an owner password under a sticky ancestor must be refused"),
+        }
+        // Even where policy lets the secret be absent, an absence nobody
+        // can vouch for is not "no secret": someone could have deleted it.
+        std::fs::remove_file(&secret).unwrap();
+        let result = with_policy(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = false\n",
+            || with_secret_path(&secret, read_derivation_secret),
+        );
+        assert!(result.is_err(), "a missing secret under a sticky ancestor must be an error, not \"no secret\"");
+        chmod(base.path(), 0o700);
+    }
+
+    #[test]
+    #[serial]
     fn oversized_secret_file_is_rejected() {
         let big = vec![b'x'; MAX_DERIVATION_SECRET_LEN + 1];
         let result = with_secret_file(&big, 0o600, |_| read_derivation_secret());

@@ -23,9 +23,9 @@
 //!   module, SoftHSM2, is a software token that would otherwise be picked
 //!   up -- and counted as hardware -- just for being installed. The
 //!   (symlink-resolved) module file, its directory, and every directory
-//!   above it must be owned by root and not writable by group or others
-//!   (sticky ancestors excepted) -- see [`validate_module_path`]:
-//!   the module is `dlopen`ed into this process. Only the module file
+//!   above it must be owned by root and not writable by group or others,
+//!   sticky or not (so never anywhere under `/tmp`) -- see
+//!   [`validate_module_path`]: the module is `dlopen`ed into this process. Only the module file
 //!   itself is checked: the libraries *it* depends on are found the usual
 //!   way (its RPATH/RUNPATH, `LD_LIBRARY_PATH`, the loader cache). That is
 //!   the same trust any library the host process loads gets, not a
@@ -259,7 +259,8 @@ fn select_token(tokens: &[(String, String)], label: Option<&str>, serial: Option
 /// Checks a PKCS#11 module path before it's ever `dlopen`ed: it must be
 /// absolute, and after resolving symlinks, the module file must be owned
 /// by root and not writable by group or others, and so must its directory
-/// and every directory above it (see [`crate::secure_file::check_dir_chain`]).
+/// and every directory above it, sticky or not (see
+/// [`crate::secure_file::check_dir_chain`]).
 /// Returns the canonical (symlink-resolved) path -- the one that was
 /// actually checked -- so that's exactly what gets loaded.
 ///
@@ -696,6 +697,55 @@ impl KekProvider for Pkcs11Provider {
             state: Arc::clone(&self.state), // cheap refcount bump, not a clone of the underlying session
         }))
     }
+
+    // Deletes the service's key pair from the token, after confirming the
+    // fingerprint on the very objects deleted. Everything runs through one
+    // read/write session -- find, read the public point, destroy -- so the
+    // handles checked are the handles destroyed. The pair must be exactly
+    // what `load_kek` would use (one of each half, hkdfguard's label and ID,
+    // its protections; see `find_key_pair_handles`): a duplicate, foreign or
+    // half-present pair is refused here as it is everywhere else, and left
+    // for an operator to inspect, rather than guessed between.
+    //
+    // The private key goes first: once it is gone the KEK is unusable,
+    // whatever happens next. If the public half then can't be removed, the
+    // error says so; the token is left in the "public key without its
+    // private key" state `find_key_pair_handles` already reports.
+    fn retire_kek(&self, service: &str, expected_fingerprint: &[u8; crate::payload::FINGERPRINT_LEN]) -> Result<()> {
+        self.check_not_refused()?;
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| Error::Provider("PKCS#11 session lock poisoned".into()))?;
+        let open = guard.as_ref().ok_or(Error::Provider("PKCS#11 session not available".into()))?;
+        let rw = open
+            .pkcs11
+            .open_rw_session(open.slot)
+            .map_err(|e| Error::Provider(format!("PKCS#11 could not open a read/write session to retire a key: {e}")))?;
+
+        let keys = find_key_pair_handles(&rw, service)?.ok_or(Error::KekNotFound)?;
+        let public = parse_ec_point(&read_ec_point(&rw, keys.public)?)?;
+        if crate::crypto::kek_fingerprint(&public) != *expected_fingerprint {
+            return Err(Error::KekFingerprintMismatch);
+        }
+
+        rw.destroy_object(keys.private)
+            .map_err(|e| Error::Provider(format!("PKCS#11 could not delete this service's private key: {e}; nothing was removed")))?;
+        rw.destroy_object(keys.public).map_err(|e| {
+            Error::Provider(format!(
+                "PKCS#11 deleted this service's private key -- the KEK is retired -- but not its public key: {e}; \
+                 remove that public key from the token by hand"
+            ))
+        })?;
+
+        // Confirmed gone, as the token itself reports it.
+        if count_labelled(&rw, ObjectClass::PRIVATE_KEY, service)? != 0 || count_labelled(&rw, ObjectClass::PUBLIC_KEY, service)? != 0 {
+            return Err(Error::Provider(
+                "PKCS#11 reported this service's key pair deleted, but objects under its label remain on the token".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // The CKA_LABEL used to identify a service's key pair on the token.
@@ -1050,8 +1100,9 @@ mod tests {
     use secrecy::ExposeSecret;
     use std::os::unix::fs::PermissionsExt;
 
-    // In a private directory of its own: `$TMPDIR` itself is usually
-    // `/tmp`, which anyone can write to, and the PIN's location is checked.
+    // In a private directory of its own under the test temp root: `$TMPDIR`
+    // is usually `/tmp`, which anyone can write to, and the PIN's location
+    // is checked -- sticky directories included.
     struct PinFile {
         dir: tempfile::TempDir,
         path: PathBuf,
@@ -1077,6 +1128,26 @@ mod tests {
         std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let err = read_pin_file(f.path()).expect_err("someone else could swap in a wrong PIN");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn pin_file_under_a_sticky_ancestor_is_rejected() {
+        // A private 0700 directory inside a /tmp-style (1777) one: someone
+        // else could create entries beside it, so the PIN is not trusted
+        // there -- however private its own directory.
+        let f = pin_file(b"1234\n", 0o600);
+        let private = f.dir.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = private.join("pkcs11.pin");
+        std::fs::rename(f.path(), &path).unwrap();
+        assert!(read_pin_file(&path).is_ok(), "a private chain is fine");
+
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let err = read_pin_file(&path).expect_err("a sticky ancestor is not trusted");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("sticky"), "says why: {err}");
         std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
@@ -1269,6 +1340,65 @@ mod tests {
         assert_eq!(*created.ecdh(&peer).unwrap(), *loaded.ecdh(&peer).unwrap(), "both handles must drive the same key");
         assert_eq!(created.public_key().unwrap(), loaded.public_key().unwrap());
 
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn retire_kek_deletes_the_pair_only_with_its_fingerprint() {
+        let service = "com.hkdfguard.test.retire";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| destroy_all_for(open, service));
+
+        assert!(matches!(provider.retire_kek(service, &[0x11; 32]), Err(Error::KekNotFound)));
+
+        let handle = provider.load_kek(service, true).unwrap();
+        let fingerprint = crate::crypto::kek_fingerprint(&handle.public_key().unwrap());
+        drop(handle);
+
+        assert!(
+            matches!(provider.retire_kek(service, &[0x11; 32]), Err(Error::KekFingerprintMismatch)),
+            "a wrong fingerprint must delete nothing"
+        );
+        assert!(provider.kek_exists(service).unwrap(), "still there after the mismatch");
+
+        provider.retire_kek(service, &fingerprint).unwrap();
+        assert!(!provider.kek_exists(service).unwrap(), "gone");
+        with_open(&provider, |open| {
+            assert_eq!(count_labelled(&open.session, ObjectClass::PRIVATE_KEY, service).unwrap(), 0);
+            assert_eq!(count_labelled(&open.session, ObjectClass::PUBLIC_KEY, service).unwrap(), 0);
+        });
+        assert!(matches!(provider.retire_kek(service, &fingerprint), Err(Error::KekNotFound)), "nothing left to retire");
+
+        // The service can be provisioned again, under a new key.
+        let again = provider.load_kek(service, true).unwrap();
+        assert_ne!(crate::crypto::kek_fingerprint(&again.public_key().unwrap()), fingerprint);
+        drop(again);
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn retire_kek_refuses_a_duplicate_pair_rather_than_choosing_one_to_delete() {
+        let service = "com.hkdfguard.test.retire.duplicate";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| destroy_all_for(open, service));
+
+        let handle = provider.load_kek(service, true).unwrap();
+        let fingerprint = crate::crypto::kek_fingerprint(&handle.public_key().unwrap());
+        drop(handle);
+        with_open(&provider, |open| plant_key_pair(open, service, key_id(service)));
+
+        let err = provider.retire_kek(service, &fingerprint).expect_err("a duplicate label must be refused");
+        assert!(err.to_string().contains("refusing to choose"), "unexpected error: {err}");
+        assert!(!err.to_string().contains(service), "errors must not name the service: {err}");
+        with_open(&provider, |open| {
+            assert_eq!(count_labelled(&open.session, ObjectClass::PRIVATE_KEY, service).unwrap(), 2, "nothing deleted");
+        });
         with_open(&provider, |open| destroy_all_for(open, service));
     }
 

@@ -1,11 +1,12 @@
 #!/bin/sh
-# Runs inside each test pod (see docker/k8s/run-tests.sh). Reports how the
-# kubelet laid out the Secret volume, then tries the deployment flow
-# against it: provision, wrap a fresh DEK, and unwrap it in a separate
-# process through the shared library. Prints one `RESULT:` line for the
-# runner to compare with what the scenario expects.
+# Runs inside each test pod (see docker/k8s/run-tests.sh and
+# run-vault-tests.sh). Reports how the secret directory was laid out -- by
+# the kubelet for a Secret volume, or by a Vault Agent sidecar -- then tries
+# the deployment flow against it: provision, wrap a fresh DEK, and unwrap it
+# in a separate process through the shared library. Prints one `RESULT:`
+# line for the runner to compare with what the scenario expects.
 #
-# MODE=rotate additionally waits for the Secret to be rotated (the runner
+# MODE=rotate additionally waits for the secret to be rotated (the runner
 # updates it after `READY_FOR_ROTATION`), then checks that the payload
 # wrapped under the old key is refused and that a new wrap works.
 set -u
@@ -22,9 +23,16 @@ if key=$(readlink -f "$MOUNT/$SERVICE"); then
     echo "== key file: $key $(stat -c '%a %U:%G' "$key" 2>&1)"
 fi
 
-# Key files go in a private directory under /tmp: /tmp is sticky and
-# root-owned, so it passes hkdfguard_open_file's directory checks.
-work=$(mktemp -d /tmp/hk.XXXXXX)
+# Key files go in this uid's private directory, which the image creates
+# (docker/k8s/Dockerfile) -- not under /tmp: the library refuses a key file
+# anywhere under a sticky, world-writable directory, and `hkdfguard wrap`
+# refuses to write one there.
+keys_root=/var/lib/hkdfguard-test/$(id -u)
+if [ ! -d "$keys_root" ]; then
+    echo "RESULT: no private key directory $keys_root for uid $(id -u) in this image (see docker/k8s/Dockerfile)"
+    exit 0
+fi
+work=$(mktemp -d "$keys_root/hk.XXXXXX")
 
 # wrap_and_check <name>: wrap a fresh DEK into $work/<name>.key and unwrap
 # it through the library. Prints the failing step's output on failure.
@@ -55,18 +63,28 @@ if [ "$MODE" != rotate ]; then
     exit 0
 fi
 
-before=$(readlink "$MOUNT/..data")
-echo "READY_FOR_ROTATION (..data -> $before)"
+# A Secret volume rotates by repointing ..data; a Vault Agent replaces the
+# file by renaming a new one over it, which gives it a new inode.
+marker() {
+    if [ -L "$MOUNT/..data" ]; then
+        echo "..data -> $(readlink "$MOUNT/..data")"
+    else
+        echo "inode $(stat -L -c %i "$MOUNT/$SERVICE" 2>/dev/null)"
+    fi
+}
+
+before=$(marker)
+echo "READY_FOR_ROTATION ($before)"
 i=0
-while [ "$(readlink "$MOUNT/..data")" = "$before" ]; do
+while [ "$(marker)" = "$before" ]; do
     i=$((i + 1))
     if [ "$i" -gt 180 ]; then
-        echo "RESULT: the Secret was not rotated within 180 s"
+        echo "RESULT: the secret was not rotated within 180 s"
         exit 0
     fi
     sleep 1
 done
-echo "== rotated after ${i}s: ..data -> $(readlink "$MOUNT/..data")"
+echo "== rotated after ${i}s: $(marker)"
 
 if old=$(cli_unwrap_check "$work/first.key" "$SERVICE" "$work/first.dek" 2>&1); then
     echo "RESULT: the payload wrapped under the old key still unwrapped: $old"

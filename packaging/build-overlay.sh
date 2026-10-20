@@ -27,7 +27,11 @@ platform=linux/$arch
 ubuntu=ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 
 TEMP_TAGS=(hkdfguard-overlay-consumer:plain hkdfguard-overlay-consumer:dev)
+# No Sigstore bundle locally: only the release workflow has an identity to
+# sign with, so the overlay's sigstore context is empty here.
+no_bundle=$(mktemp -d)
 cleanup() {
+    rm -rf "$no_bundle"
     for tag in "${TEMP_TAGS[@]}"; do docker rmi -f "$tag" >/dev/null 2>&1 || true; done
     if [ "${KEEP:-1}" = 0 ]; then docker rmi -f hkdfguard-overlay:local hkdfguard-overlay:local-dev >/dev/null 2>&1 || true; fi
 }
@@ -45,6 +49,7 @@ for target in overlay overlay-dev; do
     echo "=== Building $target for $platform as $tag ==="
     docker buildx build --platform "$platform" --load -t "$tag" \
         -f packaging/overlay/Dockerfile --build-context packages=dist/packages \
+        --build-context sigstore="$no_bundle" \
         --target "$target" packaging/overlay
 
     # Every file in the image, directories aside: exactly the binaries (and
