@@ -17,7 +17,7 @@ packaging/check-version.sh
 
 # debian/changelog names one release (Debian's). Building for another --
 # Ubuntu 24.04 -- adds the usual backport entry, in this container's copy
-# only: version 0.1.0-1~ubuntu24.04.1, distribution noble. The `~` sorts it
+# only: version 0.9.0-1~ubuntu24.04.1, distribution noble. The `~` sorts it
 # below the unmodified version, and lintian checks the distribution against
 # the release it runs on.
 # shellcheck disable=SC1091

@@ -46,7 +46,7 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 # Needs the GitHub CLI (https://cli.github.com). Works on a tarball, or on a
 # .deb, .rpm or binary taken out of one.
-gh attestation verify hkdfguard-0.1.0-ubuntu24.04-amd64.tar.gz \
+gh attestation verify hkdfguard-0.9.0-ubuntu24.04-amd64.tar.gz \
     --repo runsecure/hkdfguard-native-linux
 ```
 
@@ -72,8 +72,8 @@ together. Install the development packages only on build machines.
 **Debian and Ubuntu**
 
 ```sh
-tar -xzf hkdfguard-0.1.0-ubuntu24.04-amd64.tar.gz
-cd hkdfguard-0.1.0-ubuntu24.04-amd64
+tar -xzf hkdfguard-0.9.0-ubuntu24.04-amd64.tar.gz
+cd hkdfguard-0.9.0-ubuntu24.04-amd64
 sudo apt install ./libhkdfguard1_*.deb ./hkdfguard_*.deb
 ```
 
@@ -83,8 +83,8 @@ instead of using the local files.
 **RHEL 10 and compatibles, Amazon Linux 2023**
 
 ```sh
-tar -xzf hkdfguard-0.1.0-el10-amd64.tar.gz
-cd hkdfguard-0.1.0-el10-amd64
+tar -xzf hkdfguard-0.9.0-el10-amd64.tar.gz
+cd hkdfguard-0.9.0-el10-amd64
 sudo dnf install ./hkdfguard-libs-0*.rpm ./hkdfguard-0*.rpm
 ```
 
@@ -94,8 +94,8 @@ the CRB repository (`sudo dnf config-manager --set-enabled crb`).
 **SLES 16 and openSUSE Leap 16**
 
 ```sh
-tar -xzf hkdfguard-0.1.0-sles16-amd64.tar.gz
-cd hkdfguard-0.1.0-sles16-amd64
+tar -xzf hkdfguard-0.9.0-sles16-amd64.tar.gz
+cd hkdfguard-0.9.0-sles16-amd64
 sudo zypper install --allow-unsigned-rpm ./libhkdfguard1-*.rpm ./hkdfguard-0*.rpm
 ```
 
@@ -134,8 +134,8 @@ tpm2-tss 4.x runtime libraries from your distribution (on Debian and Ubuntu:
 To install it under `/usr/local`:
 
 ```sh
-tar -xzf hkdfguard-0.1.0-linux-amd64.tar.gz
-cd hkdfguard-0.1.0-linux-amd64
+tar -xzf hkdfguard-0.9.0-linux-amd64.tar.gz
+cd hkdfguard-0.9.0-linux-amd64
 sudo install -m 0644 lib/libhkdfguard.so.1 /usr/local/lib/
 sudo ln -sf libhkdfguard.so.1 /usr/local/lib/libhkdfguard.so
 sudo install -m 0755 bin/hkdfguard /usr/local/bin/
@@ -170,7 +170,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-tctildr0t64 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.1.0 / /
+COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.0 / /
 ```
 
 Things to know:
@@ -187,7 +187,7 @@ Things to know:
 - **Verify the image** before using it:
 
   ```sh
-  gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.1.0 \
+  gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
       --repo runsecure/hkdfguard-native-linux
   ```
 

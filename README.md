@@ -787,7 +787,7 @@ target.
 
 One `debian/` directory serves both Debian-family targets. Built on
 Ubuntu, `packaging/build-deb.sh` adds the customary backport changelog
-entry, so the Ubuntu packages are versioned `0.1.0-1~ubuntu24.04.1` for
+entry, so the Ubuntu packages are versioned `0.9.0-1~ubuntu24.04.1` for
 release `noble`. One spec serves all three RPM targets. On SUSE it follows
 SUSE's naming policy and runs `ldconfig` from scriptlets:
 
@@ -879,7 +879,7 @@ taken out of one -- with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify hkdfguard_0.1.0-1_amd64.deb \
+gh attestation verify hkdfguard_0.9.0-1_amd64.deb \
     --repo runsecure/hkdfguard-native-linux \
     --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
 ```
@@ -923,7 +923,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-tctildr0t64 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.1.0 / /
+COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.0 / /
 ```
 
 - **Debian-family images only**, with glibc 2.39 or newer: Ubuntu 24.04+
@@ -952,7 +952,7 @@ packages the build workflow tested, pushes them, and attests each image
 with Sigstore. To verify one:
 
 ```sh
-gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.1.0 \
+gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
     --repo runsecure/hkdfguard-native-linux
 ```
 
