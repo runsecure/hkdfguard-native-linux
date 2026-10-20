@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn send_to_delivers_one_datagram_and_never_blocks_or_fails() {
-        let dir = crate::secure_file::private_tempdir();
+        let dir = tempfile::Builder::new().prefix("hg-").tempdir_in("/tmp").unwrap();
         let path = dir.path().join("log.sock");
         let receiver = UnixDatagram::bind(&path).unwrap();
         let record = frame(Severity::Info, "event=1002 op=hkdfguard_wrap_dek msg=\"x\"");
