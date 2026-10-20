@@ -83,7 +83,13 @@ Read the DEK, base64 of exactly 32 bytes, from standard input.
 .BI \-\-dek\-file " path"
 Read the DEK, base64 of exactly 32 bytes, from a file. The file must be a
 regular file, not a symlink, owned by root or by the invoking user, with
-no group or other access (mode 0400 or 0600).
+no group or other access (mode 0400 or 0600). Its folder, and every folder
+above it up to
+.IR / ,
+must be a real folder owned by root or the invoking user and not writable
+by group or others \(em sticky folders such as
+.I /tmp
+included, unless on a read-only mount.
 .TP
 .BR \-\-force ", " \-f
 Replace an existing
@@ -138,7 +144,17 @@ Invalid command line.
 .I /etc/hkdfguard/policy.toml
 Administrative policy: which providers may be used, and their
 configuration. Optional. When present it must be owned by root and not
-writable by group or others.
+writable by group or others, and so must every directory above it up to
+.IR / ,
+sticky ones such as
+.I /tmp
+included. The same holds for every file it names: nothing the library
+reads is trusted anywhere under
+.IR /tmp ,
+.I /var/tmp
+or
+.IR /dev/shm ;
+only a read-only mount is exempt.
 .TP
 .I /usr/share/hkdfguard/policy.toml.example
 Annotated example policy, every setting commented out at its default.

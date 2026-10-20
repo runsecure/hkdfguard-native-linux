@@ -55,7 +55,13 @@ commented out at its default. Uncomment and change only what you need.
 - It must be **owned by root** and **not writable by group or others**
   (mode `0644` is right; the services using the library must be able to
   read it).
-- So must `/etc/hkdfguard` and every directory above it.
+- So must `/etc/hkdfguard` and every directory above it, up to `/`. Sticky
+  directories such as `/tmp` are not exempt: nothing the library reads --
+  the policy, secrets, the PIN file, the PKCS#11 module, key files -- may
+  live anywhere under `/tmp`, `/var/tmp` or `/dev/shm`, however private
+  the directory inside them. The one exception is a read-only mount, such
+  as a Kubernetes Secret or ConfigMap volume (`1777`, but nobody can write
+  to it).
 - Only a *missing* file means "no policy". A file that exists but is wrongly
   owned, too broadly writable, unreadable or malformed makes every
   operation fail, rather than falling back to the defaults. Deleting or
@@ -104,7 +110,8 @@ sudo chmod 0440 /etc/hkdfguard/tpm.derivation-secret
 ```
 
 It must be root-owned and readable by root and, optionally, one group;
-never writable by the service. Its bytes are used exactly as stored.
+never writable by the service; and in directories only root can change,
+up to `/` (so never under `/tmp`). Its bytes are used exactly as stored.
 
 #### Back up the derivation secret
 
@@ -212,11 +219,11 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
 ```
 
 - **The module**, its directory and every directory above it must be owned
-  by root and not writable by group or others. Nothing on that path can then
-  be swapped for another library.
+  by root and not writable by group or others, sticky or not (so never under
+  `/tmp`). Nothing on that path can then be swapped for another library.
 - **The PIN file** holds the token's user PIN (one trailing newline is
   ignored). It must be root-owned, mode `0400`, or `0440` with the service's
-  group. If the PIN file doesn't exist, PKCS#11 counts as absent and the
+  group, in directories only root can change, up to `/`. If the PIN file doesn't exist, PKCS#11 counts as absent and the
   next provider is tried. Once it exists, any problem fails the call
   instead.
 - **Choose the token** by `token_label` and/or `token_serial`. Exactly one
@@ -278,9 +285,12 @@ a wrong format is reported when you provision, not later.
 - resolve to a path inside the mount (symlinks are followed only while they
   stay inside it).
 
-The mount and every directory above it must not be writable by anyone else;
-sticky directories such as `/tmp`, and read-only mounts, are fine. Platform
-settings that meet the mode rule:
+The mount and every directory above it must be owned by root or the
+service's user and not writable by anyone else -- sticky directories such as
+`/tmp` included, so a mount anywhere under `/tmp`, `/var/tmp` or `/dev/shm`
+is refused. A read-only mount is the one exception: a Kubernetes Secret
+volume is `1777`, but read-only, and is fine. Platform settings that meet
+the mode rule:
 
 | Mechanism | Setting |
 |---|---|

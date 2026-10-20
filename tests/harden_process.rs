@@ -5,8 +5,8 @@
 use hkdfguard::{harden_flags, hkdfguard_harden_process, hkdfguard_harden_process_with_flags, status};
 
 // Only this user can write to it, whatever the umask, and not under the
-// sticky /tmp: the library refuses to trust a policy or secret mount in a
-// group-writable directory (see src/test_tmp.rs).
+// sticky /tmp: the library refuses a policy or secret in or under any
+// directory others can write to, sticky or not (see src/test_tmp.rs).
 #[cfg(hkdfguard_test_paths)]
 #[path = "../src/test_tmp.rs"]
 mod test_tmp;

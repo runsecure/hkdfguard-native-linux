@@ -23,9 +23,9 @@
 //!   module, SoftHSM2, is a software token that would otherwise be picked
 //!   up -- and counted as hardware -- just for being installed. The
 //!   (symlink-resolved) module file, its directory, and every directory
-//!   above it must be owned by root and not writable by group or others
-//!   (sticky ancestors excepted) -- see [`validate_module_path`]:
-//!   the module is `dlopen`ed into this process. Only the module file
+//!   above it must be owned by root and not writable by group or others,
+//!   sticky or not (so never anywhere under `/tmp`) -- see
+//!   [`validate_module_path`]: the module is `dlopen`ed into this process. Only the module file
 //!   itself is checked: the libraries *it* depends on are found the usual
 //!   way (its RPATH/RUNPATH, `LD_LIBRARY_PATH`, the loader cache). That is
 //!   the same trust any library the host process loads gets, not a
@@ -259,7 +259,8 @@ fn select_token(tokens: &[(String, String)], label: Option<&str>, serial: Option
 /// Checks a PKCS#11 module path before it's ever `dlopen`ed: it must be
 /// absolute, and after resolving symlinks, the module file must be owned
 /// by root and not writable by group or others, and so must its directory
-/// and every directory above it (see [`crate::secure_file::check_dir_chain`]).
+/// and every directory above it, sticky or not (see
+/// [`crate::secure_file::check_dir_chain`]).
 /// Returns the canonical (symlink-resolved) path -- the one that was
 /// actually checked -- so that's exactly what gets loaded.
 ///
@@ -1099,8 +1100,9 @@ mod tests {
     use secrecy::ExposeSecret;
     use std::os::unix::fs::PermissionsExt;
 
-    // In a private directory of its own: `$TMPDIR` itself is usually
-    // `/tmp`, which anyone can write to, and the PIN's location is checked.
+    // In a private directory of its own under the test temp root: `$TMPDIR`
+    // is usually `/tmp`, which anyone can write to, and the PIN's location
+    // is checked -- sticky directories included.
     struct PinFile {
         dir: tempfile::TempDir,
         path: PathBuf,
@@ -1126,6 +1128,26 @@ mod tests {
         std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let err = read_pin_file(f.path()).expect_err("someone else could swap in a wrong PIN");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn pin_file_under_a_sticky_ancestor_is_rejected() {
+        // A private 0700 directory inside a /tmp-style (1777) one: someone
+        // else could create entries beside it, so the PIN is not trusted
+        // there -- however private its own directory.
+        let f = pin_file(b"1234\n", 0o600);
+        let private = f.dir.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = private.join("pkcs11.pin");
+        std::fs::rename(f.path(), &path).unwrap();
+        assert!(read_pin_file(&path).is_ok(), "a private chain is fine");
+
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let err = read_pin_file(&path).expect_err("a sticky ancestor is not trusted");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("sticky"), "says why: {err}");
         std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 

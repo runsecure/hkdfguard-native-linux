@@ -36,10 +36,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 // Only this user can write to it, whatever the umask, and not under the
-// sticky /tmp: the library refuses to trust a policy or secret mount in a
-// group-writable directory, and a key file under any shared one -- which
-// `wrap` therefore refuses to write. `tempfile::tempdir()` creates
-// `0777 & !umask` under /tmp. See src/test_tmp.rs.
+// sticky /tmp: the library refuses a policy, a secret, or a key file in or
+// under any directory others can write to, sticky or not -- so `wrap`
+// refuses to write a key file there, and --dek-file to read one.
+// `tempfile::tempdir()` creates `0777 & !umask` under /tmp. See
+// src/test_tmp.rs.
 #[path = "../src/test_tmp.rs"]
 mod test_tmp;
 

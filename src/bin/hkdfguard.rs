@@ -61,7 +61,11 @@
 //!
 //! A `--dek-file` must be a regular file, must not be a symlink, must be
 //! owned by root or by this process's user, and must grant no access to
-//! group or others (e.g. mode `0400`/`0600`). A single trailing newline
+//! group or others (e.g. mode `0400`/`0600`). Its folder, and every folder
+//! above it up to `/`, must be a real folder (no symbolic links), owned by
+//! root or this process's user, and not writable by group or others --
+//! sticky ones such as `/tmp` included -- unless it is on a read-only mount
+//! (see [`require_private_dek_folder`]). A single trailing newline
 //! (optionally CRLF) is ignored on both paths.
 //!
 //! What this tool cannot fix: if the *caller* puts the DEK in an
@@ -490,6 +494,7 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
     // would follow a link before a `..` in it into another folder (see
     // require_real_folder). Messages still show the operator's spelling.
     let spelled = require_real_folder(Path::new(path))?;
+    require_private_dek_folder(path, &spelled)?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
@@ -940,6 +945,43 @@ fn require_unshared_folder(path: &Path, spelled: &Path) -> Result<(), String> {
              Write the key file into a folder that only its owner (or root) can write to, all the way up to /",
             dir.display(),
             path.display()
+        ));
+    }
+    Ok(())
+}
+
+// --dek-file only: the DEK file's folder, and every folder above it up to
+// `/`, is held to the rule the library applies to every file it reads:
+// owned by root or this process's user, and not writable by group or
+// others -- sticky (`/tmp`, `/var/tmp`, `/dev/shm`) or not. Otherwise
+// someone else could put a DEK of their choosing at the path, and the
+// application would end up encrypting under a key they know. As in the
+// library, a folder on a read-only mount is exempt: a Kubernetes Secret
+// volume is `1777` but nobody can write to it. `spelled` is what
+// `require_real_folder` returned, so its folder is the real one.
+fn require_private_dek_folder(path: &str, spelled: &Path) -> Result<(), String> {
+    let folder = spelled.parent().ok_or_else(|| format!("--dek-file {path} has no parent folder"))?;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    for dir in folder.ancestors() {
+        let meta = fs::metadata(dir).map_err(|e| format!("failed to check --dek-file {path}'s folder {}: {e}", dir.display()))?;
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(format!(
+                "--dek-file {path}: folder {} is owned by uid {}, which is neither root nor this process's user, \
+                 so someone else could replace the DEK file",
+                dir.display(),
+                meta.uid()
+            ));
+        }
+        let mode = meta.mode() & 0o7777;
+        if mode & 0o022 == 0 || on_read_only_mount(dir) {
+            continue;
+        }
+        let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
+        return Err(format!(
+            "--dek-file {path}: folder {} is writable by group or others (mode {mode:o}){sticky}, so someone else \
+             could replace the DEK file. Keep it in a folder only its owner (or root) can write to, all the way up to /",
+            dir.display()
         ));
     }
     Ok(())
@@ -1576,9 +1618,10 @@ mod tests {
     }
 
     // Only this user can write to it, whatever the umask, and not under the
-    // sticky /tmp: the library refuses to trust a policy or secret mount in a
-    // group-writable directory, and a key file under any shared one -- which
-    // `wrap` therefore refuses to write. See src/test_tmp.rs.
+    // sticky /tmp: the library refuses a policy, a secret, or a key file in
+    // or under any directory others can write to, sticky or not -- so
+    // `wrap` refuses to write a key file there, and --dek-file to read one.
+    // See src/test_tmp.rs.
     fn private_tempdir() -> tempfile::TempDir {
         test_tmp::private_tempdir()
     }
@@ -1797,6 +1840,7 @@ mod tests {
                 DekSource::File(missing_dek.clone()),
                 false,
                 None,
+                None,
             )
             .unwrap_err();
             assert!(err.contains("writable by group or others") && !err.contains("--dek-file"), "{err}");
@@ -1810,6 +1854,7 @@ mod tests {
             "com.hkdfguard.clitest.shared".to_string(),
             DekSource::File(missing_dek),
             false,
+            None,
             None,
         )
         .unwrap_err();
@@ -1828,6 +1873,35 @@ mod tests {
         let err = secure_delete(&base.join("link/victim.key")).unwrap_err();
         assert!(err.contains("symbolic link"), "{err}");
         assert_eq!(fs::read(real.join("victim.key")).unwrap(), b"not yours");
+    }
+
+    #[test]
+    fn read_dek_file_refuses_a_shared_folder_sticky_or_not_at_any_level() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let outer = base.join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        for d in [&outer, &inner] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let dek = inner.join("dek.b64");
+        fs::write(&dek, valid_b64()).unwrap();
+        fs::set_permissions(&dek, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut buf = [0u8; MAX_DEK_INPUT_LEN + 1];
+        assert!(read_dek_file(dek.to_str().unwrap(), &mut buf).is_ok(), "a private chain reads");
+
+        // The folder itself, or one above it: a /tmp-style sticky folder is
+        // refused like a plainly shared one, and the message says which.
+        let cases = [(&inner, 0o1777, true), (&inner, 0o770, false), (&outer, 0o1777, true), (&outer, 0o777, false)];
+        for (folder, mode, sticky) in cases {
+            fs::set_permissions(folder, fs::Permissions::from_mode(mode)).unwrap();
+            let err = read_dek_file(dek.to_str().unwrap(), &mut buf).unwrap_err();
+            assert!(err.contains("writable by group or others") && err.contains(&folder.display().to_string()), "{err}");
+            assert_eq!(err.contains("sticky, like /tmp"), sticky, "{err}");
+            fs::set_permissions(folder, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(read_dek_file(dek.to_str().unwrap(), &mut buf).is_ok());
     }
 
     #[test]

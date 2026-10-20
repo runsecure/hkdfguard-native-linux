@@ -17,7 +17,7 @@ mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.toml)
 mod provider; // provider trait + selection chain
 mod secure_file; // hardened, check-then-read-safe file access + self-wiping SecretBuffer
 #[cfg(test)]
-mod test_tmp; // where tests make temp dirs: a private root, not the sticky /tmp key files may not live under
+mod test_tmp; // where tests make temp dirs: a private root, not the sticky /tmp nothing this crate reads may live under
 
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 

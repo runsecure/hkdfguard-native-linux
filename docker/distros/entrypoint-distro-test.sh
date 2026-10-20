@@ -29,10 +29,11 @@ as_ci() { setpriv --reuid=ci --regid=ci --init-groups env HOME=/home/ci USER=ci 
 # Writes stdin into a file `ci` owns, as ci (see docker/entrypoint-test.sh
 # on fs.protected_regular).
 ci_write() { as_ci sh -c 'cat > "$1"' sh "$1"; }
-# Key files, and the DEK cli_unwrap_check probes with hkdfguard_open_file,
-# go here rather than under /tmp: the library refuses a key file anywhere
-# under a sticky, world-writable directory, and the CLI refuses to write
-# one there. /work is ci's own (prepare-image.sh) and / root's, both 0755.
+# Key files, the DEK cli_unwrap_check probes with hkdfguard_open_file, and
+# the harness's policy and PIN file go here rather than under /tmp: the
+# library refuses anything it reads anywhere under a sticky, world-writable
+# directory, and the CLI refuses to write a key file there. /work is ci's
+# own (prepare-image.sh) and / root's, both 0755.
 KEYS=$(as_ci mktemp -d /work/keys.XXXXXX)
 
 # BASE_RUSTFLAGS is set only where the target needs it (Alpine/musl:
@@ -94,7 +95,7 @@ section "initializing a SoftHSM2 token"
 # select this token by label (SOFTHSM_TEST_TOKEN_LABEL).
 as_ci softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-pin 5678
 
-HARNESS=$(as_ci mktemp -d)
+HARNESS=$(as_ci mktemp -d /work/harness.XXXXXX)
 ( umask 077; printf '1234\n' > "$HARNESS/pkcs11.pin" )
 cat > "$HARNESS/policy.toml" <<TOML
 [selection]

@@ -78,7 +78,7 @@ extern "C" {
 #define HKDFGUARD_ERR_INVALID_SERVICE_NAME (-8) /* service is null, empty, not valid UTF-8, over 128 bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." */
 
 /* Policy */
-#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or its directory, or it requires a provider this build lacks */
+#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or of any directory above it (writable by group/others, sticky /tmp-style included), or it requires a provider this build lacks */
 
 /* Wrapped payload */
 #define HKDFGUARD_ERR_PAYLOAD_MALFORMED (-10)   /* structurally invalid: truncated, trailing bytes, unknown provider type, or a field length no wrap produces */

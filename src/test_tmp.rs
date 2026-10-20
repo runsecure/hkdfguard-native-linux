@@ -1,10 +1,11 @@
 //! Test-only: where the test suites make their temp directories.
 //!
 //! Not the system temp dir. `/tmp` (and `/var/tmp`, `/dev/shm`) is sticky
-//! and world-writable, and the library refuses a key file anywhere beneath
-//! such a directory (`secure_file::check_dir_chain_strict`), so tests that
-//! read key files back -- and the CLI's `wrap`, which refuses to write one
-//! there -- need a root nobody else can write into, all the way up to `/`.
+//! and world-writable, and the library refuses every file it reads -- key
+//! files, policies, secrets, PINs -- anywhere beneath such a directory
+//! (`secure_file::check_dir_chain`), so tests that use them -- and the
+//! CLI's `wrap` and `--dek-file`, which refuse them there too -- need a
+//! root nobody else can write into, all the way up to `/`.
 //!
 //! The root is, in order:
 //!
@@ -117,7 +118,7 @@ fn tighten_owned_dirs(anchor: &Path, root: &Path) {
     }
 }
 
-// The library's strict key-file rule, applied up front so a bad root is
+// The library's directory rule, applied up front so a bad root is
 // reported once, plainly.
 fn check_chain(root: &Path) {
     // SAFETY: geteuid has no preconditions.
@@ -134,9 +135,9 @@ fn check_chain(root: &Path) {
         };
         if let Some(problem) = problem {
             panic!(
-                "test temp root {}: {} {problem}, so the library would refuse key files under it. Run \
-                 `chmod go-w` on it, or set HKDFGUARD_TEST_TMPDIR to a directory whose every ancestor is \
-                 owned by root or you and writable by nobody else.",
+                "test temp root {}: {} {problem}, so the library would refuse key files, policies and \
+                 secrets under it. Run `chmod go-w` on it, or set HKDFGUARD_TEST_TMPDIR to a directory \
+                 whose every ancestor is owned by root or you and writable by nobody else.",
                 root.display(),
                 d.display()
             );

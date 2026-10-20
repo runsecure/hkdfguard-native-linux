@@ -224,8 +224,8 @@ created would vanish when it exits.
 
 The policy file (`/etc/hkdfguard/policy.toml`) must be owned by root and
 not writable by group or others, and so must `/etc/hkdfguard` and every
-directory above it (sticky directories like `/tmp` and read-only mounts
-excepted). The service's own user is deliberately not accepted: any
+directory above it -- sticky directories like `/tmp` included; only a
+read-only mount is exempt. The service's own user is deliberately not accepted: any
 process running as that user could otherwise rewrite the policy, or
 delete it to switch policy off. Only a *missing* file in a trusted
 directory means "no policy"; a file that exists but is unreadable, too
@@ -668,8 +668,9 @@ cargo test --features pkcs11 -- --ignored   # needs SoftHSM2 or another PKCS#11 
 ```
 
 The tests make their temp directories under `<target>/tmp/hkdfguard-tests`
-(mode `0700`), not under `/tmp`: the library refuses key files anywhere
-under a sticky, world-writable directory. Every directory above it must be
+(mode `0700`), not under `/tmp`: the library refuses key files, policies
+and secrets anywhere under a sticky, world-writable directory. Every
+directory above it must be
 owned by root or you and not group/other-writable; the tests clear group
 and other write on what they own inside the target directory, and stop
 with a message naming any other offending directory (a checkout in a shared
@@ -981,10 +982,13 @@ derivation secret. `<mount>/<service>` must:
   leading anywhere else is refused;
 - sit in a **mount nobody else can write to**: the mount directory and
   every directory above it must be owned by root or the process's user and
-  not writable by group or others. Sticky ancestors (`/tmp`) and read-only
-  mounts — a Kubernetes Secret volume is `1777` but read-only — are fine. A
-  mount another user could write to would let them plant a KEK for a
-  service that isn't provisioned yet, which `create_kek` would then adopt.
+  not writable by group or others -- sticky or not, so a mount anywhere
+  under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however private the
+  directories beneath it; so must the directory the resolved file sits in,
+  and every one above it. The one exception is a read-only mount: a
+  Kubernetes Secret volume is `1777` but read-only, and is fine. A mount
+  another user could write to would let them plant a KEK for a service
+  that isn't provisioned yet, which `create_kek` would then adopt.
 
 A file that is present but fails a check is reported as an **error**,
 never as "not provisioned": a misconfigured mount must not silently fall
@@ -1108,9 +1112,12 @@ group read is never a reason to refuse a key file.
 
 A `--dek-file` must be reached through real folders (no symbolic link anywhere
 above it, as for the key file), and must be a regular file, not a symlink, owned by root or by
-the invoking user, with no group or other access (e.g. `0400`/`0600`) — the
-same rules the library applies to the PKCS#11 PIN and the TPM derivation
-secret. On both paths the input is strict standard base64 (`+/`, padded), at
+the invoking user, with no group or other access (e.g. `0400`/`0600`). Its
+folder, and every folder above it up to `/`, must be owned by root or the
+invoking user and not writable by group or others -- sticky folders such as
+`/tmp` included, unless on a read-only mount -- or someone else could put a
+DEK of their choosing there. These are the rules the library applies to the
+PKCS#11 PIN and the TPM derivation secret. On both paths the input is strict standard base64 (`+/`, padded), at
 most 64 bytes: one trailing newline (LF or CRLF) is ignored, and no other
 whitespace is accepted. A leading UTF-8 byte-order mark (some Windows tools
 add one) is skipped, and UTF-16 input is refused with a message saying so.
@@ -1282,8 +1289,12 @@ additionally may be read by nobody but root and, optionally, the
 service's group: a PIN file the service could write would let any process
 running as that user write a wrong PIN and lock the HSM user out. The
 PKCS#11 module, its directory, and every directory above it must be
-root-owned and not group/other-writable (sticky ancestors excepted), so
-nothing on the module's path can be swapped before it is `dlopen`ed.
+root-owned and not group/other-writable, so nothing on the module's path
+can be swapped before it is `dlopen`ed. "Directories only root can
+change" means every one up to `/`, sticky directories such as `/tmp`
+included: nothing here may live anywhere under `/tmp`, `/var/tmp` or
+`/dev/shm`. Only a read-only mount (a Kubernetes Secret or ConfigMap
+volume) is exempt.
 
 Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
@@ -1380,16 +1391,19 @@ its default.
   the service's own uid can't rewrite (or delete) them. Secret contents are read into a single fixed
   allocation that is never grown (so no partially-filled buffer is ever
   freed un-wiped) and zeroed on every exit path.
-- **Key files are never trusted under a shared directory.**
-  `hkdfguard_open_file` requires the key file and every directory that
-  decides what its path names, up to `/`, to be owned by root or the
-  calling user and not writable by group or others -- with no exception
-  for sticky directories, so nothing under `/tmp`, `/var/tmp` or
-  `/dev/shm` is accepted, however private the directory beneath (read-only
-  mounts, such as a Kubernetes Secret volume, excepted). The CLI's `wrap`
-  refuses to write a key file where it would be refused. (The policy, PIN,
-  derivation-secret, PKCS#11 module and external-secret checks still
-  accept a sticky *ancestor*.)
+- **Nothing the library reads is trusted under a shared directory.**
+  The policy file, the PKCS#11 module and PIN file, the TPM derivation
+  secret and owner password, external-secret KEKs, and key files opened
+  with `hkdfguard_open_file` must each sit in a directory that, with every
+  directory above it up to `/`, is owned by root (or, where the file may
+  be, the calling user) and not writable by group or others -- with no
+  exception for sticky directories, so nothing under `/tmp`, `/var/tmp` or
+  `/dev/shm` is accepted, however private the directory beneath. The one
+  exception is a read-only mount: a Kubernetes Secret or ConfigMap volume
+  is `1777` but nobody can write to it. The refusal names the directory
+  and says when it was a sticky one. The CLI holds its own files to the
+  same rule: `wrap` refuses to write a key file where it would be refused,
+  and to read a `--dek-file` from such a directory.
 - **Service names can never name a file outside their mount.** The C ABI
   rejects a `service` that starts with `.` or contains `..`, and the
   external-secret provider enforces the same rule again where the name

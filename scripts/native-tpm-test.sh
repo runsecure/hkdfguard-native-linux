@@ -62,9 +62,10 @@
 #                                `reboot`, where capture and verify must share it.
 #   HKDFGUARD_TEST_TMPDIR        where the temp dir goes (default:
 #                                $XDG_RUNTIME_DIR, else ~/.cache). Never /tmp:
-#                                the library refuses key files under a sticky,
-#                                world-writable directory, so it and every
-#                                directory above it must be private.
+#                                the library refuses policies, secrets and
+#                                key files under a sticky, world-writable
+#                                directory, so it and every directory above
+#                                it must be private.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -102,14 +103,15 @@ fi
 
 # Fails, naming the directory, unless $1 and every directory above it is
 # owned by root or this user and writable by nobody else -- sticky ones
-# (/tmp) included: the rule hkdfguard_open_file applies to key files, which
-# this script writes into $WORK and $STATE.
+# (/tmp) included: the rule the library applies to everything it reads --
+# policies, derivation secrets, PIN files and key files, which this script
+# writes into $WORK and $STATE.
 require_private_chain() { # require_private_chain <dir> <what to set instead>
     local d=$1 perm owner
     while :; do
         perm=$(stat -Lc '%a' "$d"); owner=$(stat -Lc '%u' "$d")
         if (( 8#$perm & 8#022 )) || { [ "$owner" != 0 ] && [ "$owner" != "$(id -u)" ]; }; then
-            echo "$d is $(stat -Lc '%U:%G %a' "$d"): the library refuses key files under a directory another user could write to (sticky ones like /tmp included)." >&2
+            echo "$d is $(stat -Lc '%U:%G %a' "$d"): the library refuses policies, secrets and key files under a directory another user could write to (sticky ones like /tmp included)." >&2
             echo "Run 'chmod go-w $d', or set $2 to a private directory." >&2
             exit 1
         fi
@@ -119,7 +121,7 @@ require_private_chain() { # require_private_chain <dir> <what to set instead>
 }
 
 # Scratch space for policies, secrets and key files: never under /tmp,
-# where the library refuses key files. $XDG_RUNTIME_DIR (/run/user/<uid>,
+# where the library refuses all of them. $XDG_RUNTIME_DIR (/run/user/<uid>,
 # 0700) where there is one, else ~/.cache. The cargo tests' own temp root
 # goes inside it too (HKDFGUARD_TEST_TMPDIR).
 WORK_PARENT=${HKDFGUARD_TEST_TMPDIR:-${XDG_RUNTIME_DIR:-$HOME/.cache}}
@@ -231,9 +233,9 @@ if [ "$MODE" = "reboot" ]; then
     fi
 
     # The derivation secret and the wrapped key live in $STATE, and the
-    # library refuses a secret under any directory another user could write
-    # to -- which surfaces only as "TPM context not available" -- and a key
-    # file under one even if it is sticky (/tmp). Under a umask of 002
+    # library refuses either under any directory another user could write
+    # to, even a sticky one (/tmp) -- for the secret, that surfaces only as
+    # "TPM context not available". Under a umask of 002
     # (Ubuntu's default) `mkdir -p` would create such parents itself, so
     # create them private, and name an existing open one instead of
     # letting the run fail obscurely.

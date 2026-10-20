@@ -34,9 +34,10 @@
 //!   directories that decide what the path names -- the opened file's own
 //!   and the one the path names it in, each up to `/`: owned by root or
 //!   this user, and not writable by group or others -- **sticky or not, at
-//!   any level** (see [`secure_file::check_dir_chain_strict`]). Otherwise
-//!   someone else could rename a file of their choosing over the key, or
-//!   retarget a symlink to one. So a key file anywhere under `/tmp`,
+//!   any level** (see [`secure_file::check_dir_chain`], the rule every
+//!   file this crate reads is held to). Otherwise someone else could
+//!   rename a file of their choosing over the key, or retarget a symlink to
+//!   one. So a key file anywhere under `/tmp`,
 //!   `/var/tmp`, `/dev/shm` or any other sticky, world-writable directory
 //!   is refused, however private the directories beneath it: a key file
 //!   belongs in a directory only its owner (or root) can write to, all the
@@ -182,7 +183,7 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
 
 // The directories that decide what `path` names must be as trustworthy as
 // the file: owned by root or this user, and not writable by group or others,
-// sticky or not (`secure_file::check_dir_chain_strict`). Otherwise someone
+// sticky or not (`secure_file::check_dir_chain`). Otherwise someone
 // else could rename a file of their choosing over the key, or retarget a
 // symlink to one, and the file checks alone would pass on whatever they put
 // there. Sticky (`/tmp`-style) directories are not trusted anywhere in the
@@ -199,7 +200,7 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
 // this user, in trusted directories) -- never to one they wrote.
 fn check_location(path: &Path, target_real: &Path) -> Result<(), KeyFileError> {
     let check = |dir: &Path| {
-        secure_file::check_dir_chain_strict(dir, Owner::RootOrCurrentUser)
+        secure_file::check_dir_chain(dir, Owner::RootOrCurrentUser)
             .map_err(|_| KeyFileError::Untrusted)
     };
     // Only `/` has no parent, and `/` is a directory, not a key file.

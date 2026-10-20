@@ -36,8 +36,13 @@
 //!   a weaker provider.
 //! - **In a mount nobody else can write to.** The mount directory and
 //!   every directory above it must be owned by root or this process's user
-//!   and not writable by group or others (sticky ancestors and read-only
-//!   mounts, such as a Kubernetes Secret volume, are fine). Otherwise
+//!   and not writable by group or others -- sticky or not, so a mount
+//!   anywhere under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however
+//!   private the directories beneath it (see
+//!   [`crate::secure_file::check_dir_chain`]); so must the directory the
+//!   resolved file sits in and every one above it. The one exception is
+//!   a read-only mount: a Kubernetes Secret volume is `1777` but mounted
+//!   read-only, so nobody can write to it, and it is fine. Otherwise
 //!   another user could plant a KEK for a not-yet-provisioned service.
 //! - **A regular file.** Not a directory, device, or FIFO (which would
 //!   block the read forever).
@@ -584,6 +589,60 @@ mod tests {
                 assert!(provider.kek_exists("com.company.orders").is_err(), "mode {mode:o}: an error, not absence");
             }
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_a_private_mount_under_a_sticky_ancestor() {
+        // A 0700 mount inside a /tmp-style (1777) directory: the layout of
+        // `mktemp -d` under /tmp. Refused like any shared directory -- a
+        // KEK belongs in a mount nobody else can write to, all the way up.
+        let base = crate::secure_file::private_tempdir();
+        let mount = base.path().join("secrets");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700)).unwrap();
+        provision(&mount, "com.company.orders", SecretKey::generate().to_bytes());
+        let _secret_mount = crate::policy::test_support::secret_mount(&mount);
+        let provider = ExternalSecretProvider::new();
+        provider.load_kek("com.company.orders", false).unwrap();
+
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        match provider.load_kek("com.company.orders", false) {
+            Err(Error::Provider(msg)) => assert!(msg.contains("sticky"), "says why: {msg}"),
+            Err(other) => panic!("expected Provider(..sticky..), got {other:?}"),
+            Ok(_) => panic!("a KEK under a sticky, world-writable directory must be refused"),
+        }
+        assert!(provider.kek_exists("com.company.orders").is_err(), "an error, not absence");
+        // Nothing provisioned for this one either: still an error, never "not provisioned".
+        assert!(provider.kek_exists("com.company.other").is_err());
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        provider.load_kek("com.company.orders", false).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_a_symlink_target_under_a_sticky_directory_inside_the_mount() {
+        with_dir(|provider, dir| {
+            // `<key>` -> `..2026_10_02/keys/<key>`, with `..2026_10_02`
+            // sticky and world-writable: the directory the file sits in is
+            // private, but one above it, inside the mount, is not.
+            let shared = dir.join("..2026_10_02");
+            let keys = shared.join("keys");
+            std::fs::create_dir_all(&keys).unwrap();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+            provision(&keys, "com.company.orders", SecretKey::generate().to_bytes());
+            std::os::unix::fs::symlink("..2026_10_02/keys/com.company.orders", dir.join("com.company.orders")).unwrap();
+            provider.load_kek("com.company.orders", false).unwrap();
+
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            match provider.load_kek("com.company.orders", false) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("sticky"), "says why: {msg}"),
+                Err(other) => panic!("expected Provider(..sticky..), got {other:?}"),
+                Ok(_) => panic!("a KEK under a sticky directory inside the mount must be refused"),
+            }
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
         });
     }
 
