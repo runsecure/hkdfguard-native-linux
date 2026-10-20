@@ -337,7 +337,29 @@ printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
     | as_ci $CLI wrap -kf "$RETIRE_DIR/wrapped.key" -sn $RETIRE_SERVICE --dek-stdin >/dev/null
 as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$RETIRE_DIR/wrapped.key" $RETIRE_SERVICE "$RETIRE_DIR/dek"
 
+# wrap --fingerprint: written only when the payload is sealed to the KEK
+# given; a mismatch writes nothing, and with --force leaves the file alone.
 WRONG=$(printf '%064d' 0)
+OUT=$(printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+    | as_ci $CLI wrap -kf "$RETIRE_DIR/pinned.key" -sn $RETIRE_SERVICE --dek-stdin -fp "$FP" 2>&1) \
+    || { echo "FAIL: wrap --fingerprint with the right fingerprint: $OUT" >&2; exit 1; }
+grep -q "^fingerprint: $FP (confirmed)" <<<"$OUT" || { echo "FAIL: wrap did not confirm the fingerprint: $OUT" >&2; exit 1; }
+if OUT=$(printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+        | as_ci $CLI wrap -kf "$RETIRE_DIR/refused.key" -sn $RETIRE_SERVICE --dek-stdin -fp "$WRONG" 2>&1); then
+    echo "FAIL: wrap --fingerprint with the wrong fingerprint succeeded" >&2; exit 1
+fi
+grep -q "the service's KEK is $FP, not $WRONG; nothing was written" <<<"$OUT" \
+    || { echo "FAIL: unexpected wrap mismatch message: $OUT" >&2; exit 1; }
+[ ! -e "$RETIRE_DIR/refused.key" ] || { echo "FAIL: a key file was written despite the mismatch" >&2; exit 1; }
+BEFORE=$(sha256sum < "$RETIRE_DIR/pinned.key")
+if printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+        | as_ci $CLI wrap -kf "$RETIRE_DIR/pinned.key" -sn $RETIRE_SERVICE --dek-stdin -fp "$WRONG" --force >/dev/null 2>&1; then
+    echo "FAIL: wrap --force --fingerprint with the wrong fingerprint succeeded" >&2; exit 1
+fi
+[ "$(sha256sum < "$RETIRE_DIR/pinned.key")" = "$BEFORE" ] \
+    || { echo "FAIL: --force replaced the key file despite the fingerprint mismatch" >&2; exit 1; }
+echo "wrap --fingerprint: right one written and confirmed; wrong one wrote nothing, and --force left the old file intact."
+
 if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$WRONG" 2>&1); then
     echo "FAIL: retire with the wrong fingerprint succeeded" >&2; exit 1
 fi

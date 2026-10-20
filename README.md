@@ -1023,10 +1023,12 @@ commands:
 hkdfguard provision --service-name com.company.orders
 
 # 2. Wrap a DEK under it. Never creates a KEK: if none is provisioned it
-#    fails and names the command above.
+#    fails and names the command above. --fingerprint (optional) writes
+#    nothing unless the DEK was wrapped under the KEK provision reported.
 printf '%s' "$DEK_B64" | hkdfguard wrap \
     --key-file-path /var/lib/app/key.bin \
-    --service-name com.company.orders --dek-stdin
+    --service-name com.company.orders --dek-stdin \
+    --fingerprint <fingerprint from provision>
 
 # ...or from a file: a Kubernetes/Vault secret mount, or a systemd credential
 hkdfguard wrap \
@@ -1043,6 +1045,18 @@ So a KEK that is missing or wrong on the provider fails at deployment, not
 at the first wrap. On a TPM the KEK is derived on demand, so it always
 reports present; for `external-secret` the mounted file *is* the
 provisioning; only Ephemeral actually creates anything.
+
+`provision` prints the KEK's fingerprint, and `wrap` prints the
+fingerprint of the KEK it actually wrapped under, read from the payload it
+is about to write. `wrap --fingerprint` checks the two match before
+writing: `wrap` is the step that commits a secret to a KEK, and if the
+service's KEK had been replaced since provisioning, the DEK would
+otherwise be sealed to that key, and the mistake found only at unwrap
+(`KEK_FINGERPRINT_MISMATCH`, `-16`). On a mismatch nothing is written, and
+with `--force` the existing key file is left as it was. The check reads
+the fingerprint from the finished payload rather than asking for the KEK's
+fingerprint first, so the KEK can't change between the check and the
+wrap.
 
 The DEK is base64 of exactly 32 bytes, read from stdin or a file — never
 from a command-line argument or an environment variable, both of which are

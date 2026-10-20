@@ -43,6 +43,14 @@ pub mod admin {
         }
     }
 
+    /// The KEK fingerprint a wrapped payload carries -- the KEK it was
+    /// sealed to -- parsed with the library's own payload parser (version,
+    /// field lengths, no trailing bytes), so the CLI never hard-codes this
+    /// library's private layout. `None` if `payload` isn't a well-formed one.
+    pub fn payload_fingerprint(payload: &[u8]) -> Option<[u8; payload::FINGERPRINT_LEN]> {
+        payload::Payload::from_bytes(payload).ok().map(|p| p.fingerprint)
+    }
+
     /// Permanently deletes the KEK `service` currently resolves to -- the
     /// one every wrap uses -- if its fingerprint is `expected_fingerprint`.
     /// Only a provider that stores one key per service can do this

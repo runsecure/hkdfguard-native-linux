@@ -72,7 +72,8 @@ service still has the same KEK.
 ```
 hkdfguard provision --service-name|-sn <name>
 hkdfguard wrap --key-file-path|-kf <path> --service-name|-sn <name> \
-               (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
+               (--dek-stdin | --dek-file <path>) [--group|-g <name>]
+               [--fingerprint|-fp <64 hex chars>] [--force|-f]
 hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 ```
 
@@ -83,7 +84,7 @@ hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
 | `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600` |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
-| `--fingerprint`, `-fp` | For `retire`: the KEK's fingerprint, as `provision` printed it (64 hex characters) |
+| `--fingerprint`, `-fp` | The KEK's fingerprint, as `provision` printed it (64 hex characters). For `wrap`: nothing is written unless the DEK was wrapped under that KEK. For `retire`: required; nothing is deleted unless it matches. |
 | `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
 
 Exit status: `0` success, `1` the operation failed, `2` invalid command line.
@@ -105,6 +106,13 @@ To generate a new random DEK as base64:
 
 `wrap` never creates a KEK. If the service isn't provisioned, it fails and
 tells you to run `provision`.
+
+`wrap` prints the fingerprint of the KEK it actually wrapped under, read
+from the payload it is about to write. Pass `--fingerprint` with the value
+`provision` printed and it checks this for you: if the service's KEK is not
+that one (replaced, re-provisioned, or on a different provider than you
+expected), nothing is written and the DEK is not committed to that key.
+With `--force`, the existing key file is left as it was.
 
 `retire` permanently deletes the service's KEK, and with it every DEK
 wrapped under it. It deletes nothing unless the KEK's fingerprint is the
