@@ -1,0 +1,17 @@
+# Groups HKDFGuard's security model uses (systemd-sysusers(8) format), the
+# counterparts of the Windows MSI's HkdfGuardUsers and HkdfGuardDeployers:
+#
+#   hkdfguard            application accounts that use a KEK (give them the
+#                        derivation secret, PIN or secret file 0440, see
+#                        docs/configuration.md); nothing in the library
+#                        names it.
+#   hkdfguard-deployers  under the production security model, the accounts
+#                        whose key files hkdfguard_open_file trusts, and who
+#                        may run `hkdfguard wrap`.
+#
+# Installed by both the .deb and the .rpm. Never removed, on uninstall or
+# purge: a group created again later can get a different gid, and every
+# file still carrying the old one would then belong to no group, or to
+# another one.
+g hkdfguard           -
+g hkdfguard-deployers -

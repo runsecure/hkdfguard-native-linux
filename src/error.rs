@@ -55,7 +55,7 @@ pub mod status {
     // ---- KEK ----
     pub const KEK_FINGERPRINT_MISMATCH: i32 = -16; // wrapped payload's embedded KEK fingerprint doesn't match the current KEK's public key
     pub const KEK_NOT_FOUND: i32 = -17; // no persistent KEK exists yet for this service; call hkdfguard_create_kek first
-    pub const KEK_ACCESS_DENIED: i32 = -18; // shared-table code: the KEK exists but this process may not use it -- not currently returned on Linux
+    pub const KEK_ACCESS_DENIED: i32 = -18; // this process may not do this to the KEK: on Linux, create a KEK that doesn't exist yet, or retire one, under the production security model without being root
     pub const KEK_INVALID: i32 = -19; // shared-table code: the KEK exists but is corrupt or has an invalid ACL -- not currently returned on Linux
     pub const PROCESS_HARDENING_FAILED: i32 = -20; // hkdfguard_harden_process could not disable core dumps or ptrace access, or (with REQUIRE_PROTECTED_SIGNATURE) the process can still be debugged by its own user
     // -21..-31 reserved.
@@ -68,14 +68,16 @@ pub mod status {
     pub const FILE_TOO_LONG: i32 = -36; // key file is longer than a wrapped DEK, or than its own header declares
     pub const FILE_PLAINTEXT_KEY: i32 = -37; // key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex) -- a likely key exposure
     pub const FILE_MALFORMED: i32 = -38; // key file is the right length but not a payload a wrap could have produced
-    pub const FILE_UNTRUSTED: i32 = -39; // key file, or a directory deciding what its path names, is owned by another user or writable by group/others (or was swapped mid-open): someone else could have replaced it
+    pub const FILE_UNTRUSTED: i32 = -39; // key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust or writable by someone else (or was swapped mid-open): someone else could have replaced it
     // -40..-63 reserved for future common codes.
 
     // ---- Platform bands ----
-    // Defined here so the table stays complete; none is returned on Linux.
+    // Defined here so the table stays complete; only Linux's own are
+    // returned on Linux.
     // Windows -64..-79:
     pub const WIN_GROUP_INVALID: i32 = -64; // refines POLICY_INVALID; Windows only
-    // Linux -80..-95: none defined yet.
+    // Linux -80..-95:
+    pub const LINUX_GROUP_INVALID: i32 = -80; // refines POLICY_INVALID: a deployer group (deployer_groups, or hkdfguard-deployers) doesn't exist, is over-broad, or can't be looked up
     // macOS -96..-111, each refining PROVIDER_ERROR; macOS only:
     pub const MAC_ACCESS_CONTROL_CREATION_FAILED: i32 = -96;
     pub const MAC_KEY_GENERATION_FAILED: i32 = -97;
@@ -135,6 +137,13 @@ pub enum Error {
     /// ECDH/AES-GCM is attempted -- unlike `AuthFailed`, this specifically
     /// means "wrong KEK," not "right KEK, but tampered/mismatched data."
     KekFingerprintMismatch,
+    /// The security model doesn't let this process do this: under the
+    /// production model, create a KEK that doesn't exist yet, or retire
+    /// one, without being root.
+    AccessDenied(&'static str), // static message saying what was refused
+    /// A deployer group can't be used: it doesn't exist, is over-broad, or
+    /// couldn't be looked up. Refines `Policy`.
+    GroupInvalid(String), // carries a human-readable description, for logs only
 }
 
 impl Error {
@@ -152,6 +161,8 @@ impl Error {
             Error::AuthFailed => status::PAYLOAD_AUTH_FAILED,
             Error::KekNotFound => status::KEK_NOT_FOUND,
             Error::KekFingerprintMismatch => status::KEK_FINGERPRINT_MISMATCH,
+            Error::AccessDenied(_) => status::KEK_ACCESS_DENIED,
+            Error::GroupInvalid(_) => status::LINUX_GROUP_INVALID,
         }
     }
 }
@@ -177,6 +188,8 @@ impl fmt::Display for Error {
                 f,
                 "wrapped payload's KEK fingerprint does not match the current KEK for this service"
             ),
+            Error::AccessDenied(msg) => write!(f, "access denied: {msg}"),
+            Error::GroupInvalid(msg) => write!(f, "policy error: {msg}"),
         }
     }
 }
@@ -225,6 +238,8 @@ mod tests {
             Error::KekFingerprintMismatch.status_code(),
             status::KEK_FINGERPRINT_MISMATCH
         );
+        assert_eq!(Error::AccessDenied("needs root").status_code(), status::KEK_ACCESS_DENIED);
+        assert_eq!(Error::GroupInvalid("no such group".into()).status_code(), status::LINUX_GROUP_INVALID);
     }
 
     // Every status constant, with the number the cross-platform table
@@ -257,6 +272,7 @@ mod tests {
         ("FILE_MALFORMED", status::FILE_MALFORMED, -38),
         ("FILE_UNTRUSTED", status::FILE_UNTRUSTED, -39),
         ("WIN_GROUP_INVALID", status::WIN_GROUP_INVALID, -64),
+        ("LINUX_GROUP_INVALID", status::LINUX_GROUP_INVALID, -80),
         ("MAC_ACCESS_CONTROL_CREATION_FAILED", status::MAC_ACCESS_CONTROL_CREATION_FAILED, -96),
         ("MAC_KEY_GENERATION_FAILED", status::MAC_KEY_GENERATION_FAILED, -97),
         ("MAC_KEYCHAIN_WRITE_FAILED", status::MAC_KEYCHAIN_WRITE_FAILED, -98),

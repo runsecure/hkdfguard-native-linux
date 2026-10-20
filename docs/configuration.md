@@ -10,6 +10,7 @@ is read from environment variables.
 - [The policy file](#the-policy-file)
 - [Setting up each provider](#setting-up-each-provider): [TPM 2.0](#tpm-20), [PKCS#11](#pkcs11-hsm-or-smart-card), [external secret](#external-secret-file), [ephemeral](#ephemeral-development-only)
 - [Example policies](#example-policies)
+- [Security model: who may provision, wrap and unwrap](#security-model-who-may-provision-wrap-and-unwrap)
 - [Who can use the keys](#who-can-use-the-keys)
 - [Policy reference](#policy-reference)
 
@@ -391,6 +392,109 @@ pin_file = "/etc/hkdfguard/pkcs11.pin"
 token_label = "hkdfguard"
 ```
 
+## Security model: who may provision, wrap and unwrap
+
+The top-level policy setting `security_model` splits the duties, as the
+Windows build's `SecurityModel` policy value and the macOS build's
+production mode do:
+
+```toml
+security_model = "production"            # the default; or "developer"
+deployer_groups = ["payments-deployers"] # optional; besides hkdfguard-deployers
+```
+
+Both keys go above the first `[table]`. Production applies when they are
+absent, and when there is no policy file at all: a host is a production
+install unless an administrator says otherwise. Any other value of
+`security_model` (`"development"` included) makes the policy invalid, and
+every call fails with `HKDFGUARD_ERR_POLICY_INVALID` (-9).
+
+Under **production**:
+
+| Role | Who | May |
+|---|---|---|
+| Security admin | root | `hkdfguard provision`, `hkdfguard retire` |
+| Deployment admin | root, or a *deployer* | `hkdfguard wrap`: write key files `hkdfguard_open_file` will trust |
+| Application | any other account the provider lets use the KEK | unwrap (and wrap in memory); it cannot persist a key file its own service would accept |
+
+- **Creating a KEK takes root.** `hkdfguard_create_kek` from anyone else
+  returns the existing KEK -- so an application may still call it at
+  startup -- or `HKDFGUARD_ERR_KEK_ACCESS_DENIED` (-18) when there is none
+  to return. An ephemeral KEK is the exception: it lives only in the
+  process that makes it. Retiring a KEK takes root too. How much this
+  gates depends on the provider: on PKCS#11 it is enforced directly (only
+  root generates a key pair on the token); external-secret never creates a
+  KEK (the delivered file is the provisioning); and on TPM2 it gates
+  nothing unless `tpm.require_pinned_names = true`, because without it the
+  TPM derives a KEK for any service name on demand, so any process with TPM
+  access and the derivation secret gets one. **Set `require_pinned_names =
+  true` on production TPM hosts:** a service then exists only once root has
+  run `provision` (which prints the Name to pin) and added that Name to the
+  root-owned policy.
+- **A deployer** is a direct member of the group `hkdfguard-deployers`
+  (the packages create it) or of a group listed in `deployer_groups`:
+  named in the group's member list, or having it as their primary group.
+  `deployer_groups` takes names, not gids (an all-digit entry is rejected),
+  each once. A group that doesn't exist, can't be looked up, or is
+  over-broad -- `root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`,
+  `adm`, `staff`, or gid 0 or 65534 -- fails every key-file read with
+  `HKDFGUARD_ERR_LINUX_GROUP_INVALID` (-80), which refines -9.
+- **Whose key files are trusted.** `hkdfguard_open_file` accepts a key
+  file only if it, and every directory deciding what its path names, is
+  owned by root or a deployer, and writable by nobody else: never by
+  others, and by its group only if that group is a deployer group.
+  Otherwise `HKDFGUARD_ERR_FILE_UNTRUSTED` (-39). The calling account is
+  trusted only if it is a deployer, so a key file the application wrote --
+  or copied into a folder of its own -- is refused.
+
+Under **developer**, anyone who can reach the provider may create a KEK,
+and key files owned by root or by the calling user are trusted, with no
+group write allowed: the rule before security models existed. The first
+key file read under it in each process is audited as event 1005
+(Warning), as a reminder that the host is not running production.
+
+Wrapping and unwrapping are the same in both models. Who may use a KEK at
+all is still the provider's own access control (TPM access and the
+derivation secret, the PIN file, the secret file's mode): wrap and unwrap
+are the same ECDH operation on the KEK, so nothing can grant one without
+the other. What the model decides is whose key files are believed.
+
+A deployment, as root:
+
+```sh
+# Deployers: the accounts (or CI runner) that run `hkdfguard wrap`.
+sudo usermod -aG hkdfguard-deployers alice
+
+# A folder the deployers share; setgid, so new files keep the group.
+sudo install -d -o root -g hkdfguard-deployers -m 2775 /etc/orders/keys
+
+# Security admin: provision the KEK, once. Record the fingerprint.
+sudo hkdfguard provision -sn com.company.orders
+
+# Deployment admin (alice, or root): wrap, readable by the service's group.
+printf '%s' "$DEK_B64" | hkdfguard wrap -kf /etc/orders/keys/orders.key \
+    -sn com.company.orders --dek-stdin -g orders -fp <fingerprint>
+
+# The service (user orders, not a deployer) only opens and unwraps it.
+```
+
+Things to know:
+
+- **Upgrading changes the default.** On a host with no `security_model`,
+  key files owned by the application's own account -- `hkdfguard wrap` run
+  as the service user, say -- become `FILE_UNTRUSTED` (-39). Redeploy them
+  as root or a deployer, or set `security_model = "developer"` until you
+  have.
+- **Membership is looked up on every `hkdfguard_open_file` call**, through
+  NSS, so LDAP and sssd groups count, and a slow directory slows the call.
+  Removing a deployer makes every key file they own untrusted at once:
+  redeploy those files first.
+- Tools can ask the library the same questions: `hkdfguard_security_model`
+  (the model, and whether a key file this process writes would be trusted)
+  and `hkdfguard_key_file_principal_trusted("uid:<n>"` or `"gid:<n>")`.
+- `scripts/verify-roles.sh` checks the whole split end to end, as root,
+  against a release build.
+
 ## Who can use the keys
 
 On Linux, anything that can reach a service's provider **and** read its
@@ -406,11 +510,20 @@ permissions so that only the service's own account can do both.
 | `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | As above |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
 | External secret `<dir>/<service>` | root or the service's user, `0400`; or `root:<group> 0440` | Only that service (or the pod's `fsGroup`) |
-| Wrapped key files (CLI output) | `root:<service-group> 0640` | Only that service can read its wrapped DEK |
+| Wrapped key files (CLI output) | root or a deployer, `:<service-group> 0640` | Only that service can read its wrapped DEK; under the production model, only root's and deployers' are trusted |
+| Folder holding key files | root or a deployer; `root:hkdfguard-deployers 2775` to share it | Nobody untrusted can replace a key file |
+
+The packages create two groups, from `packaging/hkdfguard.sysusers`
+(`/usr/lib/sysusers.d/hkdfguard.conf`), and never remove them, on
+uninstall or purge, since a group created again could get another gid:
+`hkdfguard`, for the accounts that may use the keys (nothing in the library
+names it), and `hkdfguard-deployers` (see
+[Security model](#security-model-who-may-provision-wrap-and-unwrap)).
 
 A practical layout for several services on one host:
 
 ```sh
+# hkdfguard exists if the packages are installed; otherwise:
 sudo groupadd --system hkdfguard        # may use the keys at all
 sudo chgrp hkdfguard /etc/hkdfguard/tpm.derivation-secret
 sudo chmod 0440 /etc/hkdfguard/tpm.derivation-secret
@@ -429,6 +542,9 @@ this as defence in depth, not a hard boundary.
 Every setting, with its default. Only `[selection]` is required.
 
 ```toml
+security_model = "production"   # production | developer. Must come before any [section].
+deployer_groups = []            # production only: groups whose direct members deploy key files,
+                                # besides hkdfguard-deployers. Names, not gids.
 preferred_order = ["tpm2", "pkcs11", "external-secret"]
                          # with mode = "prefer": the order to try; providers left out are never used.
                          # The only way to allow "ephemeral" (besides `require`). Must come before any [section].

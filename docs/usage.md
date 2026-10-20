@@ -42,17 +42,23 @@ deployment (once per host and DEK)                application (every start)
 ```
 
 ```sh
-# 1. Once per host: make sure the service has a KEK.
+# 1. Once per host, as root (the security admin): make sure the service has a KEK.
 sudo hkdfguard provision -sn com.company.orders
 
-# 2. Wrap the DEK, delivered by your secrets pipeline, into a key file.
+# 2. As root or a deployer (the deployment admin): wrap the DEK, delivered
+#    by your secrets pipeline, into a key file the service's group may read.
 printf '%s' "$DEK_B64" | sudo hkdfguard wrap \
-    -kf /var/lib/orders/dek.wrapped -sn com.company.orders --dek-stdin
+    -kf /var/lib/orders/dek.wrapped -sn com.company.orders --dek-stdin -g orders
 
-# 3. Let the service read the key file (and nobody else).
-sudo chgrp orders /var/lib/orders/dek.wrapped
-sudo chmod 0640 /var/lib/orders/dek.wrapped
+# 3. The service (the application) only reads the key file and unwraps it.
 ```
+
+These are the production security model's three roles, the default: only
+root provisions and retires, only root or a deployer (a member of
+`hkdfguard-deployers`) writes key files the library will trust, and the
+application unwraps. Under `security_model = "developer"` anyone who can
+reach the provider may do all three. See
+[configuration.md](configuration.md#security-model-who-may-provision-wrap-and-unwrap).
 
 What `provision` does depends on the provider:
 
@@ -80,7 +86,7 @@ hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 | Option | Meaning |
 |---|---|
 | `--service-name`, `-sn` | The service whose KEK is used |
-| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file, and no folder above it, up to `/`, may be writable by group or others -- sticky folders such as `/tmp` included, since `hkdfguard_open_file` refuses a key file there (`-39`). Checked before the DEK is read; only the folders' modes are checked, not who owns them. |
+| `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file, and no folder above it, up to `/`, may be writable by group or others -- sticky folders such as `/tmp` included, since `hkdfguard_open_file` refuses a key file there (`-39`). Checked before the DEK is read. Under the developer model only the folders' modes are checked, not who owns them; under production each folder must be owned by root or a deployer, and may be group-writable only through a deployer group (a `root:hkdfguard-deployers 2775` folder), exactly as the library will check it. |
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
 | `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600`, in a folder that -- with every folder above it, up to `/` -- is owned by root or you and not writable by group or others, sticky folders such as `/tmp` included (a read-only mount is exempt) |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
@@ -106,6 +112,15 @@ To generate a new random DEK as base64:
 
 `wrap` never creates a KEK. If the service isn't provisioned, it fails and
 tells you to run `provision`.
+
+Under the production security model (the default), `provision` of a KEK
+that doesn't exist yet, and `retire`, need root: anyone else gets "only root
+creates or retires a KEK" (`provision` of an existing KEK only verifies it,
+which anyone may). `wrap` needs root or a deployer -- a member of
+`hkdfguard-deployers`, or of a group the policy lists in `deployer_groups`
+-- since the library trusts only their key files; anyone else is refused
+before the DEK is read ("may not persist key files ... Nothing was
+written").
 
 `wrap` prints the fingerprint of the KEK it actually wrapped under, read
 from the payload it is about to write. Pass `--fingerprint` with the value
@@ -133,12 +148,14 @@ warning (`memory not locked as a whole`).
 
 | Function | Purpose |
 |---|---|
-| `int hkdfguard_create_kek(const char* service)` | Ensure the service has a KEK (the only call that creates one). Idempotent. |
+| `int hkdfguard_create_kek(const char* service)` | Ensure the service has a KEK (the only call that creates one). Idempotent. Under the production security model only root creates one; anyone else gets the existing KEK, or `HKDFGUARD_ERR_KEK_ACCESS_DENIED` |
 | `int hkdfguard_kek_exists(const char* service, int* exists)` | Report whether a KEK exists, without creating one |
 | `int hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int dek_len, uint8_t* out, int* out_len)` | Wrap a 32-byte DEK |
 | `int hkdfguard_unwrap_dek(const char* service, const uint8_t* wrapped, int wrapped_len, uint8_t* out, int* out_len)` | Recover the DEK from a wrapped payload |
 | `int hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int* out_len)` | Generate a random DEK and return only its wrapped form |
 | `int hkdfguard_open_file(const char* path, uint8_t* out, int* out_len)` | Read a wrapped-key file, checking its length and form; `*out_len` is the number of bytes read. Doesn't unwrap |
+| `int hkdfguard_security_model(int* out_model, int* out_may_write_key_files)` | The security model in force (`HKDFGUARD_SECURITY_MODEL_PRODUCTION` 0, `HKDFGUARD_SECURITY_MODEL_DEVELOPER` 1), and whether a key file this process writes would be trusted |
+| `int hkdfguard_key_file_principal_trusted(const char* principal, int* out_trusted)` | Whether `"uid:<n>"` may own, or `"gid:<n>"` write through its group, a key file or a folder above one, under the model in force: for tools that prepare key folders |
 | `int hkdfguard_harden_process(void)` | Opt in to process hardening: no core dumps, no same-user debugging |
 | `int hkdfguard_harden_process_with_flags(unsigned int flags)` | The same, with options. `HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE` makes a debuggable process a failure on macOS (where it depends on code signing); on Linux it's accepted and changes nothing |
 
@@ -176,6 +193,7 @@ warning (`memory not locked as a whole`).
 | -12 | `HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED` | The wrapped data has a payload version this library doesn't know |
 | -16 | `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH` | The payload was wrapped under a different KEK than the service has now |
 | -17 | `HKDFGUARD_ERR_KEK_NOT_FOUND` | The service has no KEK yet: provision it first |
+| -18 | `HKDFGUARD_ERR_KEK_ACCESS_DENIED` | Under the production security model, a non-root caller asked `hkdfguard_create_kek` for a KEK that doesn't exist yet (or the CLI's `retire`): only root creates or retires one |
 | -20 | `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` | `hkdfguard_harden_process` couldn't apply its settings |
 | -32 | `HKDFGUARD_ERR_FILE_NOT_FOUND` | `hkdfguard_open_file`: the file, or a directory in its path, doesn't exist |
 | -33 | `HKDFGUARD_ERR_FILE_ACCESS_DENIED` | `hkdfguard_open_file`: the OS refused to let this process open the file (for example, no read permission) |
@@ -184,13 +202,18 @@ warning (`memory not locked as a whole`).
 | -36 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
 | -37 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
 | -38 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
-| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by another user or writable by group or others, so someone else could have replaced it. Key files should be `0600` and owned by the service (as the CLI writes them) or by root, in a directory only the service or root can write, all the way up to `/`. Sticky directories are **not** trusted -- for key files or anything else the library reads: a key file anywhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory is refused, however private the directories beneath it (a read-only mount, such as a Kubernetes Secret volume, is fine) |
+| -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by someone the security model doesn't trust, or writable by someone else, so someone else could have replaced it. Under production (the default) key files and their directories must be owned by root or a deployer, and group-writable only through a deployer group: a key file the service's own account owns is refused. Under developer, owned by the service or by root, with no group write. Either way, all the way up to `/`. Sticky directories are **not** trusted -- for key files or anything else the library reads: a key file anywhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory is refused, however private the directories beneath it (a read-only mount, such as a Kubernetes Secret volume, is fine) |
 
 The numbers are the same in the Windows and macOS builds of this library,
 which share one status table. `hkdfguard.h` also defines the codes only
-those platforms return (`HKDFGUARD_ERR_KEK_ACCESS_DENIED` (-18) and
-`HKDFGUARD_ERR_KEK_INVALID` (-19), and the platform-specific codes from -64
-down); Linux never returns them. A platform-specific code always refines a
+those platforms return (`HKDFGUARD_ERR_KEK_INVALID` (-19), and the
+platform-specific codes from -64 down, other than Linux's own); Linux never
+returns them. Linux's own band starts at -80:
+
+| Code | Name | Meaning |
+|---|---|---|
+| -80 | `HKDFGUARD_ERR_LINUX_GROUP_INVALID` | Refines -9: a deployer group (`deployer_groups`, or `hkdfguard-deployers`) doesn't exist, is over-broad, or can't be looked up. Every key-file read fails until it is fixed |
+ A platform-specific code always refines a
 common one (its comment in the header says which), so it is safe to handle
 it as that code.
 
@@ -294,7 +317,9 @@ NUL-terminated.
 
 ## Running as a service
 
-The service's account needs the same access that `provision` and `wrap` had:
+The service's account needs the same provider access that `provision` and
+`wrap` had -- but under the production security model it is the
+application, not a deployer: it never writes its own key files.
 
 | Provider | The service account needs |
 |---|---|
@@ -327,14 +352,17 @@ the unit file can't, such as debugger attachment by other processes of the
 same user.
 
 **A one-shot wrap at deployment**, taking the DEK from a systemd credential so
-it never touches the command line (`%d` is the unit's credentials directory):
+it never touches the command line (`%d` is the unit's credentials directory).
+It runs as root (no `User=`), the deployment admin; a dedicated deployer
+account, a member of `hkdfguard-deployers`, would do as well. The service
+gets read access through `-g`, and never runs `wrap` itself:
 
 ```ini
 [Service]
 Type=oneshot
 LoadCredential=dek:/etc/orders/dek.b64
 ExecStart=/usr/bin/hkdfguard wrap -kf /var/lib/orders/dek.wrapped \
-    -sn com.company.orders --dek-file %d/dek --force
+    -sn com.company.orders --dek-file %d/dek -g orders --force
 LimitMEMLOCK=infinity
 ```
 

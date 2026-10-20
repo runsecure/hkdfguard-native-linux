@@ -37,7 +37,8 @@ prints its fingerprint: record it.
 Run it once, at deployment time. With
 .BR retire ,
 it is the only command that makes the library's setup calls, which are
-deliberately slow.
+deliberately slow. Under the production security model, creating a KEK
+needs root; for an existing one, anyone may run it to verify the KEK.
 .TP
 .B wrap
 Wraps a 32-byte Data Encryption Key (DEK) under the service's existing
@@ -46,12 +47,38 @@ KEK and writes the wrapped payload to
 mode 0600, and prints the fingerprint of the KEK it wrapped under. It
 never creates a KEK: if none has been provisioned, it fails and says to run
 .BR provision .
+Under the production security model it needs root or a deployer, and
+refuses anyone else before reading the DEK.
 .TP
 .B retire
 Permanently deletes the service's KEK, only if its fingerprint is the one
 given; every DEK wrapped under it can no longer be unwrapped. PKCS#11
 only: a TPM KEK is re-derived on demand and not stored, so there is
-nothing to delete.
+nothing to delete. Under the production security model it needs root.
+.SH SECURITY MODEL
+The policy's top-level
+.B security_model
+setting is
+.B production
+(the default, also with no policy file) or
+.BR developer .
+Production splits the duties: root, the security admin, runs
+.B provision
+and
+.BR retire ;
+root or a deployer, the deployment admin, runs
+.BR wrap ;
+the application only unwraps. A deployer is a direct member of the group
+.B hkdfguard\-deployers
+(the packages create it) or of a group listed in the policy's
+.BR deployer_groups .
+The library trusts only key files owned by root or a deployer, in folders
+owned by root or a deployer and group-writable only through a deployer
+group; any other is refused with
+.BR HKDFGUARD_ERR_FILE_UNTRUSTED .
+Under developer, anyone who can reach the provider may do all three, and
+key files owned by the reading account are trusted. Wrapping and
+unwrapping themselves are the same under both.
 .SH OPTIONS
 .TP
 .BR \-\-service\-name ", " \-sn " \fIname\fR"
@@ -74,8 +101,10 @@ included. The library refuses to read a key file under such a folder
 .RB ( HKDFGUARD_ERR_FILE_UNTRUSTED ),
 so
 .B wrap
-refuses to write one there, before the DEK is read. Only the folders'
-modes are checked, not who owns them.
+refuses to write one there, before the DEK is read. Under the developer
+security model only the folders' modes are checked, not who owns them;
+under production each folder must also be owned by root or a deployer,
+and may be group-writable only through a deployer group.
 .TP
 .B \-\-dek\-stdin
 Read the DEK, base64 of exactly 32 bytes, from standard input.
@@ -167,11 +196,18 @@ Per-host secret mixed into TPM-derived KEKs.
 .TP
 .I /etc/hkdfguard/pkcs11.pin
 Default PKCS#11 user PIN file.
+.TP
+.I /usr/lib/sysusers.d/hkdfguard.conf
+Creates the groups
+.B hkdfguard
+and
+.BR hkdfguard\-deployers ,
+which are never removed.
 .SH EXAMPLES
 .nf
-hkdfguard provision \-sn com.company.orders
-printf '%s' "$DEK_B64" | hkdfguard wrap \e
-    \-kf /var/lib/app/key.bin \-sn com.company.orders \-\-dek\-stdin
+sudo hkdfguard provision \-sn com.company.orders
+printf '%s' "$DEK_B64" | sudo hkdfguard wrap \e
+    \-kf /var/lib/app/key.bin \-sn com.company.orders \-\-dek\-stdin \-g app
 hkdfguard wrap \-kf /var/lib/app/key.bin \e
     \-sn com.company.orders \-\-dek\-file "$CREDENTIALS_DIRECTORY/dek"
 hkdfguard retire \-sn com.company.orders \-fp <fingerprint from provision>

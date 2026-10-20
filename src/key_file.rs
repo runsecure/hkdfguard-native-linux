@@ -22,20 +22,25 @@
 //!   alone, normally without its contents being read into this process. Neither
 //!   form can be mistaken for a payload: both are shorter than the smallest
 //!   one.
-//! - **Integrity.** The file must be owned by root or by this process's
-//!   user, and must not be writable by group or others; otherwise
-//!   [`KeyFileError::Untrusted`]. A wrapped DEK is ciphertext, so reading
-//!   it gains nothing -- but *replacing* it does: anyone who can write the
-//!   file and can also wrap under the service's KEK (on TPM2, any process
-//!   in the `tss` group with the derivation secret) could plant a DEK they
-//!   know, and `unwrap` would accept it as genuine. The CLI writes key
-//!   files `0600` for the same reason. Symlinks are followed, and the
-//!   checks apply to the file they resolve to. The same holds for the
-//!   directories that decide what the path names -- the opened file's own
-//!   and the one the path names it in, each up to `/`: owned by root or
-//!   this user, and not writable by group or others -- **sticky or not, at
-//!   any level** (see [`secure_file::check_dir_chain`], the rule every
-//!   file this crate reads is held to). Otherwise someone else could
+//! - **Integrity.** The file must be owned by someone the security model
+//!   trusts, and must not be writable by anyone else; otherwise
+//!   [`KeyFileError::Untrusted`]. Under the production model (the
+//!   default) that is root or a deployer, and group write is allowed only
+//!   through a deployer group; under the developer model, root or this
+//!   process's user, and no group write (see [`crate::security_model`]). A
+//!   wrapped DEK is ciphertext, so reading it gains nothing -- but
+//!   *replacing* it does: anyone who can write the file and can also wrap
+//!   under the service's KEK (on TPM2, any process in the `tss` group with
+//!   the derivation secret; under the developer model, the application
+//!   itself) could plant a DEK they know, and `unwrap` would accept it as
+//!   genuine. The CLI writes key files `0600` for the same reason.
+//!   Symlinks are followed, and the checks apply to the file they resolve
+//!   to. The same holds for the directories that decide what the path
+//!   names -- the opened file's own and the one the path names it in, each
+//!   up to `/`: owned by someone trusted, and not writable by anyone else
+//!   -- **sticky or not, at any level** (see
+//!   [`secure_file::check_dir_chain_trusting`], the rule every file this
+//!   crate reads is held to). Otherwise someone else could
 //!   rename a file of their choosing over the key, or retarget a symlink to
 //!   one. So a key file anywhere under `/tmp`,
 //!   `/var/tmp`, `/dev/shm` or any other sticky, world-writable directory
@@ -50,7 +55,7 @@ use crate::crypto::{DEK_LEN, MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN, T
 use crate::error::status;
 use crate::payload::{Payload, NONCE_LEN, SALT_LEN, VERSION};
 use crate::provider::ProviderType;
-use crate::secure_file::{self, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_WRITE};
+use crate::secure_file::{self, FileRequirements, PrincipalTrust, SecretBuffer};
 use std::io;
 use std::path::Path;
 
@@ -63,10 +68,10 @@ pub enum KeyFileError {
     /// a directory in its path), e.g. `EACCES`.
     AccessDenied,
     /// The file, or a directory deciding what its path names, is owned by
-    /// another user or is writable by group or others (sticky or not, so
-    /// anywhere under `/tmp` included) -- or the file was
-    /// swapped between being checked and being opened -- so someone else
-    /// could have replaced its contents.
+    /// someone the security model doesn't trust or is writable by someone
+    /// else (sticky or not, so anywhere under `/tmp` included) -- or the
+    /// file was swapped between being checked and being opened -- so
+    /// someone else could have replaced its contents.
     Untrusted,
     /// Not a regular file (a directory, FIFO, device...), or the read failed.
     Io,
@@ -100,8 +105,9 @@ impl KeyFileError {
             KeyFileError::NotFound => "the file, or a directory in its path, does not exist",
             KeyFileError::AccessDenied => "this process may not open the file",
             KeyFileError::Untrusted => {
-                "the file or a directory deciding what its path names is owned by another user or writable by \
-                 group/others (sticky /tmp-style directories included), so someone else could have replaced it"
+                "the file or a directory deciding what its path names is owned by someone the security model \
+                 doesn't trust, or writable by someone else (sticky /tmp-style directories included), so someone \
+                 else could have replaced it"
             }
             KeyFileError::Io => "not a regular file, or reading it failed",
             KeyFileError::TooShort => "the file is shorter than a wrapped DEK, or than its header declares",
@@ -114,7 +120,8 @@ impl KeyFileError {
     }
 }
 
-/// Opens `path` and returns its contents once they pass [`check`].
+/// Opens `path` and returns its contents once they pass [`check`], with
+/// every owner and writer judged by `trust`.
 ///
 /// The same sequence the external-secret provider uses for its secret
 /// files (`open_secret_within_mount`):
@@ -126,9 +133,9 @@ impl KeyFileError {
 /// 3. The *resolved* path is opened read-only with `O_NOFOLLOW`, so a
 ///    symlink swapped in after step 1 fails the open instead of being
 ///    followed, and with `O_NONBLOCK` so a FIFO can't hang the call.
-///    Anything but a regular file, and any file someone other than root or
-///    this user could have written, is refused on the opened descriptor's
-///    own metadata, before a byte is read.
+///    Anything but a regular file, and any file someone `trust` doesn't
+///    accept could have written, is refused on the opened descriptor's own
+///    metadata, before a byte is read.
 /// 4. The descriptor is confirmed to be the file resolved and checked in
 ///    steps 1-2 ([`secure_file::verify_opened`]): through `/proc` where it
 ///    is mounted, and by device and inode where it isn't -- equally
@@ -140,28 +147,33 @@ impl KeyFileError {
 /// come back in a [`SecretBuffer`]: a payload is ciphertext, but a refused
 /// file may have held a plaintext key, and either way the buffer is wiped
 /// when dropped.
-pub fn read(path: &Path) -> Result<SecretBuffer, KeyFileError> {
-    read_with_proc_root(path, Path::new("/proc"))
+pub fn read(path: &Path, trust: &dyn PrincipalTrust) -> Result<SecretBuffer, KeyFileError> {
+    read_with_proc_root(path, trust, Path::new("/proc"))
 }
 
 // `read`, with where `/proc` is mounted made a parameter so tests can run
 // it as though `/proc` were missing.
-fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
+fn read_with_proc_root(path: &Path, trust: &dyn PrincipalTrust, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
+    // Owner and mode are judged below, against `trust`, on the opened
+    // descriptor's metadata; `open_checked` only opens it safely.
     let req = FileRequirements {
-        owner: Some(Owner::RootOrCurrentUser),
-        forbidden_mode_bits: FORBID_GROUP_OTHER_WRITE,
+        owner: None,
+        forbidden_mode_bits: 0,
         follow_symlinks: false,
         allow_group_read_if_root_owned: false, // group read isn't forbidden here anyway: the file is ciphertext
     };
     let target_real = std::fs::canonicalize(path).map_err(open_error)?;
-    check_location(path, &target_real)?;
-    let mut file = secure_file::open_checked(&target_real, &req).map_err(|e| match e.raw_os_error() {
+    check_location(path, &target_real, trust)?;
+    let untrusted = |e: io::Error| match e.raw_os_error() {
         Some(libc::ELOOP) => KeyFileError::Untrusted, // became a symlink after it was resolved
-        // No OS error behind it: `open_checked`'s own owner/mode check on
-        // the opened descriptor refused the file, not the kernel.
+        // No OS error behind it: a check on the opened descriptor refused
+        // the file, not the kernel.
         None if e.kind() == io::ErrorKind::PermissionDenied => KeyFileError::Untrusted,
         _ => open_error(e),
-    })?;
+    };
+    let mut file = secure_file::open_checked(&target_real, &req).map_err(untrusted)?;
+    let meta = file.metadata().map_err(|_| KeyFileError::Io)?;
+    secure_file::check_metadata_trusting(&meta, trust).map_err(untrusted)?;
     secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::Untrusted)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
     if size == DEK_LEN as u64 {
@@ -182,8 +194,8 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
 }
 
 // The directories that decide what `path` names must be as trustworthy as
-// the file: owned by root or this user, and not writable by group or others,
-// sticky or not (`secure_file::check_dir_chain`). Otherwise someone
+// the file: owned by someone `trust` accepts, and not writable by anyone
+// else, sticky or not (`secure_file::check_dir_chain_trusting`). Otherwise someone
 // else could rename a file of their choosing over the key, or retarget a
 // symlink to one, and the file checks alone would pass on whatever they put
 // there. Sticky (`/tmp`-style) directories are not trusted anywhere in the
@@ -196,11 +208,11 @@ fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, Ke
 // and the one `path` names it in, which holds the symlink if `path` is one.
 // Directories that intermediate symlinks *within* the path live in are not
 // walked; someone able to retarget one could at most redirect `path` to a
-// different file that itself passes every check here (owned by root or
-// this user, in trusted directories) -- never to one they wrote.
-fn check_location(path: &Path, target_real: &Path) -> Result<(), KeyFileError> {
+// different file that itself passes every check here (owned by someone
+// trusted, in trusted directories) -- never to one they wrote.
+fn check_location(path: &Path, target_real: &Path, trust: &dyn PrincipalTrust) -> Result<(), KeyFileError> {
     let check = |dir: &Path| {
-        secure_file::check_dir_chain(dir, Owner::RootOrCurrentUser)
+        secure_file::check_dir_chain_trusting(dir, trust)
             .map_err(|_| KeyFileError::Untrusted)
     };
     // Only `/` has no parent, and `/` is a directory, not a key file.
@@ -407,7 +419,21 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use crate::payload::FINGERPRINT_LEN;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::secure_file::Owner;
+    use crate::security_model::Trust;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // Most tests here are about the file and its path, not whose it is: they
+    // read under the developer model's rule (root or this user), which
+    // `Owner::RootOrCurrentUser` is. The production model's own tests pass a
+    // `Trust` explicitly.
+    fn read(path: &Path) -> Result<SecretBuffer, KeyFileError> {
+        super::read(path, &Owner::RootOrCurrentUser)
+    }
+
+    fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
+        super::read_with_proc_root(path, &Owner::RootOrCurrentUser, proc_root)
+    }
 
     fn payload_with_key_id(key_id_len: usize) -> Vec<u8> {
         Payload {
@@ -955,6 +981,64 @@ mod tests {
         std::thread::spawn(move || tx.send(read(&fifo).err()).unwrap());
         let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("read blocked on a FIFO");
         assert_eq!(result, Some(KeyFileError::Io));
+    }
+
+    // ---- read(): the production security model ----
+
+    #[test]
+    fn production_refuses_this_user_s_own_key_file_unless_it_is_a_deployer() {
+        let (uid, name, _) = Trust::this_user_for_tests();
+        if uid == 0 {
+            return; // root's files are trusted under every model: nothing to refuse
+        }
+        let dir = secure_file::private_tempdir();
+        let path = write(dir.path(), "wrapped.key", &valid());
+        let gid = std::fs::metadata(&path).unwrap().gid();
+        assert!(read(&path).is_ok(), "the developer model trusts this user's own file");
+        assert_eq!(
+            super::read(&path, &Trust::production_for_tests(&[])).err(),
+            Some(KeyFileError::Untrusted),
+            "production: the application's own account may not persist a key file it would accept"
+        );
+        let deployer = Trust::production_for_tests(&[(gid.wrapping_add(4242), &[name.as_str()])]);
+        assert!(super::read(&path, &deployer).is_ok(), "production: a deployer's file is trusted");
+        let someone_else = Trust::production_for_tests(&[(gid.wrapping_add(4242), &["someone-else"])]);
+        assert_eq!(super::read(&path, &someone_else).err(), Some(KeyFileError::Untrusted));
+    }
+
+    #[test]
+    fn production_lets_a_deployer_group_write_the_folder_and_nobody_else() {
+        let (uid, name, _) = Trust::this_user_for_tests();
+        let base = secure_file::private_tempdir();
+        let dir = base.path().join("keys");
+        std::fs::create_dir(&dir).unwrap();
+        let path = write(&dir, "wrapped.key", &valid());
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        let deployers = Trust::production_for_tests(&[(gid, &[name.as_str()])]);
+        let other_group = Trust::production_for_tests(&[(gid.wrapping_add(4242), &[name.as_str()])]);
+
+        // `root:hkdfguard-deployers 2775`: deployers share the folder.
+        for mode in [0o770, 0o775, 0o2775] {
+            chmod(&dir, mode);
+            assert!(super::read(&path, &deployers).is_ok(), "dir mode {mode:o}, group a deployer group");
+            assert_eq!(super::read(&path, &other_group).err(), Some(KeyFileError::Untrusted), "dir mode {mode:o}, another group");
+            if uid != 0 {
+                assert_eq!(read(&path).err(), Some(KeyFileError::Untrusted), "dir mode {mode:o}: developer trusts no group");
+            }
+        }
+        // Writable by others is never trusted, deployer group or not.
+        for mode in [0o777, 0o1777, 0o757] {
+            chmod(&dir, mode);
+            assert_eq!(super::read(&path, &deployers).err(), Some(KeyFileError::Untrusted), "dir mode {mode:o}");
+        }
+        chmod(&dir, 0o700);
+
+        // The same for the file itself.
+        chmod(&path, 0o660);
+        assert!(super::read(&path, &deployers).is_ok(), "file group-writable by a deployer group");
+        assert_eq!(super::read(&path, &other_group).err(), Some(KeyFileError::Untrusted));
+        chmod(&path, 0o662);
+        assert_eq!(super::read(&path, &deployers).err(), Some(KeyFileError::Untrusted), "file writable by others");
     }
 
     #[test]

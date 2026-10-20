@@ -16,6 +16,7 @@ mod payload; // wrapped-payload wire format
 mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.toml)
 mod provider; // provider trait + selection chain
 mod secure_file; // hardened, check-then-read-safe file access + self-wiping SecretBuffer
+mod security_model; // production/developer: who may create and retire KEKs, and whose key files are trusted
 #[cfg(test)]
 mod test_tmp; // where tests make temp dirs: a private root, not the sticky /tmp nothing this crate reads may live under
 
@@ -27,6 +28,8 @@ pub use error::status; // re-export the status-code constants as part of this cr
 #[doc(hidden)]
 pub mod admin {
     use super::*;
+
+    pub use security_model::{DEPLOYERS_GROUP, OVER_BROAD_GROUPS};
 
     /// Why an administrative operation failed: the status code it maps to
     /// (as the C functions would return it), and a sentence for the
@@ -57,7 +60,9 @@ pub mod admin {
     /// (PKCS#11); any other refuses, saying why. The fingerprint is checked
     /// twice: against the KEK the service resolves to, and by the provider
     /// on the very objects it deletes. A setup call (serialized, held to
-    /// the latency floor), and audited (1004) on success.
+    /// the latency floor), and audited (1004) on success. Under the
+    /// production security model, root only: anyone else gets
+    /// `KEK_ACCESS_DENIED` and nothing is deleted.
     ///
     /// Every DEK wrapped under the KEK becomes unrecoverable. Returns the
     /// provider it was deleted from.
@@ -74,6 +79,9 @@ pub mod admin {
 
         let _policy = policy::snapshot_for_call();
         let result = gated_setup(|| -> Result<provider::ProviderType, error::Error> {
+            if !security_model::may_administer_keks(security_model::current()?) {
+                return Err(error::Error::AccessDenied("under the production security model only root retires a KEK"));
+            }
             let (provider, handle) = provider::select_existing(&service)?;
             if crypto::kek_fingerprint(&handle.public_key()?) != *expected_fingerprint {
                 return Err(error::Error::KekFingerprintMismatch);
@@ -684,7 +692,16 @@ fn create_kek_impl(service: *const c_char) -> c_int {
         // (1000/1001), not every idempotent re-run. If the question itself
         // fails, the create below reports the real error.
         let existed = provider::kek_exists(&service_str).unwrap_or(false);
-        match provider::create_kek(&service_str) {
+        // Under the production model only root creates a persistent KEK;
+        // anyone else gets the existing one, or KEK_ACCESS_DENIED.
+        let created = security_model::current().and_then(|model| {
+            if security_model::may_administer_keks(model) {
+                provider::create_kek(&service_str)
+            } else {
+                provider::create_kek_unprivileged(&service_str)
+            }
+        });
+        match created {
             Ok((provider, _handle)) => {
                 if !existed {
                     audit::kek_created(&service_str, provider.provider_type(), provider::preferred_type());
@@ -949,6 +966,157 @@ fn unwrap_impl(
     status::OK
 }
 
+/// Reports the security model in force and whether a key file this
+/// process writes would be trusted under it -- the Windows build's
+/// function, value for value. See [`security_model`].
+///
+/// # Parameters
+/// - `out_model`: receives `HKDFGUARD_SECURITY_MODEL_PRODUCTION` (0) or
+///   `HKDFGUARD_SECURITY_MODEL_DEVELOPER` (1).
+/// - `out_may_write_key_files`: receives 1 if a key file this process
+///   writes (owned by its effective uid) would be trusted by
+///   [`hkdfguard_open_file`], else 0.
+///
+/// # Returns
+/// [`status::OK`]; [`status::INVALID_ARGUMENT`] for a null pointer;
+/// [`status::POLICY_INVALID`] if the policy can't be used; or
+/// [`status::LINUX_GROUP_INVALID`] for a deployer group that can't be.
+/// Both outputs are left unchanged on failure. Never throws/unwinds.
+///
+/// # Safety
+/// Each pointer must be null or valid for writing an `int`.
+#[no_mangle]
+pub extern "C" fn hkdfguard_security_model(out_model: *mut c_int, out_may_write_key_files: *mut c_int) -> c_int {
+    match std::panic::catch_unwind(|| security_model_impl(out_model, out_may_write_key_files)) {
+        Ok(code) => code,
+        Err(_) => {
+            report_caught_panic("hkdfguard_security_model", None);
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+fn security_model_impl(out_model: *mut c_int, out_may_write_key_files: *mut c_int) -> c_int {
+    if out_model.is_null() || out_may_write_key_files.is_null() {
+        return status::INVALID_ARGUMENT;
+    }
+    let _policy = policy::snapshot_for_call();
+    match security_model::Trust::current() {
+        Ok(trust) => {
+            // SAFETY: both are non-null (checked above) and, per the caller
+            // contract, valid for writing an `int`.
+            unsafe {
+                *out_model = trust.model().c_value();
+                *out_may_write_key_files = trust.may_write_key_files() as c_int;
+            }
+            status::OK
+        }
+        Err(e) => {
+            log::error!("hkdfguard: hkdfguard_security_model: {e}");
+            e.status_code()
+        }
+    }
+}
+
+/// Whether [`hkdfguard_open_file`], under the security model in force,
+/// trusts `principal` to own a key file or a directory above one
+/// (`"uid:<n>"`), or to hold write access to one through its group
+/// (`"gid:<n>"`), `<n>` in decimal. Lets a tool that prepares or writes key
+/// files check a folder against the exact rule the library reads by. The
+/// Windows build's function, which takes a SID string instead.
+///
+/// # Returns
+/// [`status::OK`] with `*out_trusted` set to 1 or 0;
+/// [`status::INVALID_ARGUMENT`] for a null pointer or a `principal` that
+/// isn't one of those two forms; or [`status::POLICY_INVALID`] /
+/// [`status::LINUX_GROUP_INVALID`] as [`hkdfguard_security_model`].
+/// `*out_trusted` is left unchanged on failure. Never throws/unwinds.
+///
+/// # Safety
+/// `principal` must be null or a readable C string; `out_trusted` null or
+/// valid for writing an `int`.
+#[no_mangle]
+pub extern "C" fn hkdfguard_key_file_principal_trusted(principal: *const c_char, out_trusted: *mut c_int) -> c_int {
+    match std::panic::catch_unwind(|| key_file_principal_trusted_impl(principal, out_trusted)) {
+        Ok(code) => code,
+        Err(_) => {
+            report_caught_panic("hkdfguard_key_file_principal_trusted", None);
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+// Longest `principal` accepted, terminator included: "gid:" and a u32.
+const MAX_PRINCIPAL_BYTES: usize = 16;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Principal {
+    Uid(u32),
+    Gid(u32),
+}
+
+// Parses "uid:<n>" or "gid:<n>", scanning at most MAX_PRINCIPAL_BYTES bytes
+// for the terminator, as cstr_to_service does.
+fn cstr_to_principal(ptr: *const c_char) -> Result<Principal, c_int> {
+    if ptr.is_null() {
+        return Err(status::INVALID_ARGUMENT);
+    }
+    let mut len = 0usize;
+    loop {
+        if len >= MAX_PRINCIPAL_BYTES {
+            return Err(status::INVALID_ARGUMENT);
+        }
+        // SAFETY: caller contract guarantees a readable, NUL-terminated
+        // string; the loop stops at the first NUL and never reads past
+        // MAX_PRINCIPAL_BYTES bytes.
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    // SAFETY: the loop above established that `len` bytes at `ptr` are readable.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    let text = std::str::from_utf8(bytes).map_err(|_| status::INVALID_ARGUMENT)?;
+    let (kind, number) = text.split_once(':').ok_or(status::INVALID_ARGUMENT)?;
+    // Digits only: `u32::from_str` would also take a leading '+'.
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(status::INVALID_ARGUMENT);
+    }
+    let id: u32 = number.parse().map_err(|_| status::INVALID_ARGUMENT)?;
+    match kind {
+        "uid" => Ok(Principal::Uid(id)),
+        "gid" => Ok(Principal::Gid(id)),
+        _ => Err(status::INVALID_ARGUMENT),
+    }
+}
+
+fn key_file_principal_trusted_impl(principal: *const c_char, out_trusted: *mut c_int) -> c_int {
+    use secure_file::PrincipalTrust;
+    if out_trusted.is_null() {
+        return status::INVALID_ARGUMENT;
+    }
+    let principal = match cstr_to_principal(principal) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let _policy = policy::snapshot_for_call();
+    let trust = match security_model::Trust::current() {
+        Ok(trust) => trust,
+        Err(e) => {
+            log::error!("hkdfguard: hkdfguard_key_file_principal_trusted: {e}");
+            return e.status_code();
+        }
+    };
+    let trusted = match principal {
+        Principal::Uid(uid) => trust.trusts_owner(uid),
+        Principal::Gid(gid) => trust.trusts_group_writer(gid),
+    };
+    // SAFETY: out_trusted is non-null (checked above) and, per the caller
+    // contract, valid for writing an `int`.
+    unsafe { *out_trusted = trusted as c_int };
+    status::OK
+}
+
 /// Reads a wrapped-key file into `out`, exactly as stored, after checking
 /// it is a complete, well-formed wrapped DEK -- see [`key_file`] for the
 /// checks. Never unwraps and never reaches a provider.
@@ -1054,8 +1222,23 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
         return fail(status::INVALID_ARGUMENT); // a declared capacity with nowhere to write
     }
 
-    let wrapped = match key_file::read(&path) {
-        Ok(contents) => contents, // wiped when it drops at the end of this function
+    // Whose key files are trusted: the security model, and under the
+    // production one its deployer groups, as the policy says right now.
+    let _policy = policy::snapshot_for_call();
+    let trust = match security_model::Trust::current() {
+        Ok(trust) => trust,
+        Err(e) => {
+            log::error!("hkdfguard: hkdfguard_open_file can't decide whose key files to trust: {e}");
+            return fail(e.status_code());
+        }
+    };
+    let wrapped = match key_file::read(&path, &trust) {
+        Ok(contents) => {
+            if trust.model() == security_model::SecurityModel::Developer {
+                audit::developer_model_key_file(&path); // once per process
+            }
+            contents // wiped when it drops at the end of this function
+        }
         Err(e) => {
             log::error!("hkdfguard: hkdfguard_open_file refused key file {}: {}", path.display(), e.describe());
             let code = e.status_code();
@@ -2261,6 +2444,14 @@ mod ffi_tests {
 
     // ---- hkdfguard_open_file ----
 
+    // hkdfguard_open_file reads the policy for its security model, so a test
+    // of it holds a policy (and is #[serial]). These tests' key files are
+    // this user's own, which the developer model trusts; the production
+    // model's tests say so.
+    fn developer_policy() -> policy::test_support::TestPolicy {
+        policy::test_support::TestPolicy::write("security_model = \"developer\"\n")
+    }
+
     // Writes `contents` owner-only into a fresh private directory, as the
     // CLI writes a key file; the directory is returned to keep it alive.
     fn key_file_with(contents: &[u8]) -> (tempfile::TempDir, CString) {
@@ -2326,7 +2517,9 @@ mod ffi_tests {
     }
 
     #[test]
+    #[serial]
     fn open_file_accepts_an_exact_size_buffer() {
+        let _policy = developer_policy();
         let bytes = sample_wrapped_bytes();
         let (_dir, path) = key_file_with(&bytes);
         let (rc, out, out_len) = open_file(&path, bytes.len());
@@ -2336,7 +2529,9 @@ mod ffi_tests {
     }
 
     #[test]
+    #[serial]
     fn open_file_reports_each_refusal_and_zeroes_the_buffer() {
+        let _policy = developer_policy();
         let valid = sample_wrapped_bytes();
         let mut long = valid.clone();
         long.push(0);
@@ -2366,7 +2561,9 @@ mod ffi_tests {
     }
 
     #[test]
+    #[serial]
     fn open_file_reports_why_a_file_could_not_be_opened() {
+        let _policy = developer_policy();
         let dir = secure_file::private_tempdir();
         let missing = CString::new(dir.path().join("absent.key").into_os_string().into_encoded_bytes()).unwrap();
         let (rc, out, out_len) = open_file(&missing, crypto::MAX_WRAPPED_LEN);
@@ -2385,7 +2582,9 @@ mod ffi_tests {
     }
 
     #[test]
+    #[serial]
     fn open_file_refuses_a_key_file_someone_else_could_have_replaced() {
+        let _policy = developer_policy();
         use std::os::unix::fs::PermissionsExt;
         let bytes = sample_wrapped_bytes();
         let (dir, path) = key_file_with(&bytes);
@@ -2429,7 +2628,9 @@ mod ffi_tests {
     }
 
     #[test]
+    #[serial]
     fn open_file_buffer_shorter_than_the_file_reports_its_exact_length() {
+        let _policy = developer_policy();
         let bytes = sample_wrapped_bytes();
         let (_dir, path) = key_file_with(&bytes);
         let (rc, out, out_len) = open_file(&path, bytes.len() - 1);
@@ -2439,7 +2640,9 @@ mod ffi_tests {
     }
 
     #[test]
+    #[serial]
     fn open_file_invalid_arguments() {
+        let _policy = developer_policy();
         let bytes = sample_wrapped_bytes();
         let (_dir, path) = key_file_with(&bytes);
         let mut out = [0xAAu8; crypto::MAX_WRAPPED_LEN];
@@ -2484,7 +2687,9 @@ mod ffi_tests {
     }
 
     #[test]
+    #[serial]
     fn open_file_accepts_a_non_utf8_path() {
+        let _policy = developer_policy();
         use std::os::unix::ffi::OsStrExt;
         let bytes = sample_wrapped_bytes();
         let dir = secure_file::private_tempdir();
@@ -2601,11 +2806,153 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn a_plaintext_key_file_is_audited_with_its_path() {
+        let _policy = developer_policy();
         let (_dir, path) = key_file_with(&[9u8; 32]);
         let (rc, _, _) = open_file(&path, crypto::MAX_WRAPPED_LEN);
         assert_eq!(rc, status::FILE_PLAINTEXT_KEY);
         let shown = path.to_str().unwrap();
         let records = audit::captured_containing(shown);
         assert!(records.iter().any(|r| r.contains("event=2006 op=hkdfguard_open_file")), "{records:?}");
+    }
+
+    // ---- the security model ----
+
+    fn security_model_now() -> (c_int, c_int, c_int) {
+        let (mut model, mut may_write) = (-7, -7);
+        let rc = hkdfguard_security_model(&mut model, &mut may_write);
+        (rc, model, may_write)
+    }
+
+    fn principal_trusted(principal: &str) -> (c_int, c_int) {
+        let principal = CString::new(principal).unwrap();
+        let mut trusted = -7;
+        let rc = hkdfguard_key_file_principal_trusted(principal.as_ptr(), &mut trusted);
+        (rc, trusted)
+    }
+
+    fn euid() -> u32 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    #[test]
+    #[serial]
+    fn security_model_reports_production_by_default_and_developer_when_set() {
+        let _none = policy::test_support::TestPolicy::absent();
+        let is_root = (euid() == 0) as c_int;
+        assert_eq!(security_model_now(), (status::OK, 0, is_root), "no policy file: production");
+        drop(_none);
+        let _dev = developer_policy();
+        assert_eq!(security_model_now(), (status::OK, 1, 1), "developer: this account's files are trusted");
+        let _prod = policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+        assert_eq!(security_model_now(), (status::OK, 0, is_root));
+    }
+
+    #[test]
+    #[serial]
+    fn security_model_fails_closed_and_leaves_its_outputs_alone() {
+        let _bad = policy::test_support::TestPolicy::exact("security_model = \"lenient\"\n[selection]\nmode = \"prefer\"\n");
+        assert_eq!(security_model_now(), (status::POLICY_INVALID, -7, -7));
+        assert_eq!(principal_trusted("uid:0"), (status::POLICY_INVALID, -7));
+        drop(_bad);
+        let _missing = policy::test_support::TestPolicy::write("deployer_groups = [\"hkdfguard-no-such-group-xyz\"]\nsecurity_model = \"production\"\n");
+        assert_eq!(security_model_now(), (status::LINUX_GROUP_INVALID, -7, -7));
+        let mut model = 0;
+        assert_eq!(hkdfguard_security_model(&mut model, ptr::null_mut()), status::INVALID_ARGUMENT);
+        assert_eq!(hkdfguard_security_model(ptr::null_mut(), &mut model), status::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    #[serial]
+    fn key_file_principal_trusted_answers_by_the_model_in_force() {
+        let me = format!("uid:{}", euid());
+        let _dev = developer_policy();
+        assert_eq!(principal_trusted("uid:0"), (status::OK, 1), "root, always");
+        assert_eq!(principal_trusted(&me), (status::OK, 1), "developer: this account");
+        assert_eq!(principal_trusted("gid:0"), (status::OK, 0), "developer: no group may write");
+        let _prod = policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+        assert_eq!(principal_trusted("uid:0"), (status::OK, 1));
+        if euid() != 0 && crate::security_model::Trust::current().is_ok_and(|t| !t.may_write_key_files()) {
+            assert_eq!(principal_trusted(&me), (status::OK, 0), "production: not for being the caller");
+        }
+    }
+
+    #[test]
+    fn key_file_principal_trusted_takes_only_uid_or_gid_and_a_decimal_number() {
+        for bad in ["", "uid", "uid:", "uid:-1", "uid:+1", "uid: 1", "uid:0x10", "user:0", "UID:0", "uid:4294967296", "gid:99999999999"] {
+            assert_eq!(principal_trusted(bad), (status::INVALID_ARGUMENT, -7), "{bad:?}");
+        }
+        assert_eq!(cstr_to_principal(CString::new("uid:4294967295").unwrap().as_ptr()), Ok(Principal::Uid(u32::MAX)));
+        assert_eq!(cstr_to_principal(CString::new("gid:0").unwrap().as_ptr()), Ok(Principal::Gid(0)));
+        assert_eq!(cstr_to_principal(ptr::null()), Err(status::INVALID_ARGUMENT));
+        // No terminator within the limit: refused without reading past it.
+        let unterminated = [b'1'; MAX_PRINCIPAL_BYTES];
+        assert_eq!(cstr_to_principal(unterminated.as_ptr() as *const c_char), Err(status::INVALID_ARGUMENT));
+        let mut trusted = 0;
+        assert_eq!(hkdfguard_key_file_principal_trusted(ptr::null(), &mut trusted), status::INVALID_ARGUMENT);
+        let root = CString::new("uid:0").unwrap();
+        assert_eq!(hkdfguard_key_file_principal_trusted(root.as_ptr(), ptr::null_mut()), status::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    #[serial]
+    fn production_open_file_refuses_this_account_s_own_key_file() {
+        if euid() != 0 {
+            let bytes = sample_wrapped_bytes();
+            let (_dir, path) = key_file_with(&bytes);
+            let _none = policy::test_support::TestPolicy::absent();
+            if crate::security_model::Trust::current().is_ok_and(|t| !t.may_write_key_files()) {
+                let (rc, out, _) = open_file(&path, crypto::MAX_WRAPPED_LEN);
+                assert_eq!(rc, status::FILE_UNTRUSTED, "no policy file: production, and this account is no deployer");
+                assert!(out.iter().all(|&b| b == 0));
+            }
+            drop(_none);
+            let _dev = developer_policy();
+            assert_eq!(open_file(&path, crypto::MAX_WRAPPED_LEN).0, status::OK);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_key_file_read_under_the_developer_model_is_audited_once() {
+        let _dev = developer_policy();
+        let (_dir, path) = key_file_with(&sample_wrapped_bytes());
+        assert_eq!(open_file(&path, crypto::MAX_WRAPPED_LEN).0, status::OK);
+        assert_eq!(open_file(&path, crypto::MAX_WRAPPED_LEN).0, status::OK);
+        let records = audit::captured_containing("event=1005");
+        assert_eq!(records.len(), 1, "once per process: {records:?}");
+        assert!(records[0].contains("security_model=developer"), "{records:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn production_lets_only_root_create_a_kek_but_anyone_load_one() {
+        if euid() == 0 {
+            return; // root may create under every model: nothing to refuse
+        }
+        // External-secret never creates a KEK, and its mount is empty: the
+        // walk finds none, so the result says who may create one.
+        let mount = secure_file::private_tempdir();
+        let _mount = policy::test_support::secret_mount(mount.path());
+        let _external = policy::require_provider_policy_for_tests("external-secret");
+        let service = CString::new("com.company.orders.productioncreate").unwrap();
+        assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::PROVIDER_UNAVAILABLE, "developer: nobody could create one");
+        {
+            let _prod = policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+            assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::KEK_ACCESS_DENIED, "production: only root may");
+            let records = audit::captured_containing("service=\"com.company.orders.productioncreate\"");
+            assert!(records.iter().any(|r| r.contains("event=2000") && r.contains("KEK_ACCESS_DENIED")), "{records:?}");
+            let err = admin::retire_kek("com.company.orders.productioncreate", &[0x11; 32]).unwrap_err();
+            assert_eq!(err.status, status::KEK_ACCESS_DENIED, "production: only root retires: {err:?}");
+        }
+
+        // An ephemeral KEK lives in this process, so only this process can
+        // make one: production doesn't stop it. Once it exists, create_kek
+        // is the idempotent startup call it always was.
+        let _ephemeral = policy::allow_ephemeral_policy_for_tests();
+        let _prod = policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+        let service = CString::new("com.company.orders.productionephemeral").unwrap();
+        assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+        assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
     }
 }

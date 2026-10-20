@@ -52,10 +52,14 @@ use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
 // through the inherited environment, by every CLI process it spawns --
-// then restores whatever policy (if any) the harness had set.
+// then restores whatever policy (if any) the harness had set. A `doc`
+// that doesn't set `security_model` gets the developer model.
 fn with_policy<F: FnOnce()>(doc: &str, f: F) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("policy.toml");
+    // These tests run as an ordinary user, provisioning and writing key
+    // files of their own: the developer model, unless `doc` names one.
+    let doc = if doc.contains("security_model") { doc.to_string() } else { format!("security_model = \"developer\"\n{doc}") };
     fs::write(&path, doc).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: a group-writable policy is refused
     let saved = std::env::var_os("HKDFGUARD_POLICY_FILE");
@@ -340,7 +344,15 @@ fn run_wrap_dek_file(key_path: &Path, service: &str, dek_file: &Path) -> Output 
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_refuses_a_shared_key_folder_up_front() {
+    // Under the production model (no policy file) an ordinary account is
+    // refused before any of this is reached: these are the developer
+    // model's checks.
+    with_policy("[selection]\nmode = \"prefer\"\n", cli_refuses_a_shared_key_folder_up_front_under_the_developer_model);
+}
+
+fn cli_refuses_a_shared_key_folder_up_front_under_the_developer_model() {
     // A key file the library would refuse to open (FILE_UNTRUSTED) is not
     // written in the first place: a folder anyone else can write to --
     // sticky /tmp-style or plain group/other-writable, the folder itself
@@ -383,7 +395,15 @@ fn cli_refuses_a_shared_key_folder_up_front() {
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_checks_the_key_folder_mode_not_its_owner() {
+    // Under the production model (no policy file) an ordinary account is
+    // refused before any of this is reached: these are the developer
+    // model's checks.
+    with_policy("[selection]\nmode = \"prefer\"\n", cli_checks_the_key_folder_mode_not_its_owner_under_the_developer_model);
+}
+
+fn cli_checks_the_key_folder_mode_not_its_owner_under_the_developer_model() {
     // wrap often runs as root into a folder the application's account
     // owns. Only the mode is checked: a folder owned by someone else that
     // nobody else can write to gets past the check (to the missing DEK
@@ -417,7 +437,15 @@ fn cli_checks_the_key_folder_mode_not_its_owner() {
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_refuses_to_read_the_dek_from_a_terminal() {
+    // Under the production model (no policy file) an ordinary account is
+    // refused before any of this is reached: these are the developer
+    // model's checks.
+    with_policy("[selection]\nmode = \"prefer\"\n", cli_refuses_to_read_the_dek_from_a_terminal_under_the_developer_model);
+}
+
+fn cli_refuses_to_read_the_dek_from_a_terminal_under_the_developer_model() {
     // A real pseudo-terminal as stdin: what an operator typing or pasting
     // the DEK would give the CLI. Refused before anything is read, so no
     // provider is needed and nothing is written.
@@ -652,5 +680,70 @@ fn cli_key_file_opens_through_the_library_and_its_dek_input_is_refused() {
         assert_eq!(open_via_library(&key_path).0, status::FILE_UNTRUSTED);
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(open_via_library(&key_path).0, status::OK);
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn production_trusts_only_key_files_a_deployer_wrote() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root holds every role, so there is nothing to refuse");
+        return;
+    }
+    let service = "com.example.production";
+    with_provisioned_external_secret(service, || {
+        // Under the developer model this account wraps a key file of its
+        // own, and the library opens it...
+        let out_dir = tempdir().unwrap();
+        let key_path = out_dir.path().join("wrapped.key");
+        let dek = [0x6Du8; 32];
+        let wrapped = run_wrap_stdin(&key_path, service, &dek, &[]);
+        assert!(wrapped.status.success(), "{}", stderr_of(&wrapped));
+        assert_eq!(open_via_library(&key_path).0, status::OK);
+
+        // ...but under production the same account is just the
+        // application: the file it wrote is refused, and the CLI won't
+        // write another.
+        let mut policy = fs::read_to_string(std::env::var_os("HKDFGUARD_POLICY_FILE").unwrap()).unwrap();
+        policy = policy.replace("security_model = \"developer\"", "security_model = \"production\"");
+        with_policy(&policy, || {
+            let (mut model, mut may_write) = (-1, -1);
+            assert_eq!(hkdfguard::hkdfguard_security_model(&mut model, &mut may_write), status::OK);
+            assert_eq!(model, 0, "production");
+            if may_write == 1 {
+                eprintln!("skipping: this account is a deployer on this host");
+                return;
+            }
+            assert_eq!(open_via_library(&key_path).0, status::FILE_UNTRUSTED, "a key file the application could have planted");
+
+            let second = out_dir.path().join("second.key");
+            let refused = run_wrap_stdin(&second, service, &dek, &[]);
+            assert!(!refused.status.success());
+            let stderr = stderr_of(&refused);
+            assert!(stderr.contains("may not persist key files") && stderr.contains("Nothing was written"), "{stderr}");
+            assert!(!second.exists());
+
+            // Provisioning a KEK that doesn't exist yet is root's; one that
+            // does is only verified, which anyone may.
+            let provisioned = run_provision("com.example.production.unprovisioned");
+            assert!(!provisioned.status.success(), "creating a KEK needs root under production");
+            let stderr = stderr_of(&provisioned);
+            assert!(stderr.contains("only root creates or retires a KEK"), "{stderr}");
+            assert!(run_provision(service).status.success(), "verifying an existing KEK needs no role");
+
+            // Unwrapping is the same in both models: the payload itself
+            // still opens, for whoever the provider lets use the KEK.
+            let bytes = fs::read(&key_path).unwrap();
+            let mut out = [0u8; 32];
+            let mut out_len = out.len() as c_int;
+            let c_service = std::ffi::CString::new(service).unwrap();
+            assert_eq!(
+                hkdfguard_unwrap_dek(c_service.as_ptr(), bytes.as_ptr(), bytes.len() as c_int, out.as_mut_ptr(), &mut out_len),
+                status::OK
+            );
+            assert_eq!(out, dek);
+        });
     });
 }

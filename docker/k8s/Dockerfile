@@ -33,6 +33,6 @@ RUN ldconfig \
  && install -d -m 0755 /var/lib/hkdfguard-test \
  && for uid in 0 10001; do install -d -o "$uid" -g "$uid" -m 0700 "/var/lib/hkdfguard-test/$uid"; done \
  && install -d -m 0755 /etc/hkdfguard \
- && printf '[selection]\nmode = "require"\nprovider = "external-secret"\n' > /etc/hkdfguard/policy.toml \
+ && printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n' > /etc/hkdfguard/policy.toml \
  && chmod 0644 /etc/hkdfguard/policy.toml
 ENTRYPOINT ["/usr/local/bin/pod-test.sh"]
