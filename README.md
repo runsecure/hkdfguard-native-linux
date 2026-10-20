@@ -110,6 +110,9 @@ hkdfguard_generate_and_wrap_dek("com.company.orders", wrapped, &wrapped_len);
 
 ### Hardening the host process (opt-in)
 
+(Automatic once the process holds an ephemeral key: see
+[Provider chain](#provider-chain).)
+
 Keys and DEKs pass through your process's memory. `hkdfguard_harden_process`
 makes that memory harder to recover: it disables core dumps (`RLIMIT_CORE`
 set to 0, hard limit included) and calls `prctl(PR_SET_DUMPABLE, 0)`,
@@ -212,10 +215,17 @@ policy (or a policy that never names it), a missing secret mount or
 unavailable TPM makes `hkdfguard_create_kek` fail rather than silently
 degrade to it.
 
+An ephemeral key's only protection is the process's memory, so the library
+hardens the process (as `hkdfguard_harden_process` does) before it creates
+the first one, and refuses to create it if that fails. The keys are kept in
+pages excluded from core dumps and, where `RLIMIT_MEMLOCK` allows, locked
+into RAM. The `hkdfguard` CLI refuses ephemeral keys outright: one it
+created would vanish when it exits.
+
 The policy file (`/etc/hkdfguard/policy.toml`) must be owned by root and
 not writable by group or others, and so must `/etc/hkdfguard` and every
-directory above it (sticky directories like `/tmp` and read-only mounts
-excepted). The service's own user is deliberately not accepted: any
+directory above it -- sticky directories like `/tmp` included; only a
+read-only mount is exempt. The service's own user is deliberately not accepted: any
 process running as that user could otherwise rewrite the policy, or
 delete it to switch policy off. Only a *missing* file in a trusted
 directory means "no policy"; a file that exists but is unreadable, too
@@ -231,7 +241,7 @@ the host does about logging. The records use facility `authpriv` and tag
 `hkdfguard`, sent straight to `/dev/log`. On systemd hosts they land in the
 journal (`journalctl -t hkdfguard`); elsewhere in `/var/log/secure` or
 `/var/log/auth.log`. These are the Windows build's Event Log events, with the
-same IDs, meanings and severities, so one set of alerts covers both:
+same IDs, meanings and severities (1004 aside), so one set of alerts covers both:
 
 | ID | Severity | When |
 |---|---|---|
@@ -239,6 +249,7 @@ same IDs, meanings and severities, so one set of alerts covers both:
 | 1001 | warning | A KEK was created on a provider other than the policy's first choice, which was unavailable or declined. |
 | 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | info | A DEK was unwrapped. |
+| 1004 | warning | A KEK was retired (`hkdfguard retire`): deleted for good, after its fingerprint was confirmed. Names the fingerprint. Every DEK wrapped under it can no longer be unwrapped. |
 | 2000 | warning | `KEK_ACCESS_DENIED`. |
 | 2002 | error | `KEK_INVALID`. |
 | 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
@@ -286,8 +297,8 @@ failure record are always written.
 
 ### Setup calls are deliberately slow
 
-`hkdfguard_create_kek` and `hkdfguard_kek_exists` are meant to run once
-per application startup, so each takes **at least one second** of
+`hkdfguard_create_kek`, `hkdfguard_kek_exists` and
+`hkdfguard_kek_fingerprint` are meant to run once per application startup, so each takes **at least one second** of
 wall-clock time whatever its outcome (found, not found, or error), and
 they are serialized with each other across threads. This bounds how fast
 a buggy or hot-looping caller can drive the TPM/HSM (every call is a
@@ -656,6 +667,16 @@ cargo test --features tpm2 -- --ignored     # needs a TPM or swtpm, on Linux
 cargo test --features pkcs11 -- --ignored   # needs SoftHSM2 or another PKCS#11 module
 ```
 
+The tests make their temp directories under `<target>/tmp/hkdfguard-tests`
+(mode `0700`), not under `/tmp`: the library refuses key files, policies
+and secrets anywhere under a sticky, world-writable directory. Every
+directory above it must be
+owned by root or you and not group/other-writable; the tests clear group
+and other write on what they own inside the target directory, and stop
+with a message naming any other offending directory (a checkout in a shared
+folder, or one made under a `002` umask). Set `HKDFGUARD_TEST_TMPDIR` to
+another private directory to use that instead.
+
 ### Testing on a native Linux TPM (Intel PTT / AMD fTPM / discrete)
 
 Docker proves the code against `swtpm`. This repo's maintainers have run
@@ -766,7 +787,7 @@ target.
 
 One `debian/` directory serves both Debian-family targets. Built on
 Ubuntu, `packaging/build-deb.sh` adds the customary backport changelog
-entry, so the Ubuntu packages are versioned `0.1.0-1~ubuntu24.04.1` for
+entry, so the Ubuntu packages are versioned `0.9.0-1~ubuntu24.04.1` for
 release `noble`. One spec serves all three RPM targets. On SUSE it follows
 SUSE's naming policy and runs `ldconfig` from scriptlets:
 
@@ -858,7 +879,7 @@ taken out of one -- with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify hkdfguard_0.1.0-1_amd64.deb \
+gh attestation verify hkdfguard_0.9.0-1_amd64.deb \
     --repo runsecure/hkdfguard-native-linux \
     --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
 ```
@@ -868,6 +889,21 @@ Without network access to GitHub, pass the bundle from the release:
 proves the file was built by this repository's release workflow, from the
 commit and tag the attestation names; it says nothing about whether that
 code is correct.
+
+Or with cosign (2.4+), which needs no GitHub account, naming the exact
+workflow and tag:
+
+```sh
+cosign verify-blob-attestation --new-bundle-format \
+    --bundle hkdfguard-0.9.0.sigstore.json \
+    --type https://slsa.dev/provenance/v1 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0 \
+    hkdfguard_0.9.0-1_amd64.deb
+```
+
+[docs/installation.md](docs/installation.md#download-and-verify) has a
+Dockerfile that verifies a release this way before installing it.
 
 The attestations prove provenance; they do not make the packages
 installable from a signed apt, dnf or zypper repository. Those check GPG
@@ -882,12 +918,15 @@ install them to, for copying into another image
 
 ```
 /usr/lib/<multiarch>/libhkdfguard.so.1
+/usr/lib/<multiarch>/libhkdfguard.so.1.sigstore.json
 /usr/bin/hkdfguard
 ```
 
 They are taken from the tested `libhkdfguard1` and `hkdfguard` packages,
-not rebuilt; nothing else from the packages is copied.
-`packaging/build-overlay.sh` fails if the image holds anything more. About
+not rebuilt; nothing else from the packages is copied. The
+`.sigstore.json` file is the release workflow's Sigstore build-provenance
+bundle for that exact library file (see below); only released images have
+it. `packaging/build-overlay.sh` fails if the image holds anything more. About
 6 MB, for `linux/amd64` and `linux/arm64`.
 
 | Tag | Policy |
@@ -902,7 +941,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-tctildr0t64 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.1.0 / /
+COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.0 / /
 ```
 
 - **Debian-family images only**, with glibc 2.39 or newer: Ubuntu 24.04+
@@ -927,12 +966,37 @@ COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.1.0 / /
   outlive the container.
 
 The release workflow's `overlay` job builds both architectures from the
-packages the build workflow tested, pushes them, and attests each image
-with Sigstore. To verify one:
+packages the build workflow tested, pushes them, attests each image with
+Sigstore, and signs each with cosign (keyless, as the release workflow;
+the job fails unless the signature then verifies). To verify one:
 
 ```sh
-gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.1.0 \
+gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
     --repo runsecure/hkdfguard-native-linux
+# or the cosign signature, with cosign 3.0+:
+cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0
+```
+
+In a build, verify the image's digest and copy from that digest, not the
+tag; see [docs/installation.md](docs/installation.md).
+
+Before building the images, the same job attests the library file each
+one holds and puts that bundle beside it, failing the release unless the
+bundle verifies the file. The deployed library, in your image or after
+copying it out, then verifies against its own bundle:
+
+```sh
+lib=/usr/lib/x86_64-linux-gnu/libhkdfguard.so.1
+gh attestation verify "$lib" --bundle "$lib.sigstore.json" \
+    --repo runsecure/hkdfguard-native-linux \
+    --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
+# or, with cosign 2.4+:
+cosign verify-blob-attestation --new-bundle-format --bundle "$lib.sigstore.json" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp '^https://github\.com/runsecure/hkdfguard-native-linux/\.github/workflows/release\.yml@refs/tags/v' \
+    --type slsaprovenance1 "$lib"
 ```
 
 To build and test locally, from `dist/packages/ubuntu24.04-<arch>/`
@@ -949,7 +1013,10 @@ key, so it is held to the same standard as the PKCS#11 PIN and the TPM
 derivation secret. `<mount>/<service>` must:
 
 - be **owned by root or by the process's user**, with **no group or other
-  access** — `0400` or `0600`;
+  access** — `0400` or `0600`. A root-owned file may also be readable by
+  its group (`root:<group> 0440`), which is how a non-root service reads
+  it; never by others, and never by the group of a file the service owns
+  itself;
 - be a **regular file** (not a directory, device, or FIFO);
 - **resolve to a path inside the mount.** Symlinks are followed —
   Kubernetes Secret volumes present every key as a symlink into `..data/`,
@@ -958,10 +1025,13 @@ derivation secret. `<mount>/<service>` must:
   leading anywhere else is refused;
 - sit in a **mount nobody else can write to**: the mount directory and
   every directory above it must be owned by root or the process's user and
-  not writable by group or others. Sticky ancestors (`/tmp`) and read-only
-  mounts — a Kubernetes Secret volume is `1777` but read-only — are fine. A
-  mount another user could write to would let them plant a KEK for a
-  service that isn't provisioned yet, which `create_kek` would then adopt.
+  not writable by group or others -- sticky or not, so a mount anywhere
+  under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however private the
+  directories beneath it; so must the directory the resolved file sits in,
+  and every one above it. The one exception is a read-only mount: a
+  Kubernetes Secret volume is `1777` but read-only, and is fine. A mount
+  another user could write to would let them plant a KEK for a service
+  that isn't provisioned yet, which `create_kek` would then adopt.
 
 A file that is present but fails a check is reported as an **error**,
 never as "not provisioned": a misconfigured mount must not silently fall
@@ -972,17 +1042,19 @@ Every common mechanism meets the mode requirement with one setting:
 
 | Mechanism | Setting |
 |---|---|
-| Kubernetes `Secret` volume | `defaultMode: 0400` on the volume (files are root-owned) |
+| Kubernetes `Secret` volume | `defaultMode: 0400` on the volume (files are root-owned); a non-root pod also sets `fsGroup` |
 | Vault Agent template/sink | `perms = "0400"` |
 | Docker Swarm secret | `mode: 0400` (the default `0444` is refused) |
 | CSI Secrets Store | `defaultMode`/file permission in the `SecretProviderClass` |
 | systemd `LoadCredential=` | already `0400`, root-owned — works as-is |
 
-> **Kubernetes `fsGroup` caveat:** setting `fsGroup` on the pod can add
-> group-read to secret files even with `defaultMode: 0400`, which the
-> provider refuses. Either leave `fsGroup` unset for the secret volume,
-> or use `fsGroupChangePolicy: OnRootMismatch` with an owner that matches
-> the process's user.
+> **Non-root pods:** the kubelet always writes Secret files as root, so a
+> pod running as another user can only read them through `fsGroup`. With
+> `fsGroup` set, the kubelet makes each file `root:<fsGroup> 0440` and
+> adds the group to the pod's processes, and the provider accepts it.
+> Without `fsGroup`, a non-root pod is refused the file by the kernel.
+> Keep the KEK in a Secret of its own, so that only pods meant to hold it
+> mount it.
 
 ## Wrapping a key with the CLI (`hkdfguard`)
 
@@ -992,15 +1064,18 @@ wraps it there. This CLI is that step, in two deliberately separate
 commands:
 
 ```sh
-# 1. Once, at deployment time: ensure the service has a KEK. This is the
-#    only command that makes the (deliberately slow) setup calls.
+# 1. Once, at deployment time: ensure the service has a KEK, and print its
+#    fingerprint. With `retire`, the only command that makes the
+#    (deliberately slow) setup calls.
 hkdfguard provision --service-name com.company.orders
 
 # 2. Wrap a DEK under it. Never creates a KEK: if none is provisioned it
-#    fails and names the command above.
+#    fails and names the command above. --fingerprint (optional) writes
+#    nothing unless the DEK was wrapped under the KEK provision reported.
 printf '%s' "$DEK_B64" | hkdfguard wrap \
     --key-file-path /var/lib/app/key.bin \
-    --service-name com.company.orders --dek-stdin
+    --service-name com.company.orders --dek-stdin \
+    --fingerprint <fingerprint from provision>
 
 # ...or from a file: a Kubernetes/Vault secret mount, or a systemd credential
 hkdfguard wrap \
@@ -1017,6 +1092,18 @@ So a KEK that is missing or wrong on the provider fails at deployment, not
 at the first wrap. On a TPM the KEK is derived on demand, so it always
 reports present; for `external-secret` the mounted file *is* the
 provisioning; only Ephemeral actually creates anything.
+
+`provision` prints the KEK's fingerprint, and `wrap` prints the
+fingerprint of the KEK it actually wrapped under, read from the payload it
+is about to write. `wrap --fingerprint` checks the two match before
+writing: `wrap` is the step that commits a secret to a KEK, and if the
+service's KEK had been replaced since provisioning, the DEK would
+otherwise be sealed to that key, and the mistake found only at unwrap
+(`KEK_FINGERPRINT_MISMATCH`, `-16`). On a mismatch nothing is written, and
+with `--force` the existing key file is left as it was. The check reads
+the fingerprint from the finished payload rather than asking for the KEK's
+fingerprint first, so the KEK can't change between the check and the
+wrap.
 
 The DEK is base64 of exactly 32 bytes, read from stdin or a file — never
 from a command-line argument or an environment variable, both of which are
@@ -1042,6 +1129,17 @@ writes can't redirect a `wrap --force` into another folder. Spell the real
 path (`/run/...`, not `/var/run/...`). This is checked before the DEK is
 read, and again on the open file before anything is overwritten or written.
 
+Nor may the key file's folder, or any folder above it up to `/`, be
+writable by group or others -- **sticky folders such as `/tmp`, `/var/tmp`
+and `/dev/shm` included**, however private the folder inside them. The
+library refuses to read a key file under such a folder
+(`HKDFGUARD_ERR_FILE_UNTRUSTED`, `-39`), so `wrap` refuses to write one
+there, before the DEK is read or a provider is reached, naming the folder
+and its mode. Only the folders' modes are checked, not who owns them: `wrap`
+often runs as root into a folder the application's account owns, which the
+library, running as that account, accepts. Put key files somewhere like
+`/var/lib/<app>/` (mode `0700` or `0755`, owned by the application or root).
+
 The key file is written `0600`, owned by whoever runs the command. It is
 ciphertext, but anyone who can read it *and* reach the provider — on a TPM
 host, any member of `tss` — can unwrap it, so nothing beyond its owner is
@@ -1057,9 +1155,12 @@ group read is never a reason to refuse a key file.
 
 A `--dek-file` must be reached through real folders (no symbolic link anywhere
 above it, as for the key file), and must be a regular file, not a symlink, owned by root or by
-the invoking user, with no group or other access (e.g. `0400`/`0600`) — the
-same rules the library applies to the PKCS#11 PIN and the TPM derivation
-secret. On both paths the input is strict standard base64 (`+/`, padded), at
+the invoking user, with no group or other access (e.g. `0400`/`0600`). Its
+folder, and every folder above it up to `/`, must be owned by root or the
+invoking user and not writable by group or others -- sticky folders such as
+`/tmp` included, unless on a read-only mount -- or someone else could put a
+DEK of their choosing there. These are the rules the library applies to the
+PKCS#11 PIN and the TPM derivation secret. On both paths the input is strict standard base64 (`+/`, padded), at
 most 64 bytes: one trailing newline (LF or CRLF) is ignored, and no other
 whitespace is accepted. A leading UTF-8 byte-order mark (some Windows tools
 add one) is skipped, and UTF-16 input is refused with a message saying so.
@@ -1073,6 +1174,41 @@ so it isn't echoed or kept in the scrollback.
 > The remaining exposure is upstream of this tool: don't put the DEK in an
 > environment variable, and don't pipe it with an `echo` that resolves to
 > `/bin/echo` (argv again). `printf` as a shell builtin is safe.
+
+### Retiring a KEK
+
+`retire` permanently deletes a service's KEK, so that nothing wrapped under
+it can be unwrapped again. It takes the fingerprint `provision` printed for
+that KEK, and deletes nothing unless the service's current KEK has exactly
+that fingerprint:
+
+```sh
+hkdfguard provision -sn com.company.orders
+# KEK provisioned for service "com.company.orders"
+# fingerprint: 3f1c...e09a -- record this; retire requires it
+
+hkdfguard retire -sn com.company.orders -fp 3f1c...e09a   # all 64 hex characters
+```
+
+The fingerprint is checked twice: against the KEK the service resolves to
+(the one every wrap uses), and again on the exact token objects about to be
+deleted. A wrong fingerprint, a missing KEK, or a token holding anything
+other than the one key pair `provision` made (a duplicate, or a pair
+without hkdfguard's protections) deletes nothing. On success it writes audit
+event 1004, naming the fingerprint. Running `provision` afterwards creates
+a new, different KEK.
+
+`retire` exists only in the CLI. It is not part of the C API, so no
+application linking the library can delete a KEK.
+
+What can be retired depends on the provider:
+
+| Provider | `retire` |
+|---|---|
+| PKCS#11 | Deletes the service's key pair from the token. |
+| TPM | Refused. A TPM KEK is not stored anywhere: it is re-derived on every use from the TPM's seed, the derivation secret and the service name, so there is nothing to delete. Replacing the derivation secret changes every service's KEK on the host at once; `tpm.require_pinned_names` with the service's pin removed stops hkdfguard from using one service's KEK, without destroying it. |
+| External secret | Refused: the KEK is the mounted secret. Remove it where it is managed (the Kubernetes Secret, Vault entry, systemd credential). |
+| Ephemeral | Refused: an ephemeral KEK ends with its process. |
 
 ## Configuration
 
@@ -1196,8 +1332,12 @@ additionally may be read by nobody but root and, optionally, the
 service's group: a PIN file the service could write would let any process
 running as that user write a wrong PIN and lock the HSM user out. The
 PKCS#11 module, its directory, and every directory above it must be
-root-owned and not group/other-writable (sticky ancestors excepted), so
-nothing on the module's path can be swapped before it is `dlopen`ed.
+root-owned and not group/other-writable, so nothing on the module's path
+can be swapped before it is `dlopen`ed. "Directories only root can
+change" means every one up to `/`, sticky directories such as `/tmp`
+included: nothing here may live anywhere under `/tmp`, `/var/tmp` or
+`/dev/shm`. Only a read-only mount (a Kubernetes Secret or ConfigMap
+volume) is exempt.
 
 Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
@@ -1294,6 +1434,19 @@ its default.
   the service's own uid can't rewrite (or delete) them. Secret contents are read into a single fixed
   allocation that is never grown (so no partially-filled buffer is ever
   freed un-wiped) and zeroed on every exit path.
+- **Nothing the library reads is trusted under a shared directory.**
+  The policy file, the PKCS#11 module and PIN file, the TPM derivation
+  secret and owner password, external-secret KEKs, and key files opened
+  with `hkdfguard_open_file` must each sit in a directory that, with every
+  directory above it up to `/`, is owned by root (or, where the file may
+  be, the calling user) and not writable by group or others -- with no
+  exception for sticky directories, so nothing under `/tmp`, `/var/tmp` or
+  `/dev/shm` is accepted, however private the directory beneath. The one
+  exception is a read-only mount: a Kubernetes Secret or ConfigMap volume
+  is `1777` but nobody can write to it. The refusal names the directory
+  and says when it was a sticky one. The CLI holds its own files to the
+  same rule: `wrap` refuses to write a key file where it would be refused,
+  and to read a `--dek-file` from such a directory.
 - **Service names can never name a file outside their mount.** The C ABI
   rejects a `service` that starts with `.` or contains `..`, and the
   external-secret provider enforces the same rule again where the name
@@ -1351,6 +1504,7 @@ examples/
 tests/
   cli_round_trip.rs          Drives the CLI as a real subprocess
   harden_process.rs              hkdfguard_harden_process, in its own process
+  ephemeral_hardening.rs         Creating an ephemeral key hardens the process, in its own process
 scripts/
   build-release.sh           cargo build --release, then links libhkdfguard.so.1
                               (the SONAME) to Cargo's libhkdfguard.so
@@ -1367,7 +1521,7 @@ build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1
 debian/                      Debian packaging (dpkg-buildpackage)
 .github/
   workflows/build.yml        CI: lint, cargo deny, test matrix, packages, binaries
-  workflows/release.yml      v* tags: build, attest (Sigstore), draft release, overlay images
+  workflows/release.yml      v* tags: build, attest (Sigstore), draft release, signed overlay images
   dependabot.yml             Weekly updates to the pinned action SHAs
 packaging/
   build-packages.sh          Builds and smoke-tests the .deb and .rpm packages

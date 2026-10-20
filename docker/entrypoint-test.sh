@@ -22,10 +22,18 @@ as_ci() { setpriv --reuid=ci --regid=ci --init-groups env HOME=/home/ci USER=ci 
 # Creates an empty owner-only file belonging to `ci` (a secret, a DEK);
 # writing into it afterwards, as root, keeps that owner and mode.
 ci_file() { install -o ci -g ci -m 0600 /dev/null "$1"; }
-# Writes stdin into a file `ci` owns in /tmp, as ci. Root can't: with
-# fs.protected_regular=2 (a host kernel setting, which containers share)
-# even root may not open another user's file in a sticky directory.
+# Writes stdin into a file `ci` owns, as ci. Root can't if the file is in
+# a sticky directory such as /tmp: with fs.protected_regular=2 (a host
+# kernel setting, which containers share) even root may not open another
+# user's file there.
 ci_write() { as_ci sh -c 'cat > "$1"' sh "$1"; }
+# Key files (and the DEKs cli_unwrap_check probes with hkdfguard_open_file)
+# live here, and so do the harness's policies, secrets and PIN files --
+# never under /tmp: the library refuses anything it reads anywhere under a
+# sticky, world-writable directory, and the CLI refuses to write a key file
+# or read a --dek-file there. /work is ci's own (docker/Dockerfile) and /
+# is root's, both 0755, so a 0700 directory in it passes all the way up.
+KEYS=$(as_ci mktemp -d /work/keys.XXXXXX)
 
 section "cargo build (default features: external-secret, ephemeral)"
 as_ci cargo build
@@ -46,7 +54,7 @@ as_ci cargo build --features tpm2,pkcs11
 echo "Linked successfully against real tpm2-tss and PKCS#11 (loader) libraries."
 
 section "starting swtpm (software TPM2 simulator)"
-TPM_STATE_DIR=$(mktemp -d)
+TPM_STATE_DIR=$(mktemp -d /root/swtpm-state.XXXXXX) # swtpm's own state, root's, not under /tmp either
 swtpm socket \
     --tpmstate dir="$TPM_STATE_DIR" \
     --tpm2 \
@@ -79,7 +87,7 @@ echo "SoftHSM2 token ready (module=$SOFTHSM_MODULE)."
 # TPM provider requires one by default), and the SoftHSM2 token with an
 # owner-only PIN file. Tests layer their own policies over it. All of it
 # belongs to ci: a test build accepts config owned by the user running it.
-HARNESS=$(as_ci mktemp -d)
+HARNESS=$(as_ci mktemp -d /work/harness.XXXXXX)
 ( umask 077; head -c 32 /dev/urandom > "$HARNESS/tpm.derivation-secret" )
 ( umask 077; printf '1234\n' > "$HARNESS/pkcs11.pin" )
 cat > "$HARNESS/policy.toml" <<TOML
@@ -140,9 +148,9 @@ section "hkdfguard CLI output unwraps via libhkdfguard.so"
 CLISO_SERVICE=com.hkdfguard.dockertest.cliso
 ci_file "$SECRET_MOUNT/$CLISO_SERVICE"; head -c 32 /dev/urandom > "$SECRET_MOUNT/$CLISO_SERVICE"
 
-DEK_FILE=$(as_ci mktemp)
+DEK_FILE=$(as_ci mktemp -p "$KEYS")
 head -c 32 /dev/urandom | ci_write "$DEK_FILE"
-WRAPPED_FILE=$(as_ci mktemp)
+WRAPPED_FILE=$(as_ci mktemp -p "$KEYS")
 
 # `provision` is the only command that makes the (deliberately slow) setup
 # calls. For external-secret the mounted file *is* the provisioning, so
@@ -166,8 +174,8 @@ as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "
 
 # And the --dek-file path, which is what a secret mount or a systemd
 # credential provides. Mode 0600 or the CLI refuses it.
-WRAPPED_FILE2=$(as_ci mktemp)
-DEK_B64_FILE=$(as_ci mktemp)
+WRAPPED_FILE2=$(as_ci mktemp -p "$KEYS")
+DEK_B64_FILE=$(as_ci mktemp -p "$KEYS")
 base64 -w0 < "$DEK_FILE" | ci_write "$DEK_B64_FILE"
 as_ci target/release/hkdfguard wrap \
     --key-file-path "$WRAPPED_FILE2" \
@@ -178,7 +186,7 @@ as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE2" 
 
 # `wrap` never provisions: with nothing mounted for this service it must
 # fail and point at `provision`, rather than quietly creating a KEK.
-UNPROVISIONED_OUT=$(mktemp -u)
+UNPROVISIONED_OUT="$KEYS/unprovisioned.key"
 if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard wrap \
         --key-file-path "$UNPROVISIONED_OUT" --service-name com.hkdfguard.dockertest.unprovisioned --dek-stdin 2>/tmp/unprov.err; then
     echo "FAIL: wrap succeeded for a service with no provisioned KEK" >&2
@@ -188,6 +196,37 @@ grep -q 'provision --service-name com.hkdfguard.dockertest.unprovisioned' /tmp/u
     || { echo "FAIL: wrap's error did not point at the provision command:" >&2; cat /tmp/unprov.err >&2; exit 1; }
 [ ! -e "$UNPROVISIONED_OUT" ] || { echo "FAIL: a failed wrap wrote an output file" >&2; exit 1; }
 echo "--dek correctly rejected; unprovisioned wrap correctly refused; stdin and --dek-file both round-tripped."
+
+# A key file under /tmp -- even in a private mktemp -d directory there --
+# is refused: by the CLI before it reads the DEK, and by the library when
+# one is put there anyway.
+TMP_KEYS=$(as_ci mktemp -d)
+if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | as_ci target/release/hkdfguard wrap         --key-file-path "$TMP_KEYS/wrapped.key" --service-name "$CLISO_SERVICE" --dek-stdin 2>"$KEYS/tmp.err"; then
+    echo "FAIL: wrap wrote a key file under /tmp" >&2; exit 1
+fi
+grep -q 'sticky, like /tmp' "$KEYS/tmp.err" && grep -q 'the library would refuse to read a key file' "$KEYS/tmp.err"     || { echo "FAIL: unexpected refusal for a key file under /tmp:" >&2; cat "$KEYS/tmp.err" >&2; exit 1; }
+[ ! -e "$TMP_KEYS/wrapped.key" ] || { echo "FAIL: a refused wrap wrote a key file under /tmp" >&2; exit 1; }
+as_ci cp "$WRAPPED_FILE" "$TMP_KEYS/wrapped.key"
+if as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$TMP_KEYS/wrapped.key" "$CLISO_SERVICE" "$DEK_FILE" 2>"$KEYS/tmp.err"; then
+    echo "FAIL: hkdfguard_open_file accepted a key file under /tmp" >&2; exit 1
+fi
+grep -q -- '-39' "$KEYS/tmp.err" || { echo "FAIL: expected HKDFGUARD_ERR_FILE_UNTRUSTED (-39):" >&2; cat "$KEYS/tmp.err" >&2; exit 1; }
+rm -rf "$TMP_KEYS"
+echo "a key file under /tmp: wrap refuses to write it, hkdfguard_open_file refuses to read it (-39)."
+
+# A --dek-file under /tmp -- owner-only, in ci's own 0700 directory there --
+# is refused too, before it is read: the library's rule for what it reads.
+TMP_DEK=$(as_ci mktemp -d)
+as_ci sh -c "umask 077; base64 -w0 < '$DEK_FILE' > '$TMP_DEK/dek.b64'"
+if as_ci target/release/hkdfguard wrap --key-file-path "$KEYS/tmpdek.key" --service-name "$CLISO_SERVICE" \
+        --dek-file "$TMP_DEK/dek.b64" 2>"$KEYS/tmp.err"; then
+    echo "FAIL: wrap read a --dek-file under /tmp" >&2; exit 1
+fi
+grep -q -- "--dek-file $TMP_DEK/dek.b64: folder /tmp is writable by group or others (mode 1777) (sticky, like /tmp" "$KEYS/tmp.err" \
+    || { echo "FAIL: unexpected refusal for a --dek-file under /tmp:" >&2; cat "$KEYS/tmp.err" >&2; exit 1; }
+[ ! -e "$KEYS/tmpdek.key" ] || { echo "FAIL: a refused wrap wrote a key file" >&2; exit 1; }
+rm -rf "$TMP_DEK"
+echo "a --dek-file under /tmp: wrap refuses to read it."
 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
 rm -rf "$SECRET_MOUNT"
@@ -221,7 +260,7 @@ tcti = "$SWTPM_TCTI"
 TOML
 chmod 0644 /etc/hkdfguard/policy.toml
 
-BAD_DIR=$(as_ci mktemp -d)
+BAD_DIR=$(as_ci mktemp -d /work/bad.XXXXXX)
 printf 'this is not = valid [toml' > "$BAD_DIR/policy.toml"
 printf 'group-readable, so refused if read' > "$BAD_DIR/secret"; chmod 0640 "$BAD_DIR/secret"
 chown -R ci:ci "$BAD_DIR" # so the control fails on the malformed policy, not on being unable to read it
@@ -283,9 +322,216 @@ for build in release debug; do
 done
 echo "release, debug: PKCS#11 unused without pkcs11.module (no SoftHSM2 search, variables ignored)."
 
+section "retire deletes a PKCS#11 KEK only given its fingerprint; TPM2 refuses"
+# The release CLI against the real SoftHSM2 token, configured the way a
+# deployment configures it: root-owned policy naming the module, and the
+# root:ci 0440 PIN file above.
+cat > /etc/hkdfguard/policy.toml <<TOML
+[selection]
+mode = "require"
+provider = "pkcs11"
+
+[pkcs11]
+module = "$SOFTHSM_MODULE"
+pin_file = "/etc/hkdfguard/pkcs11.pin"
+token_label = "hkdfguard-test"
+TOML
+chmod 0644 /etc/hkdfguard/policy.toml
+RETIRE_SERVICE=com.hkdfguard.dockertest.retire
+RETIRE_DIR=$(as_ci mktemp -d -p "$KEYS")
+as_ci sh -c "umask 077; head -c 32 /dev/urandom > '$RETIRE_DIR/dek'"
+CLI=target/release/hkdfguard
+fingerprint_in() { sed -n 's/^fingerprint: \([0-9a-f]\{64\}\) .*/\1/p' <<<"$1"; }
+
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision on PKCS#11: $OUT" >&2; exit 1; }
+FP=$(fingerprint_in "$OUT")
+[ ${#FP} -eq 64 ] || { echo "FAIL: provision printed no fingerprint: $OUT" >&2; exit 1; }
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1)
+[ "$(fingerprint_in "$OUT")" = "$FP" ] || { echo "FAIL: a second provision reported another fingerprint: $OUT" >&2; exit 1; }
+printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+    | as_ci $CLI wrap -kf "$RETIRE_DIR/wrapped.key" -sn $RETIRE_SERVICE --dek-stdin >/dev/null
+as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$RETIRE_DIR/wrapped.key" $RETIRE_SERVICE "$RETIRE_DIR/dek"
+
+# wrap --fingerprint: written only when the payload is sealed to the KEK
+# given; a mismatch writes nothing, and with --force leaves the file alone.
+WRONG=$(printf '%064d' 0)
+OUT=$(printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+    | as_ci $CLI wrap -kf "$RETIRE_DIR/pinned.key" -sn $RETIRE_SERVICE --dek-stdin -fp "$FP" 2>&1) \
+    || { echo "FAIL: wrap --fingerprint with the right fingerprint: $OUT" >&2; exit 1; }
+grep -q "^fingerprint: $FP (confirmed)" <<<"$OUT" || { echo "FAIL: wrap did not confirm the fingerprint: $OUT" >&2; exit 1; }
+if OUT=$(printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+        | as_ci $CLI wrap -kf "$RETIRE_DIR/refused.key" -sn $RETIRE_SERVICE --dek-stdin -fp "$WRONG" 2>&1); then
+    echo "FAIL: wrap --fingerprint with the wrong fingerprint succeeded" >&2; exit 1
+fi
+grep -q "the service's KEK is $FP, not $WRONG; nothing was written" <<<"$OUT" \
+    || { echo "FAIL: unexpected wrap mismatch message: $OUT" >&2; exit 1; }
+[ ! -e "$RETIRE_DIR/refused.key" ] || { echo "FAIL: a key file was written despite the mismatch" >&2; exit 1; }
+BEFORE=$(sha256sum < "$RETIRE_DIR/pinned.key")
+if printf '%s' "$(base64 -w0 < "$RETIRE_DIR/dek")" \
+        | as_ci $CLI wrap -kf "$RETIRE_DIR/pinned.key" -sn $RETIRE_SERVICE --dek-stdin -fp "$WRONG" --force >/dev/null 2>&1; then
+    echo "FAIL: wrap --force --fingerprint with the wrong fingerprint succeeded" >&2; exit 1
+fi
+[ "$(sha256sum < "$RETIRE_DIR/pinned.key")" = "$BEFORE" ] \
+    || { echo "FAIL: --force replaced the key file despite the fingerprint mismatch" >&2; exit 1; }
+echo "wrap --fingerprint: right one written and confirmed; wrong one wrote nothing, and --force left the old file intact."
+
+if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$WRONG" 2>&1); then
+    echo "FAIL: retire with the wrong fingerprint succeeded" >&2; exit 1
+fi
+grep -q "the current KEK is $FP, not $WRONG; nothing was deleted" <<<"$OUT" \
+    || { echo "FAIL: unexpected mismatch message: $OUT" >&2; exit 1; }
+as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$RETIRE_DIR/wrapped.key" $RETIRE_SERVICE "$RETIRE_DIR/dek" \
+    || { echo "FAIL: the KEK stopped working after a refused retire" >&2; exit 1; }
+
+OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1) || { echo "FAIL: retire: $OUT" >&2; exit 1; }
+grep -q "retired KEK for service \"$RETIRE_SERVICE\" (fingerprint $FP, provider PKCS11)" <<<"$OUT" \
+    || { echo "FAIL: unexpected retire output: $OUT" >&2; exit 1; }
+if as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$RETIRE_DIR/wrapped.key" $RETIRE_SERVICE "$RETIRE_DIR/dek" 2>/dev/null; then
+    echo "FAIL: a DEK wrapped under the retired KEK still unwraps" >&2; exit 1
+fi
+if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1); then
+    echo "FAIL: retiring twice succeeded" >&2; exit 1
+fi
+grep -q 'nothing to retire' <<<"$OUT" || { echo "FAIL: unexpected second-retire message: $OUT" >&2; exit 1; }
+
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision after retire: $OUT" >&2; exit 1; }
+FP2=$(fingerprint_in "$OUT")
+[ ${#FP2} -eq 64 ] && [ "$FP2" != "$FP" ] || { echo "FAIL: provision after retire did not make a new KEK: $OUT" >&2; exit 1; }
+as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP2" >/dev/null
+echo "PKCS#11: wrong fingerprint refused, nothing deleted; right one deleted the KEK; its DEKs no longer unwrap; re-provision makes a new KEK."
+
+cat > /etc/hkdfguard/policy.toml <<TOML
+[selection]
+mode = "require"
+provider = "tpm2"
+
+[tpm]
+tcti = "$SWTPM_TCTI"
+TOML
+OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision on TPM2: $OUT" >&2; exit 1; }
+FP=$(fingerprint_in "$OUT")
+if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1); then
+    echo "FAIL: retire succeeded on TPM2, which stores no key to delete" >&2; exit 1
+fi
+grep -q "TPM2 cannot retire a single service's KEK" <<<"$OUT" || { echo "FAIL: unexpected TPM2 retire message: $OUT" >&2; exit 1; }
+echo "TPM2: retire refused, with the reason."
+rm -rf "$RETIRE_DIR"
+
 unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI TEST_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE \
       HKDFGUARD_EXTERNAL_SECRET_DIR HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT
-rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS"
+section "nothing the library reads is trusted under /tmp; a read-only 1777 mount is"
+# The release CLI, configured through /etc/hkdfguard/policy.toml as a
+# deployment is. Each file sits in a private directory (root's or ci's,
+# 0700/0755) inside the real /tmp: sticky and world-writable, so refused
+# however private the directory beneath it -- and the error says it was
+# the sticky directory.
+# expect_sticky_refusal <what> <command...>: the command must fail, naming
+# a sticky directory.
+expect_sticky_refusal() {
+    local what=$1 out; shift
+    if out=$("$@" 2>&1); then
+        echo "FAIL: $what under /tmp was accepted: $out" >&2; exit 1
+    fi
+    grep -q 'sticky, like /tmp, which is not enough' <<<"$out" \
+        || { echo "FAIL: $what under /tmp: refused, but not for the sticky directory: $out" >&2; exit 1; }
+    echo "$what under /tmp: refused ($(grep -o 'directory /tmp: [^)]*)' <<<"$out" | head -n1))."
+}
+STICKY_SERVICE=com.hkdfguard.dockertest.sticky
+
+# The TPM derivation secret (root:ci 0440 in a root-owned 0755 directory).
+TMP_ROOT=$(mktemp -d); chmod 0755 "$TMP_ROOT"
+install -o root -g ci -m 0440 /dev/null "$TMP_ROOT/tpm.derivation-secret"
+head -c 32 /dev/urandom > "$TMP_ROOT/tpm.derivation-secret"
+cat > /etc/hkdfguard/policy.toml <<TOML
+[selection]
+mode = "require"
+provider = "tpm2"
+
+[tpm]
+tcti = "$SWTPM_TCTI"
+derivation_secret_file = "$TMP_ROOT/tpm.derivation-secret"
+TOML
+expect_sticky_refusal "the TPM derivation secret" as_ci $CLI provision -sn $STICKY_SERVICE
+
+# The PKCS#11 module (a root-owned copy of SoftHSM2's), and separately the
+# PIN file (root:ci 0440), each with the other in its trusted place.
+cp "$SOFTHSM_MODULE" "$TMP_ROOT/libsofthsm2.so"; chmod 0755 "$TMP_ROOT/libsofthsm2.so"
+install -o root -g ci -m 0440 /dev/null "$TMP_ROOT/pkcs11.pin"; printf '1234\n' > "$TMP_ROOT/pkcs11.pin"
+pkcs11_policy() { # pkcs11_policy <module> <pin file>
+    printf '[selection]\nmode = "require"\nprovider = "pkcs11"\n\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' \
+        "$1" "$2" > /etc/hkdfguard/policy.toml
+}
+pkcs11_policy "$SOFTHSM_MODULE" /etc/hkdfguard/pkcs11.pin
+as_ci $CLI provision -sn $STICKY_SERVICE >/dev/null || { echo "FAIL: control: PKCS#11 from trusted places" >&2; exit 1; }
+pkcs11_policy "$TMP_ROOT/libsofthsm2.so" /etc/hkdfguard/pkcs11.pin
+expect_sticky_refusal "the PKCS#11 module" as_ci $CLI provision -sn $STICKY_SERVICE
+pkcs11_policy "$SOFTHSM_MODULE" "$TMP_ROOT/pkcs11.pin"
+expect_sticky_refusal "the PKCS#11 PIN file" as_ci $CLI provision -sn $STICKY_SERVICE
+rm -rf "$TMP_ROOT"
+
+# An external-secret mount: ci's own 0700 directory under /tmp, with the
+# service's KEK in it, owner-only.
+TMP_MOUNT=$(as_ci mktemp -d)
+ci_file "$TMP_MOUNT/$STICKY_SERVICE"; head -c 32 /dev/urandom | ci_write "$TMP_MOUNT/$STICKY_SERVICE"
+printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$TMP_MOUNT" \
+    > /etc/hkdfguard/policy.toml
+expect_sticky_refusal "an external-secret mount" as_ci $CLI provision -sn $STICKY_SERVICE
+rm -rf "$TMP_MOUNT"
+
+# The policy itself, read by the test build's CLI (the only kind that reads
+# a policy other than /etc/hkdfguard/policy.toml). Its absence is no more
+# trusted there than its presence: someone could have deleted it.
+TMP_POLICY=$(as_ci mktemp -d)
+printf '[selection]\nmode = "require"\nprovider = "pkcs11"\n' | ci_write "$TMP_POLICY/policy.toml"
+expect_sticky_refusal "the policy file" as_ci env HKDFGUARD_POLICY_FILE="$TMP_POLICY/policy.toml" \
+    "$TEST_BIN"/hkdfguard provision -sn $STICKY_SERVICE
+expect_sticky_refusal "a missing policy file" as_ci env HKDFGUARD_POLICY_FILE="$TMP_POLICY/absent.toml" \
+    "$TEST_BIN"/hkdfguard provision -sn $STICKY_SERVICE
+rm -rf "$TMP_POLICY"
+
+# The read-only exception, which Kubernetes Secret and ConfigMap volumes
+# depend on: docker/run-tests.sh mounts a volume read-only at $RO_MOUNT,
+# its root 1777 like a Secret volume's, holding a KEK for $RO_SERVICE (ci's,
+# 0400) both in the root itself and in a 0755 subdirectory -- a sticky
+# directory as the mount and as an ancestor of it. Both must work; the same
+# layout writable must not.
+RO_MOUNT=/run/hkdfguard-ro-secrets
+RO_SERVICE=com.hkdfguard.dockertest.romount
+grep -q " $RO_MOUNT " /proc/self/mountinfo \
+    || { echo "FAIL: nothing is mounted at $RO_MOUNT; run this image through docker/run-tests.sh, which mounts it" >&2; exit 1; }
+[ "$(stat -c %a "$RO_MOUNT")" = 1777 ] && [ ! -w "$RO_MOUNT" ] && ! touch "$RO_MOUNT/probe" 2>/dev/null \
+    || { echo "FAIL: $RO_MOUNT should be a read-only 1777 mount: $(stat -c '%a %U:%G' "$RO_MOUNT")" >&2; exit 1; }
+RW_MOUNT=$(mktemp -d /run/hkdfguard-rw-secrets.XXXXXX)
+chmod 1777 "$RW_MOUNT"; install -d -m 0755 "$RW_MOUNT/hkdfguard"
+for d in "$RW_MOUNT" "$RW_MOUNT/hkdfguard"; do
+    # Created by root, then handed to ci: with fs.protected_regular, root
+    # may not open an existing file of ci's in a sticky directory.
+    head -c 32 /dev/urandom > "$d/$RO_SERVICE"; chown ci:ci "$d/$RO_SERVICE"; chmod 0400 "$d/$RO_SERVICE"
+done
+for sub in "" /hkdfguard; do
+    printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT$sub" \
+        > /etc/hkdfguard/policy.toml
+    OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1) \
+        || { echo "FAIL: the read-only 1777 mount ($RO_MOUNT$sub) was refused: $OUT" >&2; exit 1; }
+    grep -q 'already provisioned' <<<"$OUT" || { echo "FAIL: no KEK found in $RO_MOUNT$sub: $OUT" >&2; exit 1; }
+    as_ci sh -c "umask 077; head -c 32 /dev/urandom > '$KEYS/ro.dek'"
+    printf '%s' "$(base64 -w0 < "$KEYS/ro.dek")" | as_ci $CLI wrap -kf "$KEYS/ro.key" -sn $RO_SERVICE --dek-stdin --force >/dev/null
+    as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$KEYS/ro.key" $RO_SERVICE "$KEYS/ro.dek" >/dev/null \
+        || { echo "FAIL: a DEK wrapped under the KEK in $RO_MOUNT$sub did not unwrap" >&2; exit 1; }
+    echo "external secret in a read-only 1777 mount ($RO_MOUNT$sub): accepted; wrap and unwrap work."
+
+    printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RW_MOUNT$sub" \
+        > /etc/hkdfguard/policy.toml
+    if OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1); then
+        echo "FAIL: the same layout writable ($RW_MOUNT$sub) was accepted: $OUT" >&2; exit 1
+    fi
+    grep -q 'sticky, like /tmp, which is not enough' <<<"$OUT" \
+        || { echo "FAIL: $RW_MOUNT$sub refused, but not for the sticky directory: $OUT" >&2; exit 1; }
+    echo "the same layout writable ($RW_MOUNT$sub): refused."
+done
+rm -rf "$RW_MOUNT" "$KEYS/ro.dek" "$KEYS/ro.key"
+
+rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS" "$KEYS"
 
 section "hkdfguard locks its memory when it can"
 # docker/run-tests.sh and CI grant CAP_IPC_LOCK, so the CLI must take the

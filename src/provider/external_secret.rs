@@ -26,14 +26,23 @@
 //! secret this crate reads from disk:
 //!
 //! - **Owned by root or by this process's user**, with **no group or
-//!   other access** (`0400`/`0600`). A group- or world-readable private
-//!   key is refused, and refused loudly: it is reported as an error, never
-//!   as "not provisioned", so a misconfigured mount can't silently fall
-//!   through to a weaker provider.
+//!   other access** (`0400`/`0600`) -- except that a root-owned file may
+//!   also be group-readable (`root:<group> 0440`), which is what a
+//!   Kubernetes Secret volume becomes when the pod sets `fsGroup`, and how
+//!   a non-root service reads a root-owned secret. A world-readable key,
+//!   or a group-readable one the service owns itself, is refused, and
+//!   refused loudly: it is reported as an error, never as "not
+//!   provisioned", so a misconfigured mount can't silently fall through to
+//!   a weaker provider.
 //! - **In a mount nobody else can write to.** The mount directory and
 //!   every directory above it must be owned by root or this process's user
-//!   and not writable by group or others (sticky ancestors and read-only
-//!   mounts, such as a Kubernetes Secret volume, are fine). Otherwise
+//!   and not writable by group or others -- sticky or not, so a mount
+//!   anywhere under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however
+//!   private the directories beneath it (see
+//!   [`crate::secure_file::check_dir_chain`]); so must the directory the
+//!   resolved file sits in and every one above it. The one exception is
+//!   a read-only mount: a Kubernetes Secret volume is `1777` but mounted
+//!   read-only, so nobody can write to it, and it is fine. Otherwise
 //!   another user could plant a KEK for a not-yet-provisioned service.
 //! - **A regular file.** Not a directory, device, or FIFO (which would
 //!   block the read forever).
@@ -51,8 +60,9 @@
 //! resolution and open -- see [`open_secret_within_mount`].
 //!
 //! Every common mechanism can meet the mode requirement with one setting:
-//! Kubernetes `defaultMode: 0400`, Vault Agent `perms = "0400"`, Docker
-//! Swarm `mode: 0400`; systemd `LoadCredential=` is already `0400`.
+//! Kubernetes `defaultMode: 0400` (`0440` with `fsGroup` for a non-root
+//! pod), Vault Agent `perms = "0400"`, Docker Swarm `mode: 0400`; systemd
+//! `LoadCredential=` is already `0400`.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
@@ -134,13 +144,7 @@ impl KekHandle for ExternalSecretHandle {
     }
 
     fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
-        let shared = p256::ecdh::diffie_hellman(
-            self.secret_key.to_nonzero_scalar(), // our private scalar
-            point.as_affine(),         // the payload's hashed point H_salt (see crypto.rs)
-        );
-        let mut out = [0u8; 32];
-        out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared secret's raw bytes
-        Ok(SharedSecret::new(out)) // wrap in the zeroizing alias
+        Ok(crate::provider::software_ecdh(&self.secret_key, point)) // point: the payload's hashed point H_salt (see crypto.rs)
     }
 
     fn public_key(&self) -> Result<PublicKey> {
@@ -240,7 +244,7 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
     owner: Some(Owner::RootOrCurrentUser),
     forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
     follow_symlinks: false, // applied to the already-resolved path; see below
-    allow_group_read_if_root_owned: false,
+    allow_group_read_if_root_owned: true, // root:<fsGroup> 0440, as the kubelet writes it for a non-root pod
 };
 
 /// Resolves `<mount>/<service>` to the real file it names, refuses the
@@ -496,7 +500,12 @@ mod tests {
             let secret_key = SecretKey::generate();
             let path = provision(dir, "com.company.orders", secret_key.to_bytes());
 
-            for mode in [0o644u32, 0o640, 0o604, 0o660, 0o444] {
+            // Group read is allowed only on a root-owned file, and the
+            // fixture is owned by whoever runs the tests.
+            // SAFETY: geteuid has no preconditions.
+            let root_owned = unsafe { libc::geteuid() } == 0;
+            let group_read: &[u32] = if root_owned { &[] } else { &[0o640, 0o440] };
+            for &mode in [0o644u32, 0o604, 0o660, 0o444].iter().chain(group_read) {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
                 match provider.load_kek("com.company.orders", true) {
                     Err(Error::Provider(msg)) => assert!(msg.contains("permissions"), "mode {mode:o}: {msg}"),
@@ -509,8 +518,9 @@ mod tests {
                 );
             }
 
-            // Owner-only modes are accepted.
-            for mode in [0o600u32, 0o400] {
+            // Owner-only modes are accepted, and root:<group> 0440 / 0640.
+            let group_read: &[u32] = if root_owned { &[0o640, 0o440] } else { &[] };
+            for &mode in [0o600u32, 0o400].iter().chain(group_read) {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
                 assert!(provider.kek_exists("com.company.orders").unwrap(), "mode {mode:o}");
                 provider.load_kek("com.company.orders", true).unwrap();
@@ -579,6 +589,60 @@ mod tests {
                 assert!(provider.kek_exists("com.company.orders").is_err(), "mode {mode:o}: an error, not absence");
             }
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_a_private_mount_under_a_sticky_ancestor() {
+        // A 0700 mount inside a /tmp-style (1777) directory: the layout of
+        // `mktemp -d` under /tmp. Refused like any shared directory -- a
+        // KEK belongs in a mount nobody else can write to, all the way up.
+        let base = crate::secure_file::private_tempdir();
+        let mount = base.path().join("secrets");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700)).unwrap();
+        provision(&mount, "com.company.orders", SecretKey::generate().to_bytes());
+        let _secret_mount = crate::policy::test_support::secret_mount(&mount);
+        let provider = ExternalSecretProvider::new();
+        provider.load_kek("com.company.orders", false).unwrap();
+
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        match provider.load_kek("com.company.orders", false) {
+            Err(Error::Provider(msg)) => assert!(msg.contains("sticky"), "says why: {msg}"),
+            Err(other) => panic!("expected Provider(..sticky..), got {other:?}"),
+            Ok(_) => panic!("a KEK under a sticky, world-writable directory must be refused"),
+        }
+        assert!(provider.kek_exists("com.company.orders").is_err(), "an error, not absence");
+        // Nothing provisioned for this one either: still an error, never "not provisioned".
+        assert!(provider.kek_exists("com.company.other").is_err());
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        provider.load_kek("com.company.orders", false).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_a_symlink_target_under_a_sticky_directory_inside_the_mount() {
+        with_dir(|provider, dir| {
+            // `<key>` -> `..2026_10_02/keys/<key>`, with `..2026_10_02`
+            // sticky and world-writable: the directory the file sits in is
+            // private, but one above it, inside the mount, is not.
+            let shared = dir.join("..2026_10_02");
+            let keys = shared.join("keys");
+            std::fs::create_dir_all(&keys).unwrap();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+            provision(&keys, "com.company.orders", SecretKey::generate().to_bytes());
+            std::os::unix::fs::symlink("..2026_10_02/keys/com.company.orders", dir.join("com.company.orders")).unwrap();
+            provider.load_kek("com.company.orders", false).unwrap();
+
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            match provider.load_kek("com.company.orders", false) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("sticky"), "says why: {msg}"),
+                Err(other) => panic!("expected Provider(..sticky..), got {other:?}"),
+                Ok(_) => panic!("a KEK under a sticky directory inside the mount must be refused"),
+            }
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
         });
     }
 

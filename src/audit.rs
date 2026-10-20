@@ -47,6 +47,8 @@ pub(crate) enum Op {
     GenerateAndWrap,
     Unwrap,
     OpenFile,
+    KekFingerprint,
+    RetireKek,
 }
 
 impl Op {
@@ -58,6 +60,10 @@ impl Op {
             Op::GenerateAndWrap => "hkdfguard_generate_and_wrap_dek",
             Op::Unwrap => "hkdfguard_unwrap_dek",
             Op::OpenFile => "hkdfguard_open_file",
+            Op::KekFingerprint => "hkdfguard_kek_fingerprint",
+            // Not a C function: the CLI's `retire`, through the library's
+            // Rust-only `admin::retire_kek`.
+            Op::RetireKek => "retire_kek",
         }
     }
 }
@@ -68,6 +74,10 @@ pub(crate) const KEK_CREATED: u32 = 1000;
 pub(crate) const KEK_CREATED_FALLBACK: u32 = 1001;
 pub(crate) const DEK_WRAPPED: u32 = 1002;
 pub(crate) const DEK_UNWRAPPED: u32 = 1003;
+// Not in the Windows table: Linux's own, for `retire`, which permanently
+// deletes a KEK. A Warning, as every DEK wrapped under it is now
+// unrecoverable.
+pub(crate) const KEK_RETIRED: u32 = 1004;
 pub(crate) const ACCESS_DENIED: u32 = 2000;
 pub(crate) const KEK_INVALID: u32 = 2002;
 pub(crate) const INTEGRITY_FAILURE: u32 = 2003;
@@ -110,6 +120,27 @@ pub(crate) fn kek_created(service: &str, provider: ProviderType, preferred: Opti
         ),
         _ => emit(Severity::Info, KEK_CREATED, &fields, &format!("KEK created on {}", provider.as_str())),
     }
+}
+
+/// A KEK was retired: deleted from `provider` for good, after its
+/// fingerprint was confirmed. Records the fingerprint (public), so the
+/// record names exactly which key was destroyed.
+pub(crate) fn kek_retired(service: &str, provider: ProviderType, fingerprint: &[u8]) {
+    emit(
+        Severity::Warning,
+        KEK_RETIRED,
+        &format!(
+            "op={} result=OK service={} provider={} kek_fingerprint={}",
+            Op::RetireKek.name(),
+            quote(service.as_bytes()),
+            provider.as_str(),
+            hex(fingerprint)
+        ),
+        &format!(
+            "KEK retired: deleted from {}; every DEK wrapped under it can no longer be unwrapped",
+            provider.as_str()
+        ),
+    );
 }
 
 /// A DEK was wrapped (`op` is Wrap or GenerateAndWrap) or unwrapped
@@ -209,7 +240,7 @@ pub(crate) fn setup_calls_exceeded(calls: u32, floor_ms: u128) {
         SETUP_CALLS_EXCEEDED,
         &format!("calls={calls} setup_min_delay_ms={floor_ms}"),
         &format!(
-            "more than {calls} hkdfguard_create_kek / hkdfguard_kek_exists calls in this process; these are meant \
+            "more than {calls} hkdfguard_create_kek / hkdfguard_kek_exists / hkdfguard_kek_fingerprint calls in this process; these are meant \
              to run once per application startup, and each costs a fresh provider connection plus at least \
              {floor_ms} ms -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
         ),
@@ -420,7 +451,12 @@ mod tests {
 
     #[test]
     fn send_to_delivers_one_datagram_and_never_blocks_or_fails() {
-        let dir = crate::secure_file::private_tempdir();
+        // Not `private_tempdir`: nothing here goes through the library's
+        // trust checks, and a socket path must fit in sun_path (108 bytes),
+        // which the test root under a deep build directory (rpmbuild's
+        // BUILD/<name>-build/<name>/target/tmp/...) can exceed. The system
+        // temp dir is short; `tempdir` makes a 0700 directory in it.
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.sock");
         let receiver = UnixDatagram::bind(&path).unwrap();
         let record = frame(Severity::Info, "event=1002 op=hkdfguard_wrap_dek msg=\"x\"");

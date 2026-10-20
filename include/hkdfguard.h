@@ -78,7 +78,7 @@ extern "C" {
 #define HKDFGUARD_ERR_INVALID_SERVICE_NAME (-8) /* service is null, empty, not valid UTF-8, over 128 bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." */
 
 /* Policy */
-#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or its directory, or it requires a provider this build lacks */
+#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or of any directory above it (writable by group/others, sticky /tmp-style included), or it requires a provider this build lacks */
 
 /* Wrapped payload */
 #define HKDFGUARD_ERR_PAYLOAD_MALFORMED (-10)   /* structurally invalid: truncated, trailing bytes, unknown provider type, or a field length no wrap produces */
@@ -102,7 +102,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_LONG (-36)       /* key file is longer than a wrapped DEK, or than its own header declares */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-38)      /* key file is the right length but not a well-formed wrapped DEK */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by another user or writable by group/others: someone else could have replaced it */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by another user or writable by group/others (sticky, /tmp-style, included): someone else could have replaced it */
 /* -40..-63 reserved for future common codes. */
 
 /* Windows-specific (-64..-79). Not returned on Linux. */
@@ -129,7 +129,8 @@ extern "C" {
  * working for the process -- hence opt-in. Call once, early in startup,
  * and after any privilege change (the kernel resets the dumpable flag
  * when credentials change). Root and CAP_SYS_PTRACE are unaffected; that
- * is host configuration. Idempotent.
+ * is host configuration. Idempotent. The library applies it itself before
+ * creating an ephemeral KEK, whose only protection is process memory.
  *
  * Same as hkdfguard_harden_process_with_flags(0).
  *
@@ -193,8 +194,8 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * tag hkdfguard) with the Windows build's event IDs - see README.md,
  * "Audit trail".
  *
- * Deliberately slow: this and hkdfguard_kek_exists are setup calls, meant
- * to run once per application startup, and each takes at least
+ * Deliberately slow: this, hkdfguard_kek_exists and hkdfguard_kek_fingerprint
+ * are setup calls, meant to run once per application startup, and each takes at least
  * `startup_behavior.setup_min_delay_ms` (policy file; default 1000 ms)
  * of wall-clock time whatever its outcome, and they are serialized with
  * each other across threads. Do not call them per request; call once at
@@ -223,6 +224,33 @@ int hkdfguard_create_kek(const char* service);
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
  */
 int hkdfguard_kek_exists(const char* service, int* exists);
+
+/*
+ * Writes the 32-byte fingerprint of the KEK `service` currently resolves
+ * to: SHA-256 of its public key, SEC1-uncompressed (0x04 || X || Y) -- the
+ * same value every payload wrapped under it carries, and that
+ * hkdfguard_unwrap_dek checks. Public-key material, not a secret. Lets an
+ * operator record which KEK a service uses after provisioning (the CLI's
+ * `provision` prints it), and confirm it before retiring it (`retire`
+ * requires it). Never creates a KEK: HKDFGUARD_ERR_KEK_NOT_FOUND if none
+ * exists.
+ *
+ * A setup call, like hkdfguard_kek_exists: whether it finds a KEK answers
+ * the same question, so it is subject to the same startup latency floor
+ * and serialization as hkdfguard_create_kek above. Argument errors and the
+ * size probe return immediately.
+ *
+ * service:  see hkdfguard_wrap_dek below.
+ * out:      receives the 32 bytes on success. May be NULL only for a size
+ *           probe (*out_len == 0).
+ * out_len:  on input, the capacity of `out`. Set to 32 on success, and to
+ *           32 on HKDFGUARD_ERR_BUFFER_TOO_SMALL (capacity under 32;
+ *           nothing written). Untouched on any other return code, as is
+ *           `out`.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int* out_len);
 
 /*
  * Wraps a 32-byte DEK under the persistent KEK identified by `service`.
@@ -360,9 +388,14 @@ int hkdfguard_generate_and_wrap_dek(
  *           names -- the one holding the opened file and the one `path`
  *           names it in (where a symlink lives), each up to `/`: owned by
  *           root or the calling user, and not writable by group or others
- *           unless sticky (like /tmp); HKDFGUARD_ERR_FILE_UNTRUSTED
- *           otherwise. The CLI writes key files 0600; a root-owned
- *           read-only secret mount also passes.
+ *           -- sticky or not, at any level: a key file anywhere under
+ *           /tmp, /var/tmp, /dev/shm or any other sticky, world-writable
+ *           directory is refused, however private the directories beneath
+ *           it; HKDFGUARD_ERR_FILE_UNTRUSTED otherwise. A directory on a
+ *           read-only mount counts as unwritable whatever its mode, so a
+ *           Kubernetes Secret or ConfigMap volume (1777, read-only)
+ *           passes. The CLI writes key files 0600, and refuses to write
+ *           one into a folder this check would refuse.
  * out:      buffer to receive the wrapped payload. May be NULL only if
  *           *out_len is 0 (to probe the size).
  * out_len:  in: capacity of `out` in bytes.

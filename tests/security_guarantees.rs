@@ -24,8 +24,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
+// A private temp root, not the sticky /tmp (see src/test_tmp.rs).
+#[path = "../src/test_tmp.rs"]
+mod test_tmp;
+
 fn tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+    test_tmp::private_tempdir()
 }
 
 /// Writes `doc` as the policy and points the library at it for the

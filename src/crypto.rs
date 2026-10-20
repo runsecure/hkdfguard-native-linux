@@ -364,7 +364,7 @@ fn aes_key(key: &Zeroizing<[u8; 32]>) -> &Key<Aes256Gcm> {
 /// equality check against it in [`unwrap`] exists purely to fail fast and
 /// cheaply on "this payload wasn't wrapped under the KEK `service`
 /// currently resolves to," before spending any effort on ECDH/AES-GCM.
-fn kek_fingerprint(public_key: &PublicKey) -> [u8; FINGERPRINT_LEN] {
+pub(crate) fn kek_fingerprint(public_key: &PublicKey) -> [u8; FINGERPRINT_LEN] {
     let encoded = public_key.to_sec1_point(false); // uncompressed SEC1 point: 0x04 || X || Y
     let digest = Sha256::digest(encoded.as_bytes());
     let mut out = [0u8; FINGERPRINT_LEN];

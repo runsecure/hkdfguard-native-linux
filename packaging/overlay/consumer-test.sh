@@ -18,7 +18,11 @@ section() { printf '\n\033[1;36m== %s ==\033[0m\n' "$1"; }
 
 [ $# -eq 1 ] || { echo "usage: $0 plain|dev" >&2; exit 2; }
 mode=$1
-work=$(mktemp -d)
+# Root's own private directory, not /tmp: the library refuses a key file
+# anywhere under a sticky, world-writable directory, and `hkdfguard wrap`
+# refuses to write one there. / and /root are root's and not writable by
+# anyone else.
+work=$(mktemp -d /root/hkdfguard-consumer.XXXXXX)
 multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || gcc -print-multiarch)
 libdir=/usr/lib/$multiarch
 
@@ -86,13 +90,18 @@ if [ "$mode" = plain ]; then
     cli_round_trip com.company.cli 3
 else
     section "dev policy, no PIN file: ephemeral"
-    # In one process, ephemeral keys work. The CLI logs which provider it
-    # fell back to; the library itself installs no logger.
+    # In one process, ephemeral keys work. The CLI refuses them: a key it
+    # created would be gone when it exits, so it must fail and say why
+    # rather than "provision" a KEK nothing could ever use.
     "$work/wrap_unwrap"
-    hkdfguard provision -sn com.company.ephemeral 2> "$work/ephemeral.log" \
-        || { cat "$work/ephemeral.log" >&2; exit 1; }
-    grep -q 'EPHEMERAL' "$work/ephemeral.log" || { cat "$work/ephemeral.log" >&2; echo "expected the ephemeral fallback warning" >&2; exit 1; }
-    echo "the CLI reports the ephemeral fallback"
+    if hkdfguard provision -sn com.company.ephemeral 2> "$work/ephemeral.log"; then
+        cat "$work/ephemeral.log" >&2
+        echo "provision must refuse an ephemeral KEK" >&2
+        exit 1
+    fi
+    grep -q 'exist only inside the process' "$work/ephemeral.log" \
+        || { cat "$work/ephemeral.log" >&2; echo "expected provision to explain the ephemeral refusal" >&2; exit 1; }
+    echo "the CLI refuses an ephemeral KEK and says why"
 
     section "dev policy, SoftHSM2 token and PIN file: PKCS#11"
     softhsm2-util --init-token --free --label hkdfguard --pin 1234 --so-pin 5678 >/dev/null

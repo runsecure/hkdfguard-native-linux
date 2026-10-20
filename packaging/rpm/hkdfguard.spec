@@ -21,7 +21,7 @@
 %global linked_licenses Apache-2.0 AND BSD-3-Clause AND ISC AND MIT AND (Apache-2.0 OR MIT) AND (MIT OR Unlicense)
 
 Name:           hkdfguard
-Version:        0.1.0
+Version:        0.9.0
 Release:        1%{?dist}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK (CLI)
 License:        MPL-2.0 AND %{linked_licenses}
@@ -147,5 +147,5 @@ cargo test --locked --offline --all-features
 %{_libdir}/libhkdfguard.a
 
 %changelog
-* Fri Oct 02 2026 runsecure <torin@torinblair.com> - 0.1.0-1
+* Fri Oct 02 2026 runsecure <torin@torinblair.com> - 0.9.0-1
 - Initial packaging.

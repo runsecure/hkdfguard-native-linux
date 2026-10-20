@@ -21,7 +21,15 @@ the library or CLI happens as `ci`, an unprivileged user in the `tss`
 group. That is what makes the ownership checks testable: as root every
 file is root-owned, so there would be nothing to refuse. The image sets
 `HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1`, so those tests fail rather than
-skip if they ever run as root. The script:
+skip if they ever run as root. Key files, policies, secrets and PIN files
+the script and the tests write go in private directories under `/work`
+(owned by `ci`) and `<target>/tmp/hkdfguard-tests`, never under `/tmp`: the
+library refuses anything it reads anywhere under a sticky, world-writable
+directory, and the CLI refuses to write a key file or read a `--dek-file`
+there. [`run-tests.sh`](run-tests.sh) also mounts a read-only volume at
+`/run/hkdfguard-ro-secrets` whose root is `1777`, like a Kubernetes Secret
+volume, to prove the one exception: a read-only mount is accepted. The
+script:
 
 1. `cargo build` / `cargo test` with the default features (external-secret,
    ephemeral) -- unit tests plus the CLI integration tests

@@ -29,6 +29,12 @@ as_ci() { setpriv --reuid=ci --regid=ci --init-groups env HOME=/home/ci USER=ci 
 # Writes stdin into a file `ci` owns, as ci (see docker/entrypoint-test.sh
 # on fs.protected_regular).
 ci_write() { as_ci sh -c 'cat > "$1"' sh "$1"; }
+# Key files, the DEK cli_unwrap_check probes with hkdfguard_open_file, and
+# the harness's policy and PIN file go here rather than under /tmp: the
+# library refuses anything it reads anywhere under a sticky, world-writable
+# directory, and the CLI refuses to write a key file there. /work is ci's
+# own (prepare-image.sh) and / root's, both 0755.
+KEYS=$(as_ci mktemp -d /work/keys.XXXXXX)
 
 # BASE_RUSTFLAGS is set only where the target needs it (Alpine/musl:
 # -crt-static). A RUSTFLAGS variable replaces configured target flags, so
@@ -89,7 +95,7 @@ section "initializing a SoftHSM2 token"
 # select this token by label (SOFTHSM_TEST_TOKEN_LABEL).
 as_ci softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-pin 5678
 
-HARNESS=$(as_ci mktemp -d)
+HARNESS=$(as_ci mktemp -d /work/harness.XXXXXX)
 ( umask 077; printf '1234\n' > "$HARNESS/pkcs11.pin" )
 cat > "$HARNESS/policy.toml" <<TOML
 [selection]
@@ -204,9 +210,9 @@ run_c target/c/wrap_unwrap
 # statically), then a separate C program unwraps through the .so. Unlike
 # the ephemeral case, the KEK lives in the token, so this must succeed.
 SERVICE=com.hkdfguard.distrotest.pkcs11
-DEK_FILE=$(as_ci mktemp)
+DEK_FILE=$(as_ci mktemp -p "$KEYS")
 head -c 32 /dev/urandom | ci_write "$DEK_FILE"
-WRAPPED_FILE=$(as_ci mktemp)
+WRAPPED_FILE=$(as_ci mktemp -p "$KEYS")
 as_ci target/release/hkdfguard provision --service-name "$SERVICE"
 base64 -w0 < "$DEK_FILE" | as_ci target/release/hkdfguard wrap \
     --key-file-path "$WRAPPED_FILE" --service-name "$SERVICE" --dek-stdin --force
@@ -221,6 +227,6 @@ fi
 echo "pkcs11: world-readable PIN file refused."
 
 rm -f "$DEK_FILE" "$WRAPPED_FILE"
-rm -rf /etc/hkdfguard
+rm -rf /etc/hkdfguard "$KEYS"
 
 section "ALL CHECKS PASSED on $DISTRO ($(uname -m))"

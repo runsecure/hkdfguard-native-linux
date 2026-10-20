@@ -8,6 +8,7 @@
 - [Fingerprint mismatch (-16)](#fingerprint-mismatch--16)
 - [Unwrap fails authentication (-11)](#unwrap-fails-authentication--11)
 - [Unwrap says the payload is malformed or unsupported (-10, -12)](#unwrap-says-the-payload-is-malformed-or-unsupported--10--12)
+- [The key file is refused as untrusted (-39)](#the-key-file-is-refused-as-untrusted--39)
 - [Other problems](#other-problems)
 
 ## First: find out why
@@ -44,6 +45,7 @@ back to defaults in that case.
 | Message contains | Cause | Fix |
 |---|---|---|
 | `refusing to trust its location (directory ...: writable by group or others (mode 775) ...)` | `/etc/hkdfguard` or a directory above it can be changed by non-root users | `sudo chmod go-w <directory>`; every directory up to `/` must be root-owned and not group- or other-writable |
+| `... (mode 1777; sticky, like /tmp, which is not enough) ...` | The file (policy, secret, PIN, module, key file) is somewhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory, even inside a private directory there | Move it to a directory only root (or, where allowed, the service) can write, all the way up to `/`. Sticky directories are never trusted; only a read-only mount, such as a Kubernetes Secret volume, is exempt |
 | `owned by uid ..., which is not an allowed owner` | The policy, or a directory above it, isn't owned by root | `sudo chown root:root /etc/hkdfguard/policy.toml` |
 | `permissions too broad (mode ...)` | The policy is group- or other-writable | `sudo chmod 0644 /etc/hkdfguard/policy.toml` |
 | `TOML parse error` | Invalid TOML. Most often a top-level key (`preferred_order`) below a `[section]`, or an unquoted service name in `[tpm.pinned_names]` | Move `preferred_order` above the first section; quote service names: `"com.company.orders" = ...` |
@@ -94,7 +96,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 
 | Symptom (CLI output) | Fix |
 |---|---|
-| `TPM derivation secret at ... is present but unusable` | Make it `root:<group> 0440` or `root:root 0400`, a regular file (not a symlink), and not empty |
+| `TPM derivation secret at ... is present but unusable` | Make it `root:<group> 0440` or `root:root 0400`, a regular file (not a symlink), and not empty, in directories only root can change up to `/` (never under `/tmp`) |
 | `TSS2_LOG enables debug/trace logging in tpm2-tss ...` | Unset `TSS2_LOG`, or lower it to `info` or below: at debug levels tpm2-tss logs secrets |
 | `tpm.require_pinned_names is set and this service has no pinned TPM Name` | The service isn't in `[tpm.pinned_names]`. Add the line the message prints, then run `provision` again. |
 | A pinned Name mismatch | The TPM derives a different key than the pinned one: the derivation secret changed, the TPM was cleared or replaced, or the pin was learned before the secret was created. Re-learn the pin only once you're sure which key is right: see [Fingerprint mismatch](#fingerprint-mismatch--16). |
@@ -106,8 +108,8 @@ wrong. The library stops rather than quietly using a weaker provider.
 
 | Symptom | Fix |
 |---|---|
-| PIN file refused | Make it `root:<group> 0440` or `root:root 0400` |
-| Module refused, or won't load | The module and every directory above it must be root-owned and not group- or other-writable. Check the path. |
+| PIN file refused | Make it `root:<group> 0440` or `root:root 0400`, in directories only root can change up to `/` (never under `/tmp`) |
+| Module refused, or won't load | The module and every directory above it must be root-owned and not group- or other-writable, sticky (`/tmp`) included. Check the path. |
 | No token matches | Check `token_label` and `token_serial` against `pkcs11-tool --list-token-slots` (from OpenSC). Exactly one token must match. |
 | `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. |
 
@@ -115,9 +117,10 @@ wrong. The library stops rather than quietly using a weaker provider.
 
 | Symptom | Fix |
 |---|---|
-| `permissions too broad (mode ...)` | The key file must be `0400` or `0600` with no group or other access. On Kubernetes, check `defaultMode`, and leave `fsGroup` unset for the secret volume. |
+| `permissions too broad (mode ...)` | The key file must be `0400` or `0600` with no group or other access, or `root:<group> 0440`. On Kubernetes, use `defaultMode: 0400` (never `0444`); a non-root pod also needs `fsGroup`. |
 | `owned by uid ..., which is not an allowed owner` | The key file must be owned by root or by the service's user |
 | `resolves to ..., outside the secret mount` | A symlink points out of the mount. Deliver the file inside it. |
+| `directory ...: writable by group or others (mode ...)` | The mount, or a directory above it or above the resolved file, can be changed by others -- a sticky one (`/tmp`) included. Mount the secrets read-only (as Kubernetes does), or somewhere only root or the service can write, up to `/`. |
 | `external secret is not a valid P-256 key (expected 32 raw bytes, PKCS#8 DER or SEC1 DER; PEM must be converted to DER)` | The file isn't one of the accepted forms. Most often it's PEM (text starting `-----BEGIN`): convert it with `openssl pkey -in key.pem -outform DER -out key.der`. Or the key is for another curve: only P-256 is accepted. |
 | A configured `external_secret.dir` is missing | The mount isn't there yet (a volume not attached, a sidecar not ready). Fix the mount; the library won't use another provider in the meantime. |
 
@@ -180,6 +183,28 @@ before unwrap is called.
 `HKDFGUARD_ERR_CRYPTO_ERROR` (-5) is for a cryptographic step
 failing for another reason, such as the OS random number generator; it never
 means the payload itself is bad.
+
+## The key file is refused as untrusted (-39)
+
+`HKDFGUARD_ERR_FILE_UNTRUSTED` from `hkdfguard_open_file` means someone
+other than root or the reading process's user could have replaced the key
+file: the file, or a directory above it (or above a symlink to it), is owned
+by another user or is writable by group or others. Find which with
+`namei -l <path>` (and `namei -l "$(readlink -f <path>)"`).
+
+| Cause | Fix |
+|---|---|
+| The file is group- or other-writable | `chmod 0600` (or `0640`/`0644`: read access is fine, it is ciphertext) |
+| The file, or a directory above it, is owned by another non-root user | Own it by the service's user or by root |
+| A directory above it is group- or other-writable | `chmod go-w <directory>`, or move the key file |
+| The key file is under `/tmp`, `/var/tmp`, `/dev/shm` or another **sticky**, world-writable directory, even inside a private `mktemp -d` directory there | Move it to a directory only the service or root can write, all the way up to `/` (for example `/var/lib/<app>/`, `0700` or `0755`). Sticky directories are never trusted, for key files or anything else the library reads. |
+
+`hkdfguard wrap` applies the same mode rule to its `--key-file-path` up
+front, before the DEK is read, and stops with
+`... is writable by group or others (mode ...); the library would refuse to read a key file at ...`
+rather than write a key file the application could never open. It checks
+modes only, not owners, since it often runs as root into a folder the
+service's account owns.
 
 ## Other problems
 

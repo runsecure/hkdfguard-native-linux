@@ -23,9 +23,15 @@ COPY --from=build /src/target/release/libhkdfguard.so /usr/local/lib/libhkdfguar
 COPY docker/k8s/pod-test.sh /usr/local/bin/pod-test.sh
 # The policy must be root-owned and not writable by anyone else, and so must
 # /etc/hkdfguard. A Windows checkout may hand the script CRLF line endings.
+# pod-test.sh writes its key files into /var/lib/hkdfguard-test/<uid>, a
+# private directory for each uid the scenarios run as (run-tests.sh and
+# run-vault-tests.sh: 0 and 10001): the library refuses key files under the
+# sticky /tmp, and a pod's arbitrary uid can create nothing elsewhere.
 RUN ldconfig \
  && sed -i 's/\r$//' /usr/local/bin/pod-test.sh \
  && chmod 0755 /usr/local/bin/pod-test.sh /usr/local/bin/hkdfguard /usr/local/bin/cli_unwrap_check \
+ && install -d -m 0755 /var/lib/hkdfguard-test \
+ && for uid in 0 10001; do install -d -o "$uid" -g "$uid" -m 0700 "/var/lib/hkdfguard-test/$uid"; done \
  && install -d -m 0755 /etc/hkdfguard \
  && printf '[selection]\nmode = "require"\nprovider = "external-secret"\n' > /etc/hkdfguard/policy.toml \
  && chmod 0644 /etc/hkdfguard/policy.toml

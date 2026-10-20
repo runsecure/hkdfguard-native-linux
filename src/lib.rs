@@ -16,8 +16,85 @@ mod payload; // wrapped-payload wire format
 mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.toml)
 mod provider; // provider trait + selection chain
 mod secure_file; // hardened, check-then-read-safe file access + self-wiping SecretBuffer
+#[cfg(test)]
+mod test_tmp; // where tests make temp dirs: a private root, not the sticky /tmp nothing this crate reads may live under
 
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
+
+/// Administration for the `hkdfguard` CLI: operations deliberately kept
+/// out of the C ABI, so no application linking the library can call them.
+/// Rust-only and not a stable interface.
+#[doc(hidden)]
+pub mod admin {
+    use super::*;
+
+    /// Why an administrative operation failed: the status code it maps to
+    /// (as the C functions would return it), and a sentence for the
+    /// operator. Never contains key material.
+    #[derive(Debug)]
+    pub struct AdminError {
+        pub status: i32,
+        pub message: String,
+    }
+
+    impl From<error::Error> for AdminError {
+        fn from(e: error::Error) -> Self {
+            AdminError { status: e.status_code(), message: e.to_string() }
+        }
+    }
+
+    /// The KEK fingerprint a wrapped payload carries -- the KEK it was
+    /// sealed to -- parsed with the library's own payload parser (version,
+    /// field lengths, no trailing bytes), so the CLI never hard-codes this
+    /// library's private layout. `None` if `payload` isn't a well-formed one.
+    pub fn payload_fingerprint(payload: &[u8]) -> Option<[u8; payload::FINGERPRINT_LEN]> {
+        payload::Payload::from_bytes(payload).ok().map(|p| p.fingerprint)
+    }
+
+    /// Permanently deletes the KEK `service` currently resolves to -- the
+    /// one every wrap uses -- if its fingerprint is `expected_fingerprint`.
+    /// Only a provider that stores one key per service can do this
+    /// (PKCS#11); any other refuses, saying why. The fingerprint is checked
+    /// twice: against the KEK the service resolves to, and by the provider
+    /// on the very objects it deletes. A setup call (serialized, held to
+    /// the latency floor), and audited (1004) on success.
+    ///
+    /// Every DEK wrapped under the KEK becomes unrecoverable. Returns the
+    /// provider it was deleted from.
+    pub fn retire_kek(service: &str, expected_fingerprint: &[u8; payload::FINGERPRINT_LEN]) -> Result<provider::ProviderType, AdminError> {
+        let c_service = std::ffi::CString::new(service).map_err(|_| AdminError {
+            status: status::INVALID_SERVICE_NAME,
+            message: "the service name contains a NUL byte".to_string(),
+        })?;
+        let service = cstr_to_service(c_service.as_ptr()).map_err(|code| AdminError {
+            status: code,
+            message: "invalid service name: 1..=128 ASCII letters, digits and '.', not starting with '.' or containing \"..\""
+                .to_string(),
+        })?;
+
+        let _policy = policy::snapshot_for_call();
+        let result = gated_setup(|| -> Result<provider::ProviderType, error::Error> {
+            let (provider, handle) = provider::select_existing(&service)?;
+            if crypto::kek_fingerprint(&handle.public_key()?) != *expected_fingerprint {
+                return Err(error::Error::KekFingerprintMismatch);
+            }
+            drop(handle);
+            provider.retire_kek(&service, expected_fingerprint)?;
+            Ok(provider.provider_type())
+        });
+        match result {
+            Ok(provider_type) => {
+                audit::kek_retired(&service, provider_type, expected_fingerprint);
+                Ok(provider_type)
+            }
+            Err(e) => {
+                log::error!("hkdfguard: retire_kek failed for service \"{service}\": {e}");
+                audit::operation_failed(audit::Op::RetireKek, &service, e.status_code());
+                Err(e.into())
+            }
+        }
+    }
+}
 
 use std::os::raw::{c_char, c_int, c_uint}; // C-ABI-compatible integer/char types
 use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
@@ -29,7 +106,8 @@ use zeroize::Zeroize; // scrub sensitive stack buffers before returning
 pub(crate) const MAX_SERVICE_LEN: usize = 128; // spec-mandated maximum service-name length in bytes
 
 /// Serializes every setup call (`hkdfguard_create_kek`,
-/// `hkdfguard_kek_exists`) so that, combined with the latency floor in
+/// `hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`, and the CLI's
+/// `admin::retire_kek`) so that, combined with the latency floor in
 /// `gated_setup`, their aggregate rate is capped at one per
 /// `policy::setup_min_delay()` regardless of how many threads call in.
 static SETUP_GATE: Mutex<()> = Mutex::new(());
@@ -87,7 +165,7 @@ fn gated_setup<T>(f: impl FnOnce() -> T) -> T {
     let count = SETUP_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     if count == SETUP_CALLS_WARN_AT + 1 {
         log::warn!(
-            "hkdfguard: more than {SETUP_CALLS_WARN_AT} create_kek/kek_exists calls in this process; \
+            "hkdfguard: more than {SETUP_CALLS_WARN_AT} create_kek/kek_exists/kek_fingerprint calls in this process; \
              these are meant to run once per application startup, and each costs a fresh provider \
              connection plus at least {} ms",
             floor.as_millis()
@@ -307,6 +385,46 @@ pub extern "C" fn hkdfguard_kek_exists(service: *const c_char, exists: *mut c_in
     }
 }
 
+/// Writes the 32-byte fingerprint of the KEK `service` currently resolves to:
+/// SHA-256 of its public key, SEC1-uncompressed (`0x04 || X || Y`) -- the
+/// same value every payload wrapped under it carries, and that
+/// [`hkdfguard_unwrap_dek`] checks. Public-key material, not a secret. Lets
+/// an operator record which KEK a service uses after provisioning, and
+/// confirm it before retiring it. Never creates a KEK.
+///
+/// A setup call, like [`hkdfguard_kek_exists`]: whether it finds a KEK
+/// answers the same question, so it is held to the same latency floor and
+/// serialized with the other setup calls. Argument errors and the size
+/// probe return immediately.
+///
+/// # Parameters
+/// - `service`: see [`hkdfguard_wrap_dek`].
+/// - `out` / `out_len`: on input, `*out_len` is the capacity of `out`. On
+///   success, the 32 bytes are written and `*out_len` is set to 32. With a
+///   capacity under 32 (a size probe: `out` NULL and `*out_len` 0), nothing
+///   is written, `*out_len` is set to 32, and the result is
+///   [`status::BUFFER_TOO_SMALL`]. Every other failure leaves `out` and
+///   `*out_len` as they were.
+///
+/// # Returns
+/// One of the status codes in [`status`]: [`status::KEK_NOT_FOUND`] if no
+/// provider holds a KEK for `service`. Never throws/unwinds.
+///
+/// # Safety
+/// `service` must be a valid, NUL-terminated, readable C string pointer.
+/// `out_len` must be a valid, writable pointer to an `int`, and `out`
+/// writable for `*out_len` bytes when non-NULL.
+#[no_mangle]
+pub extern "C" fn hkdfguard_kek_fingerprint(service: *const c_char, out: *mut u8, out_len: *mut c_int) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kek_fingerprint_impl(service, out, out_len))) {
+        Ok(code) => code,
+        Err(_) => {
+            report_caught_panic("hkdfguard_kek_fingerprint", Some((audit::Op::KekFingerprint, service)));
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
 /// Generates a fresh, cryptographically random 32-byte DEK and immediately
 /// wraps it under the persistent KEK identified by `service`, in one call --
 /// for callers that want a brand new Ephemeral Data Protection Key without
@@ -351,7 +469,9 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
 /// same-user debugger.
 ///
 /// Opt-in, because it changes process-wide state the host application
-/// owns: debuggers and crash reporters stop working for the process.
+/// owns: debuggers and crash reporters stop working for the process. The
+/// one exception is the ephemeral provider, whose key's only protection is
+/// this process's memory: it applies this itself before creating a key.
 /// Call it once, early in startup, and *after* any privilege change --
 /// the kernel resets the dumpable flag when a process's credentials
 /// change. Root, and a process with `CAP_SYS_PTRACE`, can still inspect
@@ -409,7 +529,17 @@ pub extern "C" fn hkdfguard_harden_process_with_flags(flags: c_uint) -> c_int {
     }
 }
 
-fn harden_process_impl(flags: c_uint) -> c_int {
+/// For the CLI: makes the ephemeral provider refuse to create or load a
+/// key in this process. An ephemeral key lives only in the process that
+/// creates it, so one created by a short-lived tool could never unwrap
+/// anything for the application it is preparing. Not part of the C ABI.
+#[doc(hidden)]
+pub fn refuse_ephemeral_keys_in_this_process() {
+    #[cfg(feature = "ephemeral")]
+    provider::ephemeral::refuse_in_this_process();
+}
+
+pub(crate) fn harden_process_impl(flags: c_uint) -> c_int {
     if flags & !harden_flags::ALL != 0 {
         log::error!("hkdfguard: hkdfguard_harden_process_with_flags: unknown flag bits {:#x}", flags & !harden_flags::ALL);
         return status::INVALID_ARGUMENT;
@@ -598,6 +728,56 @@ fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
             code
         }
     })
+}
+
+// The actual logic behind `hkdfguard_kek_fingerprint`, running inside the
+// `catch_unwind` wrapper above. Buffer rules as `wrap_impl`'s.
+fn kek_fingerprint_impl(service: *const c_char, out: *mut u8, out_len: *mut c_int) -> c_int {
+    if out_len.is_null() {
+        return status::INVALID_ARGUMENT;
+    }
+    // SAFETY: out_len is non-null per check above; caller contract
+    // guarantees it points at a valid, initialized `int`.
+    let capacity = unsafe { *out_len };
+    if capacity < 0 {
+        return status::INVALID_ARGUMENT;
+    }
+    let service_str = match cstr_to_service(service) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    if out.is_null() && capacity > 0 {
+        return status::INVALID_ARGUMENT; // a declared capacity with nowhere to write
+    }
+    if (capacity as usize) < payload::FINGERPRINT_LEN {
+        // SAFETY: out_len is non-null (checked above).
+        unsafe { *out_len = payload::FINGERPRINT_LEN as c_int };
+        return status::BUFFER_TOO_SMALL;
+    }
+
+    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
+    let fingerprint = gated_setup(|| {
+        let (_provider, handle) = provider::select_existing(&service_str)?;
+        Ok(crypto::kek_fingerprint(&handle.public_key()?))
+    });
+    match fingerprint {
+        Ok(fingerprint) => {
+            // SAFETY: out is non-null and writable for `capacity` >= 32
+            // bytes; out_len is non-null.
+            unsafe {
+                ptr::copy_nonoverlapping(fingerprint.as_ptr(), out, payload::FINGERPRINT_LEN);
+                *out_len = payload::FINGERPRINT_LEN as c_int;
+            }
+            status::OK
+        }
+        Err(e) => {
+            let e: error::Error = e;
+            log::error!("hkdfguard: kek_fingerprint failed for service \"{service_str}\": {e}");
+            let code = e.status_code();
+            audit::operation_failed(audit::Op::KekFingerprint, &service_str, code);
+            code
+        }
+    }
 }
 
 // The actual logic behind `hkdfguard_wrap_dek`, running inside the
@@ -975,6 +1155,116 @@ mod ffi_tests {
                 assert_eq!(exists, 0);
                 assert!(started.elapsed() >= Duration::from_millis(50));
             });
+        });
+    }
+
+    // ---- hkdfguard_kek_fingerprint ----
+
+    fn fingerprint_of(service: &CString) -> (c_int, [u8; payload::FINGERPRINT_LEN], c_int) {
+        let mut out = [0u8; payload::FINGERPRINT_LEN];
+        let mut out_len = payload::FINGERPRINT_LEN as c_int;
+        let rc = hkdfguard_kek_fingerprint(service.as_ptr(), out.as_mut_ptr(), &mut out_len);
+        (rc, out, out_len)
+    }
+
+    #[test]
+    #[serial]
+    fn kek_fingerprint_is_the_one_every_payload_carries() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders.fingerprint").unwrap();
+            assert_eq!(fingerprint_of(&service).0, status::KEK_NOT_FOUND, "never creates a KEK");
+            create_kek_for_test(&service);
+
+            let (rc, fingerprint, out_len) = fingerprint_of(&service);
+            assert_eq!(rc, status::OK);
+            assert_eq!(out_len, 32);
+            assert_ne!(fingerprint, [0u8; 32]);
+            assert_eq!(fingerprint_of(&service).1, fingerprint, "stable from call to call");
+
+            let dek = [0x42u8; crypto::DEK_LEN];
+            let mut wrapped = vec![0u8; crypto::MAX_WRAPPED_LEN];
+            let mut wrapped_len = wrapped.len() as c_int;
+            assert_eq!(
+                hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), dek.len() as c_int, wrapped.as_mut_ptr(), &mut wrapped_len),
+                status::OK
+            );
+            let payload = payload::Payload::from_bytes(&wrapped[..wrapped_len as usize]).unwrap();
+            assert_eq!(payload.fingerprint, fingerprint, "the value unwrap checks, and retire confirms");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn kek_fingerprint_buffer_rules_match_wrap() {
+        let service = CString::new("com.company.orders.fingerprint.args").unwrap();
+        let mut out = [0xA5u8; 64];
+
+        let mut out_len: c_int = 0; // size probe
+        assert_eq!(hkdfguard_kek_fingerprint(service.as_ptr(), ptr::null_mut(), &mut out_len), status::BUFFER_TOO_SMALL);
+        assert_eq!(out_len, 32);
+        let mut out_len: c_int = 31;
+        assert_eq!(hkdfguard_kek_fingerprint(service.as_ptr(), out.as_mut_ptr(), &mut out_len), status::BUFFER_TOO_SMALL);
+        assert_eq!(out_len, 32);
+        assert!(out.iter().all(|&b| b == 0xA5), "nothing written");
+
+        let mut out_len: c_int = -1;
+        assert_eq!(hkdfguard_kek_fingerprint(service.as_ptr(), out.as_mut_ptr(), &mut out_len), status::INVALID_ARGUMENT);
+        assert_eq!(out_len, -1, "untouched");
+        let mut out_len: c_int = 32;
+        assert_eq!(hkdfguard_kek_fingerprint(service.as_ptr(), ptr::null_mut(), &mut out_len), status::INVALID_ARGUMENT);
+        assert_eq!(hkdfguard_kek_fingerprint(service.as_ptr(), out.as_mut_ptr(), ptr::null_mut()), status::INVALID_ARGUMENT);
+        let bad = CString::new("bad_name").unwrap();
+        assert_eq!(hkdfguard_kek_fingerprint(bad.as_ptr(), out.as_mut_ptr(), &mut out_len), status::INVALID_SERVICE_NAME);
+        assert_eq!(hkdfguard_kek_fingerprint(ptr::null(), out.as_mut_ptr(), &mut out_len), status::INVALID_SERVICE_NAME);
+        assert_eq!(out_len, 32, "untouched");
+    }
+
+    #[test]
+    #[serial]
+    fn kek_fingerprint_pays_the_setup_floor_but_argument_errors_do_not() {
+        with_isolated_ephemeral_provider(|| {
+            with_setup_delay(Some(Duration::from_millis(50)), || {
+                let service = CString::new("com.company.nevercreated.fingerprint").unwrap();
+                let started = Instant::now();
+                assert_eq!(fingerprint_of(&service).0, status::KEK_NOT_FOUND);
+                assert!(started.elapsed() >= Duration::from_millis(50), "\"not found\" must cost the same as found");
+
+                let mut out_len: c_int = 0;
+                let started = Instant::now();
+                assert_eq!(hkdfguard_kek_fingerprint(service.as_ptr(), ptr::null_mut(), &mut out_len), status::BUFFER_TOO_SMALL);
+                assert!(started.elapsed() < Duration::from_millis(50), "the size probe is not gated");
+            });
+        });
+    }
+
+    // ---- admin::retire_kek (the CLI's retire) ----
+
+    #[test]
+    #[serial]
+    fn retire_kek_never_deletes_without_the_right_fingerprint_or_a_provider_that_can() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders.retire").unwrap();
+            let name = service.to_str().unwrap();
+
+            let err = admin::retire_kek(name, &[0x11; 32]).unwrap_err();
+            assert_eq!(err.status, status::KEK_NOT_FOUND, "{err:?}");
+
+            create_kek_for_test(&service);
+            let (_, fingerprint, _) = fingerprint_of(&service);
+
+            let err = admin::retire_kek(name, &[0x11; 32]).unwrap_err();
+            assert_eq!(err.status, status::KEK_FINGERPRINT_MISMATCH, "checked before the provider is asked: {err:?}");
+
+            // The right fingerprint, but ephemeral keeps nothing to delete.
+            let err = admin::retire_kek(name, &fingerprint).unwrap_err();
+            assert_eq!(err.status, status::PROVIDER_ERROR, "{err:?}");
+            assert!(err.message.contains("EPHEMERAL cannot retire a single service's KEK"), "{}", err.message);
+            assert_eq!(fingerprint_of(&service).1, fingerprint, "still there, unchanged");
+
+            let err = admin::retire_kek("bad_name", &fingerprint).unwrap_err();
+            assert_eq!(err.status, status::INVALID_SERVICE_NAME);
+            let err = admin::retire_kek("Com.Company.Orders.Retire", &[0x11; 32]).unwrap_err();
+            assert_eq!(err.status, status::KEK_FINGERPRINT_MISMATCH, "normalized like every other call");
         });
     }
 
