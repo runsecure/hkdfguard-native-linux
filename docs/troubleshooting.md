@@ -187,24 +187,64 @@ means the payload itself is bad.
 ## The key file is refused as untrusted (-39)
 
 `HKDFGUARD_ERR_FILE_UNTRUSTED` from `hkdfguard_open_file` means someone
-other than root or the reading process's user could have replaced the key
-file: the file, or a directory above it (or above a symlink to it), is owned
-by another user or is writable by group or others. Find which with
-`namei -l <path>` (and `namei -l "$(readlink -f <path>)"`).
+the security model doesn't trust could have replaced the key file: the
+file, or a directory above it (or above a symlink to it), is owned by
+someone untrusted or is writable by someone else. Under the production
+model (the default) only root and deployers -- members of
+`hkdfguard-deployers` or of a policy `deployer_groups` group -- are
+trusted, and a directory may be group-writable only through a deployer
+group; under the developer model, root and the reading process's user,
+with no group write. Find which with `namei -l <path>` (and
+`namei -l "$(readlink -f <path>)"`).
 
 | Cause | Fix |
 |---|---|
+| Production: the file (or a directory above it) is owned by the service's own account -- for example `hkdfguard wrap` was run as the service user, or the file was written before upgrading to a version with the production default | Redeploy it as root or a deployer (`sudo hkdfguard wrap ... -g <service-group>`), or set `security_model = "developer"` in the policy until you have |
+| Production: the file's owner was removed from the deployer group | Redeploy it as a current deployer or root. Membership is looked up on every call |
 | The file is group- or other-writable | `chmod 0600` (or `0640`/`0644`: read access is fine, it is ciphertext) |
-| The file, or a directory above it, is owned by another non-root user | Own it by the service's user or by root |
+| The file, or a directory above it, is owned by another non-root user | Own it by root or a deployer (production), or by the service's user or root (developer) |
 | A directory above it is group- or other-writable | `chmod go-w <directory>`, or move the key file |
 | The key file is under `/tmp`, `/var/tmp`, `/dev/shm` or another **sticky**, world-writable directory, even inside a private `mktemp -d` directory there | Move it to a directory only the service or root can write, all the way up to `/` (for example `/var/lib/<app>/`, `0700` or `0755`). Sticky directories are never trusted, for key files or anything else the library reads. |
 
 `hkdfguard wrap` applies the same mode rule to its `--key-file-path` up
 front, before the DEK is read, and stops with
 `... is writable by group or others (mode ...); the library would refuse to read a key file at ...`
-rather than write a key file the application could never open. It checks
-modes only, not owners, since it often runs as root into a folder the
-service's account owns.
+rather than write a key file the application could never open. Under the
+developer model it checks modes only, not owners, since it often runs as
+root into a folder the service's account owns. Under production it asks the
+library about each folder's owner and group, and stops with
+`... is owned by uid ..., whom the library does not trust with key files under the production security model ...`
+for a folder owned by someone other than root or a deployer.
+
+## `wrap` says this account "may not persist key files"
+
+`under the production security model this account (uid ...) may not persist
+key files ... Nothing was written`: the production model trusts only key
+files root or a deployer wrote, so `wrap` refuses anyone else before reading
+the DEK. Run it as root, or add the account to `hkdfguard-deployers`
+(`sudo usermod -aG hkdfguard-deployers <user>`) or to a group listed in the
+policy's `deployer_groups`. On a development machine, `security_model =
+"developer"` lifts the rule.
+
+## Creating or retiring a KEK is refused (-18)
+
+`HKDFGUARD_ERR_KEK_ACCESS_DENIED` from `hkdfguard_create_kek` (the CLI:
+`only root creates or retires a KEK`) means the production model is in
+force, the caller isn't root, and the service has no KEK yet: only root
+creates one. Run `sudo hkdfguard provision -sn <service>`; after that, the
+application's own `hkdfguard_create_kek` at startup returns the existing
+KEK. `hkdfguard retire` as non-root fails the same way. An ephemeral KEK is
+not affected.
+
+## A deployer group can't be used (-80)
+
+`HKDFGUARD_ERR_LINUX_GROUP_INVALID` refines `-9`: every key-file read (and
+`hkdfguard_security_model`, and `wrap`) fails because a group in the
+policy's `deployer_groups` doesn't exist on this host, is over-broad
+(`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`, gid
+0 or 65534), or can't be looked up -- or `hkdfguard-deployers` itself can't
+be. The library's log names the group. Create it, choose a dedicated group,
+or fix NSS (LDAP, sssd) if lookups are failing.
 
 ## Other problems
 

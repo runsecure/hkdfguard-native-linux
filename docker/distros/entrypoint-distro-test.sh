@@ -193,6 +193,8 @@ as_ci softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-p
 install -o root -g ci -m 0440 /dev/null /etc/hkdfguard/pkcs11.pin
 printf '1234\n' > /etc/hkdfguard/pkcs11.pin
 cat > /etc/hkdfguard/policy.toml <<TOML
+# ci creates the KEK here, which the production security model leaves to root.
+security_model = "developer"
 [selection]
 mode = "require"
 provider = "pkcs11"

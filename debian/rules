@@ -18,7 +18,7 @@ export CARGO_PROFILE_RELEASE_DEBUG := line-tables-only
 	dh $@
 
 override_dh_auto_clean:
-	rm -rf target
+	rm -rf target debian/libhkdfguard1.hkdfguard.sysusers
 
 override_dh_auto_build:
 	$(CARGO) build --release --all-features
@@ -41,6 +41,13 @@ override_dh_auto_install:
 		packaging/hkdfguard.pc.in > debian/tmp/$(LIBDIR)/pkgconfig/hkdfguard.pc
 	install -D -m 0644 packaging/policy.toml.example debian/tmp/usr/share/hkdfguard/policy.toml.example
 	install -D -m 0755 target/release/hkdfguard debian/tmp/usr/bin/hkdfguard
+
+# The groups the security model uses, from the same sysusers.d file the RPM
+# installs: dh_installsysusers ships it as /usr/lib/sysusers.d/hkdfguard.conf
+# and creates the groups on install (never removing them).
+override_dh_installsysusers:
+	install -m 0644 packaging/hkdfguard.sysusers debian/libhkdfguard1.hkdfguard.sysusers
+	dh_installsysusers --name=hkdfguard
 
 # dwz rejects some of the DWARF rustc emits; the -dbgsym packages are
 # still produced without it.

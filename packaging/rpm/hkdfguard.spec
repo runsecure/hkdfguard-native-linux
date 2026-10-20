@@ -57,12 +57,20 @@ service's KEK and wraps DEKs under it at deployment time.
 %package -n %{libpkg}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK
 License:        MPL-2.0 AND %{linked_licenses}
+# %%pre creates the security model's groups (see packaging/hkdfguard.sysusers).
+# Required by file, not package name: shadow-utils on Fedora-family
+# distributions, shadow on SUSE.
+Requires(pre):  /usr/bin/getent
+Requires(pre):  /usr/sbin/groupadd
 
 %description -n %{libpkg} %{common_description}
 
 Provider selection is controlled by the root-owned policy file
 /etc/hkdfguard/policy.toml, which this package does not create; an
 annotated example is installed as /usr/share/hkdfguard/policy.toml.example.
+Unless the policy says otherwise the production security model applies:
+only root creates KEKs, and only key files written by root or by a member
+of the hkdfguard-deployers group, which this package creates, are trusted.
 
 This package contains the shared library.
 
@@ -115,10 +123,22 @@ install -D -m 0755 target/release/hkdfguard %{buildroot}%{_bindir}/hkdfguard
 install -D -m 0644 packaging/hkdfguard.1 %{buildroot}%{_mandir}/man1/hkdfguard.1
 install -d -m 0755 %{buildroot}%{_sysconfdir}/hkdfguard
 install -D -m 0644 packaging/policy.toml.example %{buildroot}%{_datadir}/hkdfguard/policy.toml.example
+install -D -m 0644 packaging/hkdfguard.sysusers %{buildroot}%{_prefix}/lib/sysusers.d/hkdfguard.conf
 
 %check
 cargo test --locked --offline
 cargo test --locked --offline --all-features
+
+# The groups in packaging/hkdfguard.sysusers, created before the files land.
+# Plain groupadd rather than each distribution's sysusers macros, which
+# differ between EL10, Amazon Linux 2023 and SUSE; rpm's own sysusers
+# support, where it has it, finds them already there. Never removed (see
+# that file for why), so there is no %%postun.
+%pre -n %{libpkg}
+for group in hkdfguard hkdfguard-deployers; do
+    getent group "$group" >/dev/null || groupadd -r "$group"
+done
+exit 0
 
 %if 0%{?suse_version}
 # SUSE policy; Fedora-family glibc runs ldconfig from a file trigger.
@@ -137,6 +157,7 @@ cargo test --locked --offline --all-features
 %dir %{_sysconfdir}/hkdfguard
 %dir %{_datadir}/hkdfguard
 %{_datadir}/hkdfguard/policy.toml.example
+%{_prefix}/lib/sysusers.d/hkdfguard.conf
 
 %files devel
 %{_includedir}/hkdfguard.h

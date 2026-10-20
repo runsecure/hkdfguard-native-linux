@@ -37,6 +37,9 @@ fn tempdir() -> tempfile::TempDir {
 fn with_policy<F: FnOnce()>(doc: &str, f: F) {
     let dir = tempdir();
     let path = dir.path().join("policy.toml");
+    // These tests run as an ordinary user, provisioning and writing key
+    // files of their own: the developer model, unless `doc` names one.
+    let doc = if doc.contains("security_model") { doc.to_string() } else { format!("security_model = \"developer\"\n{doc}") };
     fs::write(&path, doc).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     let saved = std::env::var_os("HKDFGUARD_POLICY_FILE");

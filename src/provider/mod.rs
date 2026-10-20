@@ -337,7 +337,7 @@ fn reset_warn_once() {
 /// Shared walk behind [`create_kek`] and [`select_existing`]: for each
 /// policy-allowed type in priority order, constructs that one provider
 /// (see [`construct_provider`]), probes it, and calls
-/// `provider.load_kek(service, create_if_missing)`; the first to succeed
+/// `provider.load_kek(service, create_if_missing(type))`; the first to succeed
 /// wins and the walk stops -- providers later in the order are never even
 /// constructed.
 ///
@@ -356,7 +356,7 @@ fn reset_warn_once() {
 /// line still says which provider failed.
 fn walk_chain(
     service: &str,
-    create_if_missing: bool,
+    create_if_missing: fn(ProviderType) -> bool,
     not_found_err: Error,
 ) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
     // Every provider this call passed over, and why: if a later one serves
@@ -373,7 +373,7 @@ fn walk_chain(
             continue;
         }
 
-        match provider.load_kek(service, create_if_missing) {
+        match provider.load_kek(service, create_if_missing(provider_type)) {
             Ok(handle) => {
                 log::debug!("hkdfguard: using provider {} for this call", provider_type.as_str());
                 if !passed_over.is_empty() {
@@ -429,7 +429,33 @@ fn attribute(provider_type: ProviderType, e: Error) -> Error {
 /// (see [`walk_chain`]), or [`Error::NoProviderAvailable`] if every allowed
 /// provider is absent or declined.
 pub fn create_kek(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
-    walk_chain(service, true, Error::NoProviderAvailable)
+    walk_chain(service, |_| true, Error::NoProviderAvailable)
+}
+
+/// [`create_kek`] for a process the security model doesn't let create
+/// persistent KEKs (production, not root): the same walk, but only the
+/// Ephemeral provider -- whose KEK lives and dies in this process, so only
+/// this process can make it -- may create one; every other provider only
+/// loads an existing KEK. An application calling `hkdfguard_create_kek` at
+/// startup for a KEK an administrator provisioned therefore still
+/// succeeds. Fails with [`Error::AccessDenied`] if the walk finds none --
+/// or, when no allowed provider is present at all, with
+/// [`Error::NoProviderAvailable`], as [`create_kek`] would: root couldn't
+/// create one either.
+pub fn create_kek_unprivileged(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
+    match walk_chain(service, |provider_type| provider_type == ProviderType::Ephemeral, Error::KekNotFound) {
+        Err(Error::KekNotFound) if !any_provider_present()? => Err(Error::NoProviderAvailable),
+        Err(Error::KekNotFound) => Err(Error::AccessDenied(
+            "no KEK exists for this service, and under the production security model only root creates one \
+             (run `hkdfguard provision` as root)",
+        )),
+        other => other,
+    }
+}
+
+// Whether any policy-allowed provider is present on this host.
+fn any_provider_present() -> Result<bool> {
+    Ok(allowed_types()?.into_iter().filter_map(construct_provider).any(|provider| provider.probe()))
 }
 
 /// Walks the policy-allowed priority chain looking for a provider that
@@ -438,7 +464,7 @@ pub fn create_kek(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHan
 /// is walked without finding one -- the caller must call [`create_kek`]
 /// first.
 pub fn select_existing(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
-    walk_chain(service, false, Error::KekNotFound)
+    walk_chain(service, |_| false, Error::KekNotFound)
 }
 
 /// Walks the policy-allowed chain checking whether a persistent KEK already

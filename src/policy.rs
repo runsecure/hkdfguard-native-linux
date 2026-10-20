@@ -29,6 +29,7 @@
 
 use crate::error::{Error, Result};
 use crate::provider::ProviderType;
+use crate::security_model::SecurityModel;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -178,6 +179,15 @@ impl<'de> Deserialize<'de> for ProviderType {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
+    /// `"production"` (the default) or `"developer"`: see
+    /// [`crate::security_model`]. A top-level key, so it goes above the
+    /// first `[table]`.
+    #[serde(default)]
+    security_model: SecurityModel,
+    /// Groups whose direct members deploy key files under the production
+    /// model, in addition to `hkdfguard-deployers`. Names, not gids.
+    #[serde(default)]
+    deployer_groups: Vec<String>,
     #[serde(default)]
     key_requirements: KeyRequirements,
     selection: RawSelection,
@@ -258,6 +268,24 @@ fn absolute_path(field: &str, value: &str) -> Result<PathBuf> {
         return Err(Error::Policy(format!("hkdfguard policy: {field} \"{value}\" must be an absolute path")));
     }
     Ok(path)
+}
+
+// A deployer group is named, never numbered: a gid in the policy would
+// silently mean another group on a host that numbers them differently. The
+// name can't be one getgrnam could never match, either: nothing a group file
+// line uses as a separator, no whitespace or control characters, no `/`.
+fn validate_group_name(name: &str) -> Result<()> {
+    let bad = name.is_empty()
+        || name.len() > 256
+        || name.bytes().all(|b| b.is_ascii_digit())
+        || name.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | ',' | '/'));
+    if bad {
+        return Err(Error::Policy(format!(
+            "hkdfguard policy: deployer_groups entry \"{name}\" is not a group name (1..=256 bytes, not all digits, \
+             no whitespace, control characters, ':', ',' or '/')"
+        )));
+    }
+    Ok(())
 }
 
 // PKCS#11 token fields are fixed-width, blank-padded: label 32 bytes,
@@ -532,6 +560,8 @@ pub trait PolicyEvaluator {
 /// A fully parsed and cross-validated policy file.
 #[derive(Debug, Clone)]
 pub struct Policy {
+    security_model: SecurityModel,
+    deployer_groups: Vec<String>,
     selection: SelectionMode,
     minimum_protection: Option<KeyProtectionLevel>,
     preferred_order: Vec<ProviderType>,
@@ -639,6 +669,13 @@ impl Policy {
             seen.push(*p);
         }
 
+        for (i, group) in raw.deployer_groups.iter().enumerate() {
+            validate_group_name(group)?;
+            if raw.deployer_groups[..i].contains(group) {
+                return Err(Error::Policy(format!("hkdfguard policy: deployer_groups lists \"{group}\" more than once")));
+            }
+        }
+
         let setup_min_delay_ms = raw
             .startup_behavior
             .setup_min_delay_ms
@@ -716,6 +753,8 @@ impl Policy {
         };
 
         Ok(Policy {
+            security_model: raw.security_model,
+            deployer_groups: raw.deployer_groups,
             selection,
             minimum_protection,
             preferred_order: raw.preferred_order,
@@ -732,6 +771,17 @@ impl Policy {
             pkcs11,
             audit_unwrap_success: raw.audit.unwrap_success,
         })
+    }
+
+    /// The security model (`security_model`); Production unless set.
+    pub fn security_model(&self) -> SecurityModel {
+        self.security_model
+    }
+
+    /// The policy's deployer groups (`deployer_groups`), besides
+    /// `hkdfguard-deployers`; consulted under the production model only.
+    pub fn deployer_groups(&self) -> &[String] {
+        &self.deployer_groups
     }
 
     /// The Owner-hierarchy authorization file (`tpm.owner_auth_file`), if policy sets one.
@@ -1259,7 +1309,8 @@ pub(crate) mod test_support {
         /// `MERGED_TABLES` merge key by key, `doc` winning; any other
         /// top-level key `doc` sets replaces the old one whole. With no
         /// `[selection]` anywhere, `mode = "prefer"` is added, which selects
-        /// exactly as having no policy file does.
+        /// exactly as having no policy file does; with no `security_model`,
+        /// `"developer"` is.
         pub(crate) fn write(doc: &str) -> Self {
             let mut merged = base();
             let layer: toml::Table = doc.parse().unwrap_or_else(|e| panic!("TestPolicy::write: invalid TOML ({e}); use TestPolicy::exact for a malformed policy:\n{doc}"));
@@ -1275,6 +1326,12 @@ pub(crate) mod test_support {
                 let mut selection = toml::Table::new();
                 selection.insert("mode".into(), toml::Value::String("prefer".into()));
                 merged.insert("selection".into(), toml::Value::Table(selection));
+            }
+            // Unit tests run as an ordinary user whose temp files are its
+            // own, which only the developer model trusts; a test of the
+            // production model says so. `exact` and `absent` add nothing.
+            if !merged.contains_key("security_model") {
+                merged.insert("security_model".into(), toml::Value::String("developer".into()));
             }
             let text = toml::to_string(&merged).expect("a merged policy serializes");
             Self::push(&text, Some(merged))
@@ -2046,6 +2103,43 @@ mod tests {
     }
 
     // ---- load() / file-path behavior ----
+
+    #[test]
+    fn security_model_defaults_to_production_and_reads_either_value() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(base).unwrap();
+        assert_eq!(policy.security_model(), SecurityModel::Production);
+        assert!(policy.deployer_groups().is_empty());
+        for (text, model) in [("production", SecurityModel::Production), ("developer", SecurityModel::Developer)] {
+            let policy = Policy::from_toml_str(&format!("security_model = \"{text}\"\n{base}")).unwrap();
+            assert_eq!(policy.security_model(), model, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_misplaced_security_model_is_an_invalid_policy() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        for doc in [
+            format!("security_model = \"development\"\n{base}"), // the Windows name is "developer"
+            format!("security_model = \"Production\"\n{base}"),
+            format!("security_model = 1\n{base}"),
+            // Below a table header, the key belongs to that table, which rejects it.
+            format!("{base}security_model = \"developer\"\n"),
+        ] {
+            assert!(matches!(Policy::from_toml_str(&doc), Err(Error::Policy(_))), "{doc}");
+        }
+    }
+
+    #[test]
+    fn deployer_groups_must_be_distinct_group_names() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(&format!("deployer_groups = [\"payments-deploy\", \"ops_keys\"]\n{base}")).unwrap();
+        assert_eq!(policy.deployer_groups(), ["payments-deploy", "ops_keys"]);
+        for groups in ["[\"\"]", "[\"1001\"]", "[\"a b\"]", "[\"a:b\"]", "[\"a,b\"]", "[\"../x\"]", "[\"ops\", \"ops\"]", "\"ops\""] {
+            let doc = format!("deployer_groups = {groups}\n{base}");
+            assert!(matches!(Policy::from_toml_str(&doc), Err(Error::Policy(_))), "{groups}");
+        }
+    }
 
     #[test]
     #[serial_test::serial]

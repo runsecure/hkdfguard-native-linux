@@ -29,6 +29,31 @@ pub enum Owner {
     RootOrCurrentUser,
 }
 
+/// Whose files and directories are trusted: who may own one, and which
+/// groups, if any, may hold write access to one. [`Owner`] is the rule for
+/// configuration (no group ever); `security_model::Trust` the one for key
+/// files, which under the production model also trusts deployers.
+pub trait PrincipalTrust {
+    fn trusts_owner(&self, uid: u32) -> bool;
+    /// Whether write access through the file's group, `gid`, is acceptable.
+    fn trusts_group_writer(&self, gid: u32) -> bool;
+}
+
+impl PrincipalTrust for Owner {
+    fn trusts_owner(&self, uid: u32) -> bool {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        match self {
+            Owner::Root => uid == 0,
+            Owner::RootOrCurrentUser => uid == 0 || uid == euid,
+        }
+    }
+
+    fn trusts_group_writer(&self, _gid: u32) -> bool {
+        false
+    }
+}
+
 /// Who must own configuration this process reads but must not be able to
 /// change: the policy file, the PKCS#11 PIN file, the TPM derivation
 /// secret, and the directories they live in.
@@ -57,6 +82,7 @@ pub const FORBID_GROUP_OTHER_WRITE: u32 = 0o022;
 pub const FORBID_GROUP_OTHER_ACCESS: u32 = 0o077;
 
 const GROUP_READ: u32 = 0o040;
+const GROUP_WRITE: u32 = 0o020;
 const STICKY: u32 = 0o1000;
 
 /// What a file must satisfy before its contents are trusted.
@@ -135,22 +161,68 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
 /// from a directory vanishing mid-walk, is `PermissionDenied` -- never
 /// `NotFound`, which callers reserve for "the file isn't there".
 pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
+    check_dir_chain_trusting(dir, &owner)
+}
+
+/// [`check_dir_chain`] under any [`PrincipalTrust`]: each directory's owner
+/// must be one `trust` accepts, and a directory writable through its group
+/// passes only if `trust` accepts that group as a writer (a deployer group,
+/// for a key file under the production model). Writable by others never
+/// passes, sticky or not -- the read-only-mount exception aside.
+pub fn check_dir_chain_trusting(dir: &Path, trust: &dyn PrincipalTrust) -> io::Result<()> {
     for d in dir.ancestors() {
         let fail = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display()));
         let meta = std::fs::metadata(d).map_err(|e| fail(e.to_string()))?;
         if !meta.is_dir() {
             return Err(fail("not a directory".to_string()));
         }
-        check_owner_and_mode(&meta, Some(owner), 0).map_err(|e| fail(e.to_string()))?;
+        if !trust.trusts_owner(meta.uid()) {
+            return Err(fail(format!("owned by uid {}, which is not an allowed owner", meta.uid())));
+        }
 
         let mode = meta.mode();
-        if mode & FORBID_GROUP_OTHER_WRITE != 0 && !on_read_only_mount(d) {
+        if untrusted_write_bits(&meta, trust) != 0 && !on_read_only_mount(d) {
             let sticky = if mode & STICKY != 0 { "; sticky, like /tmp, which is not enough" } else { "" };
             return Err(fail(format!(
                 "writable by group or others (mode {:o}{sticky}), so entries could be created or replaced in it",
                 mode & 0o7777
             )));
         }
+    }
+    Ok(())
+}
+
+// The write bits `meta` grants to someone `trust` doesn't accept: others'
+// always, and the group's unless that group is a trusted writer.
+fn untrusted_write_bits(meta: &Metadata, trust: &dyn PrincipalTrust) -> u32 {
+    let mut bits = meta.mode() & FORBID_GROUP_OTHER_WRITE;
+    if bits & GROUP_WRITE != 0 && trust.trusts_group_writer(meta.gid()) {
+        bits &= !GROUP_WRITE;
+    }
+    bits
+}
+
+/// Checks an opened file's metadata under `trust`: a regular file, owned by
+/// someone `trust` accepts, writable by nobody else -- through its group
+/// only if `trust` accepts that group as a writer. Every refusal is
+/// `PermissionDenied` (or `InvalidData` for "not a regular file") with no
+/// `raw_os_error`, as [`open_checked`]'s own checks are.
+pub fn check_metadata_trusting(meta: &Metadata, trust: &dyn PrincipalTrust) -> io::Result<()> {
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a regular file"));
+    }
+    if !trust.trusts_owner(meta.uid()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("owned by uid {}, which is not an allowed owner", meta.uid()),
+        ));
+    }
+    let offending = untrusted_write_bits(meta, trust);
+    if offending != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("permissions too broad (mode {:o}; bits {offending:o} must be clear)", meta.mode() & 0o7777),
+        ));
     }
     Ok(())
 }
@@ -252,13 +324,7 @@ pub fn check_metadata(meta: &Metadata, owner: Option<Owner>, forbidden_mode_bits
 pub fn check_owner_and_mode(meta: &Metadata, owner: Option<Owner>, forbidden_mode_bits: u32) -> io::Result<()> {
     if let Some(owner) = owner {
         let uid = meta.uid();
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        let euid = unsafe { libc::geteuid() };
-        let ok = match owner {
-            Owner::Root => uid == 0,
-            Owner::RootOrCurrentUser => uid == 0 || uid == euid,
-        };
-        if !ok {
+        if !owner.trusts_owner(uid) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("owned by uid {uid}, which is not an allowed owner"),

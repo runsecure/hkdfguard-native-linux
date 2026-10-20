@@ -157,11 +157,13 @@ if [ "$HAVE_SOFTHSM" -eq 1 ]; then
     ( umask 077; printf '1234\n' > "$WORK/pkcs11.pin" )
 fi
 
-# Prints a complete policy: $1 (the [selection] table and anything else
-# top-level), this machine's TPM settings plus any extra [tpm] keys in $2,
-# the SoftHSM2 token if there is one, then any further tables in $3.
+# Prints a complete policy: the developer security model (this script
+# provisions and wraps as whoever runs it), $1 (the [selection] table and
+# anything else top-level), this machine's TPM settings plus any extra
+# [tpm] keys in $2, the SoftHSM2 token if there is one, then any further
+# tables in $3.
 policy() { # policy <selection...> [extra [tpm] keys] [more tables]
-    printf '%s\n\n[tpm]\ntcti = "%s"\nderivation_secret_file = "%s"\n%s\n' "$1" "$TCTI" "$SECRET" "${2:-}"
+    printf 'security_model = "developer"\n%s\n\n[tpm]\ntcti = "%s"\nderivation_secret_file = "%s"\n%s\n' "$1" "$TCTI" "$SECRET" "${2:-}"
     if [ "$HAVE_SOFTHSM" -eq 1 ]; then
         printf '\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' "$SOFTHSM_MODULE" "$WORK/pkcs11.pin"
     fi
