@@ -61,6 +61,11 @@ section "installed layout"
 [ "$(stat -c '%U:%G %a' /etc/hkdfguard)" = "root:root 755" ] \
     || { echo "/etc/hkdfguard must be root:root 0755" >&2; exit 1; }
 [ ! -e /etc/hkdfguard/policy.toml ] || { echo "packages must not install a policy" >&2; exit 1; }
+# The security model's groups, created on install (packaging/hkdfguard.sysusers).
+for group in hkdfguard hkdfguard-deployers; do
+    getent group "$group" >/dev/null || { echo "the packages must create group $group" >&2; exit 1; }
+done
+[ -f /usr/lib/sysusers.d/hkdfguard.conf ] || { echo "/usr/lib/sysusers.d/hkdfguard.conf must be installed" >&2; exit 1; }
 example_policy=/usr/share/hkdfguard/policy.toml.example
 [ "$(stat -c '%U:%G %a' "$example_policy")" = "root:root 644" ] \
     || { echo "$example_policy must be installed, root:root 0644" >&2; exit 1; }

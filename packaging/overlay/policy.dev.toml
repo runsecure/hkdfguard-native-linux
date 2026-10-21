@@ -13,7 +13,12 @@
 # SoftHSM2 is a software token: its keys are files in its token directory
 # (/var/lib/softhsm/tokens by default), so mount that directory on a volume
 # for them to survive the container.
+#
+# The developer security model: the service may create its own KEKs and
+# read key files it wrote itself. Production leaves both to root and the
+# deployers (hkdfguard-deployers).
 
+security_model = "developer"
 preferred_order = ["pkcs11", "ephemeral"]
 
 [selection]

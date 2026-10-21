@@ -19,6 +19,24 @@
 //!   setup calls, and makes "the KEK is missing" a loud, specific error
 //!   instead of something quietly fixed on the fly.
 //!
+//! ## Security model
+//!
+//! Under the library's production security model (the default; see
+//! `hkdfguard_security_model`) the three duties are split:
+//!
+//! - **Security admin** -- `provision` and `retire`: root only. The library
+//!   itself refuses to create a KEK, or retire one, for anyone else.
+//! - **Deployment admin** -- `wrap`: root, or a *deployer* (a direct member
+//!   of `hkdfguard-deployers`, or of a group the policy lists in
+//!   `deployer_groups`). Only their key files are trusted by
+//!   `hkdfguard_open_file`, so `wrap` refuses anyone else before reading
+//!   the DEK, and checks the key file's folders against the library's own
+//!   rule (`hkdfguard_key_file_principal_trusted`).
+//! - **Application** -- unwraps, through the library; it cannot persist a
+//!   key file its own service would accept.
+//!
+//! Under the developer model none of this applies, as before.
+//!
 //! `provision` and `wrap` call into the `hkdfguard` library through its stable C ABI, the
 //! same interface any other-language caller uses -- this tool takes no
 //! shortcut through the library's internal Rust types.
@@ -82,8 +100,11 @@
 //! or others -- sticky folders such as `/tmp`, `/var/tmp` and `/dev/shm`
 //! included (see [`require_unshared_folder`]): the library refuses to read
 //! a key file under one, so `wrap` refuses to write it there, also before
-//! the DEK is read. Only the folders' modes are checked, not who owns them:
-//! `wrap` may run as root into a folder the application's account owns.
+//! the DEK is read. Under the developer model only the folders' modes are
+//! checked, not who owns them: `wrap` may run as root into a folder the
+//! application's account owns. Under the production model the library's
+//! answer for each folder's owner and group decides, as it will when the
+//! key file is read.
 //!
 //! When `--force` replaces an existing file at `--key-file-path`, the wrap
 //! is completed in memory *first*, and only then is the old file securely
@@ -106,9 +127,11 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use zeroize::Zeroize;
+use hkdfguard::admin::{DEPLOYERS_GROUP, OVER_BROAD_GROUPS};
 use hkdfguard::{
     admin, harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
-    hkdfguard_kek_fingerprint, hkdfguard_wrap_dek, status,
+    hkdfguard_kek_fingerprint, hkdfguard_key_file_principal_trusted, hkdfguard_security_model, hkdfguard_wrap_dek,
+    status,
 };
 
 // rw-------: the owning deployment user only. The payload is ciphertext,
@@ -120,13 +143,15 @@ const KEY_FILE_MODE: u32 = 0o600;
 // Windows tool's --group grants the same (owner read/write, the group read).
 const KEY_FILE_GROUP_MODE: u32 = 0o640;
 
-// Groups --group refuses: each covers essentially every account on a
-// typical host, or the host's administrators or log readers -- granting one
-// read access is no narrower than world-readable for this purpose. Matched
-// by resolved gid, so a numeric gid can't dodge the list. gid 0 and the
-// overflow gid 65534 are refused whatever their names. The Windows tool
-// refuses its own equivalents (Everyone, Users, Authenticated Users, ...).
-const OVER_BROAD_GROUPS: &[&str] = &["root", "users", "nogroup", "nobody", "wheel", "sudo", "adm", "staff"];
+// Groups --group refuses are the library's OVER_BROAD_GROUPS (the ones it
+// refuses as deployer groups too): each covers essentially every account on
+// a typical host, or the host's administrators or log readers -- granting
+// one read access is no narrower than world-readable for this purpose.
+// Matched by resolved gid, so a numeric gid can't dodge the list. gid 0 and
+// the overflow gid 65534 are refused whatever their names.
+
+// hkdfguard_security_model's value for the production model.
+const SECURITY_MODEL_PRODUCTION: c_int = 0;
 
 // Number of (all-zero pass, random pass) rounds `secure_delete` runs before
 // removing the file -- 2 passes per round, so this yields 8 total
@@ -228,6 +253,10 @@ fn print_usage() {
          retire     permanently deletes the service's KEK, only if its fingerprint is the\n\
          \x20          one given; every DEK wrapped under it becomes unrecoverable. PKCS#11\n\
          \x20          only: a TPM2 KEK is not stored anywhere, so there is nothing to delete.\n\
+         \n\
+         Under the production security model (the default), provision and retire need\n\
+         root, and wrap needs root or a member of {DEPLOYERS_GROUP} (or of a group\n\
+         the policy lists in deployer_groups): the library trusts only their key files.\n\
          \n\
          The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n\
          from a command-line argument or an environment variable, both of which are\n\
@@ -653,8 +682,7 @@ fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [
 // Maps a library status code to a human-readable description, for a
 // clearer error message than a bare integer. Covers every code the Linux
 // library can return (the shared table's Windows/macOS-only codes, and
-// KEK_ACCESS_DENIED/KEK_INVALID, which Linux never returns, fall through
-// to "unknown"). Only the message depends on this: the tool's own exit
+// KEK_INVALID, which Linux never returns, fall through to "unknown"). Only the message depends on this: the tool's own exit
 // codes don't.
 fn describe_status(code: c_int) -> String {
     match code {
@@ -677,6 +705,11 @@ fn describe_status(code: c_int) -> String {
             "the wrapped payload's KEK fingerprint does not match the current KEK for this service".to_string()
         }
         status::KEK_NOT_FOUND => "no KEK exists yet for this service".to_string(),
+        status::KEK_ACCESS_DENIED => {
+            "this account may not do that: under the production security model only root creates or retires a KEK \
+             (run it as root, e.g. with sudo)"
+                .to_string()
+        }
         status::PROCESS_HARDENING_FAILED => {
             "could not disable core dumps / ptrace access for this process".to_string()
         }
@@ -690,9 +723,14 @@ fn describe_status(code: c_int) -> String {
         }
         status::FILE_MALFORMED => "the key file is not a well-formed wrapped DEK".to_string(),
         status::FILE_UNTRUSTED => {
-            "the key file, or a directory in its path, is owned by another user or writable by group/others              (sticky /tmp-style directories included)"
+            "the key file, or a directory in its path, is owned by someone the security model doesn't trust, or \
+             writable by someone else (sticky /tmp-style directories included)"
                 .to_string()
         }
+        status::LINUX_GROUP_INVALID => format!(
+            "a deployer group can't be used: one listed in the policy's deployer_groups (or {DEPLOYERS_GROUP}) \
+             doesn't exist, is over-broad, or can't be looked up (see the library's log for which)"
+        ),
         other => format!("unknown status code {other}"),
     }
 }
@@ -913,6 +951,48 @@ fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
     Ok(spelled)
 }
 
+// What the library's security model says about the key file `wrap` is
+// about to write, asked before anything is touched: under the production
+// model, the library trusts only key files owned by root or a deployer, so
+// anyone else is refused here -- nothing would ever open what they wrote.
+// Returns whether the production model is in force.
+fn require_may_persist_key_files() -> Result<bool, String> {
+    let (mut model, mut may_write): (c_int, c_int) = (0, 0);
+    let rc = hkdfguard_security_model(&mut model, &mut may_write);
+    if rc != status::OK {
+        return Err(format!("hkdfguard_security_model failed: {}; nothing was written", describe_status(rc)));
+    }
+    let production = model == SECURITY_MODEL_PRODUCTION;
+    if production && may_write != 1 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        return Err(format!(
+            "under the production security model this account (uid {euid}) may not persist key files: the library \
+             trusts only key files owned by root or a deployer, a member of {DEPLOYERS_GROUP} or of a group the \
+             policy lists in deployer_groups. Run wrap as root, or as a deployer. Nothing was written"
+        ));
+    }
+    Ok(production)
+}
+
+// The library's answer to whether `principal` ("uid:<n>" or "gid:<n>") may
+// own, or write through its group, a key file or a folder above one.
+fn principal_trusted(principal: &str) -> Result<bool, String> {
+    let c_principal = CString::new(principal).map_err(|_| "a principal must not contain a NUL byte".to_string())?;
+    let mut trusted: c_int = 0;
+    let rc = hkdfguard_key_file_principal_trusted(c_principal.as_ptr(), &mut trusted);
+    if rc != status::OK {
+        return Err(format!("hkdfguard_key_file_principal_trusted({principal}) failed: {}", describe_status(rc)));
+    }
+    Ok(trusted == 1)
+}
+
+// Who the library trusts with key files, as `require_unshared_folder`
+// asks: `None` under the developer model, where that depends on who reads
+// the file, so only modes are checked; under production, the library's
+// own answer for a uid or gid (see `principal_trusted`).
+type PrincipalCheck<'a> = Option<&'a dyn Fn(&str) -> Result<bool, String>>;
+
 // `wrap` only: the key file's folder, and every folder above it up to `/`,
 // must not be writable by group or others -- sticky (`/tmp`, `/var/tmp`,
 // `/dev/shm`) included. The library refuses to read a key file under any
@@ -922,22 +1002,48 @@ fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
 // `require_real_folder` returned, so its folder is the real one and every
 // ancestor is too.
 //
-// Mode only, not ownership: `wrap` often runs as root into a folder owned
-// by the application's account, which the library -- running as that
-// account -- accepts, while the library's ownership rule (root or the
-// reading process's own user) depends on who reads the file, which this
-// tool cannot know. As in the library, a folder on a read-only mount is
+// Developer model (`principals` is None): mode only, not ownership. `wrap`
+// often runs as root into a folder owned by the application's account,
+// which the library -- running as that account -- accepts, while the
+// library's ownership rule (root or the reading process's own user)
+// depends on who reads the file, which this tool cannot know.
+//
+// Production model: the rule doesn't depend on the reader, so it is
+// checked exactly: each folder's owner must be one the library trusts
+// (root or a deployer), and a folder writable through its group passes if
+// that group is a deployer group (a `root:hkdfguard-deployers 2775` folder
+// the deployers share). As in the library, a folder on a read-only mount is
 // not writable whatever its mode bits say (nothing can be written there
 // anyway, so the create below fails on its own).
-fn require_unshared_folder(path: &Path, spelled: &Path) -> Result<(), String> {
+fn require_unshared_folder(path: &Path, spelled: &Path, principals: PrincipalCheck) -> Result<(), String> {
     let folder = spelled.parent().ok_or_else(|| format!("{} has no parent folder", path.display()))?;
     for dir in folder.ancestors() {
         let meta = fs::metadata(dir).map_err(|e| format!("failed to check folder {}: {e}", dir.display()))?;
+        let which = if dir == folder { "the key file's folder" } else { "a folder above the key file" };
+        if let Some(trusted) = principals {
+            if !trusted(&format!("uid:{}", meta.uid()))? {
+                return Err(format!(
+                    "{which}, {}, is owned by uid {}, whom the library does not trust with key files under the \
+                     production security model (root, or a member of {DEPLOYERS_GROUP} or of a policy \
+                     deployer_groups group); it would refuse to read a key file at {} \
+                     (HKDFGUARD_ERR_FILE_UNTRUSTED)",
+                    dir.display(),
+                    meta.uid(),
+                    path.display()
+                ));
+            }
+        }
         let mode = meta.mode() & 0o7777;
         if mode & 0o022 == 0 || on_read_only_mount(dir) {
             continue;
         }
-        let which = if dir == folder { "the key file's folder" } else { "a folder above the key file" };
+        if mode & 0o002 == 0 {
+            if let Some(trusted) = principals {
+                if trusted(&format!("gid:{}", meta.gid()))? {
+                    continue; // writable only through a deployer group
+                }
+            }
+        }
         let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
         return Err(format!(
             "{which}, {}, is writable by group or others (mode {mode:o}){sticky}; the library would refuse to \
@@ -1245,10 +1351,14 @@ fn run_wrap(
     // descriptor, when the file is replaced and created below.
     let checked = require_real_folder(Path::new(&key_file_path))?;
     let path = checked.as_path();
-    // And not in a folder (or under one) that group or others can write
+    // Someone the library would trust with a key file: under the
+    // production model, root or a deployer, or nothing is written.
+    let production = require_may_persist_key_files()?;
+    // And not in a folder (or under one) that someone untrusted can write
     // to, sticky /tmp included: the library would refuse to read the key
     // file there, so refuse to write it (see require_unshared_folder).
-    require_unshared_folder(Path::new(&key_file_path), path)?;
+    let check: &dyn Fn(&str) -> Result<bool, String> = &principal_trusted;
+    require_unshared_folder(Path::new(&key_file_path), path, production.then_some(check))?;
 
     // Fast, friendly pre-check: fail before reading the DEK or touching
     // the provider if the output path obviously already exists and --force
@@ -1778,13 +1888,13 @@ mod tests {
         chmod(&outer, 0o755);
         chmod(&inner, 0o700);
         let key = inner.join("wrapped.key");
-        require_unshared_folder(&key, &key).expect("0700 under 0755 under a private root");
+        require_unshared_folder(&key, &key, None).expect("0700 under 0755 under a private root");
         chmod(&inner, 0o755);
-        require_unshared_folder(&key, &key).expect("0755: others may read, not write");
+        require_unshared_folder(&key, &key, None).expect("0755: others may read, not write");
 
         for mode in [0o775, 0o757, 0o777, 0o1777, 0o1770] {
             chmod(&inner, mode);
-            let err = require_unshared_folder(&key, &key).unwrap_err();
+            let err = require_unshared_folder(&key, &key, None).unwrap_err();
             assert!(err.contains("the key file's folder") && err.contains(&format!("mode {mode:o}")), "{err}");
             assert!(err.contains("library would refuse"), "{err}");
             assert_eq!(err.contains("sticky"), mode & 0o1000 != 0, "{err}");
@@ -1792,10 +1902,50 @@ mod tests {
         chmod(&inner, 0o700);
         for mode in [0o1777, 0o777, 0o770] {
             chmod(&outer, mode);
-            let err = require_unshared_folder(&key, &key).unwrap_err();
+            let err = require_unshared_folder(&key, &key, None).unwrap_err();
             assert!(err.contains("a folder above the key file") && err.contains(outer.to_str().unwrap()), "{err}");
         }
         chmod(&outer, 0o755);
+    }
+
+    #[test]
+    fn require_unshared_folder_under_production_asks_the_library_about_owners_and_groups() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let keys = base.join("keys");
+        fs::create_dir(&keys).unwrap();
+        let key = keys.join("wrapped.key");
+        let meta = fs::metadata(&keys).unwrap();
+        let (me, my_group) = (format!("uid:{}", meta.uid()), format!("gid:{}", meta.gid()));
+        let chmod = |mode: u32| fs::set_permissions(&keys, fs::Permissions::from_mode(mode)).unwrap();
+
+        // Every folder's owner trusted, and this folder's group a deployer group.
+        let deployer = |p: &str| -> Result<bool, String> { Ok(p == "uid:0" || p == me || p == my_group) };
+        // Every owner trusted, no group.
+        let no_group = |p: &str| -> Result<bool, String> { Ok(p.starts_with("uid:")) };
+        // Only root.
+        let root_only = |p: &str| -> Result<bool, String> { Ok(p == "uid:0") };
+
+        chmod(0o755);
+        require_unshared_folder(&key, &key, Some(&deployer)).expect("0755, trusted owners");
+        if meta.uid() != 0 {
+            let err = require_unshared_folder(&key, &key, Some(&root_only)).unwrap_err();
+            assert!(err.contains(&format!("owned by uid {}", meta.uid())) && err.contains("production"), "{err}");
+        }
+        for mode in [0o775, 0o2775, 0o770] {
+            chmod(mode);
+            require_unshared_folder(&key, &key, Some(&deployer)).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+            let err = require_unshared_folder(&key, &key, Some(&no_group)).unwrap_err();
+            assert!(err.contains("writable by group or others"), "mode {mode:o}: {err}");
+        }
+        for mode in [0o777, 0o1777, 0o757] {
+            chmod(mode);
+            let err = require_unshared_folder(&key, &key, Some(&deployer)).unwrap_err();
+            assert!(err.contains("writable by group or others"), "mode {mode:o}: others may never write: {err}");
+        }
+        chmod(0o700);
+        let failing = |_: &str| -> Result<bool, String> { Err("the library said no".to_string()) };
+        assert_eq!(require_unshared_folder(&key, &key, Some(&failing)).unwrap_err(), "the library said no");
     }
 
     #[test]
@@ -1803,7 +1953,7 @@ mod tests {
         // `/` is root's, and (as a non-root test run) not this user's: the
         // library running as the application's account would accept a key
         // file there, so wrap must not refuse it for its owner.
-        require_unshared_folder(Path::new("/wrapped.key"), Path::new("/wrapped.key")).expect("root-owned 0755");
+        require_unshared_folder(Path::new("/wrapped.key"), Path::new("/wrapped.key"), None).expect("root-owned 0755");
 
         // Owned by another non-root user: only root can arrange that.
         // SAFETY: geteuid has no preconditions.
@@ -1818,12 +1968,18 @@ mod tests {
         for mode in [0o700, 0o755] {
             fs::set_permissions(&theirs, fs::Permissions::from_mode(mode)).unwrap();
             let key = theirs.join("wrapped.key");
-            require_unshared_folder(&key, &key).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+            require_unshared_folder(&key, &key, None).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
         }
     }
 
     #[test]
+    #[serial]
+    #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
     fn wrap_refuses_a_shared_folder_before_reading_the_dek() {
+        with_ephemeral_policy(wrap_refuses_a_shared_folder_before_reading_the_dek_under_the_developer_model);
+    }
+
+    fn wrap_refuses_a_shared_folder_before_reading_the_dek_under_the_developer_model() {
         // The --dek-file does not exist: reaching it would fail with a DEK
         // error, so the folder error proves the DEK was never read.
         let dir = private_tempdir();
@@ -2310,9 +2466,14 @@ mod tests {
     // external-secret mount. Ephemeral keys are per-process, which is
     // exactly right for an in-process test of the provision flow.
     fn with_ephemeral_policy<F: FnOnce()>(f: F) {
+        with_policy("security_model = \"developer\"\npreferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n", f);
+    }
+
+    // Points the library at a policy file holding `doc` while `f` runs.
+    fn with_policy<F: FnOnce()>(doc: &str, f: F) {
         let dir = private_tempdir();
         let policy = dir.path().join("policy.toml");
-        fs::write(&policy, "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n").unwrap();
+        fs::write(&policy, doc).unwrap();
         fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: some distros default to 002 (group-writable), which the policy loader correctly refuses
         std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
         f();
@@ -2438,6 +2599,45 @@ mod tests {
             } else {
                 eprintln!("skipping the --group round trip: this process's own group is one --group refuses");
             }
+        });
+    }
+
+    #[test]
+    #[serial]
+    #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+    fn production_refuses_provision_retire_and_wrap_to_an_ordinary_account() {
+        // SAFETY: no arguments, cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root holds every role: nothing to refuse
+        }
+        with_policy("security_model = \"production\"\npreferred_order = [\"external-secret\"]\n[selection]\nmode = \"prefer\"\n", || {
+            let (mut model, mut may_write) = (-1, -1);
+            assert_eq!(hkdfguard_security_model(&mut model, &mut may_write), status::OK);
+            assert_eq!(model, SECURITY_MODEL_PRODUCTION);
+            if may_write == 1 {
+                eprintln!("skipping: this account is a deployer on this host");
+                return;
+            }
+            let err = run_provision("com.hkdfguard.clitest.production".to_string()).unwrap_err();
+            assert!(err.contains("only root creates or retires a KEK"), "{err}");
+            let err = run_retire("com.hkdfguard.clitest.production".to_string(), [0x11; FINGERPRINT_LEN]).unwrap_err();
+            assert!(err.contains("only root"), "{err}");
+
+            // The --dek-file does not exist: reaching it would be a DEK
+            // error, so this refusal comes before the DEK is read.
+            let dir = private_tempdir();
+            let key = dir.path().join("wrapped.key");
+            let err = run_wrap(
+                key.to_str().unwrap().to_string(),
+                "com.hkdfguard.clitest.production".to_string(),
+                DekSource::File(dir.path().join("no-such-dek").to_str().unwrap().to_string()),
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("may not persist key files") && err.contains("Nothing was written"), "{err}");
+            assert!(!key.exists());
         });
     }
 

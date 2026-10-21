@@ -55,7 +55,7 @@ extern "C" {
  *    -16 ..  -31   KEK
  *    -32 ..  -63   key file (hkdfguard_open_file); -40..-63 reserved
  *    -64 ..  -79   Windows-specific
- *    -80 ..  -95   Linux-specific (none defined yet)
+ *    -80 ..  -95   Linux-specific
  *    -96 .. -111   macOS-specific
  *
  * Every code in a platform band refines one common code, named in its
@@ -89,7 +89,7 @@ extern "C" {
 /* KEK */
 #define HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH (-16) /* the payload was wrapped under a different KEK than `service` resolves to now */
 #define HKDFGUARD_ERR_KEK_NOT_FOUND (-17)       /* no KEK exists yet for this service; call hkdfguard_create_kek first */
-#define HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18)   /* the KEK exists but this process may not use it -- not currently returned on Linux */
+#define HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18)   /* this process may not do this to the KEK: on Linux, under the production security model, create a KEK that doesn't exist yet (or retire one) without being root */
 #define HKDFGUARD_ERR_KEK_INVALID (-19)         /* the KEK exists but is corrupt or has an invalid ACL -- not currently returned on Linux */
 #define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED (-20) /* hkdfguard_harden_process could not disable core dumps or ptrace access, or (with HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) the process can still be debugged by its own user */
 /* -21..-31 reserved. */
@@ -102,13 +102,14 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_LONG (-36)       /* key file is longer than a wrapped DEK, or than its own header declares */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-38)      /* key file is the right length but not a well-formed wrapped DEK */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by another user or writable by group/others (sticky, /tmp-style, included): someone else could have replaced it */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust, or writable by someone else (sticky, /tmp-style, included): someone else could have replaced it */
 /* -40..-63 reserved for future common codes. */
 
 /* Windows-specific (-64..-79). Not returned on Linux. */
 #define HKDFGUARD_ERR_WIN_GROUP_INVALID (-64)   /* refines HKDFGUARD_ERR_POLICY_INVALID; Windows only */
 
-/* Linux-specific (-80..-95): none defined yet. */
+/* Linux-specific (-80..-95). */
+#define HKDFGUARD_ERR_LINUX_GROUP_INVALID (-80) /* refines HKDFGUARD_ERR_POLICY_INVALID: a deployer group (policy deployer_groups, or hkdfguard-deployers) doesn't exist, is over-broad, or can't be looked up; Linux only */
 
 /* macOS-specific (-96..-111). Each refines HKDFGUARD_ERR_PROVIDER_ERROR. Not returned on Linux. */
 #define HKDFGUARD_ERR_MAC_ACCESS_CONTROL_CREATION_FAILED (-96) /* macOS only */
@@ -188,6 +189,12 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * service this call fails and logs (at error level) the policy entry to
  * add, ready to paste. Provisioning on TPM is that root-owned policy
  * edit.
+ *
+ * Under the production security model (the default; see
+ * hkdfguard_security_model) only root creates a KEK: any other caller gets
+ * the existing KEK -- so an application may still call this at startup --
+ * or HKDFGUARD_ERR_KEK_ACCESS_DENIED if there is none. An ephemeral KEK is
+ * the exception: it exists only in this process, so this process makes it.
  *
  * Audited: creating a KEK, every wrap and unwrap, and the failures an
  * administrator needs to see are written to syslog (facility authpriv,
@@ -368,6 +375,73 @@ int hkdfguard_generate_and_wrap_dek(
     uint8_t* out,
     int* out_len);
 
+/* Values of hkdfguard_security_model's *out_model: the Windows build's. */
+#define HKDFGUARD_SECURITY_MODEL_PRODUCTION 0
+#define HKDFGUARD_SECURITY_MODEL_DEVELOPER  1
+
+/*
+ * Reports the security model in force and whether this process may persist
+ * key files under it. The Windows build has the same function.
+ *
+ * The model is the top-level policy setting
+ *
+ *     security_model = "production"   # or "developer"
+ *
+ * in /etc/hkdfguard/policy.toml. Absent -- or no policy file at all --
+ * means HKDFGUARD_SECURITY_MODEL_PRODUCTION: this is a production install
+ * unless an administrator says otherwise. Any other value makes the policy
+ * invalid, and every call fails with HKDFGUARD_ERR_POLICY_INVALID. It
+ * decides:
+ *
+ *   Who may create or retire a KEK. Production: root (see
+ *     hkdfguard_create_kek). Developer: anyone who can reach the provider.
+ *   Whose key files hkdfguard_open_file trusts. Production: root and the
+ *     deployers -- direct members of the group hkdfguard-deployers (the
+ *     packages create it) and of each group the policy lists in
+ *     `deployer_groups = ["..."]` (none of them over-broad) -- and a
+ *     deployer group may hold write access to a key file or its folders.
+ *     The calling account is trusted only if it is a deployer itself, so an
+ *     application that unwraps, and wraps ephemeral keys in memory, cannot
+ *     persist a key file its own service would accept. Developer: root and
+ *     the calling user, and no group (the rule before security models).
+ *
+ * Wrapping and unwrapping are the same in both models: any process the
+ * provider lets use the KEK may do either, in memory.
+ *
+ * out_model               - receives HKDFGUARD_SECURITY_MODEL_*.
+ * out_may_write_key_files - receives 1 if a key file written by this
+ *                           process (owned by its effective uid) would be
+ *                           trusted under that model, else 0.
+ *
+ * Returns HKDFGUARD_OK; HKDFGUARD_ERR_INVALID_ARGUMENT for a NULL pointer;
+ * HKDFGUARD_ERR_POLICY_INVALID if the policy can't be used; or
+ * HKDFGUARD_ERR_LINUX_GROUP_INVALID for a deployer group that doesn't
+ * exist, is over-broad (root, users, wheel, sudo, adm, staff, ...), or
+ * can't be looked up. Both outputs are left unchanged on failure.
+ */
+int hkdfguard_security_model(
+    int* out_model,
+    int* out_may_write_key_files);
+
+/*
+ * Whether hkdfguard_open_file, under the security model in force (see
+ * hkdfguard_security_model), trusts `principal` -- "uid:<n>" for a user,
+ * "gid:<n>" for a group, <n> in decimal -- to own a key file or a folder
+ * above one (a uid), or to hold write access to one through its group (a
+ * gid). Lets a tool that prepares or writes key files check a folder
+ * against the exact rule the library reads by. The Windows build's
+ * function of the same name takes a SID string instead.
+ *
+ * Returns HKDFGUARD_OK with *out_trusted set to 1 or 0;
+ * HKDFGUARD_ERR_INVALID_ARGUMENT for a NULL pointer or a string of any
+ * other form; or HKDFGUARD_ERR_POLICY_INVALID /
+ * HKDFGUARD_ERR_LINUX_GROUP_INVALID as hkdfguard_security_model.
+ * *out_trusted is left unchanged on failure.
+ */
+int hkdfguard_key_file_principal_trusted(
+    const char* principal,
+    int* out_trusted);
+
 /*
  * Reads a wrapped-key file -- one written by `hkdfguard wrap`,
  * or the output of hkdfguard_wrap_dek saved as-is -- into `out`, exactly as
@@ -380,14 +454,18 @@ int hkdfguard_generate_and_wrap_dek(
  *           terminator. Symlinks are followed. Must name a regular file:
  *           directories, FIFOs and devices are refused before anything is
  *           read (a FIFO never blocks the call). The file must be owned by
- *           root or by the calling user, and must not be writable by group
- *           or others (HKDFGUARD_ERR_FILE_UNTRUSTED otherwise): a
+ *           someone the security model trusts -- under the production
+ *           model (the default), root or a deployer; under the developer
+ *           model, root or the calling user (see hkdfguard_security_model)
+ *           -- and must not be writable by anyone else: not by others, and
+ *           by its group only if that is a deployer group (production
+ *           only). HKDFGUARD_ERR_FILE_UNTRUSTED otherwise: a
  *           wrapped DEK is ciphertext, but someone who can replace the file
  *           and can wrap under the service's KEK could plant a DEK they
  *           know. The same goes for the directories that decide what `path`
  *           names -- the one holding the opened file and the one `path`
  *           names it in (where a symlink lives), each up to `/`: owned by
- *           root or the calling user, and not writable by group or others
+ *           someone trusted, and not writable by anyone else
  *           -- sticky or not, at any level: a key file anywhere under
  *           /tmp, /var/tmp, /dev/shm or any other sticky, world-writable
  *           directory is refused, however private the directories beneath
@@ -395,7 +473,8 @@ int hkdfguard_generate_and_wrap_dek(
  *           read-only mount counts as unwritable whatever its mode, so a
  *           Kubernetes Secret or ConfigMap volume (1777, read-only)
  *           passes. The CLI writes key files 0600, and refuses to write
- *           one into a folder this check would refuse.
+ *           one into a folder this check would refuse -- or at all, under
+ *           the production model, unless it runs as root or a deployer.
  * out:      buffer to receive the wrapped payload. May be NULL only if
  *           *out_len is 0 (to probe the size).
  * out_len:  in: capacity of `out` in bytes.
@@ -428,6 +507,8 @@ int hkdfguard_generate_and_wrap_dek(
  * refused the open, e.g. EACCES) and HKDFGUARD_ERR_FILE_IO report why the
  * file couldn't be opened or read; HKDFGUARD_ERR_FILE_UNTRUSTED, that it
  * could be, but failed the ownership/permission checks above.
+ * HKDFGUARD_ERR_POLICY_INVALID and HKDFGUARD_ERR_LINUX_GROUP_INVALID, that
+ * whose files to trust can't be decided (see hkdfguard_security_model).
  *
  * On any failure, every byte of the caller's declared `out` capacity is
  * zeroed (unless `out_len` is NULL: then nothing is written).

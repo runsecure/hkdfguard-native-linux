@@ -70,8 +70,9 @@ same symlink (or set `LD_LIBRARY_PATH`) to run. Installed from the packages
 `pkg-config --cflags --libs hkdfguard`. The C header
 (`include/hkdfguard.h`) and exported C symbols (`hkdfguard_create_kek`,
 `hkdfguard_kek_exists`, `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`,
-`hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) are the same
-either way.
+`hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`,
+`hkdfguard_security_model`, `hkdfguard_key_file_principal_trusted`) are the
+same either way.
 
 ```c
 #include "hkdfguard.h"
@@ -234,6 +235,52 @@ someone untrusted could change -- makes every operation fail closed with
 `HKDFGUARD_ERR_POLICY_INVALID` (`-9`).
 (Only test builds -- see "Testing against scratch configuration" -- also accept the process's own user.)
 
+### Security model
+
+The policy's top-level `security_model` decides who may do what, as the
+Windows build's `SecurityModel` policy value and the macOS build's
+production mode do. **Production is the default**: with no policy file, or
+one that doesn't set it, this is a production install.
+
+| Role | Production | May |
+|---|---|---|
+| Security admin | root | `hkdfguard provision`, `hkdfguard retire` |
+| Deployment admin | root, or a deployer | `hkdfguard wrap`: key files `hkdfguard_open_file` will trust |
+| Application | anyone else the provider admits | unwrap (and wrap in memory) only |
+
+- Under production, `hkdfguard_create_kek` creates a KEK only for root;
+  anyone else gets the existing KEK, or `HKDFGUARD_ERR_KEK_ACCESS_DENIED`
+  (`-18`, which Linux now returns). An ephemeral KEK is exempt. On a TPM,
+  set `tpm.require_pinned_names = true` for this to gate anything: without
+  it the TPM derives a KEK for any service on demand.
+- A **deployer** is a direct member of `hkdfguard-deployers` (the packages
+  create it) or of a group in the policy's `deployer_groups`. Only key files
+  owned by root or a deployer, in folders owned by root or a deployer and
+  group-writable only through a deployer group, are trusted; others are
+  `HKDFGUARD_ERR_FILE_UNTRUSTED` (`-39`). So an application cannot persist a
+  key file its own service would accept.
+- A deployer group that doesn't exist, is over-broad or can't be looked up
+  fails every key-file read with `HKDFGUARD_ERR_LINUX_GROUP_INVALID`
+  (`-80`), which refines `POLICY_INVALID` (`-9`).
+- `security_model = "developer"` restores the earlier rule: anyone who can
+  reach the provider creates KEKs, and key files owned by root or the
+  calling user are trusted. Audit event 1005 marks it.
+- Wrapping and unwrapping are the same in both: the provider's own access
+  control decides who may use a KEK.
+- `hkdfguard_security_model(int* out_model, int* out_may_write_key_files)`
+  reports the model (`HKDFGUARD_SECURITY_MODEL_PRODUCTION` 0,
+  `HKDFGUARD_SECURITY_MODEL_DEVELOPER` 1) and whether this process's key
+  files would be trusted; `hkdfguard_key_file_principal_trusted(principal,
+  out_trusted)` answers for `"uid:<n>"` or `"gid:<n>"`.
+
+Upgrading changes the default: key files owned by an application's own
+account become untrusted until redeployed by root or a deployer (or until
+the policy says `security_model = "developer"`). Setup, migration and the
+deployers' shared folder are in
+[docs/configuration.md](docs/configuration.md#security-model-who-may-provision-wrap-and-unwrap);
+`scripts/verify-roles.sh` checks the split end to end, as root, against a
+release build.
+
 ### Audit trail
 
 The library writes one syslog record per security-relevant event, whatever
@@ -250,7 +297,8 @@ same IDs, meanings and severities (1004 aside), so one set of alerts covers both
 | 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | info | A DEK was unwrapped. |
 | 1004 | warning | A KEK was retired (`hkdfguard retire`): deleted for good, after its fingerprint was confirmed. Names the fingerprint. Every DEK wrapped under it can no longer be unwrapped. |
-| 2000 | warning | `KEK_ACCESS_DENIED`. |
+| 1005 | warning | A key file was read under the developer security model, which trusts files the calling account owns. Logged once per process; names the file. |
+| 2000 | warning | `KEK_ACCESS_DENIED`: under the production security model, a non-root caller tried to create a KEK that doesn't exist, or to retire one. |
 | 2002 | error | `KEK_INVALID`. |
 | 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
 | 2004 | error | `POLICY_INVALID`: every call fails closed until the policy is fixed. |
@@ -1061,7 +1109,11 @@ Every common mechanism meets the mode requirement with one setting:
 Because a wrapped payload can only be produced on the host that holds the
 KEK, a deployment pipeline delivers the *plaintext* DEK to the host and
 wraps it there. This CLI is that step, in two deliberately separate
-commands:
+commands. Under the production security model (the default), `provision` of
+a new KEK and `retire` need root, and `wrap` needs root or a deployer (a
+member of `hkdfguard-deployers`, or of a policy `deployer_groups` group);
+anyone else's `wrap` is refused before the DEK is read ("may not persist key
+files ... Nothing was written"). See "Security model".
 
 ```sh
 # 1. Once, at deployment time: ensure the service has a KEK, and print its
@@ -1135,10 +1187,15 @@ and `/dev/shm` included**, however private the folder inside them. The
 library refuses to read a key file under such a folder
 (`HKDFGUARD_ERR_FILE_UNTRUSTED`, `-39`), so `wrap` refuses to write one
 there, before the DEK is read or a provider is reached, naming the folder
-and its mode. Only the folders' modes are checked, not who owns them: `wrap`
-often runs as root into a folder the application's account owns, which the
-library, running as that account, accepts. Put key files somewhere like
-`/var/lib/<app>/` (mode `0700` or `0755`, owned by the application or root).
+and its mode. Under the developer security model only the folders' modes
+are checked, not who owns them: `wrap` often runs as root into a folder the
+application's account owns, which the library, running as that account,
+accepts. Under production the rule doesn't depend on the reader, so `wrap`
+checks it exactly, through `hkdfguard_key_file_principal_trusted`: every
+folder must be owned by root or a deployer, and may be group-writable only
+through a deployer group. Put key files somewhere like `/var/lib/<app>/`
+(`0755`, owned by root), or in a folder the deployers share,
+`root:hkdfguard-deployers 2775`.
 
 The key file is written `0600`, owned by whoever runs the command. It is
 ciphertext, but anyone who can read it *and* reach the provider — on a TPM
@@ -1199,7 +1256,8 @@ event 1004, naming the fingerprint. Running `provision` afterwards creates
 a new, different KEK.
 
 `retire` exists only in the CLI. It is not part of the C API, so no
-application linking the library can delete a KEK.
+application linking the library can delete a KEK. Under the production
+security model it also takes root.
 
 What can be retired depends on the provider:
 
@@ -1482,7 +1540,10 @@ src/
   lib.rs                    C ABI: hkdfguard_create_kek / hkdfguard_kek_exists /
                              hkdfguard_wrap_dek / hkdfguard_unwrap_dek /
                              hkdfguard_generate_and_wrap_dek /
-                             hkdfguard_harden_process(_with_flags); the setup-call gate
+                             hkdfguard_harden_process(_with_flags) / hkdfguard_open_file /
+                             hkdfguard_security_model / hkdfguard_key_file_principal_trusted;
+                             the setup-call gate
+  security_model.rs         production/developer: who creates KEKs, whose key files are trusted
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format (version 1)
   crypto.rs                 ECDH(H_salt) -> HKDF-SHA512 -> AES-256-GCM protocol; salt-to-point hashing
@@ -1496,7 +1557,7 @@ src/
     external_secret.rs      Provider 3 (feature `external-secret`, default)
     ephemeral.rs             Provider 4 (feature `ephemeral`, default)
   bin/
-    hkdfguard.rs            CLI: `provision` and `wrap`
+    hkdfguard.rs            CLI: `provision`, `wrap` and `retire`
 include/hkdfguard.h          C header
 examples/
   wrap_unwrap.c              Minimal C consumer (create_kek -> wrap -> unwrap)

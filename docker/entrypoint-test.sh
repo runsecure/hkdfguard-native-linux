@@ -251,6 +251,9 @@ mkdir -p /etc/hkdfguard
 install -o root -g ci -m 0440 /dev/null /etc/hkdfguard/tpm.derivation-secret  # required by default
 head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret
 cat > /etc/hkdfguard/policy.toml <<TOML
+# ci provisions and retires KEKs here, which the production security
+# model leaves to root: scripts/verify-roles.sh tests that split.
+security_model = "developer"
 [selection]
 mode = "require"
 provider = "tpm2"
@@ -286,6 +289,7 @@ echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE an
 # External secret: the policy names no directory, so the standard mount is
 # used; HKDFGUARD_EXTERNAL_SECRET_DIR pointing nowhere changes nothing.
 cat > /etc/hkdfguard/policy.toml <<'TOML'
+security_model = "developer"
 [selection]
 mode = "require"
 provider = "external-secret"
@@ -307,6 +311,7 @@ rm -rf /run/secrets/hkdfguard
 # but the policy names no module. Neither build may use PKCS#11 (no default
 # module search, variables ignored).
 cat > /etc/hkdfguard/policy.toml <<'TOML'
+security_model = "developer"
 [selection]
 mode = "require"
 provider = "pkcs11"
@@ -327,6 +332,7 @@ section "retire deletes a PKCS#11 KEK only given its fingerprint; TPM2 refuses"
 # deployment configures it: root-owned policy naming the module, and the
 # root:ci 0440 PIN file above.
 cat > /etc/hkdfguard/policy.toml <<TOML
+security_model = "developer"
 [selection]
 mode = "require"
 provider = "pkcs11"
@@ -401,6 +407,7 @@ as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP2" >/dev/null
 echo "PKCS#11: wrong fingerprint refused, nothing deleted; right one deleted the KEK; its DEKs no longer unwrap; re-provision makes a new KEK."
 
 cat > /etc/hkdfguard/policy.toml <<TOML
+security_model = "developer"
 [selection]
 mode = "require"
 provider = "tpm2"
@@ -443,6 +450,7 @@ TMP_ROOT=$(mktemp -d); chmod 0755 "$TMP_ROOT"
 install -o root -g ci -m 0440 /dev/null "$TMP_ROOT/tpm.derivation-secret"
 head -c 32 /dev/urandom > "$TMP_ROOT/tpm.derivation-secret"
 cat > /etc/hkdfguard/policy.toml <<TOML
+security_model = "developer"
 [selection]
 mode = "require"
 provider = "tpm2"
@@ -457,8 +465,12 @@ expect_sticky_refusal "the TPM derivation secret" as_ci $CLI provision -sn $STIC
 # PIN file (root:ci 0440), each with the other in its trusted place.
 cp "$SOFTHSM_MODULE" "$TMP_ROOT/libsofthsm2.so"; chmod 0755 "$TMP_ROOT/libsofthsm2.so"
 install -o root -g ci -m 0440 /dev/null "$TMP_ROOT/pkcs11.pin"; printf '1234\n' > "$TMP_ROOT/pkcs11.pin"
+# Developer model, as for the TPM above: the control has ci create a new
+# KEK in the token, which under production only root may do. The model
+# governs who administers KEKs and whose key files are trusted, not where
+# the module and PIN may live, so the refusals below are unaffected.
 pkcs11_policy() { # pkcs11_policy <module> <pin file>
-    printf '[selection]\nmode = "require"\nprovider = "pkcs11"\n\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' \
+    printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "pkcs11"\n\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' \
         "$1" "$2" > /etc/hkdfguard/policy.toml
 }
 pkcs11_policy "$SOFTHSM_MODULE" /etc/hkdfguard/pkcs11.pin
@@ -532,6 +544,13 @@ done
 rm -rf "$RW_MOUNT" "$KEYS/ro.dek" "$KEYS/ro.key"
 
 rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS" "$KEYS"
+
+section "the production security model: who may provision, wrap and unwrap"
+# A release build, with no policy but the script's own (production), and
+# throwaway deployer and application accounts.
+mkdir -p /etc/hkdfguard
+LD_LIBRARY_PATH="$PWD/target/release" scripts/verify-roles.sh target/release/hkdfguard /tmp/cli_unwrap_check
+rm -rf /etc/hkdfguard
 
 section "hkdfguard locks its memory when it can"
 # docker/run-tests.sh and CI grant CAP_IPC_LOCK, so the CLI must take the

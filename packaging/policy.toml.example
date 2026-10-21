@@ -27,6 +27,44 @@
 # The library re-reads this file on every call: changes take effect
 # without restarting the service.
 
+# The security model: "production" (the default, with or without this
+# file) or "developer". Any other value -- "development" included -- makes
+# the policy invalid. Production splits the duties:
+#   security admin    root: `hkdfguard provision` and `retire`. The library
+#                     creates a KEK that doesn't exist yet only for root;
+#                     anyone else gets the existing one, or
+#                     HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18). An ephemeral
+#                     KEK is exempt: it lives only in its own process.
+#                     On PKCS#11 this is enforced directly; external-secret
+#                     never creates a KEK. On TPM2 it gates nothing unless
+#                     tpm.require_pinned_names = true (the TPM otherwise
+#                     derives a KEK for any service on demand): set it on
+#                     production TPM hosts, so that only root's provision
+#                     and policy edit provision a service.
+#   deployment admin  root, or a deployer: `hkdfguard wrap`.
+#   application       anyone else: unwraps, but cannot persist a key file
+#                     hkdfguard_open_file would accept.
+# hkdfguard_open_file trusts a key file, and each directory above it, only
+# if root or a deployer owns it, and lets its group write it only if that
+# group is a deployer group. Developer: anyone who can reach the provider
+# may create a KEK, and key files owned by root or the calling user are
+# trusted (no group may write them); reading one is audited (event 1005)
+# once per process. Wrapping and unwrapping are the same in both models.
+# Must stay above the first [table] header, or the file is rejected.
+#security_model = "production"
+
+# Under production, the deployers are the direct members of the group
+# hkdfguard-deployers (the packages create it) and of each group named
+# here: listed in the group's member list, or having it as their primary
+# group. Names, not gids (an all-digit name is rejected), each listed once.
+# A group that doesn't exist, can't be looked up, or is over-broad (root,
+# users, nogroup, nobody, wheel, sudo, adm, staff, gid 0 or 65534) fails
+# every key-file read with HKDFGUARD_ERR_LINUX_GROUP_INVALID (-80).
+# Membership is looked up on every call (through NSS, so LDAP and sssd
+# groups count): removing a deployer makes their key files untrusted at
+# once. Ignored under developer. Must stay above the first [table] header.
+#deployer_groups = ["payments-deployers"]
+
 # Which providers may be used, and in what order, under mode = "prefer".
 # A provider left out of the list is never used. This is also the only way
 # to allow ephemeral (keys held in process memory, lost on restart): name

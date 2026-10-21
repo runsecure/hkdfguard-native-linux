@@ -76,13 +76,16 @@ RUN set -eu; \
 #
 # The container itself still starts as root: docker/entrypoint-test.sh
 # installs root-owned configuration under /etc/hkdfguard, exactly as a
-# deployment would, and runs everything else as `ci` (setpriv). `ci` owns
+# deployment would, and runs everything else as `ci` (setpriv). `ci` is a
+# deployer (hkdfguard-deployers, as the packages create it), so with no
+# policy file -- the production security model -- it may still `wrap`. `ci` owns
 # the source tree, the cargo registry cache, and its own SoftHSM2 token
 # store, and /work itself: `COPY --chown` below changes only what it copies,
 # not a directory that already exists, so without this `ci` can't create
 # target/ there.
 RUN groupadd --force tss \
-    && useradd --create-home --groups tss ci \
+    && groupadd --force --system hkdfguard-deployers \
+    && useradd --create-home --groups tss,hkdfguard-deployers ci \
     && chown -R ci:ci "$CARGO_HOME" \
     && install -d -o ci -g ci -m 0700 /home/ci/softhsm-tokens \
     && install -d -o ci -g ci /work \

@@ -78,6 +78,7 @@ pub(crate) const DEK_UNWRAPPED: u32 = 1003;
 // deletes a KEK. A Warning, as every DEK wrapped under it is now
 // unrecoverable.
 pub(crate) const KEK_RETIRED: u32 = 1004;
+pub(crate) const DEVELOPER_MODEL_KEY_FILE: u32 = 1005;
 pub(crate) const ACCESS_DENIED: u32 = 2000;
 pub(crate) const KEK_INVALID: u32 = 2002;
 pub(crate) const INTEGRITY_FAILURE: u32 = 2003;
@@ -171,7 +172,12 @@ pub(crate) fn dek_operation(op: Op, service: &str, payload: &[u8]) {
 /// could be reached at all.
 pub(crate) fn operation_failed(op: Op, service: &str, code: i32) {
     let (event, severity, meaning) = match code {
-        status::KEK_ACCESS_DENIED => (ACCESS_DENIED, Severity::Warning, "the caller is not authorized to use this KEK"),
+        status::KEK_ACCESS_DENIED => (
+            ACCESS_DENIED,
+            Severity::Warning,
+            "the caller is not authorized to do this to the KEK (under the production security model, only root \
+             creates or retires one)",
+        ),
         status::KEK_INVALID => (
             KEK_INVALID,
             Severity::Error,
@@ -191,7 +197,7 @@ pub(crate) fn operation_failed(op: Op, service: &str, code: i32) {
             };
             (INTEGRITY_FAILURE, Severity::Warning, meaning)
         }
-        status::POLICY_INVALID => (
+        status::POLICY_INVALID | status::LINUX_GROUP_INVALID => (
             POLICY_INVALID,
             Severity::Error,
             "the policy file can't be trusted or used; every call fails closed until it is fixed",
@@ -229,6 +235,26 @@ pub(crate) fn plaintext_key_file(path: &Path) {
         "the file looks like an unwrapped DEK (32 raw bytes, or its base64 or hex), so it may be a plaintext key \
          written to disk by mistake; none of its contents were returned. Treat that key as exposed: find out how \
          the file was written, remove it, and re-mint the DEK",
+    );
+}
+
+/// hkdfguard_open_file accepted `path` under the developer security model,
+/// which trusts key files the application's own account owns -- so the
+/// application could have planted it. Written once per process (the first
+/// such file named), as the Windows build's event 1005 is: a reminder that
+/// this host is not running the production model, not a per-read record.
+pub(crate) fn developer_model_key_file(path: &Path) {
+    static WRITTEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WRITTEN.set(()).is_err() {
+        return;
+    }
+    emit(
+        Severity::Warning,
+        DEVELOPER_MODEL_KEY_FILE,
+        &format!("op={} security_model=developer path={}", Op::OpenFile.name(), quote(path.as_os_str().as_bytes())),
+        "a key file was read under the developer security model, which trusts key files owned by the calling \
+         account: an application could plant a DEK it knows. Set security_model = \"production\" (or remove it) \
+         in /etc/hkdfguard/policy.toml on any host that is not a development machine (logged once per process)",
     );
 }
 
@@ -320,6 +346,7 @@ fn code_name(code: i32) -> &'static str {
         status::KEK_INVALID => "KEK_INVALID",
         status::PROCESS_HARDENING_FAILED => "PROCESS_HARDENING_FAILED",
         status::FILE_PLAINTEXT_KEY => "FILE_PLAINTEXT_KEY",
+        status::LINUX_GROUP_INVALID => "LINUX_GROUP_INVALID",
         _ => "UNKNOWN",
     }
 }
