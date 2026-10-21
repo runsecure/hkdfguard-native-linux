@@ -465,8 +465,12 @@ expect_sticky_refusal "the TPM derivation secret" as_ci $CLI provision -sn $STIC
 # PIN file (root:ci 0440), each with the other in its trusted place.
 cp "$SOFTHSM_MODULE" "$TMP_ROOT/libsofthsm2.so"; chmod 0755 "$TMP_ROOT/libsofthsm2.so"
 install -o root -g ci -m 0440 /dev/null "$TMP_ROOT/pkcs11.pin"; printf '1234\n' > "$TMP_ROOT/pkcs11.pin"
+# Developer model, as for the TPM above: the control has ci create a new
+# KEK in the token, which under production only root may do. The model
+# governs who administers KEKs and whose key files are trusted, not where
+# the module and PIN may live, so the refusals below are unaffected.
 pkcs11_policy() { # pkcs11_policy <module> <pin file>
-    printf '[selection]\nmode = "require"\nprovider = "pkcs11"\n\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' \
+    printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "pkcs11"\n\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' \
         "$1" "$2" > /etc/hkdfguard/policy.toml
 }
 pkcs11_policy "$SOFTHSM_MODULE" /etc/hkdfguard/pkcs11.pin
