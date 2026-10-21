@@ -105,7 +105,7 @@ const UNCOMPRESSED_POINT_LEN: usize = 65; // SEC1 uncompressed P-256 point: 1 ta
 // salt || counter)`, taking the first counter whose `X` is a valid P-256
 // x-coordinate, with the even-`Y` sign byte. Roughly half of all
 // candidates are on the curve, so the loop terminates within a few
-// iterations and 256 attempts failing has probability 2^-256. It is not
+// iterations and all 255 attempts failing has probability 2^-255. It is not
 // constant-time, and need not be: the salt is public. P-256 has cofactor
 // 1, so any point that decompresses is in the prime-order group; there
 // is no small-subgroup concern.
@@ -878,6 +878,16 @@ mod tests {
         // drop: sha2's `zeroize` feature. Without it this stops compiling.
         fn wipes_on_drop<T: sha2::digest::zeroize::ZeroizeOnDrop>() {}
         wipes_on_drop::<Sha256>();
+    }
+
+    #[test]
+    fn aes_gcm_wipes_its_key_schedule_on_drop() {
+        // `wrap`/`unwrap` zeroize the wrapping key, but the cipher built from
+        // it holds an expanded copy (AES round keys and the GHASH key) until
+        // it drops: aes-gcm's `zeroize` feature is what wipes that copy.
+        // Without it this stops compiling.
+        fn wipes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wipes_on_drop::<Aes256Gcm>();
     }
 
     #[test]

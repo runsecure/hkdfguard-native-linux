@@ -537,6 +537,15 @@ another's DEK is that it can't read the other's wrapped key files. Wrapped
 files are meant to be storable openly (in backups, for example), so treat
 this as defence in depth, not a hard boundary.
 
+The same holds for any file above that a group can read: every member of
+that group holds the key it protects, not just read access to a file. An
+external secret *is* the KEK's private key, so whoever can read it can
+unwrap the service's payloads and wrap new ones, from any host and
+indefinitely. A `root:<group> 0440` external secret makes every account in
+that group (or every container in the pod's `fsGroup`) a holder of that
+service's KEK. Give each service its own group, or deliver the secret
+uid-scoped (`0400`, for example through systemd `LoadCredential=`).
+
 ## Policy reference
 
 Every setting, with its default. Only `[selection]` is required.
