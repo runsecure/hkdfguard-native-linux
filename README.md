@@ -42,7 +42,7 @@ For installing, configuring and using HKDFGuard on a host:
 
 - [Installation](docs/installation.md): packages, standalone tarball, container overlay, verifying downloads
 - [Configuration](docs/configuration.md): `/etc/hkdfguard/policy.toml`, setting up each provider, example policies, permissions
-- [Usage](docs/usage.md): the deployment workflow, the CLI, the C API, linking, running as a service
+- [Usage](docs/usage.md): the deployment workflow, the CLI, the C API, linking, the application's account
 - [Troubleshooting](docs/troubleshooting.md): finding out why a call fails, and what each error means
 - [Why ECDH](docs/why-ecdh.md): why keys are wrapped with ECDH against a hashed point, and the forgery attack that rules out ECIES
 
@@ -146,7 +146,7 @@ cross-platform caller can pass it everywhere. Unknown flag bits return
 The `hkdfguard` command always calls it, and refuses to run if it fails.
 The CLI also locks its memory out of swap with `mlockall`, but only when
 the process has `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK` (root, or
-`LimitMEMLOCK=infinity`). Under a finite limit, locking future
+`ulimit -l unlimited`). Under a finite limit, locking future
 allocations could make one fail and abort the CLI mid-operation. In that
 case it locks only the one small buffer that holds its copies of the DEK
 (the base64 text it reads and the bytes that decodes to) with `mlock`, which

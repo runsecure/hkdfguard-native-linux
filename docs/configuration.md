@@ -96,7 +96,7 @@ belongs to the `tss` group:
 
 ```sh
 ls -l /dev/tpmrm0                      # crw-rw---- tss tss ...
-sudo usermod -aG tss <service-user>    # or SupplementaryGroups=tss in a systemd unit
+sudo usermod -aG tss <service-user>
 ```
 
 **2. Create the derivation secret.** Without it, any process that can open
@@ -527,7 +527,7 @@ A practical layout for several services on one host:
 sudo groupadd --system hkdfguard        # may use the keys at all
 sudo chgrp hkdfguard /etc/hkdfguard/tpm.derivation-secret
 sudo chmod 0440 /etc/hkdfguard/tpm.derivation-secret
-# Each service runs as its own user, with SupplementaryGroups=tss hkdfguard,
+# Each service runs as its own user, in the tss and hkdfguard groups,
 # and its wrapped key files are group-owned by that service's own group.
 ```
 
