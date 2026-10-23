@@ -33,7 +33,9 @@
 //! An ephemeral key can only ever be used by the process that created it,
 //! so the `hkdfguard` CLI turns this provider off for itself
 //! ([`refuse_in_this_process`]): a key it created would be gone when it
-//! exits, and nothing it wrapped could ever be unwrapped.
+//! exits, and nothing it wrapped could ever be unwrapped. Nor does a key
+//! spread to a child: on Linux 4.14 and later the keys' page is marked
+//! `MADV_WIPEONFORK`, so a child created with `fork()` sees zeroes there.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // the traits/types this module implements
@@ -100,6 +102,21 @@ impl KeyPage {
                     format!(
                         "hkdfguard: could not exclude ephemeral key memory from core dumps (madvise: {}); \
                          core dumps are disabled for the process instead",
+                        std::io::Error::last_os_error()
+                    ),
+                );
+            }
+            // A forked child gets this page zero-filled rather than a copy of
+            // every ephemeral KEK, so a key never spreads to a second process
+            // that may later run less trusted code. Linux 4.14 and later.
+            // SAFETY: as above.
+            if unsafe { libc::madvise(base, len, libc::MADV_WIPEONFORK) } != 0 {
+                crate::provider::log_once(
+                    log::Level::Warn,
+                    format!(
+                        "hkdfguard: could not keep ephemeral key memory out of forked child processes \
+                         (madvise MADV_WIPEONFORK: {}; Linux 4.14 or later is needed); a child forked \
+                         from this process inherits a copy of its ephemeral keys",
                         std::io::Error::last_os_error()
                     ),
                 );
