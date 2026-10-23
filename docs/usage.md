@@ -66,7 +66,7 @@ What `provision` does depends on the provider:
 |---|---|
 | TPM | Derives the key on demand, so it reports "already provisioned", after deriving it and checking any pinned Name. With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
 | PKCS#11 | Generates the key pair on the token, once; later runs find it there and report "already provisioned". |
-| External secret | Checks the delivered file and that it holds a valid key: the file itself is the provisioning. |
+| External secret | Checks the delivered file, that it holds a valid key, and that its fingerprint matches any pin: the file itself is the provisioning. With `require_pinned_keys`, it fails for an unpinned service and prints the policy line for the mounted key. |
 | Ephemeral | Refused by the CLI, for `provision` and `wrap` alike: an ephemeral key lives only in the process that creates it, so the application must wrap its own DEKs. |
 
 `provision` also prints the KEK's fingerprint. Record it: `retire` asks

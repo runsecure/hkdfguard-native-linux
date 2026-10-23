@@ -28,6 +28,7 @@
 //! allow?
 
 use crate::error::{Error, Result};
+use crate::payload::FINGERPRINT_LEN;
 use crate::provider::ProviderType;
 use crate::security_model::SecurityModel;
 use serde::Deserialize;
@@ -232,6 +233,29 @@ struct ExternalSecretPolicy {
     /// only place looked at; when unset, the provider searches the
     /// conventional secret mounts.
     dir: Option<String>,
+    /// Expected KEK fingerprint, per service, as hex: SHA-256 of the
+    /// key's uncompressed SEC1 public point, the value `provision` prints
+    /// and every payload carries. One string, or a list of them while a
+    /// rotation is in progress. When a service has an entry here, a
+    /// mounted key with any other fingerprint is refused -- see
+    /// [`pinned_external_keys`] for why the mount checks alone don't catch
+    /// a substituted key.
+    #[serde(default)]
+    pinned_keys: BTreeMap<String, PinnedKeys>,
+    /// Make `pinned_keys` the provider's allowlist: a service with no pin
+    /// is treated as having no KEK, whatever is mounted for it. Default
+    /// `false`, so existing deployments keep working until they pin.
+    #[serde(default)]
+    require_pinned_keys: bool,
+}
+
+/// One `external_secret.pinned_keys` entry: a single fingerprint, or
+/// several (old and new, during a rotation).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PinnedKeys {
+    One(String),
+    Several(Vec<String>),
 }
 
 /// PKCS#11 provider settings (`[pkcs11]`).
@@ -445,6 +469,18 @@ fn parse_tpm_name(field: &str, hex: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// Decodes a policy-supplied KEK fingerprint (SHA-256, so 32 bytes).
+fn parse_kek_fingerprint(field: &str, hex: &str) -> Result<[u8; FINGERPRINT_LEN]> {
+    let bytes = parse_hex(hex)
+        .ok_or_else(|| Error::Policy(format!("hkdfguard policy: {field} is not valid hex")))?;
+    bytes.as_slice().try_into().map_err(|_| {
+        Error::Policy(format!(
+            "hkdfguard policy: {field} is {} bytes, expected {FINGERPRINT_LEN} (a SHA-256 KEK fingerprint)",
+            bytes.len()
+        ))
+    })
+}
+
 // Decodes an even-length hex string. Returns `None` on any non-hex
 // character or odd length.
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
@@ -576,6 +612,9 @@ pub struct Policy {
     tpm_derivation_secret_file: Option<PathBuf>,
     tpm_owner_auth_file: Option<PathBuf>,
     external_secret_dir: Option<PathBuf>,
+    require_external_pinned_keys: bool,
+    /// Normalized service name -> every KEK fingerprint accepted for it.
+    pinned_external_keys: BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>,
     pkcs11: Pkcs11Settings,
     audit_unwrap_success: bool,
 }
@@ -745,6 +784,37 @@ impl Policy {
             .as_deref()
             .map(|d| absolute_path("external_secret.dir", d))
             .transpose()?;
+        // Pinned external-secret fingerprints: decoded and checked up front,
+        // with service keys normalized, as for the TPM pins above.
+        let mut pinned_external_keys = BTreeMap::new();
+        for (service, pins) in &raw.external_secret.pinned_keys {
+            let field = format!("external_secret.pinned_keys[\"{service}\"]");
+            let hexes = match pins {
+                PinnedKeys::One(hex) => std::slice::from_ref(hex),
+                PinnedKeys::Several(hexes) => hexes.as_slice(),
+            };
+            if hexes.is_empty() {
+                return Err(Error::Policy(format!(
+                    "hkdfguard policy: {field} is an empty list; remove the entry to unpin the service"
+                )));
+            }
+            let mut fingerprints = Vec::with_capacity(hexes.len());
+            for hex in hexes {
+                let fingerprint = parse_kek_fingerprint(&field, hex)?;
+                if fingerprints.contains(&fingerprint) {
+                    return Err(Error::Policy(format!("hkdfguard policy: {field} lists the same fingerprint more than once")));
+                }
+                fingerprints.push(fingerprint);
+            }
+            if pinned_external_keys
+                .insert(crate::normalize_service(service), fingerprints)
+                .is_some()
+            {
+                return Err(Error::Policy(format!(
+                    "hkdfguard policy: external_secret.pinned_keys lists \"{service}\" more than once (names are compared case-insensitively)"
+                )));
+            }
+        }
         let pkcs11 = Pkcs11Settings {
             module: raw.pkcs11.module.as_deref().map(|m| absolute_path("pkcs11.module", m)).transpose()?,
             pin_file: raw.pkcs11.pin_file.as_deref().map(|f| absolute_path("pkcs11.pin_file", f)).transpose()?,
@@ -768,6 +838,8 @@ impl Policy {
             tpm_derivation_secret_file,
             tpm_owner_auth_file,
             external_secret_dir,
+            require_external_pinned_keys: raw.external_secret.require_pinned_keys,
+            pinned_external_keys,
             pkcs11,
             audit_unwrap_success: raw.audit.unwrap_success,
         })
@@ -797,6 +869,20 @@ impl Policy {
     /// The external-secret directory (`external_secret.dir`), if policy sets one.
     pub fn external_secret_dir(&self) -> Option<&std::path::Path> {
         self.external_secret_dir.as_deref()
+    }
+
+    /// Whether the external-secret provider treats only pinned services as
+    /// provisioned (`external_secret.require_pinned_keys`).
+    pub fn require_external_pinned_keys(&self) -> bool {
+        self.require_external_pinned_keys
+    }
+
+    /// The KEK fingerprints policy accepts for `service`'s external secret,
+    /// if it pins any.
+    pub fn pinned_external_keys(&self, service: &str) -> Option<&[[u8; FINGERPRINT_LEN]]> {
+        self.pinned_external_keys
+            .get(&crate::normalize_service(service))
+            .map(|v| v.as_slice())
     }
 
     /// The PKCS#11 settings (`[pkcs11]`).
@@ -1199,6 +1285,41 @@ pub(crate) fn external_secret_dir() -> Result<Option<PathBuf>> {
         Some(Ok(policy)) => Ok(policy.external_secret_dir().map(std::path::Path::to_path_buf)),
         Some(Err(e)) => Err(e),
         None => Ok(None),
+    }
+}
+
+/// The KEK fingerprints policy accepts for `service`'s external secret
+/// (`external_secret.pinned_keys`), if any.
+///
+/// The mount checks in the external-secret provider establish *who* could
+/// have written the file -- root, this service's user, or anything with a
+/// read-write mount of the same volume (a sidecar, a shared `emptyDir`) --
+/// not *which* key it holds. Any of those writers can put a well-formed
+/// key of its own there, in time for the first `provision` or wrap. A
+/// fingerprint recorded when the key was generated, in the root-owned
+/// policy, is what makes that substitution detectable.
+///
+/// `Err` when a policy file exists but can't be trusted -- pinning must
+/// fail closed rather than silently degrade to "nothing pinned".
+#[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
+pub(crate) fn pinned_external_keys(service: &str) -> Result<Option<Vec<[u8; FINGERPRINT_LEN]>>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.pinned_external_keys(service).map(<[_]>::to_vec)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// Whether the external-secret provider only serves services whose key is
+/// pinned (`external_secret.require_pinned_keys`). No policy file →
+/// `false`. A policy file that exists but is invalid → `true`: a broken
+/// policy must never be what widens the set of keys the provider accepts.
+#[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
+pub(crate) fn require_external_pinned_keys() -> bool {
+    match load() {
+        Some(Ok(policy)) => policy.require_external_pinned_keys(),
+        Some(Err(_)) => true,
+        None => false,
     }
 }
 
@@ -1959,6 +2080,72 @@ mod tests {
         }
     }
 
+    // ---- external_secret.pinned_keys / external_secret.require_pinned_keys ----
+
+    const A_FINGERPRINT: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const B_FINGERPRINT: &str = "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
+
+    #[test]
+    fn external_pins_default_to_none_and_the_allowlist_to_off() {
+        let policy = Policy::from_toml_str("[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"/run/secrets/hkdfguard\"\n").unwrap();
+        assert!(!policy.require_external_pinned_keys(), "the allowlist must be opt-in");
+        assert_eq!(policy.pinned_external_keys("com.company.orders"), None);
+
+        let policy = Policy::from_toml_str("[selection]\nmode = \"prefer\"\n[external_secret]\nrequire_pinned_keys = true\n").unwrap();
+        assert!(policy.require_external_pinned_keys(), "on with no pins yet: the first step of rolling it out");
+    }
+
+    #[test]
+    fn external_pins_take_one_fingerprint_or_a_list_and_match_case_insensitively() {
+        let doc = format!(
+            "[selection]\nmode = \"prefer\"\n[external_secret.pinned_keys]\n\"com.company.Orders\" = \"{A_FINGERPRINT}\"\n\
+             \"com.company.billing\" = [\"{A_FINGERPRINT}\", \"{}\"]\n",
+            B_FINGERPRINT.to_ascii_uppercase()
+        );
+        let policy = Policy::from_toml_str(&doc).unwrap();
+
+        let orders = policy.pinned_external_keys("COM.COMPANY.ORDERS").expect("pinned");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0][0], 0x01);
+        assert_eq!(orders[0][FINGERPRINT_LEN - 1], 0x20);
+
+        let billing = policy.pinned_external_keys("com.company.billing").expect("pinned");
+        assert_eq!(billing.len(), 2, "both halves of a rotation");
+        assert_eq!(billing[1][0], 0x21, "upper-case hex decodes too");
+
+        assert_eq!(policy.pinned_external_keys("com.company.other"), None);
+    }
+
+    #[test]
+    fn external_pins_reject_malformed_entries() {
+        for entry in [
+            "\"com.company.orders\" = \"nothex\"".to_string(),
+            "\"com.company.orders\" = \"0102\"".to_string(), // too short
+            format!("\"com.company.orders\" = \"{A_FINGERPRINT}21\""), // one byte too long
+            format!("\"com.company.orders\" = \"{A_FINGERPRINT}\"\n\"com.company.ORDERS\" = \"{B_FINGERPRINT}\""), // duplicate after normalization
+            format!("\"com.company.orders\" = [\"{A_FINGERPRINT}\", \"{A_FINGERPRINT}\"]"), // same fingerprint twice
+            "\"com.company.orders\" = []".to_string(),
+            "\"com.company.orders\" = 7".to_string(),
+            format!("com.company.orders = \"{A_FINGERPRINT}\""), // unquoted: a dotted key, nested tables
+        ] {
+            let doc = format!("[selection]\nmode = \"prefer\"\n[external_secret.pinned_keys]\n{entry}\n");
+            assert!(Policy::from_toml_str(&doc).is_err(), "{entry:?} must be rejected");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn external_pin_helpers_without_a_policy_file_and_with_a_broken_one() {
+        {
+            let _no_policy = TestPolicy::absent();
+            assert!(!require_external_pinned_keys(), "no policy must not make the provider refuse every service");
+            assert_eq!(pinned_external_keys("com.company.orders").unwrap(), None);
+        }
+        let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\n"); // missing `provider`
+        assert!(require_external_pinned_keys(), "a broken policy must fail closed to the allowlist");
+        assert!(pinned_external_keys("com.company.orders").is_err(), "a broken policy must not report 'nothing pinned'");
+    }
+
     #[test]
     fn unknown_key_in_the_tpm_section_is_rejected() {
         let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_drivation_secret = true\n"; // typo
@@ -2328,7 +2515,7 @@ mod tests {
     fn the_policies_in_docs_configuration_md_are_valid() {
         // docs/configuration.md is what operators copy from. Every complete
         // example policy there must validate as written (placeholder TPM
-        // Names swapped for well-formed ones); every other block with a
+        // Names and KEK fingerprints swapped for well-formed ones); every other block with a
         // [selection] -- the reference, which lists every key at once --
         // must at least be valid TOML using only known keys.
         let doc = include_str!("../docs/configuration.md");
@@ -2347,7 +2534,7 @@ mod tests {
             }
             let line = doc[..body_start].lines().count();
             if (examples_start..examples_end).contains(&body_start) {
-                let policy = body.replace("000b<64 hex chars>", &dummy_name);
+                let policy = body.replace("000b<64 hex chars>", &dummy_name).replace("<64 hex chars>", &"00".repeat(32));
                 if let Err(e) = Policy::from_toml_str(&policy) {
                     panic!("docs/configuration.md line {line}: example policy is invalid: {e}");
                 }

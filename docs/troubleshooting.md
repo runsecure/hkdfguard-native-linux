@@ -122,6 +122,8 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `resolves to ..., outside the secret mount` | A symlink points out of the mount. Deliver the file inside it. |
 | `directory ...: writable by group or others (mode ...)` | The mount, or a directory above it or above the resolved file, can be changed by others -- a sticky one (`/tmp`) included. Mount the secrets read-only (as Kubernetes does), or somewhere only root or the service can write, up to `/`. |
 | `external secret is not a valid P-256 key (expected 32 raw bytes, PKCS#8 DER or SEC1 DER; PEM must be converted to DER)` | The file isn't one of the accepted forms. Most often it's PEM (text starting `-----BEGIN`): convert it with `openssl pkey -in key.pem -outform DER -out key.der`. Or the key is for another curve: only P-256 is accepted. |
+| `the external secret for this service has fingerprint ..., which is not the one pinned in policy` | The mounted key isn't the one `external_secret.pinned_keys` names. Either something else wrote the mount (check every container that mounts the volume read-write), or the key was rotated without adding its fingerprint first. Pin the new fingerprint only once you've confirmed where the key came from. |
+| `external_secret.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[external_secret.pinned_keys]`. Compare the printed fingerprint with the one you computed when generating the key, then add the line. |
 | A configured `external_secret.dir` is missing | The mount isn't there yet (a volume not attached, a sidecar not ready). Fix the mount; the library won't use another provider in the meantime. |
 
 ## No KEK for the service (-17)

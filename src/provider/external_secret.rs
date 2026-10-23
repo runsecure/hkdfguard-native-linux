@@ -63,8 +63,24 @@
 //! Kubernetes `defaultMode: 0400` (`0440` with `fsGroup` for a non-root
 //! pod), Vault Agent `perms = "0400"`, Docker Swarm `mode: 0400`; systemd
 //! `LoadCredential=` is already `0400`.
+//!
+//! ## Pinning
+//!
+//! The rules above limit *who* could have written the file: root, this
+//! service's user, or whatever else mounts the same volume read-write (a
+//! secrets sidecar, a shared `emptyDir`). They say nothing about *which*
+//! key it holds, and any of those writers can mount a valid key of its own
+//! before the real one arrives. With `external_secret.pinned_keys` naming
+//! a service, the key's fingerprint (SHA-256 of its public point, see
+//! [`crate::crypto::kek_fingerprint`]) must be one of the pinned values, or
+//! the key is refused -- an error, never "not provisioned". With
+//! `external_secret.require_pinned_keys`, a service with no pin has no KEK
+//! here, whatever is mounted for it; `provision` then reports the mounted
+//! key's fingerprint and the policy line that would accept it.
 
+use crate::crypto::kek_fingerprint; // the fingerprint every payload carries, and policy pins
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
+use crate::payload::FINGERPRINT_LEN;
 use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
 use crate::secure_file::{open_checked, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_ACCESS}; // descriptor-based trust checks and a self-wiping read buffer
 use elliptic_curve::pkcs8::DecodePrivateKey; // lets `SecretKey` parse from PKCS#8 DER (SEC1 DER is an inherent method)
@@ -178,15 +194,25 @@ impl KekProvider for ExternalSecretProvider {
         let Some(dir) = self.dir.as_ref() else {
             return Ok(false); // no mount at all
         };
-        Ok(read_key(dir, service)?.is_some()) // the parsed key drops (and zeroizes) here
+        let pins = service_pins(service)?;
+        if matches!(pins, Pins::Unpinned) {
+            return Ok(false); // the allowlist is on and this service isn't on it
+        }
+        match read_key(dir, service)? {
+            Some(key) => {
+                check_pins(&key, &pins)?;
+                Ok(true)
+            } // the parsed key drops (and zeroizes) here
+            None => Ok(false),
+        }
     }
 
-    // `create_if_missing` is deliberately ignored: this provider never
-    // creates or writes a secret (see the module-level doc comment) --
-    // whether the caller wanted to create one or only load an existing
-    // one, the answer when nothing is provisioned is the same
-    // `KeyNotProvisioned` decline either way.
-    fn load_kek(&self, service: &str, _create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
+    // This provider never creates or writes a secret (see the module-level
+    // doc comment), so `create_if_missing` never changes what is loaded.
+    // It only decides what an unpinned service under
+    // `require_pinned_keys` gets: a caller provisioning the service is told
+    // the fingerprint to pin; one only loading gets the decline.
+    fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
         self.check_not_refused()?;
         if !is_safe_file_name(service) {
             return Err(Error::Provider(
@@ -198,9 +224,22 @@ impl KekProvider for ExternalSecretProvider {
             .as_ref()
             .ok_or(Error::KeyNotProvisioned("no external secret mount found"))?; // no mount at all -> decline immediately
 
+        let pins = service_pins(service)?;
+        if matches!(pins, Pins::Unpinned) && !create_if_missing {
+            return Err(Error::KeyNotProvisioned(
+                "external_secret.require_pinned_keys is set and policy pins no key for this service",
+            ));
+        }
         let secret_key = read_key(dir, service)?.ok_or(Error::KeyNotProvisioned(
             "no secret file provisioned for this service", // mount exists, but nothing provisioned for this service yet
         ))?;
+        if matches!(pins, Pins::Unpinned) {
+            // Provisioning here means a root-owned policy edit, which this
+            // process can't make itself. Do the part it can: report the
+            // fingerprint of the key that is mounted, ready to pin.
+            return Err(Error::Provider(unpinned_service_instructions(service, &secret_key)));
+        }
+        check_pins(&secret_key, &pins)?;
         let key_id = format!("external:{service}").into_bytes();
 
         Ok(Box::new(ExternalSecretHandle {
@@ -230,6 +269,66 @@ fn read_key(mount: &Path, service: &str) -> Result<Option<SecretKey>> {
     let parsed = parse_secret_key(bytes.as_slice());
     bytes.wipe(); // the raw bytes have served their only purpose -- clear them now, on success *and* failure, before propagating anything
     parsed.map(Some)
+}
+
+/// What policy accepts as `service`'s key.
+enum Pins {
+    /// No pin, and no allowlist: any key the file checks accept.
+    Any,
+    /// A key with one of these fingerprints, and no other.
+    OneOf(Vec<[u8; FINGERPRINT_LEN]>),
+    /// No pin, under `require_pinned_keys`: no key at all.
+    Unpinned,
+}
+
+/// Looks up `service`'s pins. A policy file that exists but is broken
+/// fails closed: the pin lookup errors rather than reporting none.
+fn service_pins(service: &str) -> Result<Pins> {
+    if let Some(fingerprints) = crate::policy::pinned_external_keys(service)? {
+        return Ok(Pins::OneOf(fingerprints));
+    }
+    if crate::policy::require_external_pinned_keys() {
+        return Ok(Pins::Unpinned);
+    }
+    Ok(Pins::Any)
+}
+
+/// Refuses `key` unless its fingerprint is one `pins` accepts. A mismatch
+/// is an error, not "not provisioned": something put a valid key that
+/// isn't the administrator's where the KEK belongs, and the chain must not
+/// move on to another provider as if nothing were there.
+fn check_pins(key: &SecretKey, pins: &Pins) -> Result<()> {
+    let Pins::OneOf(accepted) = pins else {
+        return Ok(());
+    };
+    let fingerprint = kek_fingerprint(&key.public_key());
+    if accepted.contains(&fingerprint) {
+        return Ok(());
+    }
+    let accepted: Vec<String> = accepted.iter().map(|f| hex(f)).collect();
+    Err(Error::Provider(format!(
+        "the external secret for this service has fingerprint {}, which is not the one pinned in policy \
+         (external_secret.pinned_keys: {})",
+        hex(&fingerprint),
+        accepted.join(", ")
+    )))
+}
+
+/// The message `provision` gets for an unpinned service under
+/// `external_secret.require_pinned_keys`: the mounted key's fingerprint, in
+/// the form to paste into policy. The fingerprint and service name are both
+/// public, so the message carries them as-is.
+fn unpinned_service_instructions(service: &str, key: &SecretKey) -> String {
+    let fingerprint = hex(&kek_fingerprint(&key.public_key()));
+    format!(
+        "external_secret.require_pinned_keys is set and service \"{service}\" has no pinned key. The key \
+         mounted for it has fingerprint {fingerprint}. If that is the key you generated, add this to the \
+         policy file and run provision again:\n  [external_secret.pinned_keys]\n  \"{service}\" = \"{fingerprint}\""
+    )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // Largest secret file accepted. A PKCS#8 DER P-256 key is ~138 bytes and
@@ -805,6 +904,131 @@ mod tests {
         if !CANDIDATE_MOUNTS.iter().any(|m| Path::new(m).is_dir()) {
             assert_eq!(resolve_dir(), Backend::Absent);
         }
+    }
+
+    fn fingerprint_hex(key: &SecretKey) -> String {
+        hex(&kek_fingerprint(&key.public_key()))
+    }
+
+    // Layers `[external_secret.pinned_keys]` / `require_pinned_keys` over
+    // the mount `with_dir` configured.
+    fn pin_policy(require: bool, pins: &str) -> crate::policy::test_support::TestPolicy {
+        crate::policy::test_support::TestPolicy::write(&format!(
+            "[external_secret]\nrequire_pinned_keys = {require}\n[external_secret.pinned_keys]\n{pins}\n"
+        ))
+    }
+
+    #[test]
+    #[serial]
+    fn a_pinned_key_loads_and_any_other_key_is_refused() {
+        with_dir(|provider, dir| {
+            let real = SecretKey::generate();
+            let _policy = pin_policy(false, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&real)));
+
+            provision(dir, "com.company.orders", real.to_bytes());
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+            let handle = provider.load_kek("com.company.orders", false).unwrap();
+            assert_eq!(handle.public_key().unwrap(), real.public_key());
+
+            // A well-formed key, correctly owned and moded -- what a writer
+            // sharing the volume could mount first -- is still refused, and
+            // as an error, so the chain doesn't move on to another provider.
+            let planted = SecretKey::generate();
+            provision(dir, "com.company.orders", planted.to_bytes());
+            for create_if_missing in [false, true] {
+                match provider.load_kek("com.company.orders", create_if_missing) {
+                    Err(Error::Provider(msg)) => {
+                        assert!(msg.contains("not the one pinned"), "{msg}");
+                        assert!(msg.contains(&fingerprint_hex(&planted)), "names the key it found: {msg}");
+                    }
+                    Err(other) => panic!("expected Provider(..pinned..), got {other:?}"),
+                    Ok(_) => panic!("a key that isn't the pinned one must be refused"),
+                }
+            }
+            assert!(provider.kek_exists("com.company.orders").is_err(), "an error, not absence");
+
+            // Pins are per service: an unpinned one is unaffected without the allowlist.
+            provision(dir, "com.company.billing", planted.to_bytes());
+            provider.load_kek("com.company.billing", false).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_list_of_pins_accepts_either_key_during_a_rotation() {
+        with_dir(|provider, dir| {
+            let old = SecretKey::generate();
+            let new = SecretKey::generate();
+            let _policy = pin_policy(
+                true,
+                &format!("\"com.company.orders\" = [\"{}\", \"{}\"]", fingerprint_hex(&old), fingerprint_hex(&new)),
+            );
+            for key in [&old, &new] {
+                provision(dir, "com.company.orders", key.to_bytes());
+                assert_eq!(provider.load_kek("com.company.orders", false).unwrap().public_key().unwrap(), key.public_key());
+            }
+            provision(dir, "com.company.orders", SecretKey::generate().to_bytes());
+            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Provider(_))));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn require_pinned_keys_serves_only_pinned_services_and_reports_the_pin_to_add() {
+        with_dir(|provider, dir| {
+            let pinned = SecretKey::generate();
+            let unpinned = SecretKey::generate();
+            let _policy = pin_policy(true, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&pinned)));
+            provision(dir, "com.company.orders", pinned.to_bytes());
+            provision(dir, "com.company.billing", unpinned.to_bytes());
+
+            provider.load_kek("com.company.orders", false).unwrap();
+
+            // Mounted but unpinned: no KEK here, for a load...
+            assert!(!provider.kek_exists("com.company.billing").unwrap());
+            assert!(matches!(provider.load_kek("com.company.billing", false), Err(Error::KeyNotProvisioned(_))));
+            // ...and, for `provision`, the line that would pin the mounted key.
+            match provider.load_kek("com.company.billing", true) {
+                Err(Error::Provider(msg)) => assert!(
+                    msg.contains(&format!("\"com.company.billing\" = \"{}\"", fingerprint_hex(&unpinned))),
+                    "paste-ready pin: {msg}"
+                ),
+                Err(other) => panic!("expected Provider(..instructions..), got {other:?}"),
+                Ok(_) => panic!("an unpinned service must not load under require_pinned_keys"),
+            }
+            // Nothing mounted at all: the ordinary decline, even when provisioning.
+            assert!(matches!(provider.load_kek("com.company.other", true), Err(Error::KeyNotProvisioned(_))));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn the_fingerprint_is_sha256_of_the_uncompressed_public_point() {
+        // What the documented OpenSSL pipeline computes:
+        //   openssl pkey -inform DER -pubout -outform DER | tail -c 65 | sha256sum
+        // The SEC1 DER below ends with that same 65-byte point.
+        use sha2::{Digest, Sha256};
+        with_dir(|provider, dir| {
+            let der = unhex(OPENSSL_P256_SEC1_DER);
+            let expected = hex(&Sha256::digest(&der[der.len() - 65..]));
+            let _policy = pin_policy(true, &format!("\"com.company.orders\" = \"{expected}\""));
+            provision(dir, "com.company.orders", &der);
+            provider.load_kek("com.company.orders", false).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_broken_policy_refuses_rather_than_dropping_the_pins() {
+        let mount = crate::secure_file::private_tempdir();
+        provision(mount.path(), "com.company.orders", SecretKey::generate().to_bytes());
+        let _secret_mount = crate::policy::test_support::secret_mount(mount.path());
+        let provider = ExternalSecretProvider::new();
+        // Read per call, so a policy that breaks after construction must
+        // still stop the pin check from being skipped.
+        let _broken = crate::policy::test_support::TestPolicy::exact("[selection]\nmode = \"require\"\n");
+        assert!(provider.kek_exists("com.company.orders").is_err());
+        assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Policy(_))));
     }
 
     #[test]

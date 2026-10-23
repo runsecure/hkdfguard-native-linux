@@ -261,22 +261,32 @@ Otherwise the first of these that exists:
 Each service's KEK is the file `<dir>/<service-name>`, e.g.
 `/run/secrets/hkdfguard/com.company.orders`.
 
-**The key file** holds a P-256 private key, as 32 raw bytes, or in DER
-form (PKCS#8 or SEC1):
+**The key file** holds a P-256 private key. Use DER, generated with
+OpenSSL:
 
 ```sh
-# A raw 32-byte private scalar:
-( umask 077; head -c 32 /dev/urandom > com.company.orders )
-
-# Or DER, straight from OpenSSL (this writes SEC1; PKCS#8 works too):
+# Generate the key (SEC1 DER), readable only by you:
 ( umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
     -outform DER -out com.company.orders )
+
+# Its fingerprint, to pin in policy (see "Pin each key's fingerprint" below):
+openssl pkey -inform DER -in com.company.orders -pubout -outform DER \
+    | tail -c 65 | sha256sum | cut -d' ' -f1
 ```
 
-PEM (text starting `-----BEGIN`) isn't accepted: convert it to DER first,
-with `openssl pkey -in key.pem -outform DER -out key.der`. A key for any
-curve other than P-256 is refused. `provision` reads and checks the key, so
-a wrong format is reported when you provision, not later.
+Run both on the machine where you create the key, then load the file into
+your secret store (Vault, AWS Secrets Manager, Google Secret Manager, Azure
+Key Vault, a Kubernetes Secret) and record the fingerprint in the policy.
+A DER file names its curve, so a key for the wrong curve is caught, and
+OpenSSL can compute its fingerprint without any other tool.
+
+PKCS#8 DER is accepted too, and so is a bare 32-byte private scalar, but
+use DER: OpenSSL can't read a bare scalar, so there is no simple way to
+fingerprint one before it is delivered. PEM (text starting `-----BEGIN`)
+isn't accepted: convert it with
+`openssl pkey -in key.pem -outform DER -out com.company.orders`. A key for
+any curve other than P-256 is refused. `provision` reads and checks the
+key, so a wrong format is reported when you provision, not later.
 
 **File rules.** The file must:
 - be owned by root or by the service's user, with no group or other access
@@ -303,6 +313,53 @@ the mode rule:
 
 A file that is present but breaks a rule is an **error**, never "not
 provisioned".
+
+**Pin each key's fingerprint.** The file rules limit who could have
+written the key: root, the service's user, or anything else that mounts
+the same volume read-write, such as a secrets sidecar or a shared
+`emptyDir`. They can't tell whether the key is the one you generated. Any
+of those writers can put a valid key of its own in the mount before the
+real one arrives, and the library would use it. Pinning closes that gap:
+
+```toml
+[external_secret]
+dir = "/vault/secrets/hkdfguard"
+require_pinned_keys = true           # a service with no pin has no KEK here
+
+[external_secret.pinned_keys]
+"com.company.orders"   = "<64 hex chars>"
+"com.company.payments" = ["<old 64 hex>", "<new 64 hex>"]   # a list while rotating
+```
+
+A key whose fingerprint isn't pinned for its service is refused, as an
+error, so the library never moves on to another provider. Without
+`require_pinned_keys`, services you haven't pinned work as before. Service
+names must be quoted, as in `[tpm.pinned_names]`.
+
+The fingerprint is the SHA-256 of the key's uncompressed public point. It's
+the same value `provision` prints, every wrapped payload carries, and
+`retire --fingerprint` takes. It isn't secret, so it can live in the policy
+file wherever that's kept. Compute it where you generate the key, before
+the key goes into your secret store:
+
+```sh
+openssl pkey -inform DER -in com.company.orders -pubout -outform DER \
+    | tail -c 65 | sha256sum | cut -d' ' -f1
+```
+
+`-pubout` writes the public key as a SubjectPublicKeyInfo structure, which
+ends with the 65-byte uncompressed point `04 || X || Y`; `tail -c 65` keeps
+just that point, and its SHA-256 is the fingerprint. The output is 64 hex
+characters, ready to paste into `pinned_keys`.
+
+With `require_pinned_keys` on, `provision` also refuses an unpinned service
+and prints the policy line for the key that is mounted. That tells you
+which key is in the mount now, not which key you generated, so use it to
+confirm the fingerprint you computed above, never in place of it.
+
+To rotate: add the new fingerprint to the service's list, deliver the new
+key, then remove the old fingerprint. DEKs wrapped under the old key need
+re-wrapping before the old key is gone, as with any KEK change.
 
 ### Ephemeral (development only)
 
@@ -375,6 +432,10 @@ provider = "external-secret"
 
 [external_secret]
 dir = "/run/secrets/hkdfguard"
+require_pinned_keys = true
+
+[external_secret.pinned_keys]
+"com.company.orders" = "<64 hex chars>"
 ```
 
 **Development: SoftHSM2, else ephemeral.** The policy in the `-dev` container
@@ -586,6 +647,10 @@ pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; required
 
 [external_secret]
 dir = "/run/secrets/hkdfguard"    # default: the first existing conventional mount
+require_pinned_keys = false       # true: only services in pinned_keys have a KEK here
+
+[external_secret.pinned_keys]
+"com.company.orders" = "<64 hex chars>"           # or a list of them, while rotating
 
 [pkcs11]
 module = "/usr/lib/vendor/libvendor-pkcs11.so"   # default: unset (PKCS#11 not used)
