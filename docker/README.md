@@ -146,6 +146,75 @@ The images run on the Docker host's native architecture; set
 `PLATFORM=linux/amd64` (or `linux/arm64`) to test the other one under
 QEMU emulation, which is much slower.
 
+## Test the external-secret provider on Kubernetes
+
+```sh
+docker/k8s/run-tests.sh         # keys delivered as Kubernetes Secret volumes
+docker/k8s/run-vault-tests.sh   # keys delivered by a Vault Agent sidecar
+```
+
+These run the external-secret provider against a real cluster, so the
+secret files are laid out by the kubelet and by Vault Agent themselves,
+not by a simulation. Neither suite is part of `docker/run-all-tests.sh` or
+CI: run them yourself before changing how the provider reads its mount, or
+how the docs tell operators to deliver and pin keys.
+
+**What you need**
+
+- `kubectl` pointing at a cluster that shares the local Docker engine's
+  images. Docker Desktop's built-in Kubernetes does: each script builds
+  `hkdfguard-k8s-test:local` from [`k8s/Dockerfile`](k8s/Dockerfile) and
+  runs it with `imagePullPolicy: Never`. A cluster with its own image
+  store (kind, minikube) won't find the image.
+- `openssl` on the machine running the script: keys are made and
+  fingerprinted there, with the commands
+  [docs/configuration.md](../docs/configuration.md#external-secret-file)
+  gives operators.
+- For the Vault suite: rights to create a ClusterRoleBinding (Vault needs
+  `system:auth-delegator` to check service-account tokens), and the
+  `hashicorp/vault:1.19.0` image, which the script pulls.
+- Bash. On Windows, Git Bash works; the scripts convert paths for
+  `kubectl.exe` and OpenSSL.
+
+**What a scenario does.** Each one is a Job. The script generates a P-256
+key (SEC1 DER) and computes its fingerprint, then delivers the key: as a
+Secret volume, or by storing it in a Vault dev server for a Vault Agent
+native sidecar to render into a shared `emptyDir`. It also creates the
+scenario's `policy.toml` as a ConfigMap, mounted read-only over
+`/etc/hkdfguard`, which is how a deployment would ship it. In the pod,
+[`k8s/pod-test.sh`](k8s/pod-test.sh) prints the policy and the mount's
+layout, then runs `hkdfguard provision`, wraps a fresh DEK with
+`hkdfguard wrap`, and unwraps it in a separate process through
+`libhkdfguard.so`. It ends with one `RESULT:` line.
+
+Most scenarios pin the delivered key (`require_pinned_keys = true`, with
+its fingerprint in `pinned_keys`), as the docs recommend. What the others
+vary:
+
+| Suite | Scenarios |
+|---|---|
+| Secret volume | the pod's user and `fsGroup`, and the Secret's `defaultMode` (`0400`, `0440`, `0444`); rotating the Secret while the pod runs; no pinning; pinning a different key; `require_pinned_keys` with no pin; `external_secret.dir` set to the mount, and set to a path that isn't mounted |
+| Vault Agent | the agent's user and the template's `perms`; a tmpfs or disk-backed `emptyDir`, mounted whole or as a private subdirectory; a root agent with `fsGroup`; a new key version in Vault mid-run; pinning a different key; a key **planted** in the shared directory, by a container running as the app's user, while the real key is still undelivered |
+
+Every Vault scenario sets `external_secret.dir = "/vault/secrets/hkdfguard"`,
+the configuration.md pinning example. The two planted-key scenarios are a
+pair: unpinned, the planted key is used, which shows the attack works;
+pinned, it is refused.
+
+**Reading the results.** Each scenario lists the `RESULT` it expects. For
+refusals that are the point of a scenario, it also lists a reason that must
+appear in the pod's output, such as `not the one pinned in policy`. A
+refusal for any other reason counts as a failure. The summary marks each
+scenario `as expected` or `UNEXPECTED`, and the exit code is the number of
+unexpected ones. The full pod output is printed above the summary, along
+with the Vault Agent's log when a pod reported no result.
+
+Each suite runs in its own namespace (`hkdfguard-k8stest`,
+`hkdfguard-vaulttest`), and the Vault suite also creates the
+ClusterRoleBinding `hkdfguard-vaulttest-tokenreview`. All of these are
+deleted when the script exits. The test image stays in the local
+Docker engine, and the next run rebuilds it.
+
 ## Build a distributable release
 
 ```sh

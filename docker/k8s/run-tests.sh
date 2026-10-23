@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs the external-secret provider against real Kubernetes Secret volumes,
-# on whatever cluster kubectl points at (Docker Desktop's built-in
-# Kubernetes, or kind). Each scenario is a Job whose pod mounts a Secret
+# on the cluster kubectl points at, which must share the local Docker
+# engine's images (Docker Desktop's built-in Kubernetes does; see below).
+# Each scenario is a Job whose pod mounts a Secret
 # holding a P-256 KEK (SEC1 DER, made and fingerprinted on this machine
 # with the OpenSSL commands docs/configuration.md gives) and a ConfigMap
 # holding the policy at /etc/hkdfguard, and runs docker/k8s/pod-test.sh:
