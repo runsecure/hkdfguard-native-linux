@@ -19,7 +19,9 @@ elliptic-curve = { version = "0.14", features = ["pkcs8"] }
 hkdf = "0.13"
 # zeroize: the hasher wipes its state and buffered input when dropped.
 sha2 = { version = "0.11", features = ["zeroize"] }
-aes-gcm = "0.11"
+# zeroize: the cipher wipes its expanded AES round keys and GHASH key when
+# dropped, so the per-payload wrapping key doesn't outlive its own wipe.
+aes-gcm = { version = "0.11", features = ["zeroize"] }
 # The OS CSPRNG, getrandom(2): salts, nonces and generated DEKs.
 getrandom = "0.4"
 zeroize = { version = "1", features = ["derive"] }

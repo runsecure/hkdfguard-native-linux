@@ -86,9 +86,15 @@ something able to use the KEK.
 
 Each payload's salt gives it its own point, and so its own `Z`. A `Z` that
 leaks (from a core dump, swap, a same-user debugger, or the bus of a
-discrete TPM) opens only the one payload it belongs to. With a single fixed
+discrete TPM) compromises only the one salt it belongs to. With a single fixed
 point per service, `Z` would be a per-service constant, and one leak would
 open every payload that service ever wrapped or will wrap.
+
+"Compromises" is deliberately stronger than "opens". The wrapping key is
+`HKDF(salt, Z, info)`, a public function of `Z`, so whoever holds a leaked
+`Z` can also *mint* a payload under that salt that unwraps to a DEK of
+their choosing. The leak is still confined to one salt; nobody can reuse
+it for another.
 
 ## What else is bound
 
@@ -149,6 +155,14 @@ the current KEK's. A mismatch reports `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`
   wrap any DEK it likes, legitimately. Against that threat, the protection
   is keeping who may use the KEK small, and `hkdfguard_open_file`'s
   refusal of key files that anyone else could have replaced.
+- **Putting back an older genuine payload.** A payload carries no
+  counter or epoch, so any payload this KEK ever wrapped for the service
+  still unwraps, and a key file replaced with an older one is accepted.
+  `hkdfguard_open_file` refuses key files that other accounts could have
+  replaced, but not a rollback by the file's own owner (or root). Where it
+  matters, record the payload's hash when it's deployed (the audit trail
+  already logs `payload_sha256` on every unwrap) and compare it out of
+  band.
 - **A future quantum computer.** Shor's algorithm would recover `KEK_priv`
   from `KEK_pub`. A payload doesn't contain the public key, so key files
   copied off a host aren't enough on their own; the attacker would also

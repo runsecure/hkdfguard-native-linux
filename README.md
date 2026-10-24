@@ -1373,6 +1373,10 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password
 [external_secret]
 dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, the only place looked
                                     # (default: first existing of the four conventional mounts)
+require_pinned_keys = false         # true: only services in pinned_keys have a KEK here (provisioning allowlist)
+
+[external_secret.pinned_keys]       # per-service expected KEK fingerprint (or a list, while rotating); refuse any other key
+"com.company.orders" = "<64 hex>"
 
 [audit]
 unwrap_success = true               # false: no audit record (1003) for a successful unwrap; see "Audit trail"

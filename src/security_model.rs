@@ -84,11 +84,13 @@ pub(crate) fn may_administer_keks(model: SecurityModel) -> bool {
     model == SecurityModel::Developer || unsafe { libc::geteuid() } == 0
 }
 
-/// One deployer group: its gid, and the names its member list holds.
+/// One deployer group: its gid, and the names its member list holds, as
+/// the raw bytes NSS returned (never lossily decoded, so two different
+/// names can't compare equal).
 #[derive(Debug, Clone)]
 struct DeployerGroup {
     gid: libc::gid_t,
-    members: Vec<String>,
+    members: Vec<Vec<u8>>,
 }
 
 /// Whose key files, and key-file directories, this process trusts under
@@ -153,7 +155,7 @@ impl Trust {
         let Ok(Some((name, primary_gid))) = lookup_user(uid) else {
             return false;
         };
-        self.deployers.iter().any(|g| g.gid == primary_gid || g.members.contains(&name))
+        is_deployer_by(&self.deployers, uid, &name, primary_gid, |n| lookup_uid(n).ok().flatten())
     }
 
     /// Test-only: this process's euid, its user name, and its primary gid.
@@ -162,7 +164,7 @@ impl Trust {
         // SAFETY: geteuid takes no arguments and cannot fail.
         let uid = unsafe { libc::geteuid() };
         let (name, gid) = lookup_user(uid).unwrap().expect("this test's user has a passwd entry");
-        (uid, name, gid)
+        (uid, String::from_utf8(name).expect("this test's user name is UTF-8"), gid)
     }
 
     /// Test-only: whether this process's euid is a deployer through the
@@ -173,7 +175,7 @@ impl Trust {
     pub(crate) fn this_user_is_packaged_deployer_for_tests() -> bool {
         let (_, name, primary_gid) = Self::this_user_for_tests();
         match lookup_group(DEPLOYERS_GROUP).unwrap() {
-            Some(group) => group.gid == primary_gid || group.members.contains(&name),
+            Some(group) => group.gid == primary_gid || group.members.contains(&name.into_bytes()),
             None => false,
         }
     }
@@ -188,7 +190,7 @@ impl Trust {
             euid: unsafe { libc::geteuid() },
             deployers: deployers
                 .iter()
-                .map(|(gid, members)| DeployerGroup { gid: *gid, members: members.iter().map(|m| m.to_string()).collect() })
+                .map(|(gid, members)| DeployerGroup { gid: *gid, members: members.iter().map(|m| m.as_bytes().to_vec()).collect() })
                 .collect(),
         }
     }
@@ -229,7 +231,28 @@ fn vetted(name: &str, group: Group) -> Result<DeployerGroup> {
 struct Group {
     gid: libc::gid_t,
     name: String,
-    members: Vec<String>,
+    members: Vec<Vec<u8>>,
+}
+
+// Whether `uid` -- whose passwd entry gives it `name` and `primary_gid` --
+// is a direct member of one of `deployers`. A primary group is matched by
+// gid. A member list holds user *names*, though, and two uids can share a
+// name (a local account and a directory one, or an image's /etc/passwd
+// shadowing a directory entry); so a name on the list counts for `uid` only
+// if `resolve` -- getpwnam(3) -- maps it back to `uid`. That is the same
+// resolution the OS uses when it grants supplementary groups at login, and
+// an ambiguous name fails closed for every uid but the one it resolves to.
+fn is_deployer_by(
+    deployers: &[DeployerGroup],
+    uid: libc::uid_t,
+    name: &[u8],
+    primary_gid: libc::gid_t,
+    resolve: impl Fn(&[u8]) -> Option<libc::uid_t>,
+) -> bool {
+    if deployers.iter().any(|g| g.gid == primary_gid) {
+        return true;
+    }
+    deployers.iter().any(|g| g.members.iter().any(|m| m.as_slice() == name)) && resolve(name) == Some(uid)
 }
 
 // getgr*_r / getpw*_r need room for the whole entry, a group's member list
@@ -261,11 +284,13 @@ fn lookup_group(name: &str) -> std::io::Result<Option<Group>> {
         }
         let mut members = Vec::new();
         // SAFETY: getgrnam_r set gr_name to a NUL-terminated string, and
-        // gr_mem to a NULL-terminated array of them, all inside `buf`.
+        // gr_mem to a NULL-terminated array of them, all inside `buf`. The
+        // array is read unaligned: `buf` is a byte buffer, and not every libc
+        // aligns the pointers it places in it (macOS's doesn't; glibc does).
         unsafe {
             let mut member = grp.gr_mem;
-            while !member.is_null() && !(*member).is_null() {
-                members.push(CStr::from_ptr(*member).to_string_lossy().into_owned());
+            while !member.is_null() && !member.read_unaligned().is_null() {
+                members.push(CStr::from_ptr(member.read_unaligned()).to_bytes().to_vec());
                 member = member.add(1);
             }
             let name = CStr::from_ptr(grp.gr_name).to_string_lossy().into_owned();
@@ -274,8 +299,9 @@ fn lookup_group(name: &str) -> std::io::Result<Option<Group>> {
     }
 }
 
-// The user name and primary gid of `uid`; `None` if it has no passwd entry.
-fn lookup_user(uid: libc::uid_t) -> std::io::Result<Option<(String, libc::gid_t)>> {
+// The user name (raw bytes) and primary gid of `uid`; `None` if it has no
+// passwd entry.
+fn lookup_user(uid: libc::uid_t) -> std::io::Result<Option<(Vec<u8>, libc::gid_t)>> {
     let mut size = LOOKUP_INITIAL_BUF;
     loop {
         // SAFETY: an all-zero `passwd` is a valid out-parameter; getpwuid_r fills it.
@@ -295,8 +321,32 @@ fn lookup_user(uid: libc::uid_t) -> std::io::Result<Option<(String, libc::gid_t)
             return Ok(None);
         }
         // SAFETY: getpwuid_r set pw_name to a NUL-terminated string inside `buf`.
-        let name = unsafe { CStr::from_ptr(pwd.pw_name) }.to_string_lossy().into_owned();
+        let name = unsafe { CStr::from_ptr(pwd.pw_name) }.to_bytes().to_vec();
         return Ok(Some((name, pwd.pw_gid)));
+    }
+}
+
+// The uid the user name `name` resolves to; `None` if no passwd entry has it.
+fn lookup_uid(name: &[u8]) -> std::io::Result<Option<libc::uid_t>> {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return Ok(None); // an interior NUL names nobody
+    };
+    let mut size = LOOKUP_INITIAL_BUF;
+    loop {
+        // SAFETY: an all-zero `passwd` is a valid out-parameter; getpwnam_r fills it.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0u8; size];
+        // SAFETY: every pointer is to a live, correctly sized local, and `name` is NUL-terminated.
+        let rc = unsafe { libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr().cast(), buf.len(), &mut result) };
+        if rc == libc::ERANGE && size < LOOKUP_MAX_BUF {
+            size = (size * 2).min(LOOKUP_MAX_BUF);
+            continue;
+        }
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
+        return Ok(if result.is_null() { None } else { Some(pwd.pw_uid) });
     }
 }
 
@@ -416,5 +466,36 @@ mod tests {
         assert!(!name.is_empty());
         assert!(lookup_group("hkdfguard-no-such-group-xyz").unwrap().is_none());
         assert!(lookup_user(0x7fff_fff0).unwrap().is_none());
+    }
+
+    fn group(gid: libc::gid_t, members: &[&str]) -> DeployerGroup {
+        DeployerGroup { gid, members: members.iter().map(|m| m.as_bytes().to_vec()).collect() }
+    }
+
+    #[test]
+    fn a_listed_name_counts_only_for_the_uid_it_resolves_to() {
+        let deployers = [group(5000, &["alice"])];
+        // "alice" resolves to 1001: uid 1001 is a deployer...
+        assert!(is_deployer_by(&deployers, 1001, b"alice", 100, |_| Some(1001)));
+        // ...but uid 50001, whose passwd entry also says "alice", is not.
+        assert!(!is_deployer_by(&deployers, 50001, b"alice", 100, |_| Some(1001)));
+        // A name that resolves to nobody counts for nobody.
+        assert!(!is_deployer_by(&deployers, 1001, b"alice", 100, |_| None));
+    }
+
+    #[test]
+    fn a_primary_group_counts_by_gid_whatever_the_name() {
+        let deployers = [group(5000, &[])];
+        assert!(is_deployer_by(&deployers, 1001, b"anyone", 5000, |_| None));
+        assert!(!is_deployer_by(&deployers, 1001, b"anyone", 100, |_| Some(1001)));
+    }
+
+    #[test]
+    fn member_names_compare_as_raw_bytes() {
+        // Two different non-UTF-8 names that a lossy decode would both turn
+        // into the same replacement character.
+        let deployers = [DeployerGroup { gid: 5000, members: vec![vec![0xff, b'x']] }];
+        assert!(is_deployer_by(&deployers, 1001, &[0xff, b'x'], 100, |_| Some(1001)));
+        assert!(!is_deployer_by(&deployers, 1001, &[0xfe, b'x'], 100, |_| Some(1001)));
     }
 }

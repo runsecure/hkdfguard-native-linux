@@ -4,7 +4,9 @@
 # the kubelet for a Secret volume, or by a Vault Agent sidecar -- then tries
 # the deployment flow against it: provision, wrap a fresh DEK, and unwrap it
 # in a separate process through the shared library. Prints one `RESULT:`
-# line for the runner to compare with what the scenario expects.
+# line for the runner to compare with what the scenario expects. The
+# runner supplies the policy (a ConfigMap at /etc/hkdfguard) and, in MOUNT,
+# where it mounted the secret.
 #
 # MODE=rotate additionally waits for the secret to be rotated (the runner
 # updates it after `READY_FOR_ROTATION`), then checks that the payload
@@ -12,10 +14,12 @@
 set -u
 
 SERVICE=${SERVICE:-com.k8stest.orders}
-MOUNT=/var/run/secrets/hkdfguard
+MOUNT=${MOUNT:-/var/run/secrets/hkdfguard} # where the scenario mounted the secret
 MODE=${MODE:-once}
 
 echo "== identity: $(id)"
+echo "== policy (/etc/hkdfguard/policy.toml):"
+sed 's/^/   /' /etc/hkdfguard/policy.toml 2>&1
 echo "== mount: $(stat -c '%a %U:%G' "$MOUNT")"
 grep " $MOUNT " /proc/self/mountinfo | awk '{print "   options: " $6 "  fs: " $(NF-2)}'
 ls -la "$MOUNT"
