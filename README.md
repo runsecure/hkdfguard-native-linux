@@ -189,7 +189,7 @@ caller isn't steered into creating a key somewhere weaker.
 
 | Provider | Absent (the walk moves on) | Present but failing (the call fails) |
 |---|---|---|
-| TPM2 | default device can't be opened (no TPM, or not in `tss`); no derivation secret at the default path | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a policy-named derivation secret that is missing; untrusted secret; a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
+| TPM2 | default device can't be opened (no TPM, or not in `tss`) | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a missing derivation secret (at the default path or one the policy names), unless `tpm.require_derivation_secret = false`; untrusted secret; a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
 | PKCS#11 | no module configured; no PIN file | untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
 | External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
 | (any) | -- | policy present but unusable |

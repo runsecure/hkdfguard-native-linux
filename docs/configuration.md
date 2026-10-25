@@ -101,7 +101,9 @@ sudo usermod -aG tss <service-user>    # or SupplementaryGroups=tss in a systemd
 
 **2. Create the derivation secret.** Without it, any process that can open
 the TPM could derive the same keys, so the TPM provider **requires** it by
-default. Create it as root, before wrapping anything:
+default: if the service can open the TPM and the secret is missing, every
+call fails rather than falling back to another provider. Create it as root,
+before wrapping anything:
 
 ```sh
 sudo sh -c '( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )'

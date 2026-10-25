@@ -475,18 +475,22 @@ fn open_context() -> Backend<Context> {
     // missing-but-required (or present-but-untrustworthy) secret reports
     // *that* rather than surfacing as an opaque "self-test could not run".
     //
-    // Missing at the *default* path means the TPM isn't set up for use on
-    // this host, and the chain may move on; its directory is
-    // root-controlled (see `read_derivation_secret`), so its absence can't
-    // be forced by anyone else. Missing at a path the *policy* names is
-    // different, exactly as for a configured TCTI that can't be opened: the
-    // administrator said the secret is there, so its absence (a typo, a
-    // file renamed during maintenance) is an outage to surface -- never a
-    // reason to quietly wrap under a weaker provider.
+    // A missing secret is a refusal, never "absent", at the default path as
+    // much as at one the policy names. The device opened, so this process
+    // can use the TPM and the TPM is the provider it was meant to get;
+    // moving on would quietly wrap under a weaker one (an external-secret
+    // mount that happens to exist, or ephemeral under a dev policy), and
+    // the warning saying so goes nowhere in a host with no `log` backend.
+    // A host that has a TPM but deliberately uses another provider says so
+    // in policy (`preferred_order` without "tpm2", or `selection.mode =
+    // "require"`), and the TPM is then never opened.
     if let Err(e) = read_derivation_secret() {
         if derivation_secret_is_missing() && !derivation_secret_is_explicit() {
-            log::warn!("hkdfguard: TPM not used: {e}");
-            return Backend::Absent;
+            return Backend::Refused(format!(
+                "{e}. A TPM is reachable at {DEFAULT_TCTI}, so it is not skipped in favour of a weaker \
+                 provider; if this host is meant to use another provider, leave \"tpm2\" out of \
+                 preferred_order in the policy"
+            ));
         }
         return Backend::Refused(e.to_string());
     }

@@ -62,16 +62,18 @@ up on this host.
 - **No access to the device:** the account can't open `/dev/tpmrm0`. Add
   it to the `tss` group, or set `SupplementaryGroups=tss`. Check with
   `ls -l /dev/tpmrm0` and `id <user>`.
-- **No derivation secret:** a missing secret at the default path makes the
-  TPM count as not set up. The CLI shows:
+- **No derivation secret:** when the account can open the TPM but the
+  derivation secret is missing, every call fails (-4) rather than moving
+  on to a weaker provider. The CLI shows:
 
   ```
-  hkdfguard: TPM not used: TPM derivation secret /etc/hkdfguard/tpm.derivation-secret does not exist. Create it as root: ...
+  hkdfguard: TPM refused: TPM derivation secret /etc/hkdfguard/tpm.derivation-secret does not exist. Create it as root: ...
   ```
 
   Create it as the message says ([configuration.md](configuration.md#tpm-20)).
-  If the policy *names* a derivation secret path, a missing file is an
-  error instead (-4).
+  If this host has a TPM but is meant to use another provider, leave
+  `"tpm2"` out of `preferred_order` in the policy (or use
+  `selection.mode = "require"`), and the TPM is not opened at all.
 - **tpm2-tss noise:** lines such as
   `ERROR:tcti:... Failed to open specified TCTI device file /dev/tpmrm0` come
   from tpm2-tss itself while the library checks for a TPM. On a host with
