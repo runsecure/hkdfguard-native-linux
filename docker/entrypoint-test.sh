@@ -286,6 +286,53 @@ if as_ci "$TEST_BIN"/hkdfguard provision --service-name com.hkdfguard.dockertest
 fi
 echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE and failed, as designed."
 
+section "a reachable TPM without its derivation secret refuses; it never falls back to a weaker provider"
+# The TPM is reachable (swtpm, via tpm.tcti) but the derivation secret at its
+# default path is missing, and a weaker provider is ready to serve: an
+# external-secret KEK in the standard mount. Before this was a refusal the
+# chain moved on, so provision succeeded on the file-backed KEK while the
+# operator believed the service was TPM-bound. Both shipped builds must now
+# refuse, naming the missing secret; a policy that leaves tpm2 out of
+# preferred_order - the documented way to use another provider on a host
+# with a TPM - must then use the external secret, as the control.
+NOSECRET_SERVICE=com.hkdfguard.dockertest.nosecret
+mv /etc/hkdfguard/tpm.derivation-secret /etc/hkdfguard/tpm.derivation-secret.aside
+mkdir -p /run/secrets/hkdfguard
+ci_file /run/secrets/hkdfguard/$NOSECRET_SERVICE
+head -c 32 /dev/urandom > /run/secrets/hkdfguard/$NOSECRET_SERVICE
+cat > /etc/hkdfguard/policy.toml <<TOML
+security_model = "developer"
+preferred_order = ["tpm2", "external-secret"]
+[selection]
+mode = "prefer"
+
+[tpm]
+tcti = "$SWTPM_TCTI"
+TOML
+for build in release debug; do
+    if OUT=$(as_ci target/$build/hkdfguard provision --service-name $NOSECRET_SERVICE 2>&1); then
+        echo "FAIL: the $build CLI provisioned without the TPM derivation secret (fell back to a weaker provider): $OUT" >&2; exit 1
+    fi
+    grep -q 'TPM derivation secret /etc/hkdfguard/tpm.derivation-secret does not exist' <<<"$OUT" \
+        || { echo "FAIL: the $build CLI refused, but not for the missing TPM derivation secret: $OUT" >&2; exit 1; }
+    echo "$build: refused, naming the missing derivation secret; the external-secret KEK was not used."
+done
+cat > /etc/hkdfguard/policy.toml <<'TOML'
+security_model = "developer"
+preferred_order = ["external-secret"]
+[selection]
+mode = "prefer"
+TOML
+for build in release debug; do
+    OUT=$(as_ci target/$build/hkdfguard provision --service-name $NOSECRET_SERVICE 2>&1) \
+        || { echo "FAIL: control: with tpm2 left out of preferred_order the $build CLI should use the external secret: $OUT" >&2; exit 1; }
+    grep -q 'already provisioned' <<<"$OUT" \
+        || { echo "FAIL: control: the $build CLI should have found the KEK in the standard mount: $OUT" >&2; exit 1; }
+done
+echo "control: release, debug: with tpm2 left out of preferred_order, the external secret serves the call."
+rm -rf /run/secrets/hkdfguard
+mv /etc/hkdfguard/tpm.derivation-secret.aside /etc/hkdfguard/tpm.derivation-secret
+
 # External secret: the policy names no directory, so the standard mount is
 # used; HKDFGUARD_EXTERNAL_SECRET_DIR pointing nowhere changes nothing.
 cat > /etc/hkdfguard/policy.toml <<'TOML'
