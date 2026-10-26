@@ -14,17 +14,15 @@
 ## First: find out why
 
 The library returns only a status code to your application; it doesn't print
-its reasons. The CLI does print them, so run it **as the service's user, with
-the service's groups**, for the same service name:
+its reasons. The CLI does print them, so run it **as the service's user**, for the
+same service name:
 
 ```sh
-sudo systemd-run --pty --uid=orders --gid=orders \
-    -p SupplementaryGroups="tss hkdfguard" \
-    hkdfguard provision -sn com.company.orders
+sudo -u orders hkdfguard provision -sn com.company.orders
 ```
 
-(`sudo -u orders ...` works too, but only with the user's permanent groups,
-not a systemd unit's `SupplementaryGroups=`.)
+`sudo -u` runs it with the groups that account belongs to, so it sees what
+the application sees.
 
 The output names the provider, the service and the exact reason.
 
@@ -60,7 +58,7 @@ up on this host.
 
 **TPM.**
 - **No access to the device:** the account can't open `/dev/tpmrm0`. Add
-  it to the `tss` group, or set `SupplementaryGroups=tss`. Check with
+  it to the `tss` group. Check with
   `ls -l /dev/tpmrm0` and `id <user>`.
 - **No derivation secret:** when the account can open the TPM but the
   derivation secret is missing, every call fails (-4) rather than moving
@@ -265,7 +263,7 @@ them once at startup, not per request. Wrap and unwrap aren't slowed.
 
 **`warning: memory not locked as a whole ...` from the CLI.** Harmless:
 the CLI still locks its own copy of the DEK. To lock everything, run it as
-root, or with `LimitMEMLOCK=infinity` in a systemd unit.
+root, or raise the memory-lock limit first (`ulimit -l unlimited`).
 
 **`could not disable core dumps / ptrace access for this process`.** The
 CLI (or `hkdfguard_harden_process`) couldn't harden the process, so it

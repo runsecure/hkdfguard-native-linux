@@ -10,7 +10,7 @@ and the host is configured ([configuration.md](configuration.md)).
 - [The CLI: `hkdfguard`](#the-cli-hkdfguard)
 - [The C API](#the-c-api)
 - [Building and linking](#building-and-linking)
-- [Running as a service](#running-as-a-service)
+- [The application's account](#the-applications-account)
 
 ## Concepts
 
@@ -139,8 +139,8 @@ anywhere, so there's nothing to delete. See "Retiring a KEK" in the README.
 
 The CLI hardens itself before touching key material (no core dumps, no
 debugger attachment) and refuses to run if it can't. It also tries to lock
-its memory out of swap: as root, or with `LimitMEMLOCK=infinity`, everything
-is locked. Otherwise it locks only its own copy of the DEK and prints a
+its memory out of swap: as root, or with an unlimited memory-lock limit
+(`ulimit -l unlimited`), everything is locked. Otherwise it locks only its own copy of the DEK and prints a
 warning (`memory not locked as a whole`).
 
 ## The C API
@@ -318,62 +318,29 @@ Don't load it as `hkdfguard` or `libhkdfguard.so`: only the development
 package provides `libhkdfguard.so`. The `service` string must be UTF-8 and
 NUL-terminated.
 
-## Running as a service
+## The application's account
 
-The service's account needs the same provider access that `provision` and
-`wrap` had -- but under the production security model it is the
-application, not a deployer: it never writes its own key files.
+HkdfGuard runs no daemon: the library loads into your application's
+process. The application's account needs the same provider access that
+`provision` and `wrap` had -- but under the production security model it
+is the application, not a deployer: it never writes its own key files.
 
-| Provider | The service account needs |
+| Provider | The application's account needs |
 |---|---|
 | TPM | `/dev/tpmrm0` (the `tss` group), and read access to the derivation secret (its group) |
 | PKCS#11 | Access to the token, and read access to the PIN file (its group) |
 | External secret | Read access to its own file in the secret mount |
 
-Plus read access to its wrapped key file. A systemd unit for a service using
-the TPM, with the derivation secret group-owned by `hkdfguard`
+Plus read access to its wrapped key file. For an application using the TPM,
+with the derivation secret group-owned by `hkdfguard`
 ([configuration.md](configuration.md#who-can-use-the-keys)):
 
-```ini
-[Service]
-User=orders
-Group=orders
-SupplementaryGroups=tss hkdfguard
-ExecStart=/usr/local/bin/orders-service
-
-# Keep key material out of crash dumps, debuggers and other users' view.
-LimitCORE=0
-ProtectProc=invisible
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadOnlyPaths=/etc/hkdfguard
-# Don't set PrivateDevices=yes: it hides /dev/tpmrm0.
+```sh
+sudo usermod -aG tss,hkdfguard orders
 ```
 
-Also call `hkdfguard_harden_process()` early in your program; it covers what
-the unit file can't, such as debugger attachment by other processes of the
-same user.
+The account picks up new groups the next time it starts a session.
 
-**A one-shot wrap at deployment**, taking the DEK from a systemd credential so
-it never touches the command line (`%d` is the unit's credentials directory).
-It runs as root (no `User=`), the deployment admin; a dedicated deployer
-account, a member of `hkdfguard-deployers`, would do as well. The service
-gets read access through `-g`, and never runs `wrap` itself:
-
-```ini
-[Service]
-Type=oneshot
-LoadCredential=dek:/etc/orders/dek.b64
-ExecStart=/usr/bin/hkdfguard wrap -kf /var/lib/orders/dek.wrapped \
-    -sn com.company.orders --dek-file %d/dek -g orders --force
-LimitMEMLOCK=infinity
-```
-
-`/var/lib/orders` must already exist, owned by root or a deployer (`root:root
-0755`, created as in [the deployment workflow](#the-deployment-workflow)): under
-the production security model `wrap` refuses a folder the service's own
-account owns, such as a `StateDirectory=orders`, because the library would
-refuse to read a key file there (`-39`).
-
-Delete the plaintext source (`/etc/orders/dek.b64` here) once the wrapped
-file exists.
+Call `hkdfguard_harden_process()` early in your program, so key material
+stays out of core dumps and away from debuggers attached by other
+processes of the same user.
