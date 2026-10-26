@@ -47,6 +47,9 @@ sudo hkdfguard provision -sn com.company.orders
 
 # 2. As root or a deployer (the deployment admin): wrap the DEK, delivered
 #    by your secrets pipeline, into a key file the service's group may read.
+#    Under production the key file's folder, and every folder above it, must
+#    be owned by root or a deployer -- not a StateDirectory= the service owns.
+sudo install -d -m 0755 -o root -g root /var/lib/orders
 printf '%s' "$DEK_B64" | sudo hkdfguard wrap \
     -kf /var/lib/orders/dek.wrapped -sn com.company.orders --dek-stdin -g orders
 
@@ -365,6 +368,12 @@ ExecStart=/usr/bin/hkdfguard wrap -kf /var/lib/orders/dek.wrapped \
     -sn com.company.orders --dek-file %d/dek -g orders --force
 LimitMEMLOCK=infinity
 ```
+
+`/var/lib/orders` must already exist, owned by root or a deployer (`root:root
+0755`, created as in [the deployment workflow](#the-deployment-workflow)): under
+the production security model `wrap` refuses a folder the service's own
+account owns, such as a `StateDirectory=orders`, because the library would
+refuse to read a key file there (`-39`).
 
 Delete the plaintext source (`/etc/orders/dek.b64` here) once the wrapped
 file exists.
