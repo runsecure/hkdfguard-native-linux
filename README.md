@@ -17,7 +17,7 @@ ECDH (P-256, per-payload hashed point)  ->  HKDF-SHA512  ->  AES-256-GCM
 A wrapped payload can only be **created** and **opened** on the host that
 holds the KEK. The wrapping key is `ECDH(KEK_priv, H_salt)`, where
 `H_salt` is a P-256 point hashed from the payload's random 32-byte salt
-(try-and-increment; no one knows the discrete log of a hash output), so
+(RFC 9380 hash-to-curve; no one knows the discrete log of a hash output), so
 producing a valid payload requires the KEK's private key — which never
 leaves the TPM, HSM, or root-owned secret file. Because the point is
 different for every payload, so is the raw ECDH secret `Z`: capturing

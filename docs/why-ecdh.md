@@ -15,7 +15,9 @@ For every wrap:
 
 1. Generate a random 32-byte `salt` and a random 12-byte AES-GCM nonce.
 2. Hash the salt to a P-256 point:
-   `H_salt = hash_to_curve("HkdfGuard-P256-payload-ECDH-point-v1:" || salt)`.
+   `H_salt = hash_to_curve(salt)`, the standard RFC 9380 suite
+   `P256_XMD:SHA-256_SSWU_RO_` with the domain separation tag
+   `HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_`.
    Nobody knows the private key (discrete log) of `H_salt`.
 3. Ask the KEK's provider (TPM, PKCS#11 token, or secret file) to compute
    `Z = KEK_priv · H_salt`. The private key never leaves the provider.
@@ -137,13 +139,6 @@ the current KEK's. A mismatch reports `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`
   host; the host wraps it locally. That matches the deployment model:
   DEKs arrive from a pipeline and are wrapped on the host that will use
   them.
-- **A custom step.** The hash-to-curve is try-and-increment over SHA-256,
-  not RFC 9380. It's simple and sound (the salt is public, so not being
-  constant-time leaks nothing; P-256 has cofactor 1), and a known-answer
-  test pins its output. But a reviewer has to check it, rather than
-  recognising a standard construction. The domain string and the payload
-  version byte both carry `v1`, so a move to RFC 9380 would be a new
-  payload version, never a silent change.
 
 ## Alternatives considered
 
