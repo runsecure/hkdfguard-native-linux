@@ -2960,3 +2960,29 @@ mod ffi_tests {
         assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
     }
 }
+
+/// Fuzzing support: the parsers behind the C ABI, reachable in-process by
+/// the harnesses under `fuzz/`. Compiled only with `--cfg
+/// hkdfguard_test_paths`, which no build that ships has (see
+/// `policy::policy_file_path`), so nothing here is ever exported.
+#[cfg(hkdfguard_test_paths)]
+#[doc(hidden)]
+pub mod fuzz_support {
+    pub use crate::crypto::{MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN};
+
+    /// `Policy::from_toml_str`: the parse and validation
+    /// `/etc/hkdfguard/policy.toml` goes through; the refusal on `Err`.
+    pub fn parse_policy(doc: &str) -> Result<(), String> {
+        crate::policy::Policy::from_toml_str(doc).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// `key_file::check`: the status code it would return on `Err`.
+    pub fn key_file_check(bytes: &[u8]) -> Result<(), i32> {
+        crate::key_file::check(bytes).map_err(|e| e.status_code())
+    }
+
+    /// `Payload::from_bytes`: the parsed key-id and ciphertext lengths.
+    pub fn payload_from_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
+        crate::payload::Payload::from_bytes(bytes).ok().map(|p| (p.key_id.len(), p.ciphertext.len()))
+    }
+}
