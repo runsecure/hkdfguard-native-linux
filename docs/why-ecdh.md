@@ -20,9 +20,14 @@ For every wrap:
 3. Ask the KEK's provider (TPM, PKCS#11 token, or secret file) to compute
    `Z = KEK_priv · H_salt`. The private key never leaves the provider.
 4. Derive the wrapping key:
-   `K = HKDF-SHA512(salt, Z, info = prefix || service || payload header || KEK fingerprint)`.
-5. Encrypt the DEK with AES-256-GCM under `K`, with the same header bytes
-   as associated data.
+   `K = HKDF-SHA512(salt = salt, IKM = Z, info)`, where `Z` is the shared
+   point's x-coordinate, big-endian, and
+   `info = "hkdfguard-wrap-v1:" || u16_le(len(service)) || service || authenticated`.
+   `authenticated` is every payload byte except the ciphertext: the header
+   fields in wire order (version, provider tag, key-id length, key-id,
+   salt, nonce, ciphertext length), then the KEK fingerprint.
+5. Encrypt the DEK with AES-256-GCM under `K`, with `authenticated` as
+   associated data.
 
 The payload stores the salt, the nonce, the ciphertext and a SHA-256
 fingerprint of the KEK's public key. It never stores the public key.
@@ -103,13 +108,14 @@ the payload except the ciphertext:
 
 - the version
 - the provider tag
-- the key-id
+- the key-id length and the key-id
 - the salt
 - the nonce
 - the ciphertext length
 - the KEK fingerprint
 
-The `info` also covers the length-framed service name. So:
+The `info` also covers the service name, preceded by its byte length as a
+little-endian u16 so the concatenation is unambiguous. So:
 
 - **Another service:** a payload can't be replayed under a different
   service.

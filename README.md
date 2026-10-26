@@ -3,8 +3,12 @@
 Linux implementation of HKDFGuard: a stable C ABI for wrapping/unwrapping
 32-byte Data Encryption Keys (DEKs) under a persistent, per-service Key
 Encryption Key (KEK), using the strongest KEK backing available on the
-host. Same cryptographic protocol and `service`-based key identity as the
-macOS Secure Enclave and Windows TPM/CNG implementations of HKDFGuard.
+host. Same construction and `service`-based key identity as the macOS
+Secure Enclave and Windows TPM/CNG implementations of HKDFGuard -- the
+salt-to-point hash, the HKDF-SHA512 salt and `info`, the AES-256-GCM
+parameters, and the service-name rules all match -- but each platform has
+its own payload layout, and a payload is only ever opened on the host
+that wrapped it, so no other implementation parses this one.
 
 ```
 ECDH (P-256, per-payload hashed point)  ->  HKDF-SHA512  ->  AES-256-GCM
@@ -189,7 +193,7 @@ caller isn't steered into creating a key somewhere weaker.
 
 | Provider | Absent (the walk moves on) | Present but failing (the call fails) |
 |---|---|---|
-| TPM2 | default device can't be opened (no TPM, or not in `tss`); no derivation secret at the default path | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a policy-named derivation secret that is missing; untrusted secret; a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
+| TPM2 | default device can't be opened (no TPM, or not in `tss`) | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a missing derivation secret (at the default path or one the policy names), unless `tpm.require_derivation_secret = false`; untrusted secret; a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
 | PKCS#11 | no module configured; no PIN file | untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
 | External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
 | (any) | -- | policy present but unusable |
@@ -1483,9 +1487,15 @@ its default.
   `Aead::{encrypt,decrypt}`, which internally allocates a heap `Vec<u8>`
   for exactly this data.
 - **Private key material never leaves the TPM or the PKCS#11 token.**
-  `Tpm2Handle`/`Pkcs11Handle` hold no key bytes at all -- only a service
-  name and a connection; `ecdh()` asks the device/token to compute the
-  shared point and only the (non-reversible) result crosses back.
+  `Pkcs11Handle` holds no key bytes at all -- only object handles for the
+  key pair and the open session. `Tpm2Handle` holds no private key either,
+  but, when a derivation secret is configured, it holds the secret's
+  32-byte SHA-256 digest (read once per wrap/unwrap, so `public_key` and
+  `ecdh` derive from identical bytes). That digest is as sensitive as the
+  secret file itself, so it sits in a `Zeroizing` buffer, is never logged,
+  and is wiped when the handle drops at the end of the call. `ecdh()` asks
+  the device/token to compute the shared point and only the
+  (non-reversible) result crosses back.
 - **Every secret file is checked on its opened descriptor, never by path.**
   The policy file, the PKCS#11 PIN, the TPM derivation secret, an
   external-secret KEK, and the CLI's `--dek-file` all go through the same
@@ -1516,9 +1526,13 @@ its default.
   resolves inside the mount directory.
 - **Every other point a secret transits a heap buffer is explicitly
   zeroized**, not left to an incidental `Drop`: the ECDH shared secret and
-  derived AES key (`Zeroizing<[u8; 32]>` throughout), the raw bytes read
-  from a PKCS#11 token attribute, and the external-secret provider's
-  mounted secret-file bytes.
+  derived AES key (`Zeroizing<[u8; 32]>` throughout), the HKDF
+  pseudorandom key between extract and expand, the raw bytes read from a
+  PKCS#11 token attribute, and the external-secret provider's mounted
+  secret-file bytes. What stays out of reach is stack residue inside the
+  RustCrypto crates themselves: the HMAC pad blocks `hmac` 0.13 builds
+  from the HKDF key (it has no zeroize support) and compression-function
+  temporaries. Each is specific to one payload, like the shared secret.
 - **On any `hkdfguard_unwrap_dek` failure, the caller's entire declared
   output buffer is zeroed** before returning -- no partial or stale key
   material is ever left behind.

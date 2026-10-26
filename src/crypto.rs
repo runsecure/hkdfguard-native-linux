@@ -332,7 +332,16 @@ fn derive_wrapping_key(
     // already unique per payload (the salt selected its ECDH point), so
     // this is belt-and-braces separation rather than the only thing
     // keeping two payloads' AES keys apart.
-    let hk = Hkdf::<Sha512>::new(Some(salt), shared_secret);
+    //
+    // `extract`, not `new`: `new` calls it and drops the 64-byte PRK
+    // unwiped, and the wrapping key is a public function of the PRK - it
+    // opens this payload as surely as `shared_secret` does. Wiped here, as
+    // soon as the expand state holds what it needs. The HMAC pad blocks
+    // `hmac` builds from it are beyond this crate's reach (`hmac` 0.13 has
+    // no zeroize support); the SHA-512 states keyed with them are wiped by
+    // `sha2`'s `zeroize` feature.
+    let (mut prk, hk) = Hkdf::<Sha512>::extract(Some(salt), shared_secret);
+    prk.as_mut_slice().zeroize();
 
     // `info` = prefix || len(service) || service || every non-ciphertext
     // payload byte. The length prefix keeps the concatenation
@@ -803,7 +812,7 @@ mod tests {
             // whose SHA-256 is a valid x-coordinate, even y -- so it is a
             // hash output nobody knows the discrete log of, whatever salt
             // an attacker writes into a payload.
-            let hashed = (0..=u8::MAX)
+            let hashed = (0..PAYLOAD_POINT_MAX_ATTEMPTS)
                 .find_map(|counter| {
                     let x = Sha256::new().chain_update(PAYLOAD_POINT_DOMAIN).chain_update(payload.salt).chain_update([counter]).finalize();
                     let mut compressed = [0x02u8; 33];

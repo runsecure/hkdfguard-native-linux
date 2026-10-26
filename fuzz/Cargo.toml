@@ -1,0 +1,64 @@
+[package]
+name = "hkdfguard-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace root: the harnesses are never part of the library's
+# build, and the library they link is the one built with
+# `--cfg hkdfguard_test_paths` (see README.md).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+libc = "0.2"
+# What the included src/bin/hkdfguard.rs uses, at the library's versions.
+base64ct = "1.8"
+zeroize = { version = "1", features = ["derive"] }
+log = "0.4"
+getrandom = "0.4"
+
+[dependencies.hkdfguard]
+path = ".."
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "unwrap_dek"
+path = "fuzz_targets/unwrap_dek.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wrap_round_trip"
+path = "fuzz_targets/wrap_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_file"
+path = "fuzz_targets/open_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_args"
+path = "fuzz_targets/cli_args.rs"
+test = false
+doc = false
+bench = false
