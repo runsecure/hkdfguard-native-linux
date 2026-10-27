@@ -338,7 +338,7 @@ fn hex(bytes: &[u8]) -> String {
 const MAX_SECRET_FILE_LEN: usize = 4096;
 
 /// What a mounted KEK file must satisfy -- identical to the PKCS#11 PIN
-/// and the TPM derivation secret, because it is at least as sensitive.
+/// and the TPM owner password, because it is at least as sensitive.
 const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
     owner: Some(Owner::RootOrCurrentUser),
     forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,

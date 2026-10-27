@@ -83,12 +83,11 @@ as_ci softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-p
 echo "SoftHSM2 token ready (module=$SOFTHSM_MODULE)."
 
 # The harness policy every test build reads: the default selection, plus
-# this container's machine facts -- swtpm, a scratch derivation secret (the
-# TPM provider requires one by default), and the SoftHSM2 token with an
-# owner-only PIN file. Tests layer their own policies over it. All of it
+# this container's machine facts -- swtpm, a scratch TPM key directory, and
+# the SoftHSM2 token with an owner-only PIN file. Tests layer their own policies over it. All of it
 # belongs to ci: a test build accepts config owned by the user running it.
 HARNESS=$(as_ci mktemp -d /work/harness.XXXXXX)
-( umask 077; head -c 32 /dev/urandom > "$HARNESS/tpm.derivation-secret" )
+( umask 077; mkdir "$HARNESS/tpm-keys" )
 ( umask 077; printf '1234\n' > "$HARNESS/pkcs11.pin" )
 cat > "$HARNESS/policy.toml" <<TOML
 [selection]
@@ -96,7 +95,7 @@ mode = "prefer"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
-derivation_secret_file = "$HARNESS/tpm.derivation-secret"
+key_dir = "$HARNESS/tpm-keys"
 
 [pkcs11]
 module = "$SOFTHSM_MODULE"
@@ -236,20 +235,21 @@ section "builds that ship take configuration only from /etc/hkdfguard/policy.tom
 # `--cfg hkdfguard_test_paths` -- must take every security setting from the
 # root-owned policy, never the environment. Install a real policy reaching
 # swtpm through `tpm.tcti`, then set HKDFGUARD_POLICY_FILE and environment
-# variables naming a TCTI, derivation secret, secret mount and PKCS#11
-# module to values that would break anything that read them. Both shipped-style builds must ignore them and work; the
+# variables naming a TCTI, secret mount and PKCS#11 module to values that
+# would break anything that read them. Both shipped-style builds must ignore them and work; the
 # test build's CLI, as a control, must follow HKDFGUARD_POLICY_FILE to the
 # malformed policy and fail -- proving this check would catch a build that
 # honored it.
 #
-# The configuration is installed the way a deployment installs it for a
-# non-root service: root-owned, with the derivation secret root:ci 0440.
+# The configuration is installed the way a deployment installs it. ci
+# provisions here (the developer model), so the TPM key directory -- the
+# default one, since shipped builds read it -- is ci's.
 as_ci cargo build --release --features tpm2,pkcs11
 as_ci cargo build --features tpm2,pkcs11      # plain debug: must behave like release here
 test_cargo build --features tpm2,pkcs11       # the control
 mkdir -p /etc/hkdfguard
-install -o root -g ci -m 0440 /dev/null /etc/hkdfguard/tpm.derivation-secret  # required by default
-head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret
+install -d -m 0755 -o root -g root /var/lib/hkdfguard
+install -d -m 0700 -o ci -g ci /var/lib/hkdfguard/tpm
 cat > /etc/hkdfguard/policy.toml <<TOML
 # ci provisions and retires KEKs here, which the production security
 # model leaves to root: scripts/verify-roles.sh tests that split.
@@ -265,11 +265,9 @@ chmod 0644 /etc/hkdfguard/policy.toml
 
 BAD_DIR=$(as_ci mktemp -d /work/bad.XXXXXX)
 printf 'this is not = valid [toml' > "$BAD_DIR/policy.toml"
-printf 'group-readable, so refused if read' > "$BAD_DIR/secret"; chmod 0640 "$BAD_DIR/secret"
 chown -R ci:ci "$BAD_DIR" # so the control fails on the malformed policy, not on being unable to read it
 export HKDFGUARD_POLICY_FILE="$BAD_DIR/policy.toml"
 export TCTI="device:/dev/nonexistent-tpm" TPM2TOOLS_TCTI="device:/dev/nonexistent-tpm" TEST_TCTI="device:/dev/nonexistent-tpm"
-export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$BAD_DIR/secret"
 export HKDFGUARD_EXTERNAL_SECRET_DIR=/nonexistent-secret-mount
 export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE" HKDFGUARD_PKCS11_PIN_FILE="$HARNESS/pkcs11.pin" HKDFGUARD_PKCS11_SLOT=0
 
@@ -286,20 +284,21 @@ if as_ci "$TEST_BIN"/hkdfguard provision --service-name com.hkdfguard.dockertest
 fi
 echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE and failed, as designed."
 
-section "a reachable TPM without its derivation secret refuses; it never falls back to a weaker provider"
-# The TPM is reachable (swtpm, via tpm.tcti) but the derivation secret at its
-# default path is missing, and a weaker provider is ready to serve: an
-# external-secret KEK in the standard mount. Before this was a refusal the
-# chain moved on, so provision succeeded on the file-backed KEK while the
-# operator believed the service was TPM-bound. Both shipped builds must now
-# refuse, naming the missing secret; a policy that leaves tpm2 out of
-# preferred_order - the documented way to use another provider on a host
-# with a TPM - must then use the external secret, as the control.
-NOSECRET_SERVICE=com.hkdfguard.dockertest.nosecret
-mv /etc/hkdfguard/tpm.derivation-secret /etc/hkdfguard/tpm.derivation-secret.aside
+section "a TPM key file that can't be trusted refuses; it never falls back to a weaker provider"
+# The TPM is reachable (swtpm, via tpm.tcti) and a weaker provider is ready
+# to serve: an external-secret KEK in the standard mount. The service's
+# TPM key file is there but readable by others -- so anyone could use the
+# key. Both shipped builds must refuse, naming the key file, rather than
+# provision on the file-backed KEK while the operator believes the service
+# is TPM-bound; a policy that leaves tpm2 out of preferred_order - the
+# documented way to use another provider on a host with a TPM - must then
+# use the external secret, as the control.
+UNTRUSTED_SERVICE=com.hkdfguard.dockertest.untrusted
 mkdir -p /run/secrets/hkdfguard
-ci_file /run/secrets/hkdfguard/$NOSECRET_SERVICE
-head -c 32 /dev/urandom > /run/secrets/hkdfguard/$NOSECRET_SERVICE
+ci_file /run/secrets/hkdfguard/$UNTRUSTED_SERVICE
+head -c 32 /dev/urandom > /run/secrets/hkdfguard/$UNTRUSTED_SERVICE
+as_ci sh -c "printf '%s\\n' '-----BEGIN TSS2 PRIVATE KEY-----' > /var/lib/hkdfguard/tpm/$UNTRUSTED_SERVICE.tpmkey"
+chmod 0644 /var/lib/hkdfguard/tpm/$UNTRUSTED_SERVICE.tpmkey
 cat > /etc/hkdfguard/policy.toml <<TOML
 security_model = "developer"
 preferred_order = ["tpm2", "external-secret"]
@@ -310,12 +309,12 @@ mode = "prefer"
 tcti = "$SWTPM_TCTI"
 TOML
 for build in release debug; do
-    if OUT=$(as_ci target/$build/hkdfguard provision --service-name $NOSECRET_SERVICE 2>&1); then
-        echo "FAIL: the $build CLI provisioned without the TPM derivation secret (fell back to a weaker provider): $OUT" >&2; exit 1
+    if OUT=$(as_ci target/$build/hkdfguard provision --service-name $UNTRUSTED_SERVICE 2>&1); then
+        echo "FAIL: the $build CLI provisioned past an untrusted TPM key file (fell back to a weaker provider): $OUT" >&2; exit 1
     fi
-    grep -q 'TPM derivation secret /etc/hkdfguard/tpm.derivation-secret does not exist' <<<"$OUT" \
-        || { echo "FAIL: the $build CLI refused, but not for the missing TPM derivation secret: $OUT" >&2; exit 1; }
-    echo "$build: refused, naming the missing derivation secret; the external-secret KEK was not used."
+    grep -q "TPM key file /var/lib/hkdfguard/tpm/$UNTRUSTED_SERVICE.tpmkey is present but can't be trusted" <<<"$OUT" \
+        || { echo "FAIL: the $build CLI refused, but not for the untrusted TPM key file: $OUT" >&2; exit 1; }
+    echo "$build: refused, naming the untrusted key file; the external-secret KEK was not used."
 done
 cat > /etc/hkdfguard/policy.toml <<'TOML'
 security_model = "developer"
@@ -324,14 +323,14 @@ preferred_order = ["external-secret"]
 mode = "prefer"
 TOML
 for build in release debug; do
-    OUT=$(as_ci target/$build/hkdfguard provision --service-name $NOSECRET_SERVICE 2>&1) \
+    OUT=$(as_ci target/$build/hkdfguard provision --service-name $UNTRUSTED_SERVICE 2>&1) \
         || { echo "FAIL: control: with tpm2 left out of preferred_order the $build CLI should use the external secret: $OUT" >&2; exit 1; }
     grep -q 'already provisioned' <<<"$OUT" \
         || { echo "FAIL: control: the $build CLI should have found the KEK in the standard mount: $OUT" >&2; exit 1; }
 done
 echo "control: release, debug: with tpm2 left out of preferred_order, the external secret serves the call."
 rm -rf /run/secrets/hkdfguard
-mv /etc/hkdfguard/tpm.derivation-secret.aside /etc/hkdfguard/tpm.derivation-secret
+rm -f /var/lib/hkdfguard/tpm/$UNTRUSTED_SERVICE.tpmkey
 
 # External secret: the policy names no directory, so the standard mount is
 # used; HKDFGUARD_EXTERNAL_SECRET_DIR pointing nowhere changes nothing.
@@ -374,7 +373,7 @@ for build in release debug; do
 done
 echo "release, debug: PKCS#11 unused without pkcs11.module (no SoftHSM2 search, variables ignored)."
 
-section "retire deletes a PKCS#11 KEK only given its fingerprint; TPM2 refuses"
+section "retire deletes a PKCS#11 or TPM2 KEK only given its fingerprint"
 # The release CLI against the real SoftHSM2 token, configured the way a
 # deployment configures it: root-owned policy naming the module, and the
 # root:ci 0440 PIN file above.
@@ -464,14 +463,20 @@ tcti = "$SWTPM_TCTI"
 TOML
 OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision on TPM2: $OUT" >&2; exit 1; }
 FP=$(fingerprint_in "$OUT")
-if OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1); then
-    echo "FAIL: retire succeeded on TPM2, which stores no key to delete" >&2; exit 1
+KEY_FILE=/var/lib/hkdfguard/tpm/$RETIRE_SERVICE.tpmkey
+[ -f "$KEY_FILE" ] || { echo "FAIL: provision on TPM2 wrote no key file at $KEY_FILE" >&2; exit 1; }
+if as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$WRONG" >/dev/null 2>&1; then
+    echo "FAIL: TPM2 retire with the wrong fingerprint succeeded" >&2; exit 1
 fi
-grep -q "TPM2 cannot retire a single service's KEK" <<<"$OUT" || { echo "FAIL: unexpected TPM2 retire message: $OUT" >&2; exit 1; }
-echo "TPM2: retire refused, with the reason."
+[ -f "$KEY_FILE" ] || { echo "FAIL: TPM2 retire with the wrong fingerprint deleted the key file" >&2; exit 1; }
+OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1) || { echo "FAIL: TPM2 retire: $OUT" >&2; exit 1; }
+grep -q "retired KEK for service \"$RETIRE_SERVICE\" (fingerprint $FP, provider TPM2)" <<<"$OUT" \
+    || { echo "FAIL: unexpected TPM2 retire output: $OUT" >&2; exit 1; }
+[ ! -e "$KEY_FILE" ] || { echo "FAIL: TPM2 retire left the key file behind" >&2; exit 1; }
+echo "TPM2: wrong fingerprint refused, nothing deleted; right one deleted the key file."
 rm -rf "$RETIRE_DIR"
 
-unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI TEST_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE \
+unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI TEST_TCTI \
       HKDFGUARD_EXTERNAL_SECRET_DIR HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT
 section "nothing the library reads is trusted under /tmp; a read-only 1777 mount is"
 # The release CLI, configured through /etc/hkdfguard/policy.toml as a
@@ -492,10 +497,9 @@ expect_sticky_refusal() {
 }
 STICKY_SERVICE=com.hkdfguard.dockertest.sticky
 
-# The TPM derivation secret (root:ci 0440 in a root-owned 0755 directory).
+# The TPM key directory (ci's own, 0700, under a root-owned 0755 directory).
 TMP_ROOT=$(mktemp -d); chmod 0755 "$TMP_ROOT"
-install -o root -g ci -m 0440 /dev/null "$TMP_ROOT/tpm.derivation-secret"
-head -c 32 /dev/urandom > "$TMP_ROOT/tpm.derivation-secret"
+install -d -m 0700 -o ci -g ci "$TMP_ROOT/tpm-keys"
 cat > /etc/hkdfguard/policy.toml <<TOML
 security_model = "developer"
 [selection]
@@ -504,9 +508,9 @@ provider = "tpm2"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
-derivation_secret_file = "$TMP_ROOT/tpm.derivation-secret"
+key_dir = "$TMP_ROOT/tpm-keys"
 TOML
-expect_sticky_refusal "the TPM derivation secret" as_ci $CLI provision -sn $STICKY_SERVICE
+expect_sticky_refusal "the TPM key directory" as_ci $CLI provision -sn $STICKY_SERVICE
 
 # The PKCS#11 module (a root-owned copy of SoftHSM2's), and separately the
 # PIN file (root:ci 0440), each with the other in its trusted place.

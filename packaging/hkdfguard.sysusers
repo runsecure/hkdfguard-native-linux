@@ -2,7 +2,7 @@
 # counterparts of the Windows MSI's HkdfGuardUsers and HkdfGuardDeployers:
 #
 #   hkdfguard            application accounts that use a KEK (give them the
-#                        derivation secret, PIN or secret file 0440, see
+#                        TPM key directory, PIN or secret file 0440, see
 #                        docs/configuration.md); nothing in the library
 #                        names it.
 #   hkdfguard-deployers  under the production security model, the accounts

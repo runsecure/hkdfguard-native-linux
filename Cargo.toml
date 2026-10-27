@@ -14,10 +14,13 @@ name = "hkdfguard"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-p256 = { version = "0.14", features = ["ecdh", "pkcs8", "getrandom"] }
+# group-digest: RFC 9380 hash-to-curve (P256_XMD:SHA-256_SSWU_RO_) for the
+# per-payload ECDH point; pulls in only the small RustCrypto hash2curve crate.
+p256 ={ version = "0.14", features = ["ecdh", "pkcs8", "getrandom", "group-digest"] }
 elliptic-curve = { version = "0.14", features = ["pkcs8"] }
 hkdf = "0.13"
-# zeroize: the hasher wipes its state and buffered input when dropped.
+# zeroize: the hasher wipes its state and buffered input when dropped --
+# HKDF-SHA512 keys SHA-512 states with the ECDH shared secret.
 sha2 = { version = "0.11", features = ["zeroize"] }
 # zeroize: the cipher wipes its expanded AES round keys and GHASH key when
 # dropped, so the per-payload wrapping key doesn't outlive its own wipe.

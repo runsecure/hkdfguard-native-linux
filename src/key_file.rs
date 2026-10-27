@@ -30,8 +30,8 @@
 //!   process's user, and no group write (see [`crate::security_model`]). A
 //!   wrapped DEK is ciphertext, so reading it gains nothing -- but
 //!   *replacing* it does: anyone who can write the file and can also wrap
-//!   under the service's KEK (on TPM2, any process in the `tss` group with
-//!   the derivation secret; under the developer model, the application
+//!   under the service's KEK (on TPM2, any process in the `tss` group that
+//!   can read the service's TPM key file; under the developer model, the application
 //!   itself) could plant a DEK they know, and `unwrap` would accept it as
 //!   genuine. The CLI writes key files `0600` for the same reason.
 //!   Symlinks are followed, and the checks apply to the file they resolve

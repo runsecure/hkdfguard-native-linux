@@ -62,6 +62,9 @@ License:        MPL-2.0 AND %{linked_licenses}
 # distributions, shadow on SUSE.
 Requires(pre):  /usr/bin/getent
 Requires(pre):  /usr/sbin/groupadd
+# The group %%pre creates. SUSE's rpm turns the TPM key directory's
+# %%attr group into a Requires on group(hkdfguard), so say who provides it.
+Provides:       group(hkdfguard)
 
 %description -n %{libpkg} %{common_description}
 
@@ -122,6 +125,7 @@ sed -e 's|@LIBDIR@|%{_libdir}|' -e 's|@VERSION@|%{version}|' \
 install -D -m 0755 target/release/hkdfguard %{buildroot}%{_bindir}/hkdfguard
 install -D -m 0644 packaging/hkdfguard.1 %{buildroot}%{_mandir}/man1/hkdfguard.1
 install -d -m 0755 %{buildroot}%{_sysconfdir}/hkdfguard
+install -d -m 0750 %{buildroot}%{_sharedstatedir}/hkdfguard/tpm
 install -D -m 0644 packaging/policy.toml.example %{buildroot}%{_datadir}/hkdfguard/policy.toml.example
 install -D -m 0644 packaging/hkdfguard.sysusers %{buildroot}%{_prefix}/lib/sysusers.d/hkdfguard.conf
 
@@ -155,6 +159,11 @@ exit 0
 %doc README.md
 %{_libdir}/libhkdfguard.so.1
 %dir %{_sysconfdir}/hkdfguard
+# The TPM key directory: its group decides who may use TPM keys (each key
+# file takes it). %%pre creates the group before this lands. Left in place,
+# key files and all, on erase.
+%dir %attr(0755,root,root) %{_sharedstatedir}/hkdfguard
+%dir %attr(0750,root,hkdfguard) %{_sharedstatedir}/hkdfguard/tpm
 %dir %{_datadir}/hkdfguard
 %{_datadir}/hkdfguard/policy.toml.example
 %{_prefix}/lib/sysusers.d/hkdfguard.conf

@@ -3,12 +3,9 @@
 Linux implementation of HKDFGuard: a stable C ABI for wrapping/unwrapping
 32-byte Data Encryption Keys (DEKs) under a persistent, per-service Key
 Encryption Key (KEK), using the strongest KEK backing available on the
-host. Same construction and `service`-based key identity as the macOS
-Secure Enclave and Windows TPM/CNG implementations of HKDFGuard -- the
-salt-to-point hash, the HKDF-SHA512 salt and `info`, the AES-256-GCM
-parameters, and the service-name rules all match -- but each platform has
-its own payload layout, and a payload is only ever opened on the host
-that wrapped it, so no other implementation parses this one.
+host. A wrapped payload pertains only to the host that wrapped it: it is
+only ever opened there, never on another host or by another
+implementation.
 
 ```
 ECDH (P-256, per-payload hashed point)  ->  HKDF-SHA512  ->  AES-256-GCM
@@ -17,7 +14,7 @@ ECDH (P-256, per-payload hashed point)  ->  HKDF-SHA512  ->  AES-256-GCM
 A wrapped payload can only be **created** and **opened** on the host that
 holds the KEK. The wrapping key is `ECDH(KEK_priv, H_salt)`, where
 `H_salt` is a P-256 point hashed from the payload's random 32-byte salt
-(try-and-increment; no one knows the discrete log of a hash output), so
+(RFC 9380 hash-to-curve; no one knows the discrete log of a hash output), so
 producing a valid payload requires the KEK's private key — which never
 leaves the TPM, HSM, or root-owned secret file. Because the point is
 different for every payload, so is the raw ECDH secret `Z`: capturing
@@ -193,7 +190,7 @@ caller isn't steered into creating a key somewhere weaker.
 
 | Provider | Absent (the walk moves on) | Present but failing (the call fails) |
 |---|---|---|
-| TPM2 | default device can't be opened (no TPM, or not in `tss`) | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a missing derivation secret (at the default path or one the policy names), unless `tpm.require_derivation_secret = false`; untrusted secret; a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
+| TPM2 | default device can't be opened (no TPM, or not in `tss`) | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a service's key file present but untrusted or unreadable (a missing one is "not provisioned" for that service: the walk moves on); a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
 | PKCS#11 | no module configured; no PIN file | untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
 | External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
 | (any) | -- | policy present but unusable |
@@ -254,9 +251,7 @@ one that doesn't set it, this is a production install.
 
 - Under production, `hkdfguard_create_kek` creates a KEK only for root;
   anyone else gets the existing KEK, or `HKDFGUARD_ERR_KEK_ACCESS_DENIED`
-  (`-18`, which Linux now returns). An ephemeral KEK is exempt. On a TPM,
-  set `tpm.require_pinned_names = true` for this to gate anything: without
-  it the TPM derives a KEK for any service on demand.
+  (`-18`, which Linux now returns). An ephemeral KEK is exempt.
 - A **deployer** is a direct member of `hkdfguard-deployers` (the packages
   create it) or of a group in the policy's `deployer_groups`. Only key files
   owned by root or a deployer, in folders owned by root or a deployer and
@@ -296,7 +291,7 @@ same IDs, meanings and severities (1004 aside), so one set of alerts covers both
 
 | ID | Severity | When |
 |---|---|---|
-| 1000 | info | A KEK was created (not merely found). TPM2 keys are derived on demand, never created, so TPM2 doesn't produce this. |
+| 1000 | info | A KEK was created (not merely found). |
 | 1001 | warning | A KEK was created on a provider other than the policy's first choice, which was unavailable or declined. |
 | 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | info | A DEK was unwrapped. |
@@ -354,7 +349,7 @@ failure record are always written.
 wall-clock time whatever its outcome (found, not found, or error), and
 they are serialized with each other across threads. This bounds how fast
 a buggy or hot-looping caller can drive the TPM/HSM (every call is a
-fresh connection plus a key derivation) and caps Ephemeral key-map growth.
+fresh connection plus a key lookup) and caps Ephemeral key-map growth.
 Argument errors (bad pointer, invalid service name) still return
 immediately since they never reach a provider. The library logs a warning
 once a process has made more than 10 setup calls.
@@ -377,156 +372,108 @@ A policy file that is present but invalid keeps the 1 s default (the
 gated call fails closed on that same policy anyway). There is no
 environment-variable override.
 
-### Hardening the TPM key
+### The TPM key and its key file
 
-The TPM provider derives each service's KEK with a deterministic
-`TPM2_CreatePrimary` from the TPM's own primary seed plus a per-service
-label. That makes the key unexportable and machine-bound, but on its own
-it would also mean **any process that can open `/dev/tpmrm0` could issue
-the same command and reproduce the same key.** An `authValue` cannot fix
-that, because the authValue is not an input to the derivation — an
-attacker simply re-derives the key with an authValue of their own.
+Each service's KEK on the TPM is an ordinary TPM key: an ECC P-256
+decryption key that `TPM2_Create` generates under the Owner hierarchy's
+storage root key (SRK), the TCG's standard ECC P-256 storage key. The
+result is saved as a **key file**, `/var/lib/hkdfguard/tpm/<service>.tpmkey`,
+in the TPM 2.0 key file format (`-----BEGIN TSS2 PRIVATE KEY-----`, parent
+`0x40000001`) that the OpenSSL tpm2 provider and tpm2-tss-engine also use.
+Every wrap and unwrap re-creates the SRK from its template, loads the key
+file under it with `TPM2_Load`, runs `TPM2_ECDH_ZGen`, and flushes both, so
+nothing stays on the TPM and no persistent handle is needed.
 
-Two controls close that gap:
+What the TPM guarantees:
 
-**1. A host derivation secret (required by default).** The derived key
-depends on the TPM seed *and* a file the attacker must also be able to
-read. **The TPM provider refuses to run without it**, logging the exact
-command to create it; provision it before first use:
+- **The private key never leaves the TPM.** The key file's private half is
+  encrypted and integrity-protected under the SRK, whose seed the TPM
+  generated and never exports. The file is useless on any other TPM, and
+  `TPM2_Load` refuses a file whose halves don't belong together.
+- **The TPM generated it.** The library refuses a key file whose key lacks
+  `fixedTPM`, `fixedParent` or `sensitiveDataOrigin`, or differs in any
+  other attribute or parameter from the keys it creates. The TPM refuses to
+  import an object with `fixedTPM` set, so such a key was generated inside
+  this TPM and never duplicated out: no key file can hold a private key
+  anyone knows.
+
+What it does not: the key has no password, so **anyone who can read a key
+file and open the TPM can use that KEK.** Read access to the key file is
+the access control, as the PIN file is for PKCS#11. The packages create
+the directory as `root:hkdfguard 0750`, so the members of `hkdfguard` may
+use TPM keys; without the packages, create it as root:
 
 ```sh
-install -d -m 0755 -o root -g root /etc/hkdfguard
-( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )
-# For a service that doesn't run as root, let its group read it:
-chgrp <service-group> /etc/hkdfguard/tpm.derivation-secret
-chmod 0440 /etc/hkdfguard/tpm.derivation-secret
+install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 ```
 
-The secret must be owned by root, never by the service's own user: if
-the service could write it, so could any process running as that user,
-and changing it changes every TPM KEK. Group read is allowed only on a
-root-owned file; nothing for others either way. The file's bytes are used
-exactly as they are on disk — no newline trimming, because any trimming
-rule would silently change the derived key for a secret ending in that
-byte. A file that is present but untrustworthy (wrong owner, group-writable
-or other-accessible, a symlink, empty, oversized, or in a directory
-someone untrusted could change) is a hard error, never silently ignored.
+`provision` (root only, under the production security model) creates each
+key file there: owned by root, with the directory's group, mode `0440`.
+`tpm.key_dir` moves the directory. The library refuses a key file that is
+group- or world-writable, readable by others, a symlink, owned by anyone
+but root (or, under the developer model, the calling user), or in a
+directory chain someone else could change -- never as "not provisioned",
+so a damaged or planted key file can't hand the service to a weaker
+provider. A service with *no* key file has no KEK on the TPM, and `retire`
+deletes the file.
 
-To run without one, set `require_derivation_secret = false` under `[tpm]`
-in the policy. The provider then derives from the TPM seed and service
-name alone and logs a warning that any local process able to open the TPM
-can reproduce the keys. Adding or removing the secret changes every TPM
-KEK, so DEKs wrapped before the change fail their fingerprint check
-(`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`, `-16`) -- decide before
-wrapping anything.
+> **Back up the key files.** A lost key file is a lost KEK: every DEK
+> wrapped under it is unrecoverable. A copy is useless on any other TPM, so
+> backups are low-risk; on this TPM a copy can still be used, so give
+> backups the same access control. A backup recovers from losing the
+> *file*, not the *TPM*: a replaced motherboard or discrete TPM, or
+> `TPM2_Clear` (which a firmware reset or OS reinstall can trigger), resets
+> the Owner hierarchy's seed, the SRK changes, and no key file made before
+> it loads again. If DEKs must survive the hardware, keep a copy of each
+> somewhere other than this host, wrapped under a key that isn't tied to it.
 
-> **This changes the KEK.** Adding, removing, or altering the secret
-> derives a different key, so DEKs wrapped beforehand will fail their
-> fingerprint check (`-16`) rather than decrypt. Provision it before
-> wrapping anything you need to keep.
-
-> **Back up the derivation secret.** It is the one thing on a TPM host
-> that can be lost and is needed to recover anything: without the exact
-> bytes, no TPM — this one included — derives the same KEKs again, and
-> every DEK wrapped on that host is unrecoverable. Copy it, at the time
-> you create it, to wherever you keep other root-of-trust material
-> (offline, or a secrets manager with tighter access than the host), and
-> restore it byte-for-byte. A backup recovers from losing the *file*; it
-> does not recover from losing the *TPM* — a replaced motherboard or
-> discrete TPM, or `TPM2_Clear` (which a firmware reset or OS reinstall
-> can trigger), resets the seed, and the old KEKs are gone with it. If
-> DEKs must survive the hardware, keep a copy of each one somewhere other
-> than this host, wrapped under a key that isn't tied to it.
-
-The secret is folded into the `TPM2_CreatePrimary` template's `unique`
-field, which is the TPM's designed channel for influencing primary
-derivation. (`inSensitive.data` would be the more obvious choice and does
-not work: for an asymmetric key the TPM requires
-`TPMA_OBJECT.sensitiveDataOrigin` to be SET, and clearing it to supply
-sensitive data fails with `TPM_RC_ATTRIBUTES` — confirmed against swtpm.)
-
-Because a TPM that ignored the extra input would leave the secret looking
-configured while protecting nothing, the provider verifies empirically —
-once per process — that the secret actually changes the derived key, and
-refuses to use the TPM at all if it doesn't. That proves the secret is
-*used*, not that all of it is: a TPM that kept only part of `unique` would
-still pass, while getting only that part's strength. No black-box test can
-rule that out; a conformant TPM hashes the whole public template into the
-derivation, and that conformance is what is relied on.
-
-**2. Pinned TPM Names.** Record the Name your TPM reports for a service
-and the provider will refuse any key whose Name differs. Unlike the
-provider's own Name self-consistency check (which only catches a
-non-conformant stack, since a Name is a public function of the public
-area that anyone could recompute), this compares against a value held in
-the root-owned policy file, so substitution is detectable.
+**1. Pinned TPM Names.** Record the Name of each service's key and the
+provider will refuse any key file whose key has a different Name. The
+library's own check, that the Name the TPM reports for a loaded key matches
+the key file's public area, catches a non-conformant stack; a pin, held in
+the root-owned policy file, catches a key file someone replaced.
 
 ```toml
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"   # quote service names: unquoted dots make nested tables
 ```
 
-Get the values to pin from the TPM itself with the two operator-helper
-tests (see "Testing on a native Linux TPM" below; `scripts/native-tpm-test.sh`
-runs them for you). They go through the production derivation, so a pin
-learned *before* provisioning a derivation secret will not match after --
-provision the secret first, then pin. Both controls fail closed: a policy
-file that exists but can't be parsed is treated as requiring the secret,
-and pinning errors rather than reporting "nothing pinned".
-
-**Pinned Names as the provisioning allowlist.** A TPM has no stored
-per-service state: `TPM2_CreatePrimary` derives a key for *any* service
-name on demand. Left alone, that means on a TPM host `kek_exists` is
-always true, `provision` always reports "already provisioned", and `wrap`
-works for a service nobody ever provisioned — a typo in a deploy wraps
-under a different key and is only discovered at unwrap. Setting
-`require_pinned_names` moves the provisioning record into the root-owned
-policy file:
+With `require_pinned_names`, the pins are also the provisioning allowlist:
 
 ```toml
 [tpm]
 require_pinned_names = true            # only services listed below exist on the TPM
-
-[tpm.pinned_names]
-"com.company.orders" = "000b<64 hex chars>"
 ```
 
-Under it, a service with no pinned Name has no KEK: `kek_exists` returns
-0, and wrap and unwrap fail. `provision` for such a service fails too, but
-prints the exact entry to add — the Name this TPM derives for it, through
-the production derivation (so with the derivation secret, if one is
-configured):
+Under it, a service with no pinned Name has no KEK, whatever key file
+exists: `kek_exists` returns 0, and wrap and unwrap fail. `provision` for
+such a service creates its key file, then fails and prints the exact entry
+to add:
 
 ```text
 $ hkdfguard provision -sn com.company.orders
 error: hkdfguard: create_kek failed for service "com.company.orders": provider error: TPM2:
-tpm.require_pinned_names is set and service "com.company.orders" has no pinned TPM Name. To provision it,
-add this to the policy file and run provision again:
+tpm.require_pinned_names is set and service "com.company.orders" has no pinned TPM Name. Its key file is
+created; to provision it, add this to the policy file and run provision again:
   [tpm.pinned_names]
   "com.company.orders" = "000b..."
 error: hkdfguard_create_kek failed for service "com.company.orders": the selected KEK provider failed (see the
 messages above for the provider's reason)
 ```
 
-The entry is ready to paste as printed.
+Add the entry as root and run `provision` again; it then reports "already
+provisioned". `scripts/native-tpm-test.sh` shows how to read a key file's
+Name directly. A policy file that exists but can't be parsed applies the
+allowlist rather than dropping it, and pinning errors rather than reporting
+"nothing pinned".
 
-Add the entry as root and run `provision` again; it then reports
-"already provisioned". The same entry also gives you substitution
-protection (above), so one record does both jobs. A policy file that
-exists but can't be parsed applies the allowlist rather than dropping it.
+This gates the *TPM* provider. Under `mode = "prefer"`, wrap and unwrap
+treat an unpinned service like one the TPM has no key for, so a weaker
+provider later in the order that *does* hold a key for it can still serve
+it; pair the allowlist with `mode = "require"`, `provider = "tpm2"` (or
+`mode = "require-level"`, `level = "hardware"`) if that matters.
 
-This gates the *TPM* provider. `provision` for an unpinned service fails
-outright rather than creating the key elsewhere. But under
-`mode = "prefer"`, wrap and unwrap treat an unpinned service like one the
-TPM has no key for, so a weaker provider later in the order that *does*
-hold a key for it can still serve it; pair the allowlist with
-`mode = "require"`, `provider = "tpm2"` (or `mode = "require-level"`, `level = "hardware"`) if that matters. Don't
-treat the allowlist as access control, either: anything that can open the
-TPM and read the derivation secret can issue the same `CreatePrimary`
-itself. What it buys is that the set of TPM services is explicit,
-root-controlled, and checked on every call.
-
-**3. Session parameter encryption (bus protection).** On a *discrete*
+**2. Session parameter encryption (bus protection).** On a *discrete*
 TPM — a separate chip on the LPC/SPI bus — an interposer can read
 `TPM2_ECDH_ZGen`'s response, the shared secret, in cleartext. Each
 response opens one payload (the per-payload hashed point keeps a
@@ -534,7 +481,9 @@ captured `Z` from opening any other), but an interposer that stays on
 the bus captures every subsequent one. The provider can run that command inside
 a salted HMAC session with parameter encryption (TPM 2.0 Part 1 §19.6;
 the cryptography is tpm2-tss's ESAPI, not this crate's), so the secret
-crosses the bus AES-128-CFB encrypted.
+crosses the bus AES-128-CFB encrypted. Nothing else secret crosses the
+bus: `TPM2_Load` sends the key file's private half, which is encrypted
+under the SRK, and the key has no password to send.
 
 ```toml
 [tpm]
@@ -551,12 +500,13 @@ vendors are encrypted. `required` always encrypts and **refuses to load
 without a pinned salt-key Name**: an unsalted session's key is derivable
 from bus-visible nonces, and even a salted one can be man-in-the-middled
 if the attacker substitutes their own salt key at `TPM2_ReadPublic`, so
-the pin is what makes `required` mean something. The salt key is a
-deterministic primary with a fixed label, so its Name is stable and
-pinnable; it carries no derivation secret. It is a *restricted* storage
-key, so the TPM uses it only to unwrap session salts: someone who can send
-the TPM commands and recreate it still can't run ECDH with it to recover a
-session's salt.
+the pin is what makes `required` mean something. The salt key is the SRK
+itself, already loaded as the key file's parent; its Name stays the same
+until the TPM is cleared, so it is pinnable, and with a pin set every key
+file is loaded only under the pinned SRK. It is a *restricted* storage
+key, so the TPM uses it only for its children and to unwrap session
+salts: someone who can send the TPM commands and recreate it still can't
+run ECDH with it to recover a session's salt.
 
 > **`auto` only defeats a passive listener.** The manufacturer it
 > decides from is read over the same bus it is protecting. On a discrete
@@ -572,27 +522,16 @@ session's salt.
 > - **Firmware TPM or vTPM you know is one:** `auto` without a pin is fine;
 >   there is no bus to defend.
 
-> **Known limitation on discrete TPMs:** parameter encryption covers only
-> a command's *first* parameter, and `TPM2_CreatePrimary`'s first
-> parameter is `inSensitive`, not `inPublic`. The derivation-secret-derived
-> `unique` label therefore still crosses the bus in cleartext when the
-> service key is re-created, and an interposer that captures it can
-> re-derive the key. On a discrete TPM the derivation secret protects
-> against software attackers only. Closing that needs a persisted,
-> parent-encrypted key blob (`TPM2_Create` + `TPM2_Load`) instead of a
-> derived primary.
+**3. Protect the hierarchy the keys live under.** Every key file is loaded
+under the SRK, which is re-created on demand from the Owner hierarchy's
+seed, and by default the provider authorizes with an empty owner password.
+Two TPM commands are therefore dangerous in the hands of anyone who can
+open the device, whether or not they can read a key file:
 
-**4. Protect the hierarchy the keys derive from.** Every TPM KEK is
-derived on demand from the Owner hierarchy's primary seed; nothing is
-persisted, and by default the provider authorizes with an empty owner
-password. Two TPM commands are therefore dangerous in the hands of anyone who can open
-the device -- the same `tss`-group adversary the derivation secret defends
-against -- and neither needs the derivation secret:
-
-- `TPM2_Clear` regenerates the seed. Every DEK ever wrapped on the host
-  becomes unrecoverable, and the only symptom is a fingerprint mismatch
-  (`-16`) at the next unwrap. With the default empty lockout password,
-  `tpm2_clear -c l` from any `tss`-group shell does it.
+- `TPM2_Clear` regenerates the seed. Every key file on the host becomes
+  unloadable and every DEK wrapped on it unrecoverable. With the default
+  empty lockout password, `tpm2_clear -c l` from any `tss`-group shell
+  does it.
 - `TPM2_HierarchyChangeAuth` on the Owner hierarchy sets a password the
   provider does not know. Every `CreatePrimary` then fails, the self-test
   cannot run, and the TPM is refused on every call until the password is
@@ -603,23 +542,20 @@ Set a lockout-hierarchy password and, where the platform allows, disable
 user:
 
 ```sh
-LOCKOUT_PW="$(head -c 32 /dev/urandom | base64)"   # keep it with the derivation secret's backup
+LOCKOUT_PW="$(head -c 32 /dev/urandom | base64)"   # keep it with the key files' backup
 tpm2_changeauth -c lockout "$LOCKOUT_PW"
 tpm2_clearcontrol -C l -P "$LOCKOUT_PW" s          # disableClear; only platform authorization can re-enable it
 ```
 
 Then, optionally, give the Owner hierarchy a password too, and name a
-file holding it in the policy. This is the stronger control: with an empty
-owner password, anyone who can open the TPM *and* read the derivation
-secret can issue the same `CreatePrimary` and use the service's key
-themselves; with a password, `CreatePrimary` under the Owner hierarchy
-needs it as well, and `TPM2_HierarchyChangeAuth` needs the current one.
-The password is not a derivation input, so setting it changes no KEK and
-needs no re-wrapping.
+file holding it in the policy. With a password, re-creating the SRK -- and
+so loading any key file -- needs it as well, and `TPM2_HierarchyChangeAuth`
+needs the current one. The password is not an input to the SRK, so setting
+it changes no KEK and needs no re-wrapping.
 
 ```sh
 ( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.owner-auth )
-# For a service that doesn't run as root, as for the derivation secret:
+# For a service that doesn't run as root, let its group read it:
 chgrp <service-group> /etc/hkdfguard/tpm.owner-auth && chmod 0440 /etc/hkdfguard/tpm.owner-auth
 tpm2_changeauth -c o file:/etc/hkdfguard/tpm.owner-auth   # bytes used verbatim, as hkdfguard reads them
 ```
@@ -636,20 +572,20 @@ until the file or the policy entry changes: every wrong attempt counts
 toward the TPM's dictionary-attack limit, which is TPM-wide (a Hyper-V
 vTPM allows 3 per 1000 s), so a service retrying would otherwise lock the
 whole TPM within seconds. After fixing the file, the next call tries again;
-nothing needs restarting. Back the file up
-with the derivation secret. The owner password applies to the whole Owner
-hierarchy, so anything else on the host that creates keys under it with an
-empty password -- `systemd-cryptenroll --tpm2-device`, tpm2-tss FAPI,
-`tpm2_createprimary -C o` scripts -- stops working until it is given the
-password as well; check before setting it on a shared host. The provider
-presents it through an HMAC session, so it never crosses the bus in the
-clear.
+nothing needs restarting. Back the file up with the key files. The owner
+password applies to the whole Owner hierarchy, so anything else on the
+host that creates keys under it with an empty password --
+`systemd-cryptenroll --tpm2-device`, tpm2-tss FAPI, `tpm2_createprimary -C o`
+scripts -- stops working until it is given the password as well; check
+before setting it on a shared host. The provider presents it through an
+HMAC session, so it never crosses the bus in the clear.
 
 Note also that dictionary-attack lockout is TPM-wide: failed
 authorizations by any other local user of the TPM can put it in lockout,
-during which `TPM2_ECDH_ZGen` fails with `TPM_RC_LOCKOUT` until the lockout
-interval passes or the lockout password resets it. (Owner-hierarchy
-authorization failures are not counted towards it.)
+during which commands that need authorization fail with `TPM_RC_LOCKOUT`
+until the lockout interval passes or the lockout password resets it. The
+SRK and service keys are `noDA`, so their use is never refused for it, and
+Owner-hierarchy authorization failures are not counted towards it.
 
 Callers never see which provider is active. Every provider implements the
 identical `ECDH -> HKDF-SHA512 -> AES-256-GCM` protocol
@@ -668,19 +604,20 @@ same image, they need glibc 2.39 or newer: Ubuntu 24.04+, Debian 13, RHEL
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
 | `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.12.1 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against hashed per-payload points accepted |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs, **Intel PTT** and **AMD fTPM**, and against a virtual TPM, **Hyper-V's vTPM** (`MSFT`), in Ubuntu 24.04 (tpm2-tss 4.0.1) and AlmaLinux 10 (tpm2-tss 4.1.3, SELinux enforcing) guests |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite -- key files created, reloaded across connections and refused when spliced, the storage root key's determinism, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points agreeing with the key file's public key, retiring, pins, and salted/parameter-encrypted sessions producing the same `Z` as plain ones -- plus the reboot-persistence check, passes against `swtpm` (`docker/run-tests.sh`) and, via `scripts/native-tpm-test.sh`, against a real firmware TPM, **Intel PTT**, on Ubuntu 24.04 (tpm2-tss 4.0.1). The earlier derived-key design also passed against **AMD fTPM** and **Hyper-V's vTPM** (`MSFT`); the key-file design has not been run there yet |
 
-The TPM provider has been verified against `swtpm`, against two real
-firmware TPMs, Intel PTT and AMD fTPM, and against Hyper-V's virtual TPM.
-It has **not** been exercised against a discrete TPM chip (e.g. Infineon
+The TPM provider's key-file design has been verified against `swtpm` and
+a real firmware TPM, Intel PTT; its earlier derived-key design was also
+verified against AMD fTPM and Hyper-V's virtual TPM. It has **not** been
+exercised against a discrete TPM chip (e.g. Infineon
 or Nuvoton), against other hypervisors' vTPMs (VMware, Google Cloud,
 AWS NitroTPM), or against a hardware HSM/YubiHSM -- the PKCS#11 provider
 has only ever been run against SoftHSM2. `scripts/native-tpm-test.sh`
 (next section) exists precisely so you can run the same matrix on your
 own hardware, including a discrete chip, before depending on it.
 
-On the Hyper-V vTPM the *packages* were verified too, not just the test
-builds: the Ubuntu 24.04 `.deb`s and the EL10 `.rpm`s from
+On the Hyper-V vTPM the *packages* of the earlier derived-key design were
+verified too, not just the test builds: the Ubuntu 24.04 `.deb`s and the EL10 `.rpm`s from
 `packaging/build-packages.sh` (see "Packages"), installed and configured
 only through a root-owned `/etc/hkdfguard/policy.toml` that requires the
 TPM, with a `0440` derivation secret, and run as an unprivileged service
@@ -749,9 +686,9 @@ The preflight identifies the TPM from `TPM2_PT_MANUFACTURER` and tells you
 what `session_encryption = "auto"` will decide on it (skip for an
 fTPM/vTPM, encrypt for a discrete chip). The full run then does everything
 `docker/entrypoint-test.sh` does, against the real device: the
-conformance suite (determinism, Name formula, the fixed ECDH point,
-encrypted-session correctness), the same suite again with a derivation
-secret provisioned, a C ABI round trip with the KEK on the TPM under both
+conformance suite (key files, the storage root key's determinism, the
+Name formula, ECDH against hashed points, encrypted-session correctness),
+a C ABI round trip with the KEK on the TPM under both
 `auto` and a fully pinned `required` policy, and the CLI-to-C-consumer
 cross-process check. It learns the Names to pin from the TPM itself via
 two operator-helper tests (run them directly to get values for your own
@@ -771,9 +708,9 @@ The one property `swtpm` can only approximate is survival of a real
 reboot. For that:
 
 ```sh
-scripts/native-tpm-test.sh reboot capture   # wraps a DEK on the TPM and saves state
+scripts/native-tpm-test.sh reboot capture   # provisions a key file, wraps a DEK on the TPM, saves state
 # reboot the machine
-scripts/native-tpm-test.sh reboot verify    # the same KEK must re-derive and unwrap it
+scripts/native-tpm-test.sh reboot verify    # the same storage root key must come back, and the key file unwrap it
 ```
 
 ### Testing in Docker (recommended if you're not already on Linux)
@@ -853,7 +790,8 @@ SUSE's naming policy and runs `ldconfig` from scriptlets:
 All are built with every provider enabled, so the library depends on
 tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
 only ever loaded at run time, from the policy file. The packages install
-no policy file, derivation secret or PIN: those are per-host decisions
+no policy file or PIN, and an empty TPM key directory
+(`/var/lib/hkdfguard/tpm`, `root:hkdfguard 0750`): those are per-host decisions
 (see "Configuration"), and with no policy file the library uses its
 defaults. To write one, start from the annotated example:
 
@@ -1062,7 +1000,7 @@ packaging/build-overlay.sh    # hkdfguard-overlay:local and :local-dev for this 
 
 For the external-secret provider the mounted file *is* the KEK private
 key, so it is held to the same standard as the PKCS#11 PIN and the TPM
-derivation secret. `<mount>/<service>` must:
+owner password. `<mount>/<service>` must:
 
 - be **owned by root or by the process's user**, with **no group or other
   access** — `0400` or `0600`. A root-owned file may also be readable by
@@ -1142,12 +1080,12 @@ hkdfguard wrap \
 
 `provision` is idempotent and never changes an existing KEK, but it
 always verifies one: it loads the KEK through the provider (on a TPM,
-deriving it and checking it against any pinned Name; on PKCS#11, finding
-the key pair on the token) and reports "already provisioned ... verified".
-So a KEK that is missing or wrong on the provider fails at deployment, not
-at the first wrap. On a TPM the KEK is derived on demand, so it always
-reports present; for `external-secret` the mounted file *is* the
-provisioning; only Ephemeral actually creates anything.
+loading its key file into the TPM and checking it against any pinned
+Name; on PKCS#11, finding the key pair on the token) and reports "already
+provisioned ... verified". So a KEK that is missing or wrong on the
+provider fails at deployment, not at the first wrap. On a TPM it creates
+the service's key file; on PKCS#11, its key pair; for `external-secret`
+the mounted file *is* the provisioning.
 
 `provision` prints the KEK's fingerprint, and `wrap` prints the
 fingerprint of the KEK it actually wrapped under, read from the payload it
@@ -1221,7 +1159,7 @@ folder, and every folder above it up to `/`, must be owned by root or the
 invoking user and not writable by group or others -- sticky folders such as
 `/tmp` included, unless on a read-only mount -- or someone else could put a
 DEK of their choosing there. These are the rules the library applies to the
-PKCS#11 PIN and the TPM derivation secret. On both paths the input is strict standard base64 (`+/`, padded), at
+PKCS#11 PIN and the TPM owner password. On both paths the input is strict standard base64 (`+/`, padded), at
 most 64 bytes: one trailing newline (LF or CRLF) is ignored, and no other
 whitespace is accepted. A leading UTF-8 byte-order mark (some Windows tools
 add one) is skipped, and UTF-16 input is refused with a message saying so.
@@ -1268,13 +1206,13 @@ What can be retired depends on the provider:
 | Provider | `retire` |
 |---|---|
 | PKCS#11 | Deletes the service's key pair from the token. |
-| TPM | Refused. A TPM KEK is not stored anywhere: it is re-derived on every use from the TPM's seed, the derivation secret and the service name, so there is nothing to delete. Replacing the derivation secret changes every service's KEK on the host at once; `tpm.require_pinned_names` with the service's pin removed stops hkdfguard from using one service's KEK, without destroying it. |
+| TPM | Deletes the service's key file. The TPM keeps no copy, so the KEK is gone -- unless a copy of the key file survives (a backup), which still loads on this TPM: destroy those too. |
 | External secret | Refused: the KEK is the mounted secret. Remove it where it is managed (the Kubernetes Secret, Vault entry, systemd credential). |
 | Ephemeral | Refused: an ephemeral KEK ends with its process. |
 
 ## Configuration
 
-Every setting -- which TPM, which derivation secret, which secret mount,
+Every setting -- which TPM, which key directory, which secret mount,
 which PKCS#11 module, token and PIN file -- comes from one root-owned file,
 the policy at `/etc/hkdfguard/policy.toml` (see "Policy file reference"), or
 a built-in default. Nothing in the environment can redirect any of it, in
@@ -1313,7 +1251,7 @@ build:
 
 `scripts/native-tpm-test.sh`, `docker/entrypoint-test.sh` and CI build these
 into `target/test-paths`, write a harness policy naming the TPM, a scratch
-derivation secret and the SoftHSM2 token, and point
+key directory and the SoftHSM2 token, and point
 `HKDFGUARD_POLICY_FILE` at it. To do the same by hand:
 
 ```sh
@@ -1361,15 +1299,14 @@ setup_min_delay_ms = 1000           # floor on create_kek/kek_exists latency; 0 
 fail_if_requirement_unmet = true    # accepted for schema parity; the library always fails closed regardless
 
 [tpm]
-require_derivation_secret = true    # refuse the TPM without /etc/hkdfguard/tpm.derivation-secret; false warns instead
+key_dir = "/var/lib/hkdfguard/tpm"  # absolute path; one <service>.tpmkey per service, created by provision
 require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
 session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
 pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
 tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> | mssim:<conf> | swtpm:<conf>
                                     # mssim/swtpm are for testing only: no resource manager, so another client of
                                     # the same simulator can swap a key handle between its Name check and its use
-derivation_secret_file = "/etc/hkdfguard/tpm.derivation-secret"  # absolute path; root-owned, 0400 (or 0440 with the service's group)
-owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password. Absolute path, same rules; see "Protect the hierarchy"
+owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password. Absolute path; root-owned, 0400 (or 0440 with the service's group); see "Protect the hierarchy"
 
 [tpm.pinned_names]                  # per-service expected TPM Name; refuse any other key
 "com.company.orders" = "000b<64 hex>"
@@ -1409,7 +1346,7 @@ Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
 fail closed with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`) -- and resolves
 each hardening knob to its strictest setting
-(`session_encryption = "required"`, derivation secret required) rather than
+(`session_encryption = "required"`, the pinned-names allowlist on) rather than
 its default.
 
 ## Design decisions worth knowing
@@ -1426,25 +1363,21 @@ its default.
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.
-- **TPM2 KEKs are deterministic `CreatePrimary` outputs, not persistent
-  handles.** Rather than using `EvictControl` to persist a child key into
-  the TPM's limited persistent-handle range (which needs an owner-auth
-  session and a local `service -> handle number` mapping to protect and
-  never lose), each service's KEK is produced by `TPM2_CreatePrimary`
-  with the public template's `unique` field set to a hash of the service
-  name -- and, once provisioned, of the host derivation secret (see
-  "Hardening the TPM key"). `CreatePrimary` is deterministic for a fixed
-  hierarchy/template, so this reproduces the exact same key on demand from
-  the TPM's own internal primary seed -- no persistent-handle bookkeeping,
-  no exhaustion risk, nothing to lose. See the module doc in
-  [`src/provider/tpm2.rs`](src/provider/tpm2.rs) for the full rationale
-  and why this is not the kind of "derive a KEK from a machine
-  fingerprint" construction the spec prohibits (the secret input is the
-  TPM's seed; `service` is only a public domain-separation label, exactly
-  like it already is for HKDF `info`). The consequence worth knowing: on a
-  TPM every service's KEK "already exists" the moment the TPM is
-  reachable, so `hkdfguard_kek_exists` is always true there and
-  `provision` always reports already-provisioned.
+- **TPM2 KEKs are key files, not persistent handles or derived
+  primaries.** Rather than using `EvictControl` to persist a key into the
+  TPM's limited persistent-handle range (which needs an owner-auth session
+  and a local `service -> handle number` mapping to protect and never
+  lose), each service's key is created once with `TPM2_Create` under the
+  standard storage root key and saved as a key file the TPM encrypted; each
+  use re-creates the storage root key with `TPM2_CreatePrimary` (it is
+  deterministic for a fixed hierarchy and template) and loads the key file
+  under it. No persistent-handle bookkeeping, no exhaustion risk, and
+  provisioning is real: a service has a TPM KEK only once `provision` has
+  created its key file. An earlier design derived each service's key as a
+  primary, with a host secret folded into the template's `unique` field;
+  that secret crossed a discrete TPM's bus in cleartext with every
+  re-derivation, which a key file never does. See "The TPM key and its key
+  file" and the module doc in [`src/provider/tpm2.rs`](src/provider/tpm2.rs).
 - **The external-secret provider never creates keys, only loads them**,
   and declines per-service (not globally) when nothing is provisioned for
   a given `service`. `hkdfguard_create_kek` then continues down the
@@ -1456,8 +1389,8 @@ its default.
   every call and dropped after it; there are no standing TPM or PKCS#11
   sessions, no memoized provider selection, and the policy file is re-read
   from disk each time. The only per-process state is a handful of facts
-  about the *hardware* (the TPM conformance verdict, whether it honors the
-  derivation secret, and its manufacturer) that cannot change underneath a
+  about the *hardware* (the TPM conformance verdict and its manufacturer)
+  that cannot change underneath a
   running process, and the PKCS#11 module's library handle: `C_Initialize`
   and `C_Finalize` act on the whole process, and finalizing while another
   thread is mid-call is undefined behavior, so a module is initialized once
@@ -1488,27 +1421,27 @@ its default.
   for exactly this data.
 - **Private key material never leaves the TPM or the PKCS#11 token.**
   `Pkcs11Handle` holds no key bytes at all -- only object handles for the
-  key pair and the open session. `Tpm2Handle` holds no private key either,
-  but, when a derivation secret is configured, it holds the secret's
-  32-byte SHA-256 digest (read once per wrap/unwrap, so `public_key` and
-  `ecdh` derive from identical bytes). That digest is as sensitive as the
-  secret file itself, so it sits in a `Zeroizing` buffer, is never logged,
-  and is wiped when the handle drops at the end of the call. `ecdh()` asks
+  key pair and the open session. `Tpm2Handle` holds the service's key file
+  as read once per wrap/unwrap -- its public half, and its private half
+  encrypted under the storage root key, which only this TPM can use -- so
+  `public_key` and `ecdh` use the same key even if the file is replaced in
+  between. `ecdh()` asks
   the device/token to compute the shared point and only the
   (non-reversible) result crosses back.
 - **Every secret file is checked on its opened descriptor, never by path.**
-  The policy file, the PKCS#11 PIN, the TPM derivation secret, an
-  external-secret KEK, and the CLI's `--dek-file` all go through the same
+  The policy file, the PKCS#11 PIN, TPM key files and the owner password,
+  an external-secret KEK, and the CLI's `--dek-file` all go through the same
   discipline (`src/secure_file.rs`): open, then `fstat` the descriptor for
   regular-file type, ownership, and mode, so nothing can be swapped between
-  the check and the read. The policy, PIN, and derivation secret must be
-  root-owned (in every build but the test ones), in directories only root can change, so
+  the check and the read. The policy, PIN, and owner password must be
+  root-owned (in every build but the test ones), and TPM key files owned by
+  whoever may create KEKs, in directories only they can change, so
   the service's own uid can't rewrite (or delete) them. Secret contents are read into a single fixed
   allocation that is never grown (so no partially-filled buffer is ever
   freed un-wiped) and zeroed on every exit path.
 - **Nothing the library reads is trusted under a shared directory.**
-  The policy file, the PKCS#11 module and PIN file, the TPM derivation
-  secret and owner password, external-secret KEKs, and key files opened
+  The policy file, the PKCS#11 module and PIN file, TPM key files and the
+  owner password, external-secret KEKs, and key files opened
   with `hkdfguard_open_file` must each sit in a directory that, with every
   directory above it up to `/`, is owned by root (or, where the file may
   be, the calling user) and not writable by group or others -- with no
@@ -1569,8 +1502,9 @@ src/
   secure_file.rs            Descriptor-checked secret-file reads, self-wiping buffer
   provider/
     mod.rs                  KekProvider/KekHandle traits, selection chain
-    tpm2.rs                 Provider 1 (feature `tpm2`): derivation secret, Name
+    tpm2.rs                 Provider 1 (feature `tpm2`): key files, Name
                              pinning, session encryption, conformance suite
+    tpm_key_file.rs         The TPM key file format (TSS2 PRIVATE KEY), strictly parsed
     pkcs11.rs                Provider 2 (feature `pkcs11`)
     external_secret.rs      Provider 3 (feature `external-secret`, default)
     ephemeral.rs             Provider 4 (feature `ephemeral`, default)

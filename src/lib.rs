@@ -57,7 +57,7 @@ pub mod admin {
     /// Permanently deletes the KEK `service` currently resolves to -- the
     /// one every wrap uses -- if its fingerprint is `expected_fingerprint`.
     /// Only a provider that stores one key per service can do this
-    /// (PKCS#11); any other refuses, saying why. The fingerprint is checked
+    /// (TPM2, PKCS#11); any other refuses, saying why. The fingerprint is checked
     /// twice: against the KEK the service resolves to, and by the provider
     /// on the very objects it deletes. A setup call (serialized, held to
     /// the latency floor), and audited (1004) on success. Under the

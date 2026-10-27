@@ -226,15 +226,16 @@ fn pkcs11_concurrent_wraps_all_succeed() {
 }
 
 // ---------------------------------------------------------------------
-// A *policy-named* derivation-secret file that is missing must make the
-// TPM provider Refused (the call fails), like a policy-named TCTI that
-// can't be opened -- never Absent, which under `prefer` would quietly move
-// the wrap to a weaker provider that happens to hold a KEK for the service.
+// A TPM key file that is there but can't be trusted must fail the call,
+// like a policy-named TCTI that can't be opened -- never read as "not
+// provisioned", which under `prefer` would quietly move the wrap to a
+// weaker provider that happens to hold a KEK for the service. (No key file
+// at all is "not provisioned", and does move on.)
 // ---------------------------------------------------------------------
 #[test]
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs RUSTFLAGS=\"--cfg hkdfguard_test_paths\"")]
-fn tpm_missing_policy_named_derivation_secret_fails_the_call() {
+fn tpm_untrustworthy_key_file_fails_the_call() {
     if std::env::var_os("HKDFGUARD_TEST_TPM").is_none() {
         eprintln!("SKIP: HKDFGUARD_TEST_TPM not set (needs a reachable TPM and the tpm2 feature)");
         return;
@@ -248,33 +249,39 @@ fn tpm_missing_policy_named_derivation_secret_fails_the_call() {
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
     let service = CString::new(service_name).unwrap();
     let dek = [0x55u8; 32];
+    let key_dir = tempdir();
+    let policy = format!(
+        "preferred_order = [\"tpm2\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
+         [startup_behavior]\nsetup_min_delay_ms = 0\n\
+         [tpm]\nkey_dir = \"{}\"\n\
+         [external_secret]\ndir = \"{}\"\n",
+        key_dir.path().display(),
+        mount.path().display()
+    );
 
     // Control: a policy-named TCTI that can't be opened is Refused -> the
     // whole call fails, nothing falls through.
-    let refused = format!(
-        "preferred_order = [\"tpm2\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
-         [startup_behavior]\nsetup_min_delay_ms = 0\n\
-         [tpm]\ntcti = \"device:/dev/hkdfguard-no-such-tpm\"\n\
-         [external_secret]\ndir = \"{}\"\n",
-        mount.path().display()
-    );
+    let refused = policy.replace("[tpm]\n", "[tpm]\ntcti = \"device:/dev/hkdfguard-no-such-tpm\"\n");
     with_policy(&refused, || {
         let mut out = [0u8; 512];
         assert_eq!(wrap(&service, &dek, &mut out, 512).0, status::PROVIDER_ERROR, "an unreachable policy-named TCTI fails the call");
     });
 
-    // A policy-named derivation secret that is missing must behave the
-    // same way: the call fails, nothing is wrapped by external-secret.
-    let missing_secret = format!(
-        "preferred_order = [\"tpm2\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
-         [startup_behavior]\nsetup_min_delay_ms = 0\n\
-         [tpm]\nderivation_secret_file = \"/etc/hkdfguard/hkdfguard-test-no-such-secret\"\n\
-         [external_secret]\ndir = \"{}\"\n",
-        mount.path().display()
-    );
-    with_policy(&missing_secret, || {
+    // No TPM key file for the service: not provisioned on the TPM, so the
+    // external-secret KEK serves it.
+    with_policy(&policy, || {
+        let mut out = [0u8; 512];
+        assert_eq!(wrap(&service, &dek, &mut out, 512).0, status::OK, "no key file: the next provider serves the call");
+    });
+
+    // A key file anyone could read (and so use): the call fails, nothing
+    // is wrapped by external-secret.
+    let file = key_dir.path().join(format!("{service_name}.tpmkey"));
+    fs::write(&file, "-----BEGIN TSS2 PRIVATE KEY-----\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    with_policy(&policy, || {
         let mut out = [0u8; 512];
         let (rc, _) = wrap(&service, &dek, &mut out, 512);
-        assert_eq!(rc, status::PROVIDER_ERROR, "a missing policy-named derivation secret must fail the call, not fall through");
+        assert_eq!(rc, status::PROVIDER_ERROR, "an untrustworthy key file must fail the call, not fall through");
     });
 }

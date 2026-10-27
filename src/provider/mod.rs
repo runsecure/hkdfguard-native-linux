@@ -37,6 +37,11 @@ pub mod external_secret;
 pub mod pkcs11;
 #[cfg(feature = "tpm2")]
 pub mod tpm2;
+// The TPM provider's key file format. Pure Rust, so its tests run in every
+// build, not only those with the tpm2 feature.
+#[cfg(any(feature = "tpm2", test))]
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+mod tpm_key_file;
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::policy::PolicyEvaluator; // brings `.allowed_providers()` into scope on `crate::policy::Policy`
@@ -111,8 +116,7 @@ pub(crate) enum Backend<T> {
     /// Connected and usable.
     Ready(T),
     /// Not on this host, or not configured for use here (no TPM device we
-    /// can open, no derivation secret, no PKCS#11 module or PIN file, no
-    /// secret mount). The provider takes no part in the chain.
+    /// can open, no PKCS#11 module or PIN file, no secret mount). The provider takes no part in the chain.
     Absent,
     /// There and configured, but unusable or untrustworthy: a secret with
     /// the wrong owner or mode, a TPM that fails its self-test, a module
@@ -175,9 +179,8 @@ pub trait KekProvider: Send + Sync {
     /// [`Error::KekNotFound`] if it holds none, and
     /// [`Error::KekFingerprintMismatch`] if it holds a different one.
     ///
-    /// Only a provider that stores one key per service can do this; the
-    /// default refuses. TPM2 stores nothing (each KEK is re-derived on
-    /// demand from the TPM's seed), an external secret belongs to the
+    /// Only a provider that stores one key per service can do this (TPM2,
+    /// PKCS#11); the default refuses. An external secret belongs to the
     /// platform that mounted it, and an ephemeral KEK ends with its process.
     fn retire_kek(&self, service: &str, expected_fingerprint: &[u8; crate::payload::FINGERPRINT_LEN]) -> Result<()> {
         let _ = (service, expected_fingerprint);
@@ -185,10 +188,7 @@ pub trait KekProvider: Send + Sync {
             "{} cannot retire a single service's KEK: {}",
             self.provider_type().as_str(),
             match self.provider_type() {
-                ProviderType::Tpm2 => {
-                    "it stores no key -- each KEK is re-derived on demand from the TPM's seed and the derivation \
-                     secret -- so there is nothing to delete; see the README on retiring TPM2 KEKs"
-                }
+                ProviderType::Tpm2 => "this build's TPM provider does not implement it",
                 ProviderType::ExternalSecret => {
                     "the KEK is a secret the platform provides; remove it there (the Kubernetes Secret, Vault \
                      entry, systemd credential, ...)"
