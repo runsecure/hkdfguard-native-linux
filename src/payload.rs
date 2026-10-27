@@ -3,10 +3,9 @@
 //! Deliberately hand-rolled rather than `serde`+`bincode`: this is a
 //! security-critical, cross-version wire format, so every field width and
 //! order is pinned here explicitly rather than left to a serialization
-//! library's defaults. It is this Linux library's own format: the macOS and
-//! Windows libraries share the C ABI but each has its own payload format,
-//! and a payload is only ever opened on the host that wrapped it, so no
-//! other implementation parses this one (see include/hkdfguard.h).
+//! library's defaults. A payload is only ever opened on the host that
+//! wrapped it, so nothing but this library parses it (see
+//! include/hkdfguard.h).
 //!
 //! Layout (all integers little-endian):
 //!

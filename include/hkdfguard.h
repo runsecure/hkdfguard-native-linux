@@ -182,13 +182,11 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * hkdfguard_generate_and_wrap_dek both return HKDFGUARD_ERR_KEK_NOT_FOUND
  * if called before this for a given `service`.
  *
- * TPM2 exception: the TPM derives a KEK for any service on demand, so by
- * default every service already "exists" there and this call has nothing
- * to create. With `tpm.require_pinned_names: true` in the policy file, a
- * service exists on the TPM only if policy pins its Name; for an unpinned
- * service this call fails and logs (at error level) the policy entry to
- * add, ready to paste. Provisioning on TPM is that root-owned policy
- * edit.
+ * On TPM2 this creates the service's key file (see README.md, "The TPM
+ * key and its key file"). With `tpm.require_pinned_names: true` in the
+ * policy file, a service exists on the TPM only if policy also pins its
+ * Name; for an unpinned service this call creates the key file, then fails
+ * and logs (at error level) the policy entry to add, ready to paste.
  *
  * Under the production security model (the default; see
  * hkdfguard_security_model) only root creates a KEK: any other caller gets
@@ -268,8 +266,8 @@ int hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int* out_len);
  * public key, which hkdfguard_unwrap_dek checks before decrypting -- see
  * its own doc comment below.
  *
- * service:  NUL-terminated UTF-8 string, 1..=128 bytes. The logical,
- *           cross-platform identity of the KEK (e.g. "com.company.orders").
+ * service:  NUL-terminated UTF-8 string, 1..=128 bytes. The logical
+ *           identity of the KEK (e.g. "com.company.orders").
  *           Only ASCII alphanumeric characters and '.' are allowed, and it
  *           may not start with '.' or contain two consecutive dots (".."),
  *           so it can never name ".", "..", or a hidden file. NULL, an

@@ -171,7 +171,8 @@ hkdfguard --help
 ls -l /usr/share/hkdfguard/policy.toml.example
 ```
 
-The packages install no policy, derivation secret or PIN file: those are
+The packages create an empty TPM key directory, `/var/lib/hkdfguard/tpm`
+(`root:hkdfguard 0750`), and install no policy or PIN file: those are
 per-host decisions. With no policy the library uses its defaults, described
 in [configuration.md](configuration.md).
 
@@ -317,7 +318,8 @@ sudo dnf remove hkdfguard hkdfguard-libs          # RHEL, Amazon Linux
 sudo zypper remove hkdfguard libhkdfguard1        # SLES
 ```
 
-Removing the packages leaves `/etc/hkdfguard/policy.toml`, the derivation
-secret and any other files you created there. **Keep the derivation secret
-and your key material if you may need to unwrap existing DEKs later**: see
-[configuration.md](configuration.md#back-up-the-derivation-secret).
+Removing the packages leaves `/etc/hkdfguard/policy.toml`, the TPM key
+files in `/var/lib/hkdfguard/tpm`, and any other files you created. **Keep
+the key files and your other key material if you may need to unwrap
+existing DEKs later**: see
+[configuration.md](configuration.md#back-up-the-key-files).

@@ -42,12 +42,22 @@
 //! compute `KEK_priv · H_salt` for any salt. The salt is public, so the
 //! (non-constant-time) hashing is fine.
 //!
+//! In standard terms the wrapping key is the 2HashDH PRF keyed by the KEK,
+//! `F(k, salt) = H2(salt, k · H1(salt))` -- the PRF underneath RFC 9497's
+//! oblivious PRFs, without the blinding -- with `H1` the RFC 9380
+//! hash-to-curve and `H2` HKDF-SHA512. It is a PRF in the random-oracle
+//! model under CDH on P-256, which gives both unforgeability and
+//! per-payload isolation.
+//!
 //! See `docs/why-ecdh.md` for the full rationale.
 //!
 //! ## What is bound
 //!
-//! The salt does double duty: it selects the ECDH point, and it is the
-//! HKDF salt. Both the derived key and the AEAD are bound to
+//! The salt has three jobs: it is the PRF input (hashed to the ECDH
+//! point), the HKDF salt (where it enters `H2`), and part of the
+//! authenticated header below. `docs/why-ecdh.md` ("The salt's three
+//! jobs") explains why one field safely does all three. Both the derived
+//! key and the AEAD are bound to
 //! [`crate::payload::Payload::authenticated_bytes`] -- every byte of the
 //! payload except the ciphertext -- plus the length-framed service name.
 //! That authenticates the `provider_type` tag (so a payload cannot be
@@ -147,24 +157,6 @@ pub const MIN_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN;
 /// Largest possible wrapped payload, for any provider and any valid service
 /// name. Mirrored as `HKDFGUARD_WRAPPED_MAX_LEN` in `include/hkdfguard.h`.
 pub const MAX_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN + MAX_KEY_ID_LEN;
-
-/// Finalizes a SHA-256 hash of secret input into a zeroizing buffer, and
-/// consumes the hasher so it is wiped at once.
-///
-/// A hasher holds the unprocessed tail of its input (up to 63 bytes, e.g.
-/// the end of a derivation secret) in its block buffer, plus the chaining
-/// state. With `sha2`'s `zeroize` feature (Cargo.toml) both are wiped when
-/// the hasher drops, which here is the end of this function; the digest is
-/// written straight into the zeroizing output, with no other copy. Best
-/// effort: the compression function's own stack temporaries are out of
-/// reach, as for every other stack copy here.
-#[cfg_attr(not(feature = "tpm2"), allow(dead_code))] // the TPM provider is the caller that hashes secrets
-pub(crate) fn finalize_sha256_wiping(hasher: Sha256) -> Zeroizing<[u8; 32]> {
-    let mut out = Zeroizing::new([0u8; 32]);
-    let digest: &mut sha2::digest::Output<Sha256> = (&mut out[..]).try_into().expect("SHA-256 output is 32 bytes");
-    Digest::finalize_into(hasher, digest);
-    out
-}
 
 // Wraps `dek` under the persistent KEK for `service`, returning the
 // serialized wrapped payload ready to store/transmit. The KEK must already
@@ -320,10 +312,11 @@ fn derive_wrapping_key(
     salt: &[u8; SALT_LEN],
     authenticated: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>> {
-    // HKDF-Extract with the payload's random salt. The shared secret is
-    // already unique per payload (the salt selected its ECDH point), so
-    // this is belt-and-braces separation rather than the only thing
-    // keeping two payloads' AES keys apart.
+    // HKDF-Extract with the payload's random salt: the salt entering the
+    // outer hash `H2` of `F(k, salt) = H2(salt, k · H1(salt))` (see the
+    // module doc). It isn't what keeps two payloads' AES keys apart -- the
+    // shared secret is already unique per payload, because the salt
+    // selected its ECDH point -- and it needn't be secret.
     //
     // `extract`, not `new`: `new` calls it and drops the 64-byte PRK
     // unwiped, and the wrapping key is a public function of the PRK - it
@@ -855,28 +848,12 @@ mod tests {
     }
 
     #[test]
-    fn wiping_finalize_matches_a_plain_finalize() {
-        // Any change to the digest would change every TPM KEK, so the
-        // wiping variant must agree with plain `finalize` byte for byte --
-        // across tails that end mid-block, exactly at a block boundary, and
-        // one byte short of one (where padding spills into a second block).
-        for len in [0usize, 1, 31, 32, 55, 56, 63, 64, 65, 127, 200] {
-            let input: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-            let expected = Sha256::digest(&input);
-
-            let mut hasher = Sha256::new();
-            hasher.update(&input);
-            let got = finalize_sha256_wiping(hasher);
-            assert_eq!(&got[..], &expected[..], "input length {len}");
-        }
-    }
-
-    #[test]
-    fn sha256_wipes_itself_on_drop() {
-        // What makes the hasher `finalize_sha256_wiping` consumes safe to
-        // drop: sha2's `zeroize` feature. Without it this stops compiling.
+    fn sha512_wipes_itself_on_drop() {
+        // HKDF-SHA512 keys SHA-512 states with the ECDH shared secret (see
+        // `derive_wrapping_key`): sha2's `zeroize` feature is what wipes
+        // them when they drop. Without it this stops compiling.
         fn wipes_on_drop<T: sha2::digest::zeroize::ZeroizeOnDrop>() {}
-        wipes_on_drop::<Sha256>();
+        wipes_on_drop::<Sha512>();
     }
 
     #[test]

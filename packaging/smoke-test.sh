@@ -66,6 +66,9 @@ for group in hkdfguard hkdfguard-deployers; do
     getent group "$group" >/dev/null || { echo "the packages must create group $group" >&2; exit 1; }
 done
 [ -f /usr/lib/sysusers.d/hkdfguard.conf ] || { echo "/usr/lib/sysusers.d/hkdfguard.conf must be installed" >&2; exit 1; }
+# The TPM key directory, group-owned by hkdfguard so its members can use TPM keys.
+[ "$(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm)" = "root:hkdfguard 750" ] \
+    || { echo "/var/lib/hkdfguard/tpm must be root:hkdfguard 0750, is $(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm 2>&1)" >&2; exit 1; }
 example_policy=/usr/share/hkdfguard/policy.toml.example
 [ "$(stat -c '%U:%G %a' "$example_policy")" = "root:root 644" ] \
     || { echo "$example_policy must be installed, root:root 0644" >&2; exit 1; }

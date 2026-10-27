@@ -67,7 +67,7 @@ What `provision` does depends on the provider:
 
 | Provider | What `provision` does |
 |---|---|
-| TPM | Derives the key on demand, so it reports "already provisioned", after deriving it and checking any pinned Name. With `require_pinned_names`, it fails for an unlisted service and prints the policy line to add. |
+| TPM | Has the TPM generate the key and saves it as the service's key file, once; later runs load it into the TPM, check any pinned Name, and report "already provisioned". With `require_pinned_names`, it creates the key file for an unlisted service, then fails and prints the policy line to add. **Back up the key file**: a lost key file is a lost KEK. |
 | PKCS#11 | Generates the key pair on the token, once; later runs find it there and report "already provisioned". |
 | External secret | Checks the delivered file, that it holds a valid key, and that its fingerprint matches any pin: the file itself is the provisioning. With `require_pinned_keys`, it fails for an unpinned service and prints the policy line for the mounted key. |
 | Ephemeral | Refused by the CLI, for `provision` and `wrap` alike: an ephemeral key lives only in the process that creates it, so the application must wrap its own DEKs. |
@@ -327,12 +327,12 @@ is the application, not a deployer: it never writes its own key files.
 
 | Provider | The application's account needs |
 |---|---|
-| TPM | `/dev/tpmrm0` (the `tss` group), and read access to the derivation secret (its group) |
+| TPM | `/dev/tpmrm0` (the `tss` group), and read access to its key file (the key directory's group) |
 | PKCS#11 | Access to the token, and read access to the PIN file (its group) |
 | External secret | Read access to its own file in the secret mount |
 
 Plus read access to its wrapped key file. For an application using the TPM,
-with the derivation secret group-owned by `hkdfguard`
+with the key directory group-owned by `hkdfguard`
 ([configuration.md](configuration.md#who-can-use-the-keys)):
 
 ```sh

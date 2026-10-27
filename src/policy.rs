@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Location of the policy file. Every build that ships reads only this
-/// path; every other piece of configuration (TPM, derivation secret,
+/// path; every other piece of configuration (TPM and its key directory,
 /// secret mount, PKCS#11 module, token and PIN file) is named inside it.
 #[cfg_attr(test, allow(dead_code))] // unit tests never read the real policy (see `policy_file_path`)
 const DEFAULT_POLICY_FILE: &str = "/etc/hkdfguard/policy.toml";
@@ -327,16 +327,9 @@ fn token_field(field: &str, value: &str, max: usize) -> Result<String> {
 /// TPM2-provider-specific administrative controls. Parsed and validated
 /// on every build (so a policy file is portable across builds with and
 /// without the `tpm2` feature) but only consulted by the TPM2 provider.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TpmPolicy {
-    /// Refuse to use the TPM provider at all unless the derivation-secret
-    /// file is present and trustworthy. Default `true`: without the secret
-    /// the derivation depends only on the TPM seed and a public label, so
-    /// any local process that can open the TPM reproduces every key.
-    /// Setting it `false` allows running without one, with a warning.
-    #[serde(default = "default_true")]
-    require_derivation_secret: bool,
     /// Expected TPM Name, per service, as lowercase hex. When a service
     /// has an entry here, the Name the TPM reports for its key must match
     /// it exactly or the operation fails -- see
@@ -346,9 +339,7 @@ struct TpmPolicy {
     pinned_names: BTreeMap<String, String>,
     /// Make `pinned_names` the TPM provider's allowlist: a service with no
     /// pinned Name is treated as having no KEK (`kek_exists` is false,
-    /// wrap/unwrap decline). Without this, the TPM derives a key for any
-    /// service name on demand, so "provisioning" gates nothing. Default
-    /// `false`, so existing deployments keep working until they pin.
+    /// wrap/unwrap decline), whatever key file it has. Default `false`.
     #[serde(default)]
     require_pinned_names: bool,
     /// Whether `TPM2_ECDH_ZGen` runs inside a salted, parameter-encrypted
@@ -377,16 +368,15 @@ struct TpmPolicy {
     /// `TPM2_ECDH_ZGen`. `device:/dev/tpmrm0` and `tabrmd` give each
     /// connection its own handles, which closes that window.
     tcti: Option<String>,
-    /// Absolute path of the derivation-secret file (default
-    /// `/etc/hkdfguard/tpm.derivation-secret`).
-    derivation_secret_file: Option<String>,
+    /// Absolute path of the directory holding the TPM key files, one
+    /// `<service>.tpmkey` per service (default `/var/lib/hkdfguard/tpm`).
+    key_dir: Option<String>,
     /// Absolute path of a file holding the Owner hierarchy's
     /// authorization value, used verbatim. Unset (the default): the Owner
     /// hierarchy is assumed to have an empty password. Setting an owner
-    /// password, and this file, stops anyone without it from deriving keys
-    /// under the Owner hierarchy at all -- including re-deriving this
-    /// crate's KEKs. It is not a derivation input, so adding it changes no
-    /// KEK.
+    /// password, and this file, stops anyone without it from deriving the
+    /// storage primary key every key file is loaded under -- and so from
+    /// using this crate's KEKs at all. Adding it changes no KEK.
     owner_auth_file: Option<String>,
 }
 
@@ -405,24 +395,6 @@ fn validate_tcti(tcti: &str) -> Result<()> {
         "hkdfguard policy: tpm.tcti \"{tcti}\" must start with one of: {}",
         TCTI_KINDS.join(", ")
     )))
-}
-
-// Manual rather than derived: `require_derivation_secret` must default to
-// true when the `[tpm]` table is absent, exactly as when it is present
-// without the key.
-impl Default for TpmPolicy {
-    fn default() -> Self {
-        TpmPolicy {
-            require_derivation_secret: true,
-            pinned_names: BTreeMap::new(),
-            require_pinned_names: false,
-            session_encryption: SessionEncryption::default(),
-            pinned_session_salt_key_name: None,
-            tcti: None,
-            derivation_secret_file: None,
-            owner_auth_file: None,
-        }
-    }
 }
 
 /// Policy for TPM session parameter encryption (`tpm.session_encryption`).
@@ -602,14 +574,13 @@ pub struct Policy {
     minimum_protection: Option<KeyProtectionLevel>,
     preferred_order: Vec<ProviderType>,
     setup_min_delay: Duration,
-    require_tpm_derivation_secret: bool,
     require_tpm_pinned_names: bool,
     /// Normalized service name -> expected TPM Name bytes.
     pinned_tpm_names: BTreeMap<String, Vec<u8>>,
     tpm_session_encryption: SessionEncryption,
     pinned_session_salt_key_name: Option<Vec<u8>>,
     tpm_tcti: Option<String>,
-    tpm_derivation_secret_file: Option<PathBuf>,
+    tpm_key_dir: Option<PathBuf>,
     tpm_owner_auth_file: Option<PathBuf>,
     external_secret_dir: Option<PathBuf>,
     require_external_pinned_keys: bool,
@@ -765,12 +736,7 @@ impl Policy {
         if let Some(tcti) = &raw.tpm.tcti {
             validate_tcti(tcti)?;
         }
-        let tpm_derivation_secret_file = raw
-            .tpm
-            .derivation_secret_file
-            .as_deref()
-            .map(|f| absolute_path("tpm.derivation_secret_file", f))
-            .transpose()?;
+        let tpm_key_dir = raw.tpm.key_dir.as_deref().map(|d| absolute_path("tpm.key_dir", d)).transpose()?;
         let tpm_owner_auth_file = raw
             .tpm
             .owner_auth_file
@@ -829,13 +795,12 @@ impl Policy {
             minimum_protection,
             preferred_order: raw.preferred_order,
             setup_min_delay: Duration::from_millis(setup_min_delay_ms),
-            require_tpm_derivation_secret: raw.tpm.require_derivation_secret,
             require_tpm_pinned_names: raw.tpm.require_pinned_names,
             pinned_tpm_names,
             tpm_session_encryption: raw.tpm.session_encryption,
             pinned_session_salt_key_name,
             tpm_tcti: raw.tpm.tcti,
-            tpm_derivation_secret_file,
+            tpm_key_dir,
             tpm_owner_auth_file,
             external_secret_dir,
             require_external_pinned_keys: raw.external_secret.require_pinned_keys,
@@ -895,9 +860,9 @@ impl Policy {
         self.tpm_tcti.as_deref()
     }
 
-    /// The derivation-secret file (`tpm.derivation_secret_file`), if policy sets one.
-    pub fn tpm_derivation_secret_file(&self) -> Option<&std::path::Path> {
-        self.tpm_derivation_secret_file.as_deref()
+    /// The TPM key-file directory (`tpm.key_dir`), if policy sets one.
+    pub fn tpm_key_dir(&self) -> Option<&std::path::Path> {
+        self.tpm_key_dir.as_deref()
     }
 
     /// The administrator-pinned Name of the session salt key, if any.
@@ -916,12 +881,6 @@ impl Policy {
     /// see the module-level [`audit_unwrap_success`].
     pub fn audit_unwrap_success(&self) -> bool {
         self.audit_unwrap_success
-    }
-
-    /// Whether the TPM provider must refuse to run without a
-    /// derivation-secret file (`tpm.require_derivation_secret`).
-    pub fn require_tpm_derivation_secret(&self) -> bool {
-        self.require_tpm_derivation_secret
     }
 
     /// Whether the TPM provider treats only pinned services as provisioned
@@ -1178,21 +1137,6 @@ pub(crate) fn audit_unwrap_success() -> bool {
     }
 }
 
-/// Whether the TPM2 provider may only be used with a derivation-secret
-/// file present (`tpm.require_derivation_secret`).
-///
-/// `true` unless a valid policy explicitly sets it `false`: with no policy
-/// file, with a policy that doesn't mention it, and with a policy file
-/// that exists but is invalid (a broken policy must never be the thing
-/// that relaxes a security control).
-#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
-pub(crate) fn require_tpm_derivation_secret() -> bool {
-    match load() {
-        Some(Ok(policy)) => policy.require_tpm_derivation_secret(),
-        Some(Err(_)) | None => true,
-    }
-}
-
 /// The administrator-pinned TPM Name for `service`, if any.
 ///
 /// This is the part of Name checking that actually resists substitution.
@@ -1252,12 +1196,13 @@ pub(crate) fn tpm_tcti() -> Result<Option<String>> {
     }
 }
 
-/// The derivation-secret file policy names (`tpm.derivation_secret_file`),
-/// if any. `Err` on a policy file that exists but can't be trusted.
+/// The TPM key-file directory policy names (`tpm.key_dir`), if any. `Err`
+/// on a policy file that exists but can't be trusted: the TPM provider then
+/// fails rather than reading or writing keys at the default directory.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
-pub(crate) fn tpm_derivation_secret_file() -> Result<Option<PathBuf>> {
+pub(crate) fn tpm_key_dir() -> Result<Option<PathBuf>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.tpm_derivation_secret_file().map(std::path::Path::to_path_buf)),
+        Some(Ok(policy)) => Ok(policy.tpm_key_dir().map(std::path::Path::to_path_buf)),
         Some(Err(e)) => Err(e),
         None => Ok(None),
     }
@@ -1402,8 +1347,8 @@ pub(crate) mod test_support {
     }
 
     // What a new layer is merged onto: the innermost live layer, or with
-    // none, the harness's policy (HKDFGUARD_POLICY_FILE: which TPM, which
-    // derivation secret, which PKCS#11 token this machine's test run uses).
+    // none, the harness's policy (HKDFGUARD_POLICY_FILE: which TPM and key
+    // directory, which PKCS#11 token this machine's test run uses).
     fn base() -> toml::Table {
         if let Some(layer) = layers().last() {
             return layer.table.clone().unwrap_or_default();
@@ -1872,25 +1817,37 @@ mod tests {
         assert_eq!(delay, Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
     }
 
-    // ---- tpm.require_derivation_secret / tpm.pinned_names ----
+    // ---- tpm.key_dir / tpm.pinned_names ----
 
     const A_NAME: &str = "000b0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 
     #[test]
-    fn tpm_section_defaults_to_requiring_the_secret_and_no_pins() {
+    fn tpm_section_defaults_to_the_default_key_dir_and_no_pins() {
         let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
         let policy = Policy::from_toml_str(base).unwrap();
-        assert!(policy.require_tpm_derivation_secret(), "required by default with no [tpm] table");
+        assert!(policy.tpm_key_dir().is_none(), "no [tpm] table: the provider's default directory");
         assert!(!policy.require_tpm_pinned_names(), "the allowlist must be opt-in");
         assert_eq!(policy.pinned_tpm_name("com.company.orders"), None);
 
-        // A [tpm] table that doesn't mention it gets the same default.
-        let doc = format!("{base}[tpm]\nsession_encryption = \"auto\"\n");
-        assert!(Policy::from_toml_str(&doc).unwrap().require_tpm_derivation_secret());
+        let doc = format!("{base}[tpm]\nkey_dir = \"/srv/hkdfguard/tpm\"\n");
+        assert_eq!(Policy::from_toml_str(&doc).unwrap().tpm_key_dir(), Some(std::path::Path::new("/srv/hkdfguard/tpm")));
+    }
 
-        // Only an explicit `false` turns it off.
-        let doc = format!("{base}[tpm]\nrequire_derivation_secret = false\n");
-        assert!(!Policy::from_toml_str(&doc).unwrap().require_tpm_derivation_secret());
+    #[test]
+    fn a_relative_tpm_key_dir_is_rejected() {
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nkey_dir = \"var/lib/hkdfguard/tpm\"\n";
+        let err = Policy::from_toml_str(doc).unwrap_err().to_string();
+        assert!(err.contains("tpm.key_dir") && err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn the_removed_derivation_secret_settings_are_rejected() {
+        // TPM keys are key files now; a policy still naming the old
+        // derivation secret is refused rather than silently ignored.
+        for key in ["derivation_secret_file = \"/etc/hkdfguard/tpm.derivation-secret\"", "require_derivation_secret = true"] {
+            let doc = format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\n{key}\n");
+            assert!(Policy::from_toml_str(&doc).is_err(), "{key}");
+        }
     }
 
     #[test]
@@ -1908,12 +1865,6 @@ mod tests {
         let policy = Policy::from_toml_str(doc).unwrap();
         assert!(policy.require_tpm_pinned_names());
         assert_eq!(policy.pinned_tpm_name("com.company.orders"), None);
-    }
-
-    #[test]
-    fn tpm_require_derivation_secret_is_read() {
-        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n";
-        assert!(Policy::from_toml_str(doc).unwrap().require_tpm_derivation_secret());
     }
 
     #[test]
@@ -2156,10 +2107,10 @@ mod tests {
     #[serial_test::serial]
     fn tpm_helpers_without_a_policy_file() {
         let _no_policy = TestPolicy::absent();
-        let required = require_tpm_derivation_secret();
+        let key_dir = tpm_key_dir();
         let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
-        assert!(required, "the derivation secret is required by default, policy or not");
+        assert_eq!(key_dir.unwrap(), None, "no policy: the provider's default directory");
         assert!(!allowlist, "no policy must not silently make the TPM refuse every service");
         assert_eq!(pinned.unwrap(), None);
     }
@@ -2168,13 +2119,13 @@ mod tests {
     #[serial_test::serial]
     fn tpm_helpers_fail_closed_on_a_broken_policy() {
         // A policy that can't be parsed must not be the reason a security
-        // control is skipped: requiring becomes true, and pinning errors
-        // rather than reporting "nothing pinned".
+        // control is skipped: the allowlist applies, and the key directory
+        // and pin lookups error rather than reporting defaults.
         let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n"); // missing `provider`
-        let required = require_tpm_derivation_secret();
+        let key_dir = tpm_key_dir();
         let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
-        assert!(required, "a broken policy must fail closed to requiring the secret");
+        assert!(key_dir.is_err(), "a broken policy must not mean the default key directory");
         assert!(allowlist, "a broken policy must fail closed to the allowlist");
         assert!(pinned.is_err(), "a broken policy must not report 'nothing pinned'");
     }
@@ -2182,12 +2133,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tpm_helpers_read_the_configured_file() {
-        let _policy = TestPolicy::write(&format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n"));
-        let required = require_tpm_derivation_secret();
+        let _policy = TestPolicy::write(&format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nkey_dir = \"/srv/tpm-keys\"\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n"));
+        let key_dir = tpm_key_dir();
         let pinned = pinned_tpm_name("com.company.orders");
         let unpinned = pinned_tpm_name("com.company.billing");
 
-        assert!(required);
+        assert_eq!(key_dir.unwrap(), Some(PathBuf::from("/srv/tpm-keys")));
         assert_eq!(pinned.unwrap().unwrap().len(), SHA256_TPM_NAME_LEN);
         assert_eq!(unpinned.unwrap(), None);
     }
@@ -2486,13 +2437,12 @@ mod tests {
             vec![ProviderType::Tpm2, ProviderType::Pkcs11, ProviderType::ExternalSecret]
         );
         assert_eq!(policy.setup_min_delay(), Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
-        assert!(policy.require_tpm_derivation_secret());
         assert!(!policy.require_tpm_pinned_names());
         assert!(policy.pinned_tpm_name("com.company.orders").is_none());
         assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Auto);
         assert!(policy.pinned_session_salt_key_name().is_none());
         assert!(policy.tpm_tcti().is_none());
-        assert!(policy.tpm_derivation_secret_file().is_none());
+        assert!(policy.tpm_key_dir().is_none());
         assert!(policy.tpm_owner_auth_file().is_none());
         assert!(policy.external_secret_dir().is_none());
         assert_eq!(policy.pkcs11(), &Pkcs11Settings::default());
