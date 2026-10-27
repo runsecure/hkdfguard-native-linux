@@ -19,8 +19,8 @@
 //!   file under it is audited (event 1005), once per process.
 //!
 //! Wrapping and unwrapping are the same in both: the provider's own access
-//! control (the `tss` group and derivation secret, the PIN file, the secret
-//! file's mode) decides who may use a KEK at all. Wrap and unwrap are the
+//! control (the `tss` group and the TPM key file's mode, the PIN file, the
+//! secret file's mode) decides who may use a KEK at all. Wrap and unwrap are the
 //! same ECDH operation on the KEK, so no setting can grant one without the
 //! other; what the model decides is whose key files are believed.
 //!

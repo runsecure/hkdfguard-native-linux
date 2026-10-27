@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
 # Approximates TPM reboot/persistence testing for hkdfguard's TPM2
-# provider: TPM2_CreatePrimary's determinism (see the design note in
-# src/provider/tpm2.rs) means a primary key derived from a fixed template
-# must reproduce identically even after the emulated TPM process itself
-# is stopped and restarted, as long as its state directory (where swtpm
-# persists the primary seed) survives.
+# provider: every key file is loaded under the storage root key, which
+# TPM2_CreatePrimary re-creates from a fixed template on each use (see the
+# design note in src/provider/tpm2.rs). That primary must reproduce
+# identically even after the emulated TPM process itself is stopped and
+# restarted, as long as its state directory (where swtpm persists the
+# primary seed) survives -- or no key file made before the restart loads.
 #
 # This is an approximation, not a literal invocation of hkdfguard's own
 # Rust code: it drives tpm2-tools directly against a plain default ECC
-# template rather than reimplementing src/provider/tpm2.rs's exact
-# per-service SHA-256(service) `unique`-field derivation in shell. That
-# per-service differentiation is already covered, in-process and without
-# needing a real restart, by the `#[ignore]`d
-# different_services_produce_different_public_keys /
-# _names tests in src/provider/tpm2.rs. What only an actual restart can
-# exercise -- and what this script is for -- is whether CreatePrimary's
-# output for a *fixed* template survives that restart at all.
+# template rather than the exact TCG storage-key template in
+# src/provider/tpm2.rs. What only an actual restart can exercise -- and
+# what this script is for -- is whether CreatePrimary's output for a
+# *fixed* template survives that restart at all.
 #
 # Workflow:
 #   1. Start swtpm with persistent state.

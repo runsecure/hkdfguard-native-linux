@@ -62,7 +62,7 @@ services:
     # the separate `swtpm` service above. The TPM is named in a scratch
     # policy, read by a `--cfg hkdfguard_test_paths` test build.
     # As the image's unprivileged test user, like entrypoint-test.sh's tests.
-    # The scratch policy and derivation secret go in a private directory
+    # The scratch policy and TPM key directory go in a private directory
     # under /work (ci's own), not /tmp: the library refuses anything it
     # reads under a sticky, world-writable directory.
     user: ci
@@ -72,9 +72,9 @@ services:
         set -euo pipefail
         tpm2_startup -c -T "$$TPM2TOOLS_TCTI"
         H=$$(mktemp -d /work/harness.XXXXXX)
-        ( umask 077; head -c 32 /dev/urandom > "$$H/tpm.derivation-secret" )
-        printf '[selection]\nmode = "prefer"\n\n[tpm]\ntcti = "%s"\nderivation_secret_file = "%s"\n' \
-          "$$TPM2TOOLS_TCTI" "$$H/tpm.derivation-secret" > "$$H/policy.toml"
+        ( umask 077; mkdir "$$H/tpm-keys" )
+        printf '[selection]\nmode = "prefer"\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\n' \
+          "$$TPM2TOOLS_TCTI" "$$H/tpm-keys" > "$$H/policy.toml"
         chmod 0644 "$$H/policy.toml"
         HKDFGUARD_POLICY_FILE="$$H/policy.toml" RUSTFLAGS="--cfg hkdfguard_test_paths" CARGO_TARGET_DIR=target/test-paths \
           cargo test --features tpm2 -- --ignored --test-threads=1

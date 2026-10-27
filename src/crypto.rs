@@ -42,12 +42,22 @@
 //! compute `KEK_priv · H_salt` for any salt. The salt is public, so the
 //! (non-constant-time) hashing is fine.
 //!
+//! In standard terms the wrapping key is the 2HashDH PRF keyed by the KEK,
+//! `F(k, salt) = H2(salt, k · H1(salt))` -- the PRF underneath RFC 9497's
+//! oblivious PRFs, without the blinding -- with `H1` the RFC 9380
+//! hash-to-curve and `H2` HKDF-SHA512. It is a PRF in the random-oracle
+//! model under CDH on P-256, which gives both unforgeability and
+//! per-payload isolation.
+//!
 //! See `docs/why-ecdh.md` for the full rationale.
 //!
 //! ## What is bound
 //!
-//! The salt does double duty: it selects the ECDH point, and it is the
-//! HKDF salt. Both the derived key and the AEAD are bound to
+//! The salt has three jobs: it is the PRF input (hashed to the ECDH
+//! point), the HKDF salt (where it enters `H2`), and part of the
+//! authenticated header below. `docs/why-ecdh.md` ("The salt's three
+//! jobs") explains why one field safely does all three. Both the derived
+//! key and the AEAD are bound to
 //! [`crate::payload::Payload::authenticated_bytes`] -- every byte of the
 //! payload except the ciphertext -- plus the length-framed service name.
 //! That authenticates the `provider_type` tag (so a payload cannot be
@@ -74,7 +84,8 @@ use crate::provider; // provider selection functions (`select_existing`, `get_by
 use aes_gcm::{AeadInOut, Aes256Gcm, Key, KeyInit, Nonce, Tag}; // in-place AEAD trait, concrete cipher, and its key/nonce/tag types (all fixed-size, stack-resident)
 use elliptic_curve::sec1::ToSec1Point; // lets us serialize the KEK public key to SEC1 bytes
 use hkdf::Hkdf; // HKDF-SHA512 key derivation
-use p256::PublicKey; // P-256 public key type
+use p256::hash2curve::GroupDigest; // RFC 9380 hash-to-curve for the per-payload ECDH point
+use p256::{NistP256, PublicKey}; // the curve (for `GroupDigest`) and its public key type
 use sha2::{Digest, Sha256, Sha512}; // `Sha256` for the KEK fingerprint, `Sha512` for HKDF, `Digest` for `Sha256::digest`
 use zeroize::{Zeroize, Zeroizing}; // `Zeroize` for explicit scrubbing of stack arrays, `Zeroizing` for auto-scrubbing owned buffers
 
@@ -101,37 +112,28 @@ const UNCOMPRESSED_POINT_LEN: usize = 65; // SEC1 uncompressed P-256 point: 1 ta
 // one payload, not the whole service's history. The salt is also HKDF's
 // salt, so a single 32-byte header field provides both separations.
 //
-// The hash-to-curve is simple try-and-increment: `X = SHA-256(domain ||
-// salt || counter)`, taking the first counter whose `X` is a valid P-256
-// x-coordinate, with the even-`Y` sign byte. Roughly half of all
-// candidates are on the curve, so the loop terminates within a few
-// iterations and all 255 attempts failing has probability 2^-255. It is not
-// constant-time, and need not be: the salt is public. P-256 has cofactor
-// 1, so any point that decompresses is in the prime-order group; there
-// is no small-subgroup concern.
+// The hash-to-curve is the standard RFC 9380 suite
+// `P256_XMD:SHA-256_SSWU_RO_` (p256's `GroupDigest`): expand_message_xmd
+// with SHA-256, two simplified-SWU maps, and their sum. Its output is
+// indistinguishable from a random oracle over the whole group, and its
+// correctness is checked against the RFC's own test vectors rather than a
+// bespoke argument. P-256 has cofactor 1, so there is no small-subgroup
+// concern.
 
-/// Domain-separation prefix for the salt-to-point hash.
-const PAYLOAD_POINT_DOMAIN: &[u8] = b"HkdfGuard-P256-payload-ECDH-point-v1:";
-
-/// Upper bound on try-and-increment attempts; see the note above.
-const PAYLOAD_POINT_MAX_ATTEMPTS: u8 = u8::MAX;
+/// RFC 9380 domain separation tag for the salt-to-point hash, in the
+/// RFC's recommended `<app>-V<xx>-CS<yy>-with-<suite ID>` form; the suite
+/// ID is appended from [`GroupDigest::HASH_TO_CURVE_ID`].
+const PAYLOAD_POINT_DST_PREFIX: &[u8] = b"HkdfGuard-payload-ECDH-point-V01-CS01-with-";
 
 /// Hashes `salt` to a P-256 point. Deterministic, so `unwrap` recovers the
 /// same point `wrap` used from the salt carried in the payload header.
 pub(crate) fn payload_ecdh_point(salt: &[u8; SALT_LEN]) -> Result<PublicKey> {
-    let mut compressed = [0u8; 33];
-    compressed[0] = 0x02; // the even-Y candidate of the two points sharing this X
-    for counter in 0..PAYLOAD_POINT_MAX_ATTEMPTS {
-        let mut hasher = Sha256::new();
-        hasher.update(PAYLOAD_POINT_DOMAIN);
-        hasher.update(salt);
-        hasher.update([counter]);
-        compressed[1..].copy_from_slice(&hasher.finalize());
-        if let Ok(point) = PublicKey::from_sec1_bytes(&compressed) {
-            return Ok(point);
-        }
-    }
-    Err(Error::Crypto("no P-256 point found for this payload salt"))
+    let point = NistP256::hash_from_bytes(&[salt], &[PAYLOAD_POINT_DST_PREFIX, NistP256::HASH_TO_CURVE_ID])
+        .map_err(|_| Error::Crypto("hash-to-curve failed for this payload salt"))?;
+    // The sum of the two mapped points is the identity with negligible
+    // probability; `from_affine` refuses it rather than returning a point
+    // every KEK would agree on.
+    PublicKey::from_affine(point.to_affine()).map_err(|_| Error::Crypto("payload salt hashed to the identity point"))
 }
 
 pub const DEK_LEN: usize = 32; // the mandated, fixed DEK size in bytes
@@ -155,24 +157,6 @@ pub const MIN_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN;
 /// Largest possible wrapped payload, for any provider and any valid service
 /// name. Mirrored as `HKDFGUARD_WRAPPED_MAX_LEN` in `include/hkdfguard.h`.
 pub const MAX_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN + MAX_KEY_ID_LEN;
-
-/// Finalizes a SHA-256 hash of secret input into a zeroizing buffer, and
-/// consumes the hasher so it is wiped at once.
-///
-/// A hasher holds the unprocessed tail of its input (up to 63 bytes, e.g.
-/// the end of a derivation secret) in its block buffer, plus the chaining
-/// state. With `sha2`'s `zeroize` feature (Cargo.toml) both are wiped when
-/// the hasher drops, which here is the end of this function; the digest is
-/// written straight into the zeroizing output, with no other copy. Best
-/// effort: the compression function's own stack temporaries are out of
-/// reach, as for every other stack copy here.
-#[cfg_attr(not(feature = "tpm2"), allow(dead_code))] // the TPM provider is the caller that hashes secrets
-pub(crate) fn finalize_sha256_wiping(hasher: Sha256) -> Zeroizing<[u8; 32]> {
-    let mut out = Zeroizing::new([0u8; 32]);
-    let digest: &mut sha2::digest::Output<Sha256> = (&mut out[..]).try_into().expect("SHA-256 output is 32 bytes");
-    Digest::finalize_into(hasher, digest);
-    out
-}
 
 // Wraps `dek` under the persistent KEK for `service`, returning the
 // serialized wrapped payload ready to store/transmit. The KEK must already
@@ -328,10 +312,11 @@ fn derive_wrapping_key(
     salt: &[u8; SALT_LEN],
     authenticated: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>> {
-    // HKDF-Extract with the payload's random salt. The shared secret is
-    // already unique per payload (the salt selected its ECDH point), so
-    // this is belt-and-braces separation rather than the only thing
-    // keeping two payloads' AES keys apart.
+    // HKDF-Extract with the payload's random salt: the salt entering the
+    // outer hash `H2` of `F(k, salt) = H2(salt, k · H1(salt))` (see the
+    // module doc). It isn't what keeps two payloads' AES keys apart -- the
+    // shared secret is already unique per payload, because the salt
+    // selected its ECDH point -- and it needn't be secret.
     //
     // `extract`, not `new`: `new` calls it and drops the 64-byte PRK
     // unwiped, and the wrapping key is a public function of the PRK - it
@@ -516,7 +501,7 @@ mod tests {
 
     #[test]
     fn payload_point_is_a_valid_usable_curve_point_for_many_salts() {
-        // Try-and-increment must land on the curve for arbitrary salts,
+        // The hash must land on the curve for arbitrary salts,
         // including degenerate ones, and the result must be a real point
         // usable for ECDH from the scalar side.
         let mut salts: Vec<[u8; SALT_LEN]> = vec![[0u8; SALT_LEN], [0xffu8; SALT_LEN]];
@@ -808,18 +793,16 @@ mod tests {
 
             // 2. So the protocol must never do that, and doesn't: the only
             // point unwrap ever uses is a hash of the salt. Recomputed here
-            // independently of `payload_ecdh_point` -- the first counter
-            // whose SHA-256 is a valid x-coordinate, even y -- so it is a
-            // hash output nobody knows the discrete log of, whatever salt
-            // an attacker writes into a payload.
-            let hashed = (0..PAYLOAD_POINT_MAX_ATTEMPTS)
-                .find_map(|counter| {
-                    let x = Sha256::new().chain_update(PAYLOAD_POINT_DOMAIN).chain_update(payload.salt).chain_update([counter]).finalize();
-                    let mut compressed = [0x02u8; 33];
-                    compressed[1..].copy_from_slice(&x);
-                    PublicKey::from_sec1_bytes(&compressed).ok()
-                })
-                .unwrap();
+            // independently of `payload_ecdh_point` -- RFC 9380
+            // hash_to_curve with the expander and full DST spelled out --
+            // so it is a hash output nobody knows the discrete log of,
+            // whatever salt an attacker writes into a payload.
+            let hashed = p256::hash2curve::hash_from_bytes::<NistP256, p256::hash2curve::ExpandMsgXmd<Sha256>>(
+                &[&payload.salt],
+                &[b"HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_"],
+            )
+            .unwrap();
+            let hashed = PublicKey::from_affine(hashed.to_affine()).unwrap();
             assert_eq!(h, hashed, "unwrap's point is exactly the hash of the payload's salt");
             assert_ne!(h, attacker_point, "and so never a point the attacker chose");
 
@@ -865,28 +848,12 @@ mod tests {
     }
 
     #[test]
-    fn wiping_finalize_matches_a_plain_finalize() {
-        // Any change to the digest would change every TPM KEK, so the
-        // wiping variant must agree with plain `finalize` byte for byte --
-        // across tails that end mid-block, exactly at a block boundary, and
-        // one byte short of one (where padding spills into a second block).
-        for len in [0usize, 1, 31, 32, 55, 56, 63, 64, 65, 127, 200] {
-            let input: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-            let expected = Sha256::digest(&input);
-
-            let mut hasher = Sha256::new();
-            hasher.update(&input);
-            let got = finalize_sha256_wiping(hasher);
-            assert_eq!(&got[..], &expected[..], "input length {len}");
-        }
-    }
-
-    #[test]
-    fn sha256_wipes_itself_on_drop() {
-        // What makes the hasher `finalize_sha256_wiping` consumes safe to
-        // drop: sha2's `zeroize` feature. Without it this stops compiling.
+    fn sha512_wipes_itself_on_drop() {
+        // HKDF-SHA512 keys SHA-512 states with the ECDH shared secret (see
+        // `derive_wrapping_key`): sha2's `zeroize` feature is what wipes
+        // them when they drop. Without it this stops compiling.
         fn wipes_on_drop<T: sha2::digest::zeroize::ZeroizeOnDrop>() {}
-        wipes_on_drop::<Sha256>();
+        wipes_on_drop::<Sha512>();
     }
 
     #[test]
@@ -927,19 +894,48 @@ mod tests {
     }
 
     #[test]
+    fn payload_point_suite_matches_rfc9380_test_vectors() {
+        // RFC 9380 Appendix J.1.1 (P256_XMD:SHA-256_SSWU_RO_), under the
+        // RFC's own DST: confirms the library implements the suite that
+        // `payload_ecdh_point` names, not merely something self-consistent.
+        const DST: &[u8] = b"QUUX-V01-CS02-with-P256_XMD:SHA-256_SSWU_RO_";
+        for (msg, x, y) in [
+            (
+                &b""[..],
+                "2c15230b26dbc6fc9a37051158c95b79656e17a1a920b11394ca91c44247d3e4",
+                "8a7a74985cc5c776cdfe4b1f19884970453912e9d31528c060be9ab5c43e8415",
+            ),
+            (
+                b"abc",
+                "0bb8b87485551aa43ed54f009230450b492fead5f1cc91658775dac4a3388a0f",
+                "5c41b3d0731a27a7b14bc0bf0ccded2d8751f83493404c84a88e71ffd424212e",
+            ),
+            (
+                b"abcdef0123456789",
+                "65038ac8f2b1def042a5df0b33b1f4eca6bff7cb0f9c6c1526811864e544ed80",
+                "cad44d40a656e7aff4002a8de287abc8ae0482b5ae825822bb870d6df9b56ca3",
+            ),
+        ] {
+            let point = NistP256::hash_from_bytes(&[msg], &[DST]).unwrap().to_affine();
+            let got: String = point.to_sec1_point(false).as_bytes()[1..].iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, format!("{x}{y}"), "msg {msg:?}");
+        }
+    }
+
+    #[test]
     fn payload_ecdh_point_known_vectors() {
-        // Computed independently (Python: Euler's criterion on x^3 - 3x + b
-        // mod p) and pinned in the macOS library's tests too
-        // (HkdfGuardPayloadPointTests), so the two hash a salt to the same
-        // point. The second and third need the counter past 0.
+        // Computed independently with a from-the-RFC Python implementation
+        // of RFC 9380 hash_to_curve (itself checked against Appendix J.1.1)
+        // under this crate's DST, so a change to the DST or suite shows up
+        // here.
         let mut ascending = [0u8; SALT_LEN];
         for (i, b) in ascending.iter_mut().enumerate() {
             *b = i as u8;
         }
         for (salt, compressed) in [
-            (ascending, "02074508261589a2c703bcb88966769c27f980a528de99cd3dc92d93d3de8fa2a6"),
-            ([0x00; SALT_LEN], "02c68960c82e7e3d5395da61ee0f2024fb5e9ec0e45e2f104e33c65cca87c93620"),
-            ([0xFF; SALT_LEN], "02d31f6c8437eae360104be32527bbd36356c573c3047bc685ebbbde53148c13cb"),
+            (ascending, "03877847fb8a2cfbcf800b4191284aaba0934fd52e7e1971d30fa14b296544229e"),
+            ([0x00; SALT_LEN], "02a2b51e2ca3a067bd58078749da73319c73c7e25985053d8cc6f046a3346f38f5"),
+            ([0xFF; SALT_LEN], "036fecbe49be33b5a13f69f948456292aa1f60c5bb3e3d0d702736765af0f160c0"),
         ] {
             let point = payload_ecdh_point(&salt).unwrap();
             let got: String = point.to_sec1_point(true).as_bytes().iter().map(|b| format!("{b:02x}")).collect();
@@ -1172,17 +1168,17 @@ mod known_answer {
 
     // Frozen from a known-good build, and reproduced independently with
     // pyca/cryptography (OpenSSL), which shares no code with this crate.
-    const POINT: &str = "028b28b65f7985dc4744ce179dcdcf2c463b469d8c032cadaf26f415e52e79aada";
-    const SHARED_SECRET: &str = "89dc5c245004699ed3c2c5c72f456cf3d83807512d511a8db546f32ea4df92b2";
+    const POINT: &str = "02b23092bba6aaf88b48a76e47eff090537c0f22de2d07f8ea53d688533a71fd78";
+    const SHARED_SECRET: &str = "c25dfa74f08cf0cfc90c09b137e1ce621163a914e04d734e5d811ee9d8012707";
     const FINGERPRINT: &str = "550baec2e009d8c4ba938306605e9c55657d613e13ee25e208736c90567b6d88";
-    const WRAPPING_KEY: &str = "ce57db74b0f45cce92c7a74a05ae974439f7e3cf5849a6d0e960fb9efbe89ee9";
+    const WRAPPING_KEY: &str = "513e5531a4a065f8cc55444d0642a87599525282156d338292860e7be62cfb31";
     const CIPHERTEXT_AND_TAG: &str =
-        "760b828e0b85d18b97a9ab592c0c54eed5fbc07f35282f838bf09b2efd2e09fc76257eb112fdfba067cd4e61247a0d36";
+        "c2d840acab45552dfabe45d3d2d3556d4134bd2ae71e2163e39a4a27ef53593f6591b2dc77414d94e6a0a78f236efb6d";
     const KEK_PKCS8_DER: &str = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2aa144034200040c901d423c831ca85e27c73c263ba132721bb9d7a84c4f0380b2a6756fd601331c8870234dec878504c174144fa4b14b66a651691606d8173e55bd37e381569e";
     /// A whole payload `wrap` produced for DEK under the external-secret
     /// KEK_SCALAR (random salt and nonce, so it can only be frozen, not
     /// recomputed).
-    const WRAPPED: &str = "01031a0065787465726e616c3a636f6d2e686b646667756172642e6b6174f19e14b88861e505a308026e42c673fddf3bb2ea2f9fc1772b3c35ea96095c923f25b66ea046a30b599e904230000000cf94fb647987ec9d62a7a992cbd39978cf011ac1b655ba632b72ae681fe043a7d4172237ab3564493ea98bb20b4be323550baec2e009d8c4ba938306605e9c55657d613e13ee25e208736c90567b6d88";
+    const WRAPPED: &str = "01031a0065787465726e616c3a636f6d2e686b646667756172642e6b6174839d341ef74e55fcdbdcdbffdfe2d6ba346cf22ee9e826be2a62f96bc20f2aba22160d8880117e22c0dec52d30000000a3b9f646bc8e4f13b8051e0dcb1867cadd3105c6ca229bfe8f910a8185b773f266fb491cf9707ab0d0930fd83f98b8f7550baec2e009d8c4ba938306605e9c55657d613e13ee25e208736c90567b6d88";
 
     #[test]
     fn every_protocol_step_matches_its_known_answer() {

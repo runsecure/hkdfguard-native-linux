@@ -35,12 +35,8 @@
 #                     anyone else gets the existing one, or
 #                     HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18). An ephemeral
 #                     KEK is exempt: it lives only in its own process.
-#                     On PKCS#11 this is enforced directly; external-secret
-#                     never creates a KEK. On TPM2 it gates nothing unless
-#                     tpm.require_pinned_names = true (the TPM otherwise
-#                     derives a KEK for any service on demand): set it on
-#                     production TPM hosts, so that only root's provision
-#                     and policy edit provision a service.
+#                     On TPM2 and PKCS#11 this is enforced directly;
+#                     external-secret never creates a KEK.
 #   deployment admin  root, or a deployer: `hkdfguard wrap`.
 #   application       anyone else: unwraps, but cannot persist a key file
 #                     hkdfguard_open_file would accept.
@@ -98,27 +94,30 @@ mode = "prefer"
 # are for test harnesses only.
 #tcti = "device:/dev/tpmrm0"
 
-# Host secret mixed into every TPM-derived KEK. Without it, any process
-# that can open the TPM can re-derive every key. The TPM provider refuses
-# to run without the file unless require_derivation_secret = false.
-# Root-owned, mode 0400 (or 0440 with the service's group). Create it
-# before pinning any names below: it changes every derived Name.
-#   ( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )
-#require_derivation_secret = true
-#derivation_secret_file = "/etc/hkdfguard/tpm.derivation-secret"
+# Directory of TPM key files, one <service>.tpmkey per service, created by
+# `hkdfguard provision`. Whoever can read a key file and open the TPM can
+# use that KEK, so the directory's group is the services that use TPM keys;
+# each key file takes that group, mode 0440. The packages create the
+# default directory as root:hkdfguard 0750; a key_dir of your own needs
+#   install -d -m 0750 -o root -g <key-users> <dir>
+# Back the key files up: a lost key file is a lost KEK. A copy is useless
+# on any other TPM.
+#key_dir = "/var/lib/hkdfguard/tpm"
 
 # File holding the Owner hierarchy's password, if you set one. Unset: an
-# empty password. Same ownership rules as the derivation secret.
+# empty password. Root-owned, mode 0400 (or 0440 with the service's group).
 #owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 
-# true: only services listed in [tpm.pinned_names] have a KEK on the TPM.
-# `hkdfguard provision -sn <service>` then prints the exact
-# entry to add for a service that isn't listed yet.
+# true: only services listed in [tpm.pinned_names] have a KEK on the TPM,
+# whatever key files exist. `hkdfguard provision -sn <service>` then
+# creates the key file and prints the exact entry to add.
 #require_pinned_names = false
 
 # Encrypt the ECDH shared secret on the TPM bus: "auto" | "required" | "off".
 # "auto" skips encryption only for TPMs known to have no external bus
-# (firmware TPMs). "required" needs pinned_session_salt_key_name.
+# (firmware TPMs). "required" needs pinned_session_salt_key_name: the Name
+# of the TPM's storage root key, which every key file is loaded under and
+# which salts the session.
 #session_encryption = "auto"
 #pinned_session_salt_key_name = "000b<64 hex chars>"
 

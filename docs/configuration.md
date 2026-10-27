@@ -20,7 +20,7 @@ There are four providers, from strongest to weakest:
 
 | Provider | Policy name | Protection level | Where the KEK lives |
 |---|---|---|---|
-| TPM 2.0 | `tpm2` | `hardware` | Derived inside the TPM on demand; the private key never leaves it |
+| TPM 2.0 | `tpm2` | `hardware` | Generated inside the TPM; stored as a key file only this TPM can load |
 | PKCS#11 | `pkcs11` | `hardware` | Generated and kept on an HSM or token |
 | External secret | `external-secret` | `external` | A root-owned file delivered by your platform (Kubernetes, Vault, systemd credentials, ...) |
 | Ephemeral | `ephemeral` | `ephemeral` | Process memory only; **lost when the process exits** |
@@ -87,8 +87,11 @@ call, so there is nothing to restart.
 
 ### TPM 2.0
 
-The TPM provider derives each service's KEK inside the TPM from the TPM's
-own seed. The private key never leaves the chip, and nothing is stored on it.
+Each service's KEK is a key the TPM generates and never exports. It is
+stored as a **key file**, `/var/lib/hkdfguard/tpm/<service>.tpmkey`, whose
+private half is encrypted by the TPM: the file is useless on any other
+TPM. Each operation loads the key file into the TPM, uses it, and flushes
+it, so nothing stays on the TPM.
 
 **1. Give the service access to the TPM.** The library opens
 `/dev/tpmrm0` (the kernel's resource manager). On most distributions it
@@ -99,41 +102,44 @@ ls -l /dev/tpmrm0                      # crw-rw---- tss tss ...
 sudo usermod -aG tss <service-user>
 ```
 
-**2. Create the derivation secret.** Without it, any process that can open
-the TPM could derive the same keys, so the TPM provider **requires** it by
-default: if the service can open the TPM and the secret is missing, every
-call fails rather than falling back to another provider. Create it as root,
-before wrapping anything:
+**2. The key directory.** The key has no password: anyone who can read a
+key file *and* open the TPM can use that KEK. So reading the key file is
+the access control, and the key directory's group decides who may. The
+packages create `/var/lib/hkdfguard/tpm` as `root:hkdfguard 0750`, so add
+each service that uses TPM keys to `hkdfguard`. Without the packages,
+create it as root:
 
 ```sh
-sudo sh -c '( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )'
-# For a service that doesn't run as root, let its group read it:
-sudo chgrp <service-group> /etc/hkdfguard/tpm.derivation-secret
-sudo chmod 0440 /etc/hkdfguard/tpm.derivation-secret
+sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 ```
 
-It must be root-owned and readable by root and, optionally, one group;
-never writable by the service; and in directories only root can change,
-up to `/` (so never under `/tmp`). Its bytes are used exactly as stored.
+On a `.deb` system, record a different owner or mode with
+`dpkg-statoverride` or an upgrade puts `root:hkdfguard 0750` back.
 
-#### Back up the derivation secret
+`hkdfguard provision` then creates each key file there, owned by root,
+with the directory's group, mode `0440`. The library refuses a key file,
+or a directory above it, that anyone else could write to, so never put
+the directory under `/tmp`. `tpm.key_dir` moves it.
 
-The derivation secret is part of every TPM KEK on the host. **If it is lost
-or changed, every DEK wrapped on this host becomes unrecoverable.** Copy it
-when you create it, to wherever you keep other root-of-trust material
-(offline, or a secrets manager with tighter access than the host).
+#### Back up the key files
+
+**A lost key file is a lost KEK:** every DEK wrapped under it becomes
+unrecoverable. Copy each key file after `provision`, to wherever you keep
+other root-of-trust material. A copy is useless on any other TPM, so
+backups are low-risk; on this TPM, though, a copy can still be used, so
+give backups the same access control as the directory.
 
 A backup protects against losing the *file*, not the *TPM*. A motherboard
 or TPM replacement, or a TPM clear (which a firmware reset can trigger),
-changes the TPM's seed, and every key derived from it is gone. If DEKs must
-survive the hardware, keep a copy of each somewhere other than this host,
-protected by a key not tied to it.
+changes the TPM's seed, and no key file made before it can be loaded
+again. If DEKs must survive the hardware, keep a copy of each somewhere
+other than this host, protected by a key not tied to it.
 
-**3. Make provisioning explicit with pinned names (recommended).** A TPM
-derives a key for *any* service name on demand, so by default a typo in a
-service name silently gets its own key. With `require_pinned_names`, only
-services listed in the policy have a key, and each one's key must have the
-exact TPM Name recorded there:
+**3. Pin each service's key (recommended).** A key file is checked for
+the attributes every key this library creates has, but a key file someone
+with root put there is otherwise taken as is. With `require_pinned_names`,
+only services listed in the policy have a key, and each one's key must
+have the exact TPM Name recorded there:
 
 ```toml
 [tpm]
@@ -144,19 +150,19 @@ require_pinned_names = true
 ```
 
 You don't need to work out the Name yourself. With `require_pinned_names`
-set, provisioning an unlisted service fails and prints the exact line to
-add:
+set, provisioning an unlisted service creates its key file, then fails and
+prints the exact line to add:
 
 ```sh
 sudo hkdfguard provision -sn com.company.orders
-#   error: ... add this to the policy file and run provision again:
+#   error: ... Its key file is created; to provision it, add this to the
+#   policy file and run provision again:
 #     [tpm.pinned_names]
 #     "com.company.orders" = "000b..."
 ```
 
-Add the line as printed, then run `provision`
-again; it reports "already provisioned". **Create the derivation secret
-before pinning:** the Name depends on it.
+Add the line as printed, then run `provision` again; it reports "already
+provisioned".
 
 **4. Encrypt the TPM bus traffic where it matters.** On a *discrete* TPM
 (a separate chip), the shared secret each unwrap computes crosses the
@@ -170,9 +176,10 @@ motherboard bus. `session_encryption` controls whether it is encrypted:
 
 `auto` relies on the manufacturer the TPM reports over that same bus, so
 against an attacker who can rewrite bus traffic only `required` holds. The
-salt-key Name it needs is learned from the TPM. It doesn't depend on the
-derivation secret, so it can be learned at any time. From a source checkout
-on the host, as a user in the `tss` group:
+Name it needs is that of the TPM's storage root key, which every key file
+is loaded under and which salts the session. It is learned from the TPM,
+and stays the same until the TPM is cleared. From a source checkout on the
+host, as a user in the `tss` group:
 
 ```sh
 cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning \
@@ -184,22 +191,23 @@ cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning \
 
 **5. Protect the TPM hierarchy (recommended on shared hosts).** Anyone who
 can open the TPM can, with the default empty passwords, *clear* it, which
-destroys every key derived from it. Set a lockout password and disable
+makes every key file unloadable. Set a lockout password and disable
 clearing:
 
 ```sh
-LOCKOUT_PW="$(head -c 32 /dev/urandom | base64)"   # store it with the derivation secret's backup
+LOCKOUT_PW="$(head -c 32 /dev/urandom | base64)"   # store it with the key files' backup
 tpm2_changeauth -c lockout "$LOCKOUT_PW"
 tpm2_clearcontrol -C l -P "$LOCKOUT_PW" s
 ```
 
 Optionally, also set an **owner** password and name a file holding it in
-`tpm.owner_auth_file`. Then deriving any key under the TPM's owner
-hierarchy needs that password too. It changes no existing key. But other
+`tpm.owner_auth_file`. Then the storage root key every key file is loaded
+under can't be re-created without that password either. It changes no
+existing key. But other
 software on the host that uses the owner hierarchy with an empty password
 (for example `systemd-cryptenroll --tpm2-device`) stops working until it is
 given the password. See the README's "Protect the hierarchy the keys
-derive from" for the steps.
+live under" for the steps.
 
 **Other TPM settings.**
 
@@ -243,6 +251,21 @@ so nothing someone creates on the token without the PIN is ever used. A pair
 provisioned before this rule existed has a public half that isn't private: it
 is reported as a private key whose public key is missing; delete both halves
 and run `provision` again (this changes that service's KEK).
+
+**What the HSM must allow.** Each wrap and unwrap runs ECDH on the token
+with `CKM_ECDH1_DERIVE` and no token-side KDF (`CKD_NULL`), into a
+temporary session object that is *extractable* and *not sensitive*
+(`CKA_EXTRACTABLE=true`, `CKA_SENSITIVE=false`). The library reads the
+shared secret out of it, destroys it, and runs HKDF-SHA512 itself, since
+that is the same key derivation every provider uses. The service's private
+key never leaves the token, and each shared secret it exports covers only
+one payload (see [Why ECDH](why-ecdh.md)). Some HSMs refuse this in their
+FIPS-approved mode: they reject `CKD_NULL`, or any derived key that is
+extractable or not sensitive. If yours does, `provision` succeeds (it only
+generates the key pair) but the first wrap fails with
+`HKDFGUARD_ERR_PROVIDER_ERROR` (-4), and the log names `CKM_ECDH1_DERIVE`.
+Check the HSM's policy, and run the PKCS#11 test suite against it before
+relying on it: so far it has only been run against SoftHSM2.
 
 ### External secret (file)
 
@@ -401,8 +424,7 @@ minimum_protection = "hardware"
 
 [tpm]
 tcti = "device:/dev/tpmrm0"
-require_derivation_secret = true
-derivation_secret_file = "/etc/hkdfguard/tpm.derivation-secret"
+key_dir = "/var/lib/hkdfguard/tpm"
 require_pinned_names = true          # only the services below have a key
 session_encryption = "required"
 pinned_session_salt_key_name = "000b<64 hex chars>"
@@ -484,16 +506,12 @@ Under **production**:
   returns the existing KEK -- so an application may still call it at
   startup -- or `HKDFGUARD_ERR_KEK_ACCESS_DENIED` (-18) when there is none
   to return. An ephemeral KEK is the exception: it lives only in the
-  process that makes it. Retiring a KEK takes root too. How much this
-  gates depends on the provider: on PKCS#11 it is enforced directly (only
-  root generates a key pair on the token); external-secret never creates a
-  KEK (the delivered file is the provisioning); and on TPM2 it gates
-  nothing unless `tpm.require_pinned_names = true`, because without it the
-  TPM derives a KEK for any service name on demand, so any process with TPM
-  access and the derivation secret gets one. **Set `require_pinned_names =
-  true` on production TPM hosts:** a service then exists only once root has
-  run `provision` (which prints the Name to pin) and added that Name to the
-  root-owned policy.
+  process that makes it. Retiring a KEK takes root too. On TPM2 and
+  PKCS#11 this is enforced directly (only root creates a key file, or
+  generates a key pair on the token); external-secret never creates a KEK
+  (the delivered file is the provisioning). With
+  `tpm.require_pinned_names = true`, a TPM service also needs its key's
+  Name in the root-owned policy: `provision` prints it.
 - **A deployer** is a direct member of the group `hkdfguard-deployers`
   (the packages create it) or of a group listed in `deployer_groups`:
   named in the group's member list, or having it as their primary group.
@@ -517,8 +535,8 @@ key file read under it in each process is audited as event 1005
 (Warning), as a reminder that the host is not running production.
 
 Wrapping and unwrapping are the same in both models. Who may use a KEK at
-all is still the provider's own access control (TPM access and the
-derivation secret, the PIN file, the secret file's mode): wrap and unwrap
+all is still the provider's own access control (TPM access and the key
+file's mode, the PIN file, the secret file's mode): wrap and unwrap
 are the same ECDH operation on the KEK, so nothing can grant one without
 the other. What the model decides is whose key files are believed.
 
@@ -562,14 +580,15 @@ Things to know:
 
 On Linux, anything that can reach a service's provider **and** read its
 wrapped key file can recover that DEK. For the TPM, reaching the provider
-means TPM access plus read access to the derivation secret. Arrange
+means TPM access plus read access to the service's TPM key file. Arrange
 permissions so that only the service's own account can do both.
 
 | File | Owner and mode | Why |
 |---|---|---|
 | `/etc/hkdfguard/` | `root:root 0755` | Only root may change what's inside |
 | `/etc/hkdfguard/policy.toml` | `root:root 0644` | Readable by services; changeable only by root |
-| `/etc/hkdfguard/tpm.derivation-secret` | `root:<key-users> 0440` | Readable by the services allowed to use TPM keys |
+| `/var/lib/hkdfguard/tpm/` | `root:<key-users> 0750` | Only root may add or replace a key; its group is the group of each key file in it |
+| `/var/lib/hkdfguard/tpm/<service>.tpmkey` | `root:<key-users> 0440` (`provision` sets it) | Readable by the services allowed to use TPM keys |
 | `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | As above |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
 | External secret `<dir>/<service>` | root or the service's user, `0400`; or `root:<group> 0440` | Only that service (or the pod's `fsGroup`) |
@@ -586,16 +605,19 @@ names it), and `hkdfguard-deployers` (see
 A practical layout for several services on one host:
 
 ```sh
-# hkdfguard exists if the packages are installed; otherwise:
+# hkdfguard and /var/lib/hkdfguard/tpm exist if the packages are installed; otherwise:
 sudo groupadd --system hkdfguard        # may use the keys at all
-sudo chgrp hkdfguard /etc/hkdfguard/tpm.derivation-secret
-sudo chmod 0440 /etc/hkdfguard/tpm.derivation-secret
+sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 # Each service runs as its own user, in the tss and hkdfguard groups,
 # and its wrapped key files are group-owned by that service's own group.
 ```
 
-Every member of `hkdfguard` can derive every service's TPM key: there is one
-derivation secret per host. What stops one service from recovering
+As provisioned, every member of `hkdfguard` can use every service's TPM
+key: each key file takes the directory's group. To give each service its
+own, change a key file's group to that service's own group after
+`provision` (`sudo chgrp orders /var/lib/hkdfguard/tpm/com.company.orders.tpmkey`);
+the services still need the directory's group to reach it. Without that,
+what stops one service from recovering
 another's DEK is that it can't read the other's wrapped key files. Wrapped
 files are meant to be storable openly (in backups, for example), so treat
 this as defence in depth, not a hard boundary.
@@ -637,8 +659,7 @@ unwrap_success = true             # false: no audit record for a successful unwr
 
 [tpm]
 tcti = "device:/dev/tpmrm0"
-require_derivation_secret = true
-derivation_secret_file = "/etc/hkdfguard/tpm.derivation-secret"
+key_dir = "/var/lib/hkdfguard/tpm"                    # one <service>.tpmkey per service
 owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"     # default: unset (empty owner password)
 require_pinned_names = false
 session_encryption = "auto"                           # auto | required | off

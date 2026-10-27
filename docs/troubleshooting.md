@@ -60,15 +60,10 @@ up on this host.
 - **No access to the device:** the account can't open `/dev/tpmrm0`. Add
   it to the `tss` group. Check with
   `ls -l /dev/tpmrm0` and `id <user>`.
-- **No derivation secret:** when the account can open the TPM but the
-  derivation secret is missing, every call fails (-4) rather than moving
-  on to a weaker provider. The CLI shows:
-
-  ```
-  hkdfguard: TPM refused: TPM derivation secret /etc/hkdfguard/tpm.derivation-secret does not exist. Create it as root: ...
-  ```
-
-  Create it as the message says ([configuration.md](configuration.md#tpm-20)).
+- **No key file for the service:** a service with no key file in the key
+  directory has no KEK on the TPM, so wrap and unwrap move on to the next
+  provider, or fail with -17 when there is none. Run `sudo hkdfguard
+  provision -sn <service>` ([configuration.md](configuration.md#tpm-20)).
   If this host has a TPM but is meant to use another provider, leave
   `"tpm2"` out of `preferred_order` in the policy (or use
   `selection.mode = "require"`), and the TPM is not opened at all.
@@ -96,10 +91,13 @@ wrong. The library stops rather than quietly using a weaker provider.
 
 | Symptom (CLI output) | Fix |
 |---|---|
-| `TPM derivation secret at ... is present but unusable` | Make it `root:<group> 0440` or `root:root 0400`, a regular file (not a symlink), and not empty, in directories only root can change up to `/` (never under `/tmp`) |
+| `TPM key file ... is present but can't be trusted` | Make it `root:<group> 0440` or `root:root 0400`, a regular file (not a symlink), in directories only root can change up to `/` (never under `/tmp`) |
+| `TPM key file ... is not a key this library creates`, or holds an unreadable part | The file isn't one `provision` wrote, or is damaged. Restore it from your backup. |
+| `TPM key directory ... does not exist` | `provision` needs it: create it as the message says, with the group of the services that use TPM keys. |
+| `TPM2_Load of this service's key file failed` | The key file was made by another TPM, or this TPM was cleared since (a firmware reset can do it). The key is gone for good; see [Fingerprint mismatch](#fingerprint-mismatch--16). |
 | `TSS2_LOG enables debug/trace logging in tpm2-tss ...` | Unset `TSS2_LOG`, or lower it to `info` or below: at debug levels tpm2-tss logs secrets |
 | `tpm.require_pinned_names is set and this service has no pinned TPM Name` | The service isn't in `[tpm.pinned_names]`. Add the line the message prints, then run `provision` again. |
-| A pinned Name mismatch | The TPM derives a different key than the pinned one: the derivation secret changed, the TPM was cleared or replaced, or the pin was learned before the secret was created. Re-learn the pin only once you're sure which key is right: see [Fingerprint mismatch](#fingerprint-mismatch--16). |
+| A pinned Name mismatch | The service's key file holds a different key than the pinned one: it was replaced, or the service was retired and provisioned again. Restore the original key file from your backup, or re-learn the pin only once you're sure which key is right: see [Fingerprint mismatch](#fingerprint-mismatch--16). |
 | A failed owner authorization | `owner_auth_file` and the TPM's owner password disagree. Set both in the same change. |
 | `could not open the configured TCTI` | The `tcti` the policy names can't be opened. Check the path, or that `tpm2-abrmd` is running for `tabrmd:`. |
 | `TPM_RC_LOCKOUT` | The TPM is in dictionary-attack lockout, often from another program's failed authorizations. Wait for the lockout interval, or reset it with the lockout password. |
@@ -144,8 +142,9 @@ but otherwise must match exactly.
 `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH` means the payload was wrapped under a **different
 KEK** than the one the service resolves to now. Something changed the key:
 
-- **TPM:** the derivation secret was changed, lost, added or removed; or
-  the TPM was cleared (by a firmware reset or `tpm2_clear`) or replaced.
+- **TPM:** the service's key file was replaced, or retired and provisioned
+  again. (A TPM cleared by a firmware reset or `tpm2_clear`, or replaced,
+  fails earlier: its key files no longer load at all.)
 - **External secret:** the key file was replaced or rotated.
 - **PKCS#11:** the key pair was deleted and generated again, or a
   different token is now selected.
@@ -159,7 +158,7 @@ To recover:
   is every DEK wrapped only under it. Deliver the DEK again from its source
   and wrap it anew.
 
-This is why [backing up the derivation secret](configuration.md#back-up-the-derivation-secret)
+This is why [backing up the key files](configuration.md#back-up-the-key-files)
 matters.
 
 ## Unwrap fails authentication (-11)
@@ -249,12 +248,6 @@ be. The library's log names the group. Create it, choose a dedicated group,
 or fix NSS (LDAP, sssd) if lookups are failing.
 
 ## Other problems
-
-**`provision` says "already provisioned" for a service you never set up.**
-On a TPM without `require_pinned_names`, the TPM derives a key for any name,
-so `provision` always reports a key; a typo in a service name then quietly
-gets its own key. Enable pinned names to make provisioning explicit
-([configuration.md](configuration.md#tpm-20), step 3).
 
 **Startup takes about a second per service.** By design:
 `hkdfguard_create_kek` and `hkdfguard_kek_exists` take at least

@@ -1,1 +1,2 @@
 etc/hkdfguard
+var/lib/hkdfguard/tpm

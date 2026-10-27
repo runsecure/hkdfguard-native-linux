@@ -251,8 +251,8 @@ fn print_usage() {
          \x20          Prints the fingerprint of the KEK it wrapped under; with --fingerprint,\n\
          \x20          writes nothing unless that is the KEK given.\n\
          retire     permanently deletes the service's KEK, only if its fingerprint is the\n\
-         \x20          one given; every DEK wrapped under it becomes unrecoverable. PKCS#11\n\
-         \x20          only: a TPM2 KEK is not stored anywhere, so there is nothing to delete.\n\
+         \x20          one given; every DEK wrapped under it becomes unrecoverable. TPM2 and\n\
+         \x20          PKCS#11 only.\n\
          \n\
          Under the production security model (the default), provision and retire need\n\
          root, and wrap needs root or a member of {DEPLOYERS_GROUP} (or of a group\n\
@@ -1234,13 +1234,14 @@ fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String
 // `provision`: with `retire`, the only place the setup calls are made. Always calls
 // hkdfguard_create_kek, whether or not the KEK exists, as the Windows tool
 // does: for an existing KEK that call loads it through the provider
-// (`load_kek`) -- on TPM2, deriving the key and checking it against the
-// pinned Name; on PKCS#11, finding the key pair on the token -- so a key
-// that exists in policy but not on the provider, or doesn't match its pin,
-// fails here at deployment rather than at the first wrap. kek_exists alone
-// can't tell: on TPM2 it only consults the policy. kek_exists is still
-// asked first, only to report the outcome precisely -- "provisioned" versus
-// "already provisioned". Neither call changes an existing KEK.
+// (`load_kek`) -- on TPM2, loading its key file into the TPM and checking
+// it against the pinned Name; on PKCS#11, finding the key pair on the
+// token -- so a key that exists on disk but won't load on this TPM, or
+// doesn't match its pin, fails here at deployment rather than at the first
+// wrap. kek_exists alone can't tell: on TPM2 it only reads the key file.
+// kek_exists is still asked first, only to report the outcome precisely --
+// "provisioned" versus "already provisioned". Neither call changes an
+// existing KEK.
 fn run_provision(mut service_name: String) -> Result<(), String> {
     let service_c = prepare_service(&mut service_name)?;
 

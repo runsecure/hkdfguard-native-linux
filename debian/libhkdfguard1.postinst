@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+# The TPM key directory: its group decides who may use TPM keys (each key
+# file `hkdfguard provision` writes takes it), so it belongs to hkdfguard,
+# which the sysusers snippet above has just created. Set on every configure
+# unless an administrator has recorded their own owner and mode with
+# dpkg-statoverride.
+if [ "$1" = configure ] && ! dpkg-statoverride --list /var/lib/hkdfguard/tpm >/dev/null; then
+    chown root:hkdfguard /var/lib/hkdfguard/tpm
+    chmod 0750 /var/lib/hkdfguard/tpm
+fi
+
+exit 0

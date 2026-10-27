@@ -55,16 +55,15 @@ impl PrincipalTrust for Owner {
 }
 
 /// Who must own configuration this process reads but must not be able to
-/// change: the policy file, the PKCS#11 PIN file, the TPM derivation
-/// secret, and the directories they live in.
+/// change: the policy file, the PKCS#11 PIN file, the TPM owner password,
+/// and the directories they live in.
 ///
 /// Every build that ships requires root. Accepting the service's own uid would let
 /// any process running as that uid rewrite them -- and under Yama
 /// `ptrace_scope >= 1` or in a container without `CAP_SYS_PTRACE`, such a
 /// process can rewrite the service's files without being able to read its
 /// memory. Rewriting the policy redirects every future wrap to a KEK the
-/// writer controls; rewriting the PIN locks the HSM user out; rewriting the
-/// derivation secret changes every TPM KEK. Test builds (`cfg(test)`, or
+/// writer controls; rewriting the PIN locks the HSM user out. Test builds (`cfg(test)`, or
 /// the harnesses' `--cfg hkdfguard_test_paths`) also accept this process's
 /// own uid, so tests can use temp files; no ordinary build setting --
 /// debug profile included -- relaxes it.
@@ -153,7 +152,7 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
 /// Applied, through [`check_location`] or directly, to every file this
 /// crate reads: key files (`key_file::read`, behind `hkdfguard_open_file`),
 /// the policy file, external-secret mounts, the PKCS#11 module and PIN
-/// file, and the TPM derivation secret and owner-authorization file. With
+/// file, and the TPM key files and owner-authorization file. With
 /// the target file's own ownership also checked, nobody untrusted can swap
 /// the path between this check and a later open or `dlopen` of it by path.
 ///
@@ -630,7 +629,7 @@ mod tests {
 
     #[test]
     fn location_under_a_sticky_ancestor_is_refused_present_or_absent() {
-        // The policy, PIN, derivation secret and owner password all go
+        // The policy, PIN, TPM key files and owner password all go
         // through check_location: a private directory under a /tmp-style
         // one is no place for any of them, whether or not the file exists.
         let base = crate::secure_file::private_tempdir();
