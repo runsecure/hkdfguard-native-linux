@@ -1,7 +1,7 @@
 # Why HKDFGuard wraps keys with ECDH against a hashed point
 
-> **Superseded.** This describes payload format 1, a pre-release design
-> that was never released. HKDFGuard now uses a device-held HMAC key and
+> **Superseded.** This describes a pre-release design that was never
+> released. HKDFGuard now uses a device-held HMAC key and
 > the SP 800-108 KDF, which is safe against quantum computers and uses
 > only NIST-approved functions: see [why-hmac-prf.md](why-hmac-prf.md) and
 > [ADR-0001](adr/0001-post-quantum-wrapping-suite.md). Kept as the record

@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn unsupported_version_is_malformed() {
-        for version in [0u8, 1, 3, 0xFF] {
+        for version in [0u8, 2, 3, 0xFF] {
             let mut bytes = valid();
             bytes[0] = version;
             assert_eq!(check(&bytes), Err(KeyFileError::Malformed), "version {version}");

@@ -298,7 +298,7 @@ service's HMAC-SHA-256 key. Generate it with either:
 ( umask 077; openssl rand -out com.company.orders 32 )
 
 # Its fingerprint, to pin in policy (see "Pin each key's fingerprint" below):
-printf '\0\0\0\001hkdfguard-kek-fingerprint-v2\0\0\0\001\0' \
+printf '\0\0\0\001hkdfguard-kek-fingerprint-v1\0\0\0\001\0' \
     | openssl dgst -sha256 -mac HMAC \
         -macopt hexkey:$(od -An -v -tx1 com.company.orders | tr -d ' \n')
 ```
@@ -365,7 +365,7 @@ error, so the library never moves on to another provider. Without
 names must be quoted, as in `[tpm.pinned_names]`.
 
 The fingerprint is one HMAC-SHA-256 output of the key over a fixed
-input, `HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v2" || 0x00 || [256]_32)`
+input, `HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)`
 (an NIST SP 800-108 counter-mode KDF block). It's the same value
 `provision` prints, every wrapped payload carries, and
 `retire --fingerprint` takes. It isn't secret and reveals nothing about the
@@ -373,7 +373,7 @@ key, so it can live in the policy file wherever that's kept. Compute it
 where you generate the key, before the key goes into your secret store:
 
 ```sh
-printf '\0\0\0\001hkdfguard-kek-fingerprint-v2\0\0\0\001\0' \
+printf '\0\0\0\001hkdfguard-kek-fingerprint-v1\0\0\0\001\0' \
     | openssl dgst -sha256 -mac HMAC \
         -macopt hexkey:$(od -An -v -tx1 com.company.orders | tr -d ' \n')
 ```

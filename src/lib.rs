@@ -2534,7 +2534,7 @@ mod ffi_tests {
         let mut long = valid.clone();
         long.push(0);
         let mut bad_version = valid.clone();
-        bad_version[0] = 1; // the pre-release ECDH format
+        bad_version[0] = 2; // a version this library does not know
         let b64_dek = {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode([9u8; 32]) + "\n"

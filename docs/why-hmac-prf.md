@@ -23,15 +23,15 @@ A service's KEK is a 256-bit HMAC-SHA-256 key. For every wrap:
 
 1. Generate a random 32-byte `salt` and a random 12-byte AES-GCM nonce.
 2. Build the payload header: every field before the ciphertext, in wire
-   order -- version (`2`), provider tag, key-id length, key-id, salt,
+   order -- version (`1`), provider tag, key-id length, key-id, salt,
    nonce, ciphertext length.
 3. Ask the KEK's provider for two HMAC outputs, in one call. Each is one
    block of the NIST SP 800-108 counter-mode KDF with HMAC-SHA-256 as its
    PRF (`i = 1`, `L = 256`, integers big-endian):
 
    ```text
-   fingerprint = HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v2" || 0x00 || [256]_32)
-   K_wrap      = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v2" || 0x00 || Context || [256]_32)
+   fingerprint = HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)
+   K_wrap      = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v1" || 0x00 || Context || [256]_32)
    Context     = u16_le(len(service)) || service || header
    ```
 

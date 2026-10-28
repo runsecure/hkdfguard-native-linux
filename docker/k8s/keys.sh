@@ -25,7 +25,7 @@ new_key() {
 # fingerprint <file>: the KEK's fingerprint, as policy pins it: HMAC-SHA-256
 # under the key of the fixed SP 800-108 fingerprint block.
 fingerprint() {
-    printf '\0\0\0\001hkdfguard-kek-fingerprint-v2\0\0\0\001\0' |
+    printf '\0\0\0\001hkdfguard-kek-fingerprint-v1\0\0\0\001\0' |
         openssl dgst -sha256 -mac HMAC -macopt "hexkey:$(od -An -v -tx1 "$1" | tr -d ' \n')" | awk '{print $NF}'
 }
 

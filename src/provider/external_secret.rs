@@ -961,14 +961,14 @@ mod tests {
     #[serial]
     fn the_fingerprint_is_the_documented_hmac() {
         // What the documented OpenSSL command computes from the secret file:
-        //   printf '\0\0\0\001hkdfguard-kek-fingerprint-v2\0\0\0\001\0' |
+        //   printf '\0\0\0\001hkdfguard-kek-fingerprint-v1\0\0\0\001\0' |
         //     openssl dgst -sha256 -mac HMAC -macopt hexkey:$(od -An -v -tx1 <file> | tr -d ' \n')
         // i.e. HMAC-SHA-256 over the SP 800-108 block, built here by hand.
         use hmac::{Hmac, KeyInit, Mac};
         with_dir(|provider, dir| {
             let key = random_key();
             let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&key).unwrap();
-            mac.update(b"\x00\x00\x00\x01hkdfguard-kek-fingerprint-v2\x00\x00\x00\x01\x00");
+            mac.update(b"\x00\x00\x00\x01hkdfguard-kek-fingerprint-v1\x00\x00\x00\x01\x00");
             let expected = hex(&mac.finalize().into_bytes());
             let _policy = pin_policy(true, &format!("\"com.company.orders\" = \"{expected}\""));
             provision(dir, "com.company.orders", key);

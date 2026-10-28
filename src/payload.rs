@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       1     version            (currently 2)
+//! 0       1     version            (currently 1)
 //! 1       1     provider_type      (1=TPM2 2=PKCS11 3=EXTERNAL_SECRET 5=EPHEMERAL;
 //!                                   4 is unassigned and rejected -- see `ProviderType`)
 //! 2       2     key_id_len (u16)
@@ -44,7 +44,7 @@
 use crate::error::{Error, Result}; // this module's own error type + `Result<T, Error>` alias
 use crate::provider::ProviderType; // the provider tag stored in the payload (1, 2, 3 or 5)
 
-pub const VERSION: u8 = 2; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes. 1 was the pre-release ECDH suite, never released: rejected like any other unknown version
+pub const VERSION: u8 = 1; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes
 pub const SALT_LEN: usize = 32; // per-payload random salt; 256 bits, so two payloads never share a wrapping key
 pub const NONCE_LEN: usize = 12; // AES-GCM's standard 96-bit nonce size
 pub const FINGERPRINT_LEN: usize = 32; // SHA-256 digest size
@@ -273,7 +273,7 @@ mod tests {
         // Every other value -- below, above, or far above -- is refused
         // rather than misparsed, so a future layout change can never be
         // read through this parser by accident.
-        for other in [0u8, 1, 3, 255] {
+        for other in [0u8, 2, 3, 255] {
             bytes[0] = other;
             let err = Payload::from_bytes(&bytes).unwrap_err();
             assert!(

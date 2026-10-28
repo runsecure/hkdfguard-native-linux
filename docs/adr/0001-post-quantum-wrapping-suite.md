@@ -1,6 +1,6 @@
 # ADR-0001: Replace the ECDH wrapping suite with a post-quantum HMAC suite
 
-**Status:** Accepted, implemented (payload format 2)
+**Status:** Accepted, implemented (payload format 1, the first release)
 **Date:** 2026-10-27
 **Deciders:** HKDFGuard maintainers
 
@@ -33,15 +33,15 @@ Three further forces shaped the choice:
 
 ## Decision
 
-1. **Replace the ECDH suite with a symmetric one, payload format 2.** The
-   service's KEK is an HMAC-SHA-256 key held by the provider. The wrapping
-   key is one block of an SP 800-108 counter-mode KDF with that HMAC as its
+1. **Replace the ECDH suite with a symmetric one, released as payload
+   format 1.** The service's KEK is an HMAC-SHA-256 key held by the
+   provider. The wrapping key is one block of an SP 800-108 counter-mode KDF with that HMAC as its
    PRF, computed by the provider:
 
    ```text
-   K_wrap      = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v2" || 0x00 || Context || [256]_32)
+   K_wrap      = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v1" || 0x00 || Context || [256]_32)
    Context     = u16_le(len(service)) || service || header
-   fingerprint = HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v2" || 0x00 || [256]_32)
+   fingerprint = HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)
    ```
 
    `header` is every payload field before the ciphertext. `K_wrap` is the
@@ -49,14 +49,18 @@ Three further forces shaped the choice:
    the header followed by the fingerprint. The fingerprint is not in
    `Context`, so the provider computes both outputs in one call: one key
    load per wrap or unwrap on a TPM, as before. The wire layout is
-   unchanged apart from the version byte, so payload sizes and
+   unchanged, so payload sizes and
    `HKDFGUARD_WRAPPED_MAX_LEN` stay the same. The longest input is 352
    bytes, under the 1024 a TPM accepts per `TPM2_HMAC` call.
 
 2. **Remove ECDH entirely.** No suite setting in `policy.toml`, no
-   version dispatch, no migration path. Format 1 payloads are refused as
-   unsupported, and a TPM key file holding an ECC key is refused with
-   instructions to provision the service again.
+   version dispatch, no migration path. Nothing was released, so the new
+   construction is the first release's format 1 and its labels end in
+   `-v1`. Pre-release ECDH payloads also carry version 1; they fail the
+   KEK fingerprint check and are never decrypted (pinned by
+   `a_pre_release_ecdh_payload_fails_the_fingerprint_check`). A TPM key
+   file holding an ECC key is refused with instructions to provision the
+   service again.
 
 3. **Per provider:**
 
@@ -124,7 +128,7 @@ what the design needs:
 
 | Device | Result |
 |---|---|
-| TPM 2.0 | One-shot `TPM2_HMAC` matches software HMAC-SHA-256 on the v2 input shape; a TPM-generated key gives repeatable, salt-dependent output and still works after a reboot. Input limit per call: 1024 bytes |
+| TPM 2.0 | One-shot `TPM2_HMAC` matches software HMAC-SHA-256 on the PRF input shape; a TPM-generated key gives repeatable, salt-dependent output and still works after a reboot. Input limit per call: 1024 bytes |
 | SoftHSM2 | `CKM_SHA256_HMAC` matches software HMAC-SHA-256; a generated key is sensitive and non-extractable. Keys must be at least 32 bytes (`CKR_KEY_SIZE_RANGE` below that) |
 
 The same session found one hazard: the multi-command HMAC sequence
@@ -150,7 +154,7 @@ uses only that.
   TPM's self-test still reported success afterwards.
 - Across a real reboot (`scripts/native-tpm-test.sh reboot capture`, then
   `reboot verify`), the storage root key's Name was unchanged and a DEK
-  wrapped under a v2 TPM key file before the reboot unwrapped after it.
+  wrapped under an HMAC TPM key file before the reboot unwrapped after it.
 
 ## Consequences
 
@@ -158,7 +162,7 @@ uses only that.
 
 - Describing payloads as safe against a quantum computer, including
   payloads harvested today together with the host's key files.
-- A FIPS claim: v2 uses only approved functions. The remaining work is
+- A FIPS claim: the construction uses only approved functions. The remaining work is
   moving the software crypto into a validated module and running on
   validated devices.
 - Review: one construction, built from standard parts, with no

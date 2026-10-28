@@ -18,7 +18,7 @@ provider computes one block of the NIST SP 800-108 counter-mode KDF, with
 HMAC-SHA-256 as the PRF:
 
 ```
-K_wrap  = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v2" || 0x00 || Context || [256]_32)
+K_wrap  = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v1" || 0x00 || Context || [256]_32)
 Context = len(service)_16le || service || header
 ```
 
@@ -44,12 +44,13 @@ for the decision record), and note the consequence: a build server
 **cannot** pre-wrap a DEK for a host. DEKs are delivered to the host and
 wrapped there.
 
-Wire format version 2 (version 1, the unreleased ECDH format, is refused
-as unsupported). The header is bound into the KDF context, and the AEAD's
+Wire format version 1. (Payloads from pre-release builds, which used an
+ECDH construction under the same version number, fail the KEK fingerprint
+check and are never decrypted.) The header is bound into the KDF context, and the AEAD's
 associated data is the header plus the KEK fingerprint -- every byte of a
 payload except the ciphertext -- so the `provider_type` tag and the
 fingerprint are authenticated rather than merely present. The fingerprint,
-`HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v2" || 0x00 || [256]_32)`,
+`HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)`,
 is public, the same for every payload a KEK wraps, and reveals nothing
 about the KEK; unwrap checks it before decrypting. The provider computes
 the fingerprint and the wrapping key in one call.
@@ -1541,7 +1542,7 @@ src/
                              the setup-call gate
   security_model.rs         production/developer: who creates KEKs, whose key files are trusted
   error.rs                  Internal error type <-> C status codes
-  payload.rs                Wrapped-payload wire format (version 2)
+  payload.rs                Wrapped-payload wire format (version 1)
   crypto.rs                 HMAC-SHA-256 SP 800-108 block -> AES-256-GCM protocol; KEK fingerprint
   policy.rs                 /etc/hkdfguard/policy.toml parsing and evaluation
   secure_file.rs            Descriptor-checked secret-file reads, self-wiping buffer

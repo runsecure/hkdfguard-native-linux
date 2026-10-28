@@ -13,7 +13,7 @@
 //! counter-mode KDF with that HMAC as its PRF, computed by the provider:
 //!
 //! ```text
-//! K_wrap  = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v2" || 0x00 || Context || [256]_32)
+//! K_wrap  = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v1" || 0x00 || Context || [256]_32)
 //! Context = len(service)_16 || service || header
 //! ```
 //!
@@ -52,7 +52,7 @@
 //! under: another SP 800-108 block, with its own label and no context,
 //!
 //! ```text
-//! fingerprint = HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v2" || 0x00 || [256]_32)
+//! fingerprint = HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)
 //! ```
 //!
 //! It is the same for every payload a KEK wraps, and public: one fixed PRF
@@ -99,10 +99,10 @@ pub(crate) const TAG_LEN: usize = 16; // AES-GCM's standard 128-bit authenticati
 // ---------------------------------------------------------------------
 
 /// SP 800-108 label for a payload's wrapping key.
-const WRAP_LABEL: &[u8] = b"hkdfguard-wrap-v2";
+const WRAP_LABEL: &[u8] = b"hkdfguard-wrap-v1";
 
 /// SP 800-108 label for the KEK fingerprint.
-const FINGERPRINT_LABEL: &[u8] = b"hkdfguard-kek-fingerprint-v2";
+const FINGERPRINT_LABEL: &[u8] = b"hkdfguard-kek-fingerprint-v1";
 
 /// `L`, the KDF's output length in bits: one HMAC-SHA-256 block.
 const OUTPUT_BITS: u32 = 256;
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(block, [&[0, 0, 0, 1][..], b"LBL", &[0], b"ctx", &[0, 0, 1, 0]].concat());
         assert_eq!(
             fingerprint_block(),
-            [&[0, 0, 0, 1][..], b"hkdfguard-kek-fingerprint-v2", &[0], &[0, 0, 1, 0]].concat(),
+            [&[0, 0, 0, 1][..], b"hkdfguard-kek-fingerprint-v1", &[0], &[0, 0, 1, 0]].concat(),
             "the fingerprint block has no context"
         );
     }
@@ -728,20 +728,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn a_format_v1_payload_is_refused_as_unsupported() {
-        // Format 1 was the pre-release ECDH suite. Its payloads have the
-        // same layout, so the version byte alone must turn them away,
-        // before any key is touched.
-        with_isolated_ephemeral_provider(|| {
-            crate::provider::create_kek("com.company.orders").unwrap();
-            let mut wrapped = wrap("com.company.orders", &[0x12u8; DEK_LEN]).unwrap();
-            wrapped[0] = 1;
-            assert!(matches!(unwrap("com.company.orders", &wrapped), Err(Error::Unsupported(_))));
-        });
-    }
-
-    #[test]
     fn sha256_wipes_itself_on_drop() {
         // HMAC-SHA-256 keys SHA-256 states with the KEK held in software
         // (see `provider::software_prf`): sha2's `zeroize` feature is what
@@ -993,14 +979,14 @@ mod known_answer {
     // Frozen from a known-good build, and reproduced independently with
     // Python's hmac module and pyca/cryptography (OpenSSL), which share no
     // code with this crate.
-    const FINGERPRINT: &str = "116039009e7cf849d58fc5522ace2a75a34c6b90d44e1ef6ee645edef4c336a7";
+    const FINGERPRINT: &str = "59aa2ac550f7c40ea3d52b6c56720fa8c62b4c2e78be0ef64b77dc40eb01145b";
     const WRAP_BLOCK: &str =
-        "00000001686b646667756172642d777261702d7632001100636f6d2e686b646667756172642e6b617402031a0065787465726e616c3a636f6d2e686b646667756172642e6b617411111111111111111111111111111111111111111111111111111111111111112222222222222222222222223000000000000100";
-    const WRAPPING_KEY: &str = "4678dca75b873906bd88f26b307789b6357fae1061c0aef296fffde54c29cbad";
+        "00000001686b646667756172642d777261702d7631001100636f6d2e686b646667756172642e6b617401031a0065787465726e616c3a636f6d2e686b646667756172642e6b617411111111111111111111111111111111111111111111111111111111111111112222222222222222222222223000000000000100";
+    const WRAPPING_KEY: &str = "a2790d8f1306fbb0f234811df731e4104e2cf1bc5883c75f6c8248312710b684";
     const CIPHERTEXT_AND_TAG: &str =
-        "d16e223bbcfaf65514f46268b55783108b4476c9619cd3bf84e21add7aef34210ad2f8e8835e8f4141cce8180907a8e0";
+        "201fb8c3f6d223966400ddfe6deb04f133284cd891f0450ef14e68fc35f9f5b2e95a65a169d3e3eaf4f837d8ff73a27f";
     const PAYLOAD: &str =
-        "02031a0065787465726e616c3a636f6d2e686b646667756172642e6b6174111111111111111111111111111111111111111111111111111111111111111122222222222222222222222230000000d16e223bbcfaf65514f46268b55783108b4476c9619cd3bf84e21add7aef34210ad2f8e8835e8f4141cce8180907a8e0116039009e7cf849d58fc5522ace2a75a34c6b90d44e1ef6ee645edef4c336a7";
+        "01031a0065787465726e616c3a636f6d2e686b646667756172642e6b6174111111111111111111111111111111111111111111111111111111111111111122222222222222222222222230000000201fb8c3f6d223966400ddfe6deb04f133284cd891f0450ef14e68fc35f9f5b2e95a65a169d3e3eaf4f837d8ff73a27f59aa2ac550f7c40ea3d52b6c56720fa8c62b4c2e78be0ef64b77dc40eb01145b";
 
     #[test]
     fn every_protocol_step_matches_its_known_answer() {
@@ -1024,6 +1010,23 @@ mod known_answer {
         // And a fresh wrap under the same KEK carries the same fingerprint.
         let fresh = Payload::from_bytes(&wrap(SERVICE, &DEK).unwrap()).unwrap();
         assert_eq!(hex(&fresh.fingerprint), FINGERPRINT);
+    }
+
+    #[test]
+    #[serial]
+    fn a_pre_release_ecdh_payload_fails_the_fingerprint_check() {
+        // A payload from the ECDH construction used before the first
+        // release (docs/why-ecdh.md), frozen by that build's known-answer
+        // test for this same service, with these same 32 KEK bytes as its
+        // P-256 scalar. It shares this format's version byte and layout,
+        // so only the fingerprint tells it apart -- and it must, before
+        // anything is decrypted.
+        const ECDH_PAYLOAD: &str = "01031a0065787465726e616c3a636f6d2e686b646667756172642e6b6174839d341ef74e55fcdbdcdbffdfe2d6ba346cf22ee9e826be2a62f96bc20f2aba22160d8880117e22c0dec52d30000000a3b9f646bc8e4f13b8051e0dcb1867cadd3105c6ca229bfe8f910a8185b773f266fb491cf9707ab0d0930fd83f98b8f7550baec2e009d8c4ba938306605e9c55657d613e13ee25e208736c90567b6d88";
+        let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
+        let dir = crate::secure_file::private_tempdir();
+        let _mount = crate::policy::test_support::secret_mount(dir.path());
+        write_kek(dir.path());
+        assert!(matches!(unwrap(SERVICE, &unhex(ECDH_PAYLOAD)), Err(Error::KekFingerprintMismatch)));
     }
 
     fn write_kek(dir: &std::path::Path) {

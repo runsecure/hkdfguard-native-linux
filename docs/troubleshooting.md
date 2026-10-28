@@ -179,9 +179,10 @@ HKDFGuard can't tell these apart, by design.
 wrapped DEK at all: most often a **truncated** or **extended** copy (compare
 its size with what `wrap` reported, at most 276 bytes), or the wrong file.
 `HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED` means the payload's version byte isn't
-one this library knows (it accepts version 2 only): a payload from a newer
-HKDFGuard, one from a pre-release build in the unreleased version 1 (ECDH)
-format, or not a payload.
+one this library knows (it accepts version 1 only): a payload from a newer
+HKDFGuard, or not a payload. A payload from a pre-release build (the ECDH
+format, which also carried version 1) fails instead with
+`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`, and is never decrypted.
 Read key files with `hkdfguard_open_file`, which reports these problems
 before unwrap is called.
 
