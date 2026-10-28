@@ -2611,7 +2611,16 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return; // root holds every role: nothing to refuse
         }
-        with_policy("security_model = \"production\"\npreferred_order = [\"external-secret\"]\n[selection]\nmode = \"prefer\"\n", || {
+        // An empty mount of its own, so a provider is present -- and the
+        // refusal is the role check's, not "no provider" -- whether or not
+        // this host has a conventional external-secret mount.
+        let mount = private_tempdir();
+        let policy = format!(
+            "security_model = \"production\"\npreferred_order = [\"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
+             [external_secret]\ndir = \"{}\"\n",
+            mount.path().display()
+        );
+        with_policy(&policy, || {
             let (mut model, mut may_write) = (-1, -1);
             assert_eq!(hkdfguard_security_model(&mut model, &mut may_write), status::OK);
             assert_eq!(model, SECURITY_MODEL_PRODUCTION);
