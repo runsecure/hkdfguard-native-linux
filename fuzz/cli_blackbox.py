@@ -61,7 +61,7 @@ class Worker:
         for svc in SERVICES:
             path = os.path.join(secrets, svc)
             with open(path, "wb") as f:
-                f.write(b"\x00" + os.urandom(31))  # a P-256 scalar below the group order
+                f.write(os.urandom(32))  # a KEK: 32 random bytes
             os.chmod(path, 0o600)
         self.policy = os.path.join(self.dir, "policy.toml")
         with open(self.policy, "w") as f:

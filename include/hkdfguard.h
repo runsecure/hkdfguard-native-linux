@@ -5,7 +5,7 @@
  * per-service Key Encryption Key (KEK), using the strongest available
  * provider on the host (TPM2 > PKCS#11 > external secret > ephemeral).
  * See the crate's provider/ module docs for the protocol
- * (ECDH P-256 against a per-payload hashed point -> HKDF-SHA512 -> AES-256-GCM) and
+ * (an SP 800-108 HMAC-SHA-256 KDF keyed by the KEK -> AES-256-GCM) and
  * provider details. A wrapped payload can only be created, and only be
  * opened, on the host holding the KEK: it is not possible to pre-wrap a
  * DEK for a host from elsewhere.
@@ -70,7 +70,7 @@ extern "C" {
 #define HKDFGUARD_ERR_BUFFER_TOO_SMALL (-2)     /* `out` is too small; *out_len says what to retry with */
 #define HKDFGUARD_ERR_PROVIDER_UNAVAILABLE (-3) /* no KEK provider could be reached at all */
 #define HKDFGUARD_ERR_PROVIDER_ERROR (-4)       /* a provider was reachable but failed to create, load, or use the KEK */
-#define HKDFGUARD_ERR_CRYPTO_ERROR (-5)         /* a cryptographic operation failed for a reason other than authentication: RNG, hash-to-curve, HKDF, or encryption */
+#define HKDFGUARD_ERR_CRYPTO_ERROR (-5)         /* a cryptographic operation failed for a reason other than authentication: RNG or encryption */
 #define HKDFGUARD_ERR_INTERNAL_ERROR (-6)       /* an unexpected internal failure (a caught panic) */
 /* -7 is reserved and never returned. A `service` string that isn't valid
  * UTF-8 is one more way for it to be invalid, reported as
@@ -232,9 +232,9 @@ int hkdfguard_kek_exists(const char* service, int* exists);
 
 /*
  * Writes the 32-byte fingerprint of the KEK `service` currently resolves
- * to: SHA-256 of its public key, SEC1-uncompressed (0x04 || X || Y) -- the
- * same value every payload wrapped under it carries, and that
- * hkdfguard_unwrap_dek checks. Public-key material, not a secret. Lets an
+ * to: a fixed HMAC-SHA-256 output under the KEK -- the same value every
+ * payload wrapped under it carries, and that hkdfguard_unwrap_dek checks.
+ * Public, not a secret: it reveals nothing about the KEK. Lets an
  * operator record which KEK a service uses after provisioning (the CLI's
  * `provision` prints it), and confirm it before retiring it (`retire`
  * requires it). Never creates a KEK: HKDFGUARD_ERR_KEK_NOT_FOUND if none
@@ -262,8 +262,8 @@ int hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int* out_len);
  * The KEK must already exist -- see hkdfguard_create_kek above; this
  * never creates one itself.
  *
- * The wrapped payload embeds a 32-byte SHA-256 fingerprint of this KEK's
- * public key, which hkdfguard_unwrap_dek checks before decrypting -- see
+ * The wrapped payload embeds this KEK's 32-byte fingerprint, which
+ * hkdfguard_unwrap_dek checks before decrypting -- see
  * its own doc comment below.
  *
  * service:  NUL-terminated UTF-8 string, 1..=128 bytes. The logical
@@ -307,7 +307,7 @@ int hkdfguard_wrap_dek(
  * `service`, recovering the original 32-byte DEK.
  *
  * Before attempting any decryption, checks the wrapped payload's embedded
- * KEK fingerprint against the public key of the KEK `service` currently
+ * KEK fingerprint against the fingerprint of the KEK `service` currently
  * resolves to, failing fast with HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH
  * (-16) if they don't match -- this specifically means "wrong/rotated KEK,"
  * as opposed to HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, which means "right KEK,

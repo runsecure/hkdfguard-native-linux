@@ -233,9 +233,9 @@ struct ExternalSecretPolicy {
     /// only place looked at; when unset, the provider searches the
     /// conventional secret mounts.
     dir: Option<String>,
-    /// Expected KEK fingerprint, per service, as hex: SHA-256 of the
-    /// key's uncompressed SEC1 public point, the value `provision` prints
-    /// and every payload carries. One string, or a list of them while a
+    /// Expected KEK fingerprint, per service, as hex: the fixed HMAC
+    /// output `crypto::kek_fingerprint` defines, the value `provision`
+    /// prints and every payload carries. One string, or a list of them while a
     /// rotation is in progress. When a service has an entry here, a
     /// mounted key with any other fingerprint is refused -- see
     /// [`pinned_external_keys`] for why the mount checks alone don't catch
@@ -342,9 +342,9 @@ struct TpmPolicy {
     /// wrap/unwrap decline), whatever key file it has. Default `false`.
     #[serde(default)]
     require_pinned_names: bool,
-    /// Whether `TPM2_ECDH_ZGen` runs inside a salted, parameter-encrypted
-    /// HMAC session, so the shared secret does not cross the TPM bus in
-    /// cleartext. See [`SessionEncryption`].
+    /// Whether `TPM2_HMAC` runs inside a salted, parameter-encrypted HMAC
+    /// session, so its output -- a payload's wrapping key -- does not cross
+    /// the TPM bus in cleartext. See [`SessionEncryption`].
     #[serde(default)]
     session_encryption: SessionEncryption,
     /// Expected TPM Name of the key that salts encrypted sessions, as
@@ -364,8 +364,7 @@ struct TpmPolicy {
     /// to a simulator directly, with no resource manager in between, so
     /// object handles are shared by every client of that simulator: another
     /// client could flush and replace the key between the provider's
-    /// `TPM2_ReadPublic` (where its Name is checked) and its
-    /// `TPM2_ECDH_ZGen`. `device:/dev/tpmrm0` and `tabrmd` give each
+    /// `TPM2_ReadPublic` (where its Name is checked) and its `TPM2_HMAC`. `device:/dev/tpmrm0` and `tabrmd` give each
     /// connection its own handles, which closes that window.
     tcti: Option<String>,
     /// Absolute path of the directory holding the TPM key files, one
@@ -400,8 +399,8 @@ fn validate_tcti(tcti: &str) -> Result<()> {
 /// Policy for TPM session parameter encryption (`tpm.session_encryption`).
 ///
 /// The threat this addresses is an interposer on a *discrete* TPM's LPC or
-/// SPI bus reading `TPM2_ECDH_ZGen`'s response -- the shared secret -- in
-/// cleartext. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has no
+/// SPI bus reading `TPM2_HMAC`'s response -- a payload's wrapping key --
+/// in cleartext. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has no
 /// external bus, so encryption there is pure overhead with no security
 /// return; the residual fTPM threats are inside the TPM's own trust
 /// boundary, where transport encryption cannot help.

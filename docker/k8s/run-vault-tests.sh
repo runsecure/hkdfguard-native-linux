@@ -3,7 +3,7 @@
 # sidecar instead of a Kubernetes Secret volume, on whatever cluster kubectl
 # points at (see run-tests.sh). A Vault dev server runs in the test
 # namespace with Kubernetes auth enabled -- the login the Vault Agent
-# Injector sets up -- and each scenario's key (SEC1 DER, made and
+# Injector sets up -- and each scenario's key (32 random bytes, made and
 # fingerprinted on this machine with the OpenSSL commands
 # docs/configuration.md gives) is stored there base64-encoded in KV v2.
 # Each scenario is a Job whose pod runs Vault Agent as a native sidecar: it

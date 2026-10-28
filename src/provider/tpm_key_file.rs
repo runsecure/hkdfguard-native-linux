@@ -33,7 +33,7 @@ pub(crate) const PARENT_OWNER_HIERARCHY: u32 = 0x4000_0001;
 const PEM_BEGIN: &str = "-----BEGIN TSS2 PRIVATE KEY-----";
 const PEM_END: &str = "-----END TSS2 PRIVATE KEY-----";
 
-/// Upper bound on a key file's size. An ECC P-256 key's file is about 400
+/// Upper bound on a key file's size. An HMAC key's file is about 300
 /// bytes; this is a sanity limit, not a format one.
 pub(crate) const MAX_KEY_FILE_LEN: usize = 4096;
 
@@ -217,8 +217,8 @@ mod tests {
     use super::*;
 
     fn sample() -> KeyBlob {
-        // Sizes like a real P-256 key's: a ~88-byte TPMT_PUBLIC and a
-        // ~126-byte private buffer, enough to need DER's long length form.
+        // Sizes like a real key's: an ~88-byte TPMT_PUBLIC and a ~126-byte
+        // private buffer, enough to need DER's long length form.
         KeyBlob { public: (0..88u8).collect(), private: (0..126u8).rev().collect() }
     }
 

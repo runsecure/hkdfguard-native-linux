@@ -46,8 +46,9 @@ Requires:       %{libpkg}%{?_isa} = %{version}-%{release}
 HKDFGuard wraps 32-byte Data Encryption Keys (DEKs) under a persistent,
 per-service Key Encryption Key (KEK) held by the strongest provider the
 host offers: a TPM 2.0, a PKCS#11 token, or an administrator-provisioned
-secret file. Wrapping is ECDH (P-256) against a per-payload point,
-HKDF-SHA512 and AES-256-GCM.}
+secret file. Each DEK is wrapped with AES-256-GCM under a per-payload
+key derived from the KEK with HMAC-SHA-256 (NIST SP 800-108); there is
+no public-key step, so the scheme is safe against quantum computers.}
 
 %description %{common_description}
 

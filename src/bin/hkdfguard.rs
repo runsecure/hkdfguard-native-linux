@@ -226,7 +226,7 @@ enum Command {
     },
 }
 
-// A KEK fingerprint: SHA-256 of its public key.
+// A KEK fingerprint: a fixed HMAC output of the KEK (see crypto.rs).
 const FINGERPRINT_LEN: usize = 32;
 
 enum ParseOutcome {

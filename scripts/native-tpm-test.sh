@@ -18,9 +18,8 @@
 #   3. Unit tests for the tpm2 feature (no device needed).
 #   4. The #[ignore]d conformance suite against the REAL TPM: key files
 #      created, reloaded and refused when spliced, the storage root key's
-#      determinism, the Name formula, acceptance of the hashed per-payload
-#      ECDH points, salted/encrypted session correctness, auto-mode, pins,
-#      and retiring. Each test uses its own key directory.
+#      determinism, the Name formula, TPM2_HMAC known answers,
+#      salted/encrypted session correctness, auto-mode, pins, and retiring. Each test uses its own key directory.
 #   5. Provisions com.company.orders with the CLI, then learns the storage
 #      root key's and that key file's Names (the operator helpers in
 #      src/provider/tpm2.rs) and writes a policy that REQUIRES encrypted
@@ -296,7 +295,7 @@ if [ "$NO_EXTERNAL_BUS" -eq 0 ]; then
     # This test asserts `auto` SKIPS encryption, which is only true on an
     # fTPM/vTPM. On a discrete chip `auto` correctly encrypts, so the
     # assertion would fail for the right reason. Skip it, not the mechanism:
-    # encrypted_session_ecdh_yields_the_same_z_as_a_plain_session still runs.
+    # an_encrypted_session_hmac_equals_a_plain_session_hmac still runs.
     SKIP=(--skip auto_mode_skips_encryption_on_an_internal_tpm_unless_pinned_and_required_forces_it)
     note "discrete TPM ($MANUFACTURER): skipping the fTPM-only auto-mode assertion"
 fi
@@ -342,7 +341,7 @@ LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
 section "C ABI round trip -- policy: session_encryption REQUIRED with both Names pinned"
 use_policy "$REQUIRED_SELECTION" "$REQUIRED_TPM_KEYS" "$REQUIRED_PINS"
 LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
-note "every ECDH in that run went through a salted, AES-128-CFB-encrypted session against a pinned storage root key"
+note "every TPM2_HMAC in that run went through a salted, AES-128-CFB-encrypted session against a pinned storage root key"
 
 # ---------------------------------------------------------------------
 # 7. CLI -> separate C consumer, across processes, on the TPM

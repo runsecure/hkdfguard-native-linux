@@ -1,6 +1,6 @@
 //! Provider 5: Ephemeral Memory-Only KEK.
 //!
-//! Generates a fresh, cryptographically random P-256 KEK per service the
+//! Generates a fresh, cryptographically random 256-bit HMAC KEK per service the
 //! first time it is requested, keeps it in memory for the lifetime of the
 //! process, and never persists it. Used only when the policy names it.
 //!
@@ -19,13 +19,13 @@
 //!   Creating a key fails if that can't be done. It is re-applied on every
 //!   key creation, since the kernel clears the non-dumpable flag when the
 //!   process changes credentials.
-//! - **The private scalars live in dedicated pages**, mapped once and never
+//! - **The keys live in dedicated pages**, mapped once and never
 //!   moved or freed: locked into RAM where `RLIMIT_MEMLOCK` allows it (so
 //!   they are never written to swap), and excluded from core dumps. Only
 //!   the service-name index lives on the ordinary heap, and service names
 //!   are not secret.
-//! - **Copies are wiped:** each call's `SecretKey` zeroes itself on drop,
-//!   and ECDH wipes its scalar (see `provider::software_ecdh`).
+//! - **Copies are wiped:** each call's copy of the key zeroes itself on
+//!   drop (see `provider::software_prf` for what HMAC itself leaves).
 //!
 //! Root, or a process with `CAP_SYS_PTRACE`, can still read the key: no
 //! software-only key is protected from them.
@@ -38,15 +38,13 @@
 //! `MADV_WIPEONFORK`, so a child created with `fork()` sees zeroes there.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
-use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // the traits/types this module implements
-use p256::{PublicKey, SecretKey}; // P-256 key types from RustCrypto's `p256` crate
-use p256::elliptic_curve::Generate; // `SecretKey::try_generate`, from the OS CSPRNG
+use crate::provider::{KekHandle, KekProvider, PrfOutput, ProviderType, KEK_LEN}; // the traits/types this module implements
 use std::collections::HashMap; // service name -> slot index
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock}; // guards the store so concurrent calls don't race
-use zeroize::Zeroize as _;
+use zeroize::Zeroizing;
 
-const KEY_LEN: usize = 32; // a P-256 private scalar
+const KEY_LEN: usize = KEK_LEN; // one HMAC-SHA-256 key
 
 static PROCESS_KEYS: OnceLock<Arc<Mutex<KeyStore>>> = OnceLock::new();
 
@@ -60,8 +58,7 @@ pub fn refuse_in_this_process() {
     REFUSED.store(true, Ordering::SeqCst);
 }
 
-/// One page of anonymous memory holding up to `len / KEY_LEN` private
-/// scalars. Mapped once, never moved and never unmapped, so no copy of a
+/// One page of anonymous memory holding up to `len / KEY_LEN` keys. Mapped once, never moved and never unmapped, so no copy of a
 /// key is ever left behind by a reallocation.
 struct KeyPage {
     base: *mut u8,
@@ -163,13 +160,13 @@ impl KeyStore {
         self.pages[n / per_page].slot(n % per_page)
     }
 
-    fn load(&mut self, service: &str) -> Option<Result<SecretKey>> {
+    fn load(&mut self, service: &str) -> Option<Zeroizing<[u8; KEY_LEN]>> {
         let n = *self.index.get(service)?;
-        Some(SecretKey::from_slice(&self.slot(n)[..]).map_err(|_| Error::Provider("an ephemeral key was corrupted".into())))
+        Some(Zeroizing::new(*self.slot(n)))
     }
 
     /// Generates and stores a key for `service`, which has none yet.
-    fn create(&mut self, service: &str) -> Result<SecretKey> {
+    fn create(&mut self, service: &str) -> Result<Zeroizing<[u8; KEY_LEN]>> {
         // A key is only ever created in a hardened process.
         if crate::harden_process_impl(0) != crate::status::OK {
             return Err(Error::Provider(
@@ -188,18 +185,17 @@ impl KeyStore {
         if self.pages.is_empty() || self.used == self.pages.len() * self.pages[0].slots() {
             self.pages.push(KeyPage::new()?);
         }
-        let key = SecretKey::try_generate().map_err(|_| Error::Provider("the OS random number generator failed".into()))?;
         let n = self.used;
-        let mut bytes = key.to_bytes();
-        self.slot(n).copy_from_slice(&bytes);
-        bytes.as_mut_slice().zeroize();
+        // Generated straight into its slot: no other copy is ever made.
+        getrandom::fill(&mut self.slot(n)[..]).map_err(|_| Error::Provider("the OS random number generator failed".into()))?;
+        let key = Zeroizing::new(*self.slot(n));
         self.used += 1;
         self.index.insert(service.to_string(), n);
         Ok(key)
     }
 }
 
-// Holds one P-256 private key per service name, entirely in process
+// Holds one HMAC key per service name, entirely in process
 // memory. Nothing here is ever written to disk.
 pub struct EphemeralProvider {
     keys: Arc<Mutex<KeyStore>>,
@@ -221,8 +217,8 @@ impl Default for EphemeralProvider {
 // The handle type this provider hands back from `load_kek`; holds a copy
 // of the service's key (zeroed on drop) for the duration of one call.
 struct EphemeralHandle {
-    key_id: Vec<u8>,       // diagnostic-only tag, embedded in the wrapped payload
-    secret_key: SecretKey, // the actual private key material for this service
+    key_id: Vec<u8>,                // diagnostic-only tag, embedded in the wrapped payload
+    key: Zeroizing<[u8; KEY_LEN]>, // the actual key material for this service
 }
 
 impl KekHandle for EphemeralHandle {
@@ -230,12 +226,8 @@ impl KekHandle for EphemeralHandle {
         &self.key_id // just hand back the borrowed bytes
     }
 
-    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
-        Ok(crate::provider::software_ecdh(&self.secret_key, point))
-    }
-
-    fn public_key(&self) -> Result<PublicKey> {
-        Ok(self.secret_key.public_key()) // trivial: the public half is always derivable from the private key we already hold
+    fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
+        Ok(crate::provider::software_prf(&self.key, inputs))
     }
 }
 
@@ -272,8 +264,8 @@ impl KekProvider for EphemeralProvider {
             .lock() // acquire the mutex; blocks if another call is using the store right now
             .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?; // a prior panic while holding the lock would poison it
 
-        let secret_key = match keys.load(service) {
-            Some(existing) => existing?,
+        let key = match keys.load(service) {
+            Some(existing) => existing,
             None if !create_if_missing => {
                 return Err(Error::KeyNotProvisioned("no ephemeral KEK created yet for this service"));
             }
@@ -285,16 +277,13 @@ impl KekProvider for EphemeralProvider {
         // key material and is not used for lookup (the service string is).
         let key_id = format!("ephemeral:{service}").into_bytes();
 
-        Ok(Box::new(EphemeralHandle {
-            key_id,
-            secret_key,
-        })) // box it up as the trait-object handle the caller expects
+        Ok(Box::new(EphemeralHandle { key_id, key })) // box it up as the trait-object handle the caller expects
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*; // bring `EphemeralProvider`, `SecretKey`, etc. into scope
+    use super::*; // bring `EphemeralProvider`, `KekHandle`, etc. into scope
     use std::sync::Arc;
     use std::thread;
 
@@ -328,19 +317,22 @@ mod tests {
         provider.load_kek(service, false).unwrap(); // now loads fine without creating
     }
 
+    /// One PRF output, for comparing keys.
+    fn prf_of(handle: &dyn KekHandle, input: &[u8]) -> [u8; 32] {
+        *handle.prf(&[input]).unwrap()[0]
+    }
+
     #[test]
-    fn public_key_matches_the_key_used_for_ecdh() {
+    fn prf_is_hmac_sha256_under_the_stored_key() {
         let provider = EphemeralProvider::new();
-        let handle = provider.load_kek("com.company.pubkey-test", true).unwrap();
-        let reported_public = handle.public_key().unwrap();
-
-        let peer_key = SecretKey::generate();
-        let peer = peer_key.public_key();
-
-        let via_handle = handle.ecdh(&peer).unwrap();
-        let via_reported = p256::ecdh::diffie_hellman(peer_key.to_nonzero_scalar(), reported_public.as_affine());
-
-        assert_eq!(via_handle.as_slice(), via_reported.raw_secret_bytes().as_slice());
+        let service = "com.company.prf-test";
+        let handle = provider.load_kek(service, true).unwrap();
+        let key = PROCESS_KEYS.get().unwrap().lock().unwrap().load(service).unwrap();
+        let outputs = handle.prf(&[b"one", b"two"]).unwrap();
+        assert_eq!(outputs.len(), 2, "one output per input, in order");
+        assert_eq!(*outputs[0], *crate::provider::software_prf(&key, &[b"one"])[0]);
+        assert_eq!(*outputs[1], *crate::provider::software_prf(&key, &[b"two"])[0]);
+        assert_ne!(*outputs[0], *outputs[1]);
     }
 
     #[test]
@@ -355,13 +347,7 @@ mod tests {
         let provider = EphemeralProvider::new();
         let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call creates the key
         let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second call must reuse it
-
-        let peer_key = SecretKey::generate(); // a throwaway peer key for this test
-        let peer = peer_key.public_key();
-
-        let s1 = h1.ecdh(&peer).unwrap();
-        let s2 = h2.ecdh(&peer).unwrap();
-        assert_eq!(*s1, *s2); // same underlying key -> same shared secret against the same peer point
+        assert_eq!(prf_of(&*h1, b"input"), prf_of(&*h2, b"input")); // same underlying key -> same PRF output
     }
 
     #[test]
@@ -369,23 +355,16 @@ mod tests {
         let provider = EphemeralProvider::new();
         let h1 = provider.load_kek("com.company.orders", true).unwrap();
         let h2 = provider.load_kek("com.company.billing", true).unwrap(); // a different service name
-
-        let peer_key = SecretKey::generate();
-        let peer = peer_key.public_key();
-
-        let s1 = h1.ecdh(&peer).unwrap();
-        let s2 = h2.ecdh(&peer).unwrap();
-        assert_ne!(*s1, *s2); // different services must never share a KEK, so the secrets must differ
+        assert_ne!(prf_of(&*h1, b"input"), prf_of(&*h2, b"input")); // different services must never share a KEK
     }
 
     #[test]
     fn keys_beyond_one_page_stay_distinct_and_stable() {
         let provider = EphemeralProvider::new();
-        let peer = SecretKey::generate().public_key();
         // More than one page's worth, so the store has to map a second page.
         let services: Vec<String> = (0..300).map(|i| format!("com.company.paging-test-{i}")).collect();
-        let first: Vec<_> = services.iter().map(|s| *provider.load_kek(s, true).unwrap().ecdh(&peer).unwrap()).collect();
-        let again: Vec<_> = services.iter().map(|s| *provider.load_kek(s, false).unwrap().ecdh(&peer).unwrap()).collect();
+        let first: Vec<_> = services.iter().map(|s| prf_of(&*provider.load_kek(s, true).unwrap(), b"input")).collect();
+        let again: Vec<_> = services.iter().map(|s| prf_of(&*provider.load_kek(s, false).unwrap(), b"input")).collect();
         assert_eq!(first, again, "every key must survive the store growing");
         let distinct: std::collections::HashSet<_> = first.iter().collect();
         assert_eq!(distinct.len(), services.len());
@@ -400,23 +379,14 @@ mod tests {
             let p = Arc::clone(&provider);
             handles.push(thread::spawn(move || {
                 let service = if i % 2 == 0 { "service.a" } else { "service.b" };
-                let h = p.load_kek(service, true).unwrap();
-                let peer_key = SecretKey::generate();
-                h.ecdh(&peer_key.public_key()).unwrap()
+                prf_of(&*p.load_kek(service, true).unwrap(), b"input")
             }));
         }
 
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // Verify that keys for service.a and service.b are stable
-        let ha = provider.load_kek("service.a", true).unwrap();
-        let hb = provider.load_kek("service.b", true).unwrap();
-        let peer_key = SecretKey::generate();
-        assert_ne!(
-            *ha.ecdh(&peer_key.public_key()).unwrap(),
-            *hb.ecdh(&peer_key.public_key()).unwrap()
-        );
+        let outputs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Every thread for one service saw the same key, and the two services' keys differ.
+        assert!(outputs.iter().step_by(2).all(|o| *o == outputs[0]));
+        assert!(outputs.iter().skip(1).step_by(2).all(|o| *o == outputs[1]));
+        assert_ne!(outputs[0], outputs[1]);
     }
 }

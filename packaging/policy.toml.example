@@ -113,7 +113,7 @@ mode = "prefer"
 # creates the key file and prints the exact entry to add.
 #require_pinned_names = false
 
-# Encrypt the ECDH shared secret on the TPM bus: "auto" | "required" | "off".
+# Encrypt each wrapping key (TPM2_HMAC's output) on the TPM bus: "auto" | "required" | "off".
 # "auto" skips encryption only for TPMs known to have no external bus
 # (firmware TPMs). "required" needs pinned_session_salt_key_name: the Name
 # of the TPM's storage root key, which every key file is loaded under and

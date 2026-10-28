@@ -38,7 +38,7 @@ pub mod status {
     pub const BUFFER_TOO_SMALL: i32 = -2; // caller's output buffer capacity is smaller than required
     pub const PROVIDER_UNAVAILABLE: i32 = -3; // no KEK provider could be reached at all
     pub const PROVIDER_ERROR: i32 = -4; // a provider was reachable but failed to produce/load a key
-    pub const CRYPTO_ERROR: i32 = -5; // a cryptographic operation failed for a reason other than authentication (RNG, hash-to-curve, HKDF, encryption)
+    pub const CRYPTO_ERROR: i32 = -5; // a cryptographic operation failed for a reason other than authentication (RNG, encryption)
     pub const INTERNAL_ERROR: i32 = -6; // an unexpected panic was caught at the FFI boundary
     // -7 is reserved and never returned. A `service` string that isn't
     // valid UTF-8 is one more way for it to be invalid, reported as
@@ -53,7 +53,7 @@ pub mod status {
     // -13..-15 reserved.
 
     // ---- KEK ----
-    pub const KEK_FINGERPRINT_MISMATCH: i32 = -16; // wrapped payload's embedded KEK fingerprint doesn't match the current KEK's public key
+    pub const KEK_FINGERPRINT_MISMATCH: i32 = -16; // wrapped payload's embedded KEK fingerprint doesn't match the current KEK's
     pub const KEK_NOT_FOUND: i32 = -17; // no persistent KEK exists yet for this service; call hkdfguard_create_kek first
     pub const KEK_ACCESS_DENIED: i32 = -18; // this process may not do this to the KEK: on Linux, create a KEK that doesn't exist yet, or retire one, under the production security model without being root
     pub const KEK_INVALID: i32 = -19; // shared-table code: the KEK exists but is corrupt or has an invalid ACL -- not currently returned on Linux
@@ -109,7 +109,7 @@ pub enum Error {
     /// logging a warning.
     KeyNotProvisioned(&'static str), // static message; no allocation needed since it's always a fixed string
     /// A cryptographic operation failed for a reason other than
-    /// authentication: the OS RNG, hash-to-curve, HKDF, or encryption.
+    /// authentication: the OS RNG, or encryption.
     /// Payload parsing and AEAD failures have their own variants below.
     Crypto(&'static str), // static message describing which crypto step failed
     /// The wrapped payload is structurally invalid: truncated, trailing
@@ -129,12 +129,12 @@ pub enum Error {
     /// and nothing has one" result, surfaced to the caller so they know to
     /// call `hkdfguard_create_kek` first.
     KekNotFound,
-    /// The wrapped payload's embedded KEK fingerprint (a SHA-256 hash of
-    /// the persistent KEK's public key, appended to every payload -- see
-    /// `crypto::kek_fingerprint`) doesn't match the public key of the KEK
+    /// The wrapped payload's embedded KEK fingerprint (a fixed PRF output
+    /// of the persistent KEK, appended to every payload -- see
+    /// `crypto::kek_fingerprint`) doesn't match the fingerprint of the KEK
     /// `service` currently resolves to: this payload was not wrapped
-    /// under the key `unwrap` is about to use. Detected before any
-    /// ECDH/AES-GCM is attempted -- unlike `AuthFailed`, this specifically
+    /// under the key `unwrap` is about to use. Detected before AES-GCM is
+    /// attempted -- unlike `AuthFailed`, this specifically
     /// means "wrong KEK," not "right KEK, but tampered/mismatched data."
     KekFingerprintMismatch,
     /// The security model doesn't let this process do this: under the

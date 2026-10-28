@@ -15,19 +15,26 @@
 //!
 //! ## Design
 //!
-//! Each service's KEK is an ordinary TPM key: an unrestricted ECC P-256
-//! decryption key created by `TPM2_Create` under the Owner hierarchy's
+//! Each service's KEK is an ordinary TPM key: a 256-bit HMAC-SHA-256
+//! keyed-hash object created by `TPM2_Create` under the Owner hierarchy's
 //! storage root key (SRK), and stored as a **key file**,
 //! `<tpm.key_dir>/<service>.tpmkey` (default `/var/lib/hkdfguard/tpm`).
-//! Every ECDH re-derives the SRK with `TPM2_CreatePrimary` from the
+//! Every PRF call re-derives the SRK with `TPM2_CreatePrimary` from the
 //! standard TCG template, loads the key file under it with `TPM2_Load`,
-//! runs `TPM2_ECDH_ZGen`, and flushes both: nothing stays resident in the
-//! TPM, and no persistent handle has to be allocated, authorized, mapped
-//! to a service or kept from colliding.
+//! runs one `TPM2_HMAC` per input, and flushes both: nothing stays resident
+//! in the TPM, and no persistent handle has to be allocated, authorized,
+//! mapped to a service or kept from colliding.
+//!
+//! Only the one-shot `TPM2_HMAC` command is used, never the
+//! `TPM2_HMAC_Start` / `TPM2_SequenceUpdate` sequence: between commands
+//! the kernel's resource manager has to save and reload a sequence object,
+//! and on at least one Intel PTT firmware that put the TPM into failure
+//! mode until the next reboot. Every PRF input fits one command (see
+//! [`crate::crypto::MAX_PRF_INPUT_LEN`]).
 //!
 //! What the TPM itself guarantees about a key file:
 //!
-//! - **Its private key never leaves this TPM.** The file's private area is
+//! - **Its key never leaves this TPM.** The file's private area is
 //!   encrypted and integrity-protected under the SRK, whose seed is
 //!   generated inside the TPM and never exported. The file is useless on
 //!   any other TPM, and `TPM2_Load` refuses a file whose two halves don't
@@ -36,7 +43,7 @@
 //!   `fixedTPM`, `fixedParent` and `sensitiveDataOrigin` (see
 //!   [`verify_matches_template`]). The TPM refuses to import an object with
 //!   `fixedTPM` set, so such a key can only have been created inside this
-//!   TPM and never duplicated out: a key file can't hold a private key
+//!   TPM and never duplicated out: a key file can't hold a key
 //!   anyone knows.
 //!
 //! What it does not guarantee: the key has no password, so anyone who can
@@ -53,10 +60,8 @@
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::tpm_key_file::{self, KeyBlob}; // the key file's on-disk format
-use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
+use crate::provider::{Backend, KekHandle, KekProvider, PrfOutput, ProviderType, KEK_LEN}; // traits/types this module implements
 use crate::secure_file::{FileIdentity, Owner};
-use elliptic_curve::sec1::ToSec1Point; // lets us split the payload's point into X/Y coordinates
-use p256::PublicKey; // the P-256 point type `ecdh` takes
 use sha2::{Digest as ShaDigest, Sha256}; // the payload's key_id tag and TPM Names (aliased to avoid clashing with tss-esapi's own `Digest`)
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf}; // the key directory and key files
@@ -66,14 +71,15 @@ use std::sync::{Arc, Mutex, OnceLock}; // shared, lock-protected TPM context; `O
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder}; // TPM object-attribute and session-attribute bitfields
 use tss_esapi::constants::{PropertyTag, SessionType}; // TPM_PT_MANUFACTURER lookup, and the HMAC session type
 use tss_esapi::handles::{KeyHandle, ObjectHandle, SessionHandle}; // opaque TPM-side handles to a loaded key / a started session
-use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm}; // enum constants for "SHA-256" and "ECC"
+use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm}; // enum constants for "SHA-256", "ECC" and "keyed hash"
 use tss_esapi::interface_types::ecc::EccCurve; // enum constant for "NIST P-256"
 use tss_esapi::interface_types::resource_handles::Hierarchy; // selects the Owner hierarchy for CreatePrimary
 use tss_esapi::interface_types::session_handles::AuthSession; // a started session, as passed to execute_with_session
 use tss_esapi::structures::{
-    EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, Name, Private, Public, PublicBuilder,
-    PublicEccParametersBuilder, SymmetricDefinition, SymmetricDefinitionObject,
-}; // the TPM public-template types this module builds, the TPM Name value, the key file's private area, and the session cipher
+    Digest, EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme, MaxBuffer, Name, Private,
+    Public, PublicBuilder, PublicEccParametersBuilder, PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
+    SymmetricDefinitionObject,
+}; // the TPM public-template types this module builds, the TPM Name value, the key file's private area, HMAC input and the session cipher
 use tss_esapi::traits::{Marshall, UnMarshall}; // TPMT_PUBLIC to and from its wire bytes
 use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its configuration type
 
@@ -171,9 +177,15 @@ fn read_key_file(service: &str) -> Result<Option<KeyFile>> {
     if public.marshall().ok().as_deref() != Some(blob.public.as_slice()) {
         return Err(fail("holds a public area that is not in canonical form".to_string()));
     }
+    if matches!(public, Public::Ecc { .. }) {
+        return Err(fail(
+            "holds an ECC key, from the ECDH format hkdfguard used before its first release; delete the file and \
+             provision the service again"
+                .to_string(),
+        ));
+    }
     verify_matches_template(&service_key_template()?, &public)
         .map_err(|e| fail(format!("is not a key this library creates: {e}")))?;
-    encode_tpm_public_key(&public).map_err(|e| fail(format!("holds no valid public key: {e}")))?;
     let private = Private::try_from(blob.private).map_err(|e| fail(format!("holds an unreadable private area: {e}")))?;
     Ok(Some(KeyFile { public, private, identity }))
 }
@@ -453,8 +465,8 @@ pub struct Tpm2Provider {
     // A TPM ESYS context is not safe to drive concurrently; serialize
     // access to the (typically low-throughput, one DEK-wrap-at-a-time) TPM
     // channel behind a mutex. Shared (via Arc) with every handle so the
-    // actual Load+ECDH_ZGen round trip can happen lazily in
-    // `KekHandle::ecdh`, once the payload's point is known.
+    // actual Load+HMAC round trip can happen lazily in `KekHandle::prf`,
+    // once the payload's PRF inputs are known.
     context: Arc<Mutex<Option<Context>>>,
     // Set when a TPM is there but can't be trusted or used (see
     // `crate::provider::Backend::Refused`); every call then fails with it.
@@ -513,8 +525,8 @@ fn open_context() -> Backend<Context> {
         if tss2_log_exposes_secrets(&level.to_string_lossy()) {
             return Backend::Refused(
                 "TSS2_LOG enables debug/trace logging in tpm2-tss, which writes raw TPM commands and \
-                 responses (including ECDH shared secrets), session keys and plaintext parameters to \
-                 its log; unset TSS2_LOG or lower it to info or below"
+                 responses (including HMAC outputs, i.e. wrapping keys), session keys and plaintext \
+                 parameters to its log; unset TSS2_LOG or lower it to info or below"
                     .to_string(),
             );
         }
@@ -593,7 +605,7 @@ fn open_context() -> Backend<Context> {
 
 /// Whether a `TSS2_LOG` value turns on tpm2-tss logging at `debug` or
 /// `trace` for any module. At those levels its TCTI layer logs raw command
-/// and response bytes -- `TPM2_ECDH_ZGen`'s response is the shared secret
+/// and response bytes -- `TPM2_HMAC`'s response is a payload's wrapping key
 /// -- and its ESAPI layer logs session keys and parameters before
 /// encryption. `TSS2_LOGFILE` can send all of that to any path.
 ///
@@ -614,17 +626,24 @@ fn tss2_log_exposes_secrets(value: &str) -> bool {
 static TPM_CONFORMANCE_VERDICT: OnceLock<bool> = OnceLock::new();
 
 /// Empirically validates, against the real TPM this process just
-/// connected to, the one behavior the key files depend on: the SRK must be
-/// reproducible. `TPM2_CreatePrimary` from the same template must return
-/// the same key every time, or a key file created under one SRK could
-/// never be loaded under the next. Called once, at connection time (see
-/// `open_context`) -- refusing a TPM that can't honor this up front beats
-/// creating key files that turn out to be unloadable.
+/// connected to, the two behaviors the key files depend on. Called once,
+/// at connection time (see `open_context`) -- refusing a TPM that can't
+/// honor them up front beats creating key files that turn out to be
+/// unloadable, or wrapping DEKs under a PRF that isn't the one specified.
+///
+/// 1. **The SRK must be reproducible.** `TPM2_CreatePrimary` from the same
+///    template must return the same key every time, or a key file created
+///    under one SRK could never be loaded under the next.
+/// 2. **`TPM2_HMAC` must be HMAC-SHA-256.** A known-answer test: a
+///    keyed-hash key with a known value, created for this test only, must
+///    give the same HMAC as this crate's software implementation over an
+///    input of the longest length a PRF call ever sends. That also proves
+///    the TPM supports the command and accepts that input length.
 ///
 /// Returns `Ok(true)` if the TPM is compatible, `Ok(false)` if it
 /// definitively is not (a verdict `open_context` caches for the process),
 /// and `Err` only if the self-test itself couldn't be carried out -- a
-/// command failure, which says nothing about the TPM's determinism and so
+/// command failure, which says nothing about the TPM's behavior and so
 /// must not be cached as a verdict.
 fn validate_tpm_compatibility(ctx: &mut Context) -> Result<bool> {
     let mut publics = Vec::new();
@@ -637,7 +656,41 @@ fn validate_tpm_compatibility(ctx: &mut Context) -> Result<bool> {
         log::warn!("hkdfguard: TPM behavior incompatible with hkdfguard requirements: the storage root key is not reproducible");
         return Ok(false);
     }
+
+    let input = vec![0x5a; crate::crypto::MAX_PRF_INPUT_LEN];
+    let on_tpm = hmac_known_answer(ctx, &input)?;
+    if on_tpm != *crate::provider::software_prf(&KNOWN_ANSWER_KEY, &[&input])[0] {
+        log::warn!("hkdfguard: TPM behavior incompatible with hkdfguard requirements: TPM2_HMAC does not compute HMAC-SHA-256");
+        return Ok(false);
+    }
     Ok(true)
+}
+
+/// The key of the conformance self-test's known-answer HMAC. Public by
+/// design: it protects nothing, and is never a service's key.
+const KNOWN_ANSWER_KEY: [u8; KEK_LEN] = *b"hkdfguard-tpm-hmac-known-answer!";
+
+/// `TPM2_HMAC` of `input` under [`KNOWN_ANSWER_KEY`], created under the
+/// SRK with its value supplied (so not `sensitiveDataOrigin`, which no
+/// service key lacks -- see [`verify_matches_template`]) and flushed
+/// afterwards.
+fn hmac_known_answer(ctx: &mut Context, input: &[u8]) -> Result<[u8; 32]> {
+    let template = hmac_key_template(false)?;
+    let srk = create_srk(ctx)?;
+    let value = SensitiveData::try_from(KNOWN_ANSWER_KEY.to_vec())
+        .map_err(|e| Error::Provider(format!("failed to build the self-test key: {e}")))?;
+    let created = ctx.execute_with_nullauth_session(|ctx| ctx.create(srk, template, None, Some(value), None, None));
+    let loaded = created
+        .map_err(|e| Error::Provider(format!("TPM2_Create (self-test HMAC key) failed: {e}")))
+        .and_then(|created| {
+            ctx.execute_with_nullauth_session(|ctx| ctx.load(srk, created.out_private, created.out_public))
+                .map_err(|e| Error::Provider(format!("TPM2_Load (self-test HMAC key) failed: {e}")))
+        });
+    let _ = ctx.flush_context(srk.into());
+    let key = loaded?;
+    let mac = tpm_hmac(ctx, None, key, input);
+    let _ = ctx.flush_context(key.into());
+    Ok(*mac?)
 }
 
 // ---------------------------------------------------------------------
@@ -651,13 +704,9 @@ const TPM_ALG_SHA256: [u8; 2] = [0x00, 0x0B];
 /// Recomputes an object's TPM Name from its public area:
 /// `nameAlg || H_nameAlg(marshalled TPMT_PUBLIC)`.
 fn computed_name(public: &Public) -> Result<Vec<u8>> {
-    let Public::Ecc {
-        name_hashing_algorithm,
-        ..
-    } = public
-    else {
+    let (Public::Ecc { name_hashing_algorithm, .. } | Public::KeyedHash { name_hashing_algorithm, .. }) = public else {
         return Err(Error::Provider(
-            "TPM key is not an ECC public key".into(), // defensive: our own templates always request ECC
+            "TPM object is neither an ECC nor a keyed-hash object".into(), // defensive: our own templates request only these
         ));
     };
     if *name_hashing_algorithm != HashingAlgorithm::Sha256 {
@@ -724,43 +773,48 @@ fn verify_name(service: &str, public: &Public, name: &Name) -> Result<()> {
 
 /// Checks that a public area is the key that was asked for: the same type,
 /// attributes, name algorithm, auth policy, and parameters (curve, scheme,
-/// KDF, symmetric) as `template`. Only `unique` -- the public point -- may
-/// differ.
+/// KDF, symmetric; or the HMAC scheme) as `template`. Only `unique` -- the
+/// public point, or a keyed-hash object's seed digest -- may differ.
 ///
 /// For a service key this is what proves a key file holds a key the TPM
 /// generated and will never export (`fixedTPM`, `fixedParent`,
-/// `sensitiveDataOrigin`; see the module doc), and that it has no auth
-/// policy that could let it be used some other way. For the SRK it proves
-/// the TPM returned the standard storage key, not some other object.
+/// `sensitiveDataOrigin`; see the module doc), that it is usable only for
+/// HMAC, and that it has no auth policy that could let it be used some
+/// other way. For the SRK it proves the TPM returned the standard storage
+/// key, not some other object.
 fn verify_matches_template(template: &Public, returned: &Public) -> Result<()> {
+    let mut differs = Vec::new();
+    let mut compare = |same: bool, what: &'static str| {
+        if !same {
+            differs.push(what);
+        }
+    };
     match (template, returned) {
         (
             Public::Ecc { object_attributes: ta, name_hashing_algorithm: tn, auth_policy: tp, parameters: tparams, .. },
             Public::Ecc { object_attributes: ra, name_hashing_algorithm: rn, auth_policy: rp, parameters: rparams, .. },
         ) => {
-            let mut differs = Vec::new();
-            if ta != ra {
-                differs.push("object attributes");
-            }
-            if tn != rn {
-                differs.push("name algorithm");
-            }
-            if tp != rp {
-                differs.push("auth policy");
-            }
-            if tparams != rparams {
-                differs.push("ECC parameters");
-            }
-            if differs.is_empty() {
-                Ok(())
-            } else {
-                Err(Error::Provider(format!(
-                    "the key does not match the expected template ({} differ)",
-                    differs.join(", ")
-                )))
-            }
+            compare(ta == ra, "object attributes");
+            compare(tn == rn, "name algorithm");
+            compare(tp == rp, "auth policy");
+            compare(tparams == rparams, "ECC parameters");
         }
-        _ => Err(Error::Provider("the key is not an ECC key".into())),
+        (
+            Public::KeyedHash { object_attributes: ta, name_hashing_algorithm: tn, auth_policy: tp, parameters: tparams, .. },
+            Public::KeyedHash { object_attributes: ra, name_hashing_algorithm: rn, auth_policy: rp, parameters: rparams, .. },
+        ) => {
+            compare(ta == ra, "object attributes");
+            compare(tn == rn, "name algorithm");
+            compare(tp == rp, "auth policy");
+            compare(tparams == rparams, "keyed-hash parameters");
+        }
+        (Public::Ecc { .. }, _) => return Err(Error::Provider("the key is not an ECC key".into())),
+        _ => return Err(Error::Provider("the key is not a keyed-hash (HMAC) key".into())),
+    }
+    if differs.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Provider(format!("the key does not match the expected template ({} differ)", differs.join(", "))))
     }
 }
 
@@ -779,7 +833,9 @@ fn verify_matches_template(template: &Public, returned: &Public) -> Result<()> {
 /// children and, as a session's `tpmKey`, to unwrap a session salt: it
 /// refuses `TPM2_ECDH_ZGen` and `TPM2_ECC_Decrypt` with it. That matters
 /// because anyone who can send the TPM commands can recreate it from this
-/// public template.
+/// public template. The SRK is the one ECC key hkdfguard uses: it protects
+/// key files at rest inside the TPM and salts sessions, and never takes
+/// part in wrapping a DEK.
 fn srk_template() -> Result<Public> {
     let object_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
@@ -812,40 +868,39 @@ fn srk_template() -> Result<Public> {
         .map_err(|e| Error::Provider(format!("failed to build TPM public template: {e}")))
 }
 
-/// A service key's template: an unrestricted ECC P-256 decryption key
-/// (required for `TPM2_ECDH_ZGen`), non-signing, generated by the TPM
-/// (`sensitiveDataOrigin`) and fixed to this TPM and this parent, so never
-/// duplicable or exportable. No auth policy and an empty password: reading
-/// the key file is the access control (see the module doc). `noDA`, since
-/// an empty password can't be guessed and its use must never count toward
-/// the TPM's dictionary-attack lockout.
+/// A service key's template: an HMAC-SHA-256 keyed-hash object, usable
+/// only for HMAC (`sign`, not `decrypt` or `restricted`), generated by the
+/// TPM (`sensitiveDataOrigin`) and fixed to this TPM and this parent, so
+/// never duplicable or exportable. No auth policy and an empty password:
+/// reading the key file is the access control (see the module doc).
+/// `noDA`, since an empty password can't be guessed and its use must never
+/// count toward the TPM's dictionary-attack lockout. A keyed-hash key the
+/// TPM generates is the size of its hash's digest: 256 bits.
 fn service_key_template() -> Result<Public> {
+    hmac_key_template(true)
+}
+
+/// The service key's template, or -- `generated` false -- the same key
+/// with its value supplied by the caller, for the conformance self-test's
+/// known-answer key alone.
+fn hmac_key_template(generated: bool) -> Result<Public> {
     let object_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true) // key can never be moved to a different TPM
         .with_fixed_parent(true) // key can never be re-parented/duplicated
-        .with_sensitive_data_origin(true) // the private part is generated by the TPM itself
+        .with_sensitive_data_origin(generated) // the key is generated by the TPM itself
         .with_user_with_auth(true) // standard "USER role" authorization (the empty password) is sufficient to use the key
         .with_no_da(true)
-        .with_decrypt(true) // required: a decryption-family key (ECDH)
-        .with_sign_encrypt(false) // this key must not be usable for signing
-        .with_restricted(false)
+        .with_sign_encrypt(true) // required: TPM2_HMAC needs a signing key
+        .with_decrypt(false) // and nothing else: not usable to derive or unseal
+        .with_restricted(false) // TPM2_HMAC refuses a restricted key
         .build()
         .map_err(|e| Error::Provider(format!("failed to build TPM object attributes: {e}")))?;
-    let ecc_params = PublicEccParametersBuilder::new()
-        .with_ecc_scheme(EccScheme::Null) // no fixed signing/KDF scheme baked into the key itself
-        .with_curve(EccCurve::NistP256) // the mandated curve
-        .with_key_derivation_function_scheme(KeyDerivationFunctionScheme::Null) // no on-TPM KDF; this crate does its own HKDF afterward
-        .with_is_decryption_key(true) // mirrors the object attribute above, for the builder's own consistency checks
-        .with_is_signing_key(false)
-        .with_restricted(false)
-        .build()
-        .map_err(|e| Error::Provider(format!("failed to build TPM ECC parameters: {e}")))?;
     PublicBuilder::new()
-        .with_public_algorithm(PublicAlgorithm::Ecc)
+        .with_public_algorithm(PublicAlgorithm::KeyedHash)
         .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
         .with_object_attributes(object_attributes)
-        .with_ecc_parameters(ecc_params)
-        .with_ecc_unique_identifier(EccPoint::default()) // ignored by TPM2_Create: the TPM fills in the generated point
+        .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::HMAC_SHA_256)) // fixed to HMAC with SHA-256
+        .with_keyed_hash_unique_identifier(Digest::default()) // ignored by TPM2_Create: the TPM fills in the seed's digest
         .build()
         .map_err(|e| Error::Provider(format!("failed to build TPM public template: {e}")))
 }
@@ -925,7 +980,6 @@ fn create_service_key(ctx: &mut Context) -> Result<KeyBlob> {
     let _ = ctx.flush_context(srk.into());
     let created = created.map_err(|e| Error::Provider(format!("TPM2_Create (service key) failed: {e}")))?;
     verify_matches_template(&template, &created.out_public)?;
-    encode_tpm_public_key(&created.out_public)?;
     Ok(KeyBlob {
         public: created
             .out_public
@@ -963,11 +1017,11 @@ fn load_service_key(ctx: &mut Context, srk: KeyHandle, service: &str, public: &P
 // ---------------------------------------------------------------------
 //
 // A discrete TPM sits on an LPC or SPI bus that an interposer can read
-// byte-for-byte. `TPM2_ECDH_ZGen`'s response is the shared point Z for
-// one payload; a captured response opens that payload (the per-payload
-// hashed point in crypto.rs keeps it from opening any other), and an
-// interposer that stays on the bus captures every subsequent one. A
-// firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has
+// byte-for-byte. `TPM2_HMAC`'s response is one payload's wrapping key (or
+// the KEK fingerprint, which is public); a captured response opens that
+// payload (the salt in each payload's KDF input keeps it from opening any
+// other), and an interposer that stays on the bus captures every
+// subsequent one. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has
 // no external bus, so this is pure overhead there -- hence the `auto`
 // policy mode, which skips it only for known-internal manufacturers.
 // That decision rests on `TPM_PT_MANUFACTURER`, read over the very bus in
@@ -981,9 +1035,9 @@ fn load_service_key(ctx: &mut Context, srk: KeyHandle, service: &str, public: &P
 // session salt is encrypted to that key (one-pass ECDH) and the session
 // key derived from it is never on the bus in cleartext; with
 // `TPMA_SESSION.encrypt` set, the first response parameter -- here
-// `outPoint`, i.e. Z -- is AES-128-CFB encrypted under a key derived from
-// the session key. The cryptography lives in tpm2-tss's ESAPI layer,
-// which tss-esapi wraps; this module only configures the session.
+// `outHMAC` -- is AES-128-CFB encrypted under a key derived from the
+// session key. The cryptography lives in tpm2-tss's ESAPI layer, which
+// tss-esapi wraps; this module only configures the session.
 //
 // Three things are load-bearing. An *unsalted* session's key derives
 // from the two nonces, both visible on the bus, so the interposer computes
@@ -996,6 +1050,12 @@ fn load_service_key(ctx: &mut Context, srk: KeyHandle, service: &str, public: &P
 // interposer can substitute its own and man-in-the-middle the session;
 // that is what `tpm.pinned_session_salt_key_name` defeats, and why
 // `required` mode refuses to run without a pin.
+//
+// The session salt's one-pass ECDH is the TPM specification's, and the
+// one place a quantum computer would matter here: someone who records the
+// bus today and can later break P-256 recovers the session keys, and with
+// them the wrapping keys that crossed the bus. Only the TCG can change
+// that mechanism. On a firmware or virtual TPM there is no bus to record.
 //
 // Nothing secret crosses the bus outside the session: `TPM2_Load` sends
 // the key file's private area, which is encrypted under the SRK, and the
@@ -1044,8 +1104,8 @@ static TPM_NO_EXTERNAL_BUS: OnceLock<bool> = OnceLock::new();
 /// Logged once: `auto` chose to encrypt but the SRK isn't pinned.
 static UNPINNED_SALT_KEY_WARNED: OnceLock<()> = OnceLock::new();
 
-/// Whether `TPM2_ECDH_ZGen` should run inside an encrypted session on
-/// this call, per `tpm.session_encryption`.
+/// Whether `TPM2_HMAC` should run inside an encrypted session on this
+/// call, per `tpm.session_encryption`.
 fn session_encryption_enabled(ctx: &mut Context) -> Result<bool> {
     use crate::policy::SessionEncryption;
     match crate::policy::tpm_session_encryption() {
@@ -1073,7 +1133,7 @@ fn session_encryption_enabled(ctx: &mut Context) -> Result<bool> {
                 }
                 Ok(Some(id)) => {
                     log::info!(
-                        "hkdfguard: TPM manufacturer {:?} treated as discrete; ECDH runs in a salted, parameter-encrypted session",
+                        "hkdfguard: TPM manufacturer {:?} treated as discrete; HMAC runs in a salted, parameter-encrypted session",
                         String::from_utf8_lossy(&id.to_be_bytes())
                     );
                     false
@@ -1115,8 +1175,8 @@ fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSess
         .ok_or_else(|| Error::Provider("TPM2_StartAuthSession returned no session".into()))?;
 
     let (attributes, mask) = SessionAttributesBuilder::new()
-        .with_decrypt(true) // encrypt the command's first parameter (inPoint)
-        .with_encrypt(true) // encrypt the response's first parameter (outPoint, i.e. Z)
+        .with_decrypt(true) // encrypt the command's first parameter (buffer, the PRF input -- public, but harmless)
+        .with_encrypt(true) // encrypt the response's first parameter (outHMAC, i.e. the wrapping key)
         .with_continue_session(true)
         .build();
     if let Err(e) = ctx.tr_sess_set_attributes(session, attributes, mask) {
@@ -1125,9 +1185,9 @@ fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSess
     }
     // Read the attributes back and refuse a session that won't encrypt.
     // Encryption is invisible to the caller -- an unencrypted session
-    // returns the very same Z -- so nothing downstream would notice a
-    // stack that accepted the attributes and then dropped them, and Z
-    // would cross the bus in the clear. A local ESAPI call: no TPM round
+    // returns the very same HMAC -- so nothing downstream would notice a
+    // stack that accepted the attributes and then dropped them, and the
+    // wrapping key would cross the bus in the clear. A local ESAPI call: no TPM round
     // trip.
     let encrypts = ctx.tr_sess_get_attributes(session).map(|a| a.decrypt() && a.encrypt());
     match encrypts {
@@ -1135,7 +1195,7 @@ fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSess
         Ok(false) => {
             let _ = ctx.flush_context(SessionHandle::from(session).into());
             Err(Error::Provider(
-                "the TPM session did not keep its decrypt/encrypt attributes; refusing to send Z through it unencrypted"
+                "the TPM session did not keep its decrypt/encrypt attributes; refusing to send HMAC outputs through it unencrypted"
                     .into(),
             ))
         }
@@ -1146,16 +1206,55 @@ fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSess
     }
 }
 
-/// `TPM2_ECDH_ZGen` with `key`, inside a session salted to `srk` with
-/// parameter encryption. Owns the session's lifecycle: it is flushed on
-/// every path, so no session slot (TPMs have very few) can leak.
-fn ecdh_z_gen_encrypted(ctx: &mut Context, srk: KeyHandle, key: KeyHandle, peer_point: &EccPoint) -> Result<EccPoint> {
-    let session = start_encrypted_session(ctx, srk)?;
-    let z = ctx
-        .execute_with_session(Some(session), |ctx| ctx.ecdh_z_gen(key, peer_point.clone()))
-        .map_err(|e| Error::Provider(format!("TPM2_ECDH_ZGen (encrypted session) failed: {e}")));
-    let _ = ctx.flush_context(SessionHandle::from(session).into());
-    z
+/// One `TPM2_HMAC` of `input` with `key`: in `session` when given (see
+/// [`start_encrypted_session`]), else a plain HMAC authorization session.
+/// One-shot, never a sequence (see the module doc).
+fn tpm_hmac(ctx: &mut Context, session: Option<AuthSession>, key: KeyHandle, input: &[u8]) -> Result<PrfOutput> {
+    let buffer = MaxBuffer::try_from(input.to_vec())
+        .map_err(|e| Error::Provider(format!("a {}-byte PRF input does not fit one TPM2_HMAC: {e}", input.len())))?;
+    let mac = match session {
+        Some(session) => ctx.execute_with_session(Some(session), |ctx| ctx.hmac(key.into(), buffer, HashingAlgorithm::Sha256)),
+        None => ctx.execute_with_nullauth_session(|ctx| ctx.hmac(key.into(), buffer, HashingAlgorithm::Sha256)),
+    }
+    .map_err(|e| Error::Provider(format!("TPM2_HMAC failed: {e}")))?; // a `Digest` wipes itself on drop
+    if mac.value().len() != 32 {
+        return Err(Error::Provider(format!("TPM2_HMAC returned {} bytes, not an HMAC-SHA-256", mac.value().len())));
+    }
+    let mut out = PrfOutput::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
+    out.copy_from_slice(mac.value());
+    Ok(out)
+}
+
+/// The PRF on the TPM: re-derives the SRK, loads the key file's key under
+/// it -- verifying its Name, and any policy-pinned Name, *before* it is
+/// used, so a key that isn't the one policy expects never computes
+/// anything -- runs one `TPM2_HMAC` per input, and flushes everything on
+/// every path, so no transient object or session slot (TPMs have very few)
+/// can leak. Under session encryption all the inputs share one session.
+fn tpm_prf(ctx: &mut Context, service: &str, public: &Public, private: &Private, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
+    let srk = create_srk(ctx)?;
+    let key = match load_service_key(ctx, srk, service, public, private) {
+        Ok(key) => key,
+        Err(e) => {
+            let _ = ctx.flush_context(srk.into());
+            return Err(e);
+        }
+    };
+    let outputs = match session_encryption_enabled(ctx) {
+        Err(e) => Err(e),
+        Ok(true) => match start_encrypted_session(ctx, srk) {
+            Ok(session) => {
+                let outputs = inputs.iter().map(|input| tpm_hmac(ctx, Some(session), key, input)).collect();
+                let _ = ctx.flush_context(SessionHandle::from(session).into());
+                outputs
+            }
+            Err(e) => Err(e),
+        },
+        Ok(false) => inputs.iter().map(|input| tpm_hmac(ctx, None, key, input)).collect(),
+    };
+    let _ = ctx.flush_context(key.into());
+    let _ = ctx.flush_context(srk.into());
+    outputs
 }
 
 // ---------------------------------------------------------------------
@@ -1163,9 +1262,9 @@ fn ecdh_z_gen_encrypted(ctx: &mut Context, srk: KeyHandle, key: KeyHandle, peer_
 // ---------------------------------------------------------------------
 
 // Handle type returned from `load_kek`. Holds the key file as it was read
-// once in `load_kek`, so `public_key` and `ecdh` within one wrap/unwrap
-// use the same key even if the file is replaced in between; the key is
-// loaded into the TPM only inside `ecdh`, and flushed before it returns.
+// once in `load_kek`, so every PRF call within one wrap/unwrap uses the
+// same key even if the file is replaced in between; the key is loaded into
+// the TPM only inside `prf`, and flushed before it returns.
 struct Tpm2Handle {
     key_id: Vec<u8>,                      // diagnostic-only tag embedded in the wrapped payload
     service: String,                      // the service name, for its policy pin
@@ -1179,81 +1278,9 @@ impl KekHandle for Tpm2Handle {
         &self.key_id
     }
 
-    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
-        let peer_point = encode_peer_point(point)?; // the payload's point, TPM-encoded
-        let z = with_context(&self.context, |ctx| {
-            let srk = create_srk(ctx)?;
-            // Loads the key and verifies its Name (and any policy-pinned
-            // Name) *before* it is used for ECDH -- so a key that isn't
-            // the one policy expects never computes a shared secret at all.
-            let key = match load_service_key(ctx, srk, &self.service, &self.public, &self.private) {
-                Ok(key) => key,
-                Err(e) => {
-                    let _ = ctx.flush_context(srk.into());
-                    return Err(e);
-                }
-            };
-            // TPM2_ECDH_ZGen: computes the shared point Z inside the TPM.
-            // Under an encrypted session its response -- Z itself -- is
-            // AES-CFB encrypted before it crosses the bus; see
-            // `ecdh_z_gen_encrypted`.
-            let z = match session_encryption_enabled(ctx) {
-                Err(e) => Err(e),
-                Ok(true) => ecdh_z_gen_encrypted(ctx, srk, key, &peer_point),
-                Ok(false) => ctx
-                    .execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(key, peer_point.clone()))
-                    .map_err(|e| Error::Provider(format!("TPM2_ECDH_ZGen failed: {e}"))),
-            };
-            // Always flush both, even on ECDH failure, so no transient
-            // object slot leaks.
-            let _ = ctx.flush_context(key.into());
-            let _ = ctx.flush_context(srk.into());
-            z
-        })?;
-
-        let x_bytes = z.x().value(); // the shared secret is conventionally just the X-coordinate of Z
-        if x_bytes.len() != 32 {
-            return Err(Error::Provider(
-                "TPM returned unexpected ECDH shared point size".into(), // defensive: should always be 32 for P-256
-            ));
-        }
-        let mut secret = SharedSecret::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
-        secret.copy_from_slice(x_bytes);
-        Ok(secret)
+    fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
+        with_context(&self.context, |ctx| tpm_prf(ctx, &self.service, &self.public, &self.private, inputs))
     }
-
-    // Straight from the key file's public area: no TPM round trip. `ecdh`
-    // loads the same public area, and `TPM2_Load` refuses it unless the
-    // private area belongs to it, so this is the key `ecdh` uses.
-    fn public_key(&self) -> Result<PublicKey> {
-        encode_tpm_public_key(&self.public)
-    }
-}
-
-// Converts the ECC public point in a key's public area into a
-// `p256::PublicKey`.
-fn encode_tpm_public_key(public: &Public) -> Result<PublicKey> {
-    let Public::Ecc { unique, .. } = public else {
-        return Err(Error::Provider(
-            "TPM key is not an ECC public key".into(), // defensive: our own template always requests ECC
-        ));
-    };
-
-    let x = unique.x().value();
-    let y = unique.y().value();
-    if x.len() != 32 || y.len() != 32 {
-        return Err(Error::Provider(
-            "TPM key has an unexpected ECC public key coordinate size".into(), // should always be 32 for P-256
-        ));
-    }
-
-    let mut point = [0u8; 65]; // uncompressed SEC1 point: 0x04 || X || Y
-    point[0] = 0x04;
-    point[1..33].copy_from_slice(x);
-    point[33..65].copy_from_slice(y);
-
-    PublicKey::from_sec1_bytes(&point)
-        .map_err(|_| Error::Provider("TPM key holds an invalid ECC public key".into()))
 }
 
 impl KekProvider for Tpm2Provider {
@@ -1330,17 +1357,27 @@ impl KekProvider for Tpm2Provider {
         }))
     }
 
-    // Deletes the key file, once its key is confirmed to have
+    // Deletes the key file, once its key is confirmed (on the TPM) to have
     // `expected_fingerprint` and the file is confirmed to be the one read.
     // The TPM keeps no copy, so every DEK wrapped under it is then
     // unrecoverable -- unless a copy of the key file survives (a backup),
     // which still loads on this TPM.
     fn retire_kek(&self, service: &str, expected_fingerprint: &[u8; crate::payload::FINGERPRINT_LEN]) -> Result<()> {
         self.check_not_refused()?;
+        if !self.connected() {
+            return Err(Error::Provider("TPM context not available".into()));
+        }
         let Some(file) = read_key_file(service)? else {
             return Err(Error::KekNotFound);
         };
-        if crate::crypto::kek_fingerprint(&encode_tpm_public_key(&file.public)?) != *expected_fingerprint {
+        let handle = Tpm2Handle {
+            key_id: Vec::new(),
+            service: service.to_string(),
+            public: file.public,
+            private: file.private,
+            context: Arc::clone(&self.context),
+        };
+        if crate::crypto::kek_fingerprint(&handle)? != *expected_fingerprint {
             return Err(Error::KekFingerprintMismatch);
         }
         let dir = key_dir()?;
@@ -1380,30 +1417,9 @@ fn service_fingerprint(service: &str) -> Vec<u8> {
     Sha256::digest(service.as_bytes()).to_vec()
 }
 
-// Converts the payload's P-256 point (a `p256::PublicKey`)
-// into the TPM crate's `EccPoint` representation, as required by
-// `ecdh_z_gen`.
-fn encode_peer_point(peer_public: &PublicKey) -> Result<EccPoint> {
-    let encoded = peer_public.to_sec1_point(false); // uncompressed SEC1 encoding, so X and Y are both directly available
-    let x = encoded
-        .x()
-        .ok_or(Error::Provider("point has no X coordinate".into()))?; // should never actually be missing for a valid point
-    let y = encoded
-        .y()
-        .ok_or(Error::Provider("point has no Y coordinate".into()))?;
-
-    let x_param = EccParameter::try_from(x.to_vec())
-        .map_err(|e| Error::Provider(format!("failed to encode peer point X: {e}")))?;
-    let y_param = EccParameter::try_from(y.to_vec())
-        .map_err(|e| Error::Provider(format!("failed to encode peer point Y: {e}")))?;
-
-    Ok(EccPoint::new(x_param, y_param))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*; // bring `Tpm2Provider` etc. into scope
-    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use crate::policy::test_support::TestPolicy;
     use serial_test::serial; // the tests below set process-wide env vars
 
@@ -1544,14 +1560,22 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn a_service_key_is_tpm_generated_fixed_and_unrestricted_and_the_srk_is_the_tcg_storage_key() {
-        let Public::Ecc { object_attributes: key, auth_policy, .. } = service_key_template().unwrap() else {
-            panic!("expected an ECC template");
+    fn a_service_key_is_tpm_generated_fixed_and_hmac_only_and_the_srk_is_the_tcg_storage_key() {
+        let Public::KeyedHash { object_attributes: key, auth_policy, parameters, .. } = service_key_template().unwrap() else {
+            panic!("expected a keyed-hash template");
         };
         assert!(key.fixed_tpm() && key.fixed_parent() && key.sensitive_data_origin(), "never exported, generated in the TPM");
-        assert!(key.decrypt() && !key.sign_encrypt() && !key.restricted(), "usable for ECDH_ZGen, and only that");
+        assert!(key.sign_encrypt() && !key.decrypt() && !key.restricted(), "usable for TPM2_HMAC, and only that");
         assert!(key.user_with_auth() && key.no_da());
         assert!(auth_policy.value().is_empty(), "no policy that could authorize the key some other way");
+        assert_eq!(parameters, PublicKeyedHashParameters::new(KeyedHashScheme::HMAC_SHA_256));
+
+        // The self-test's key differs only in having a supplied value.
+        let Public::KeyedHash { object_attributes: known, .. } = hmac_key_template(false).unwrap() else {
+            panic!("expected a keyed-hash template");
+        };
+        assert!(!known.sensitive_data_origin());
+        assert!(verify_matches_template(&service_key_template().unwrap(), &hmac_key_template(false).unwrap()).is_err());
 
         let Public::Ecc { object_attributes: srk, unique, .. } = srk_template().unwrap() else {
             panic!("expected an ECC template");
@@ -1583,23 +1607,21 @@ mod tests {
     }
 
     // A public area shaped exactly like a service key the TPM made: the
-    // service-key template with a real, random P-256 point.
+    // service-key template with a random `unique` (the seed's digest).
     fn fake_service_public() -> Public {
-        public_with_attributes(service_key_template().unwrap())
-    }
-
-    fn public_with_attributes(template: Public) -> Public {
-        let point = p256::SecretKey::generate().public_key().to_sec1_point(false);
-        let coordinate = |c: &[u8]| EccParameter::try_from(c.to_vec()).unwrap();
-        let Public::Ecc { object_attributes, name_hashing_algorithm, auth_policy, parameters, .. } = template else {
-            panic!("expected an ECC template");
+        let mut unique = [0u8; 32];
+        getrandom::fill(&mut unique).unwrap();
+        let Public::KeyedHash { object_attributes, name_hashing_algorithm, auth_policy, parameters, .. } =
+            service_key_template().unwrap()
+        else {
+            panic!("expected a keyed-hash template");
         };
-        Public::Ecc {
+        Public::KeyedHash {
             object_attributes,
             name_hashing_algorithm,
             auth_policy,
             parameters,
-            unique: EccPoint::new(coordinate(point.x().unwrap()), coordinate(point.y().unwrap())),
+            unique: Digest::try_from(unique.to_vec()).unwrap(),
         }
     }
 
@@ -1734,13 +1756,13 @@ mod tests {
     fn a_key_file_holding_a_key_this_library_would_not_create_is_refused() {
         with_key_dir(|_| {
             // fixedTPM clear: a key that could have been imported, with a
-            // private key someone outside the TPM knows.
-            let Public::Ecc { object_attributes, name_hashing_algorithm, auth_policy, parameters, unique } =
+            // value someone outside the TPM knows.
+            let Public::KeyedHash { object_attributes, name_hashing_algorithm, auth_policy, parameters, unique } =
                 fake_service_public()
             else {
                 unreachable!()
             };
-            let importable = Public::Ecc {
+            let importable = Public::KeyedHash {
                 object_attributes: tss_esapi::attributes::ObjectAttributes::from(
                     tss_esapi::tss2_esys::TPMA_OBJECT::from(object_attributes) & !0x2, // TPMA_OBJECT_FIXEDTPM
                 ),
@@ -1939,14 +1961,16 @@ mod tests {
         provider
     }
 
-    // Runs the exact same `load_kek` + `ecdh` path production code uses
-    // and returns the resulting shared secret.
-    fn ecdh_secret(service: &str, create: bool, peer: &PublicKey) -> Result<[u8; 32]> {
+    // Runs the exact same `load_kek` + `prf` path production code uses
+    // and returns the PRF output for `input`.
+    fn prf_output(service: &str, create: bool, input: &[u8]) -> Result<[u8; 32]> {
         let handle = provider().load_kek(service, create)?;
-        let secret = handle.ecdh(peer)?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(secret.as_slice());
-        Ok(out)
+        Ok(*handle.prf(&[input])?[0])
+    }
+
+    // The fingerprint of the key a handle uses: what a payload carries.
+    fn fingerprint(handle: &dyn KekHandle) -> [u8; 32] {
+        crate::crypto::kek_fingerprint(handle).unwrap()
     }
 
     fn srk_name() -> Vec<u8> {
@@ -1967,22 +1991,20 @@ mod tests {
             assert!(!tpm.kek_exists(SERVICE).unwrap());
             assert!(matches!(tpm.load_kek(SERVICE, false), Err(Error::KeyNotProvisioned(_))), "no key file: not provisioned");
 
-            let created = tpm.load_kek(SERVICE, true).unwrap().public_key().unwrap();
+            let created = fingerprint(&*tpm.load_kek(SERVICE, true).unwrap());
             assert!(tpm.kek_exists(SERVICE).unwrap());
             let file = dir.join("com.company.orders.tpmkey");
             let bytes = std::fs::read(&file).unwrap();
 
             // Provisioning again is idempotent: the same key, the file untouched.
-            assert_eq!(tpm.load_kek(SERVICE, true).unwrap().public_key().unwrap(), created);
+            assert_eq!(fingerprint(&*tpm.load_kek(SERVICE, true).unwrap()), created);
             assert_eq!(std::fs::read(&file).unwrap(), bytes);
 
             // A new connection -- as a new process would have -- loads the
-            // same key, and the TPM's ECDH agrees with the file's public key.
-            let peer = p256::SecretKey::generate();
-            let z = ecdh_secret(SERVICE, false, &peer.public_key()).unwrap();
-            let expected = p256::ecdh::diffie_hellman(peer.to_nonzero_scalar(), created.as_affine());
-            assert_eq!(z.as_slice(), expected.raw_secret_bytes().as_slice(), "Z must be ECDH with the key file's public key");
-            assert_eq!(z, ecdh_secret(SERVICE, false, &peer.public_key()).unwrap(), "repeatable");
+            // same key, and its HMAC is repeatable.
+            let first = prf_output(SERVICE, false, b"input").unwrap();
+            assert_eq!(first, prf_output(SERVICE, false, b"input").unwrap(), "repeatable");
+            assert_eq!(fingerprint(&*provider().load_kek(SERVICE, false).unwrap()), created);
         });
     }
 
@@ -1992,8 +2014,7 @@ mod tests {
     fn different_services_get_different_keys() {
         with_key_dir(|_| {
             let tpm = provider();
-            let keys: Vec<_> =
-                ["orders", "billing", "payments"].iter().map(|s| tpm.load_kek(s, true).unwrap().public_key().unwrap()).collect();
+            let keys: Vec<_> = ["orders", "billing", "payments"].iter().map(|s| fingerprint(&*tpm.load_kek(s, true).unwrap())).collect();
             assert_ne!(keys[0], keys[1]);
             assert_ne!(keys[0], keys[2]);
             assert_ne!(keys[1], keys[2]);
@@ -2011,15 +2032,15 @@ mod tests {
         // itself is then only covered by `a_second_write_never_replaces_the_first_key`.
         let simulator = crate::policy::tpm_tcti().unwrap().is_some_and(|t| t.starts_with("swtpm:") || t.starts_with("mssim:"));
         with_key_dir(|_| {
-            let provision = || Tpm2Provider::new().load_kek(SERVICE, true).map(|h| h.public_key());
+            let provision = || Tpm2Provider::new().load_kek(SERVICE, true).and_then(|h| crate::crypto::kek_fingerprint(&*h));
             let keys: Vec<_> = if simulator {
-                (0..4).map(|_| provision().unwrap().unwrap()).collect()
+                (0..4).map(|_| provision().unwrap()).collect()
             } else {
                 (0..4)
                     .map(|_| std::thread::spawn(provision))
                     .collect::<Vec<_>>()
                     .into_iter()
-                    .map(|t| t.join().unwrap().unwrap().unwrap())
+                    .map(|t| t.join().unwrap().unwrap())
                     .collect()
             };
             assert!(keys.iter().all(|k| *k == keys[0]), "every provisioner must end up with the one key on disk");
@@ -2045,7 +2066,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
             let handle = tpm.load_kek("spliced", false).expect("the file checks can't see the splice");
-            match handle.ecdh(&crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap()) {
+            match handle.prf(&[b"input"]) {
                 Err(Error::Provider(msg)) => assert!(msg.contains("TPM2_Load"), "{msg}"),
                 other => panic!("the TPM must refuse the spliced key file, got {:?}", other.map(|_| ())),
             }
@@ -2058,7 +2079,7 @@ mod tests {
         // Exercises `validate_tpm_compatibility` the same way `open_context`
         // does at connection time: a compatible TPM must pass it, and
         // `Tpm2Provider::new()` must therefore still report itself available.
-        assert!(with_tpm_context(validate_tpm_compatibility).unwrap(), "the SRK must be reproducible");
+        assert!(with_tpm_context(validate_tpm_compatibility).unwrap(), "the SRK must be reproducible and TPM2_HMAC standard");
         assert!(Tpm2Provider::new().probe());
     }
 
@@ -2092,28 +2113,32 @@ mod tests {
 
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    fn tpm2_hmac_is_hmac_sha256_for_every_input_length() {
+        // The self-test checks the longest input; the PRF's real inputs
+        // are shorter and vary (the fingerprint block, and wrap blocks for
+        // every service-name length). Each must match software HMAC.
+        let lengths = [0, 1, 37, 63, 64, 65, 200, crate::crypto::MAX_PRF_INPUT_LEN];
+        for len in lengths {
+            let input = vec![0xa5; len];
+            let on_tpm = with_tpm_context(|ctx| hmac_known_answer(ctx, &input)).unwrap();
+            assert_eq!(on_tpm, *crate::provider::software_prf(&KNOWN_ANSWER_KEY, &[&input])[0], "{len}-byte input");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
-    fn tpm_accepts_hashed_payload_points() {
-        // The forgery-resistant protocol derives the wrapping key from
-        // ECDH(KEK_priv, H_salt) for a point hashed from the payload
-        // salt, whose discrete log nobody knows. If a backend refused to
-        // do ECDH against such a caller-supplied point, the entire
-        // construction would be unusable there -- so confirm it against
-        // a real TPM before building on it, rather than assuming.
+    fn the_prf_is_repeatable_and_separates_keys_and_inputs() {
         with_key_dir(|_| {
-            let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
-            let z1 = ecdh_secret(SERVICE, true, &h).unwrap();
-            let z2 = ecdh_secret(SERVICE, false, &h).unwrap();
-            assert_eq!(z1, z2, "ECDH against the same point must be repeatable for the same service");
-            assert_ne!(z1, [0u8; 32], "shared secret must not be all zeroes");
+            let first = prf_output(SERVICE, true, b"salt-1").unwrap();
+            assert_eq!(first, prf_output(SERVICE, false, b"salt-1").unwrap(), "repeatable for the same service and input");
+            assert_ne!(first, prf_output(SERVICE, false, b"salt-2").unwrap(), "different inputs must yield different outputs");
+            assert_ne!(first, prf_output("com.company.billing", true, b"salt-1").unwrap(), "different KEKs must differ");
 
-            // Each service's KEK must produce its own Z against the same point.
-            let z_billing = ecdh_secret("com.company.billing", true, &h).unwrap();
-            assert_ne!(z1, z_billing, "different KEKs must yield different Z against the same point");
-
-            // And each salt's point must produce its own Z for the same KEK.
-            let h2 = crate::crypto::payload_ecdh_point(&[0x43u8; 32]).unwrap();
-            assert_ne!(z1, ecdh_secret(SERVICE, false, &h2).unwrap(), "different salts must yield different Z for the same KEK");
+            // Several inputs in one call: one key load, the same outputs.
+            let both = provider().load_kek(SERVICE, false).unwrap().prf(&[b"salt-1", b"salt-2"]).unwrap();
+            assert_eq!(*both[0], first);
+            assert_eq!(*both[1], prf_output(SERVICE, false, b"salt-2").unwrap());
         });
     }
 
@@ -2123,8 +2148,7 @@ mod tests {
     fn retiring_deletes_the_key_file_only_with_the_right_fingerprint() {
         with_key_dir(|dir| {
             let tpm = provider();
-            let public = tpm.load_kek(SERVICE, true).unwrap().public_key().unwrap();
-            let right = crate::crypto::kek_fingerprint(&public);
+            let right = fingerprint(&*tpm.load_kek(SERVICE, true).unwrap());
             let mut wrong = right;
             wrong[0] ^= 1;
             assert!(matches!(tpm.retire_kek(SERVICE, &wrong), Err(Error::KekFingerprintMismatch)));
@@ -2141,30 +2165,31 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
-    fn encrypted_session_ecdh_yields_the_same_z_as_a_plain_session() {
+    fn an_encrypted_session_hmac_equals_a_plain_session_hmac() {
         // Correctness: parameter encryption must be transparent -- the
-        // TPM computes the same Z, ESAPI decrypts the response, and the
+        // TPM computes the same HMAC, ESAPI decrypts the response, and the
         // caller sees identical bytes. If the SRK weren't an acceptable
         // `tpmKey`, or the attributes were wrong, this is where it would
         // fail.
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
             let file = read_key_file(SERVICE).unwrap().unwrap();
-            let peer = encode_peer_point(&crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap()).unwrap();
+            let input = vec![0x42; crate::crypto::MAX_PRF_INPUT_LEN];
             let (plain, encrypted) = with_tpm_context(|ctx| {
                 let srk = create_srk(ctx)?;
                 let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private)?;
-                let plain = ctx
-                    .execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(key, peer.clone()))
-                    .map_err(|e| Error::Provider(format!("plain ECDH failed: {e}")));
-                let encrypted = ecdh_z_gen_encrypted(ctx, srk, key, &peer);
+                let plain = tpm_hmac(ctx, None, key, &input);
+                let encrypted = start_encrypted_session(ctx, srk).and_then(|session| {
+                    let mac = tpm_hmac(ctx, Some(session), key, &input);
+                    let _ = ctx.flush_context(SessionHandle::from(session).into());
+                    mac
+                });
                 let _ = ctx.flush_context(key.into());
                 let _ = ctx.flush_context(srk.into());
                 Ok((plain?, encrypted?))
             })
             .unwrap();
-            assert_eq!(plain.x().value(), encrypted.x().value(), "Z must be identical through an encrypted session");
-            assert_eq!(plain.y().value(), encrypted.y().value());
+            assert_eq!(*plain, *encrypted, "the HMAC must be identical through an encrypted session");
         });
     }
 
@@ -2173,9 +2198,9 @@ mod tests {
     #[serial]
     fn encrypted_sessions_really_carry_the_encryption_attributes() {
         // The test above cannot tell an encrypting session from one that
-        // silently isn't: Z is identical either way. This checks what
-        // decides it -- the session's own attributes, as ESAPI reports
-        // them for the session `ecdh_z_gen_encrypted` would use.
+        // silently isn't: the HMAC is identical either way. This checks
+        // what decides it -- the session's own attributes, as ESAPI
+        // reports them for the session `tpm_prf` would use.
         let attributes = with_tpm_context(|ctx| {
             let srk = create_srk(ctx)?;
             let session = start_encrypted_session(ctx, srk);
@@ -2189,34 +2214,32 @@ mod tests {
         .unwrap()
         .expect("an encrypted session must start")
         .expect("its attributes must be readable");
-        assert!(attributes.decrypt(), "the command's first parameter (inPoint) must be encrypted");
-        assert!(attributes.encrypt(), "the response's first parameter (Z) must be encrypted");
+        assert!(attributes.decrypt(), "the command's first parameter (buffer) must be encrypted");
+        assert!(attributes.encrypt(), "the response's first parameter (outHMAC) must be encrypted");
     }
 
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
-    fn the_tpm_refuses_ecdh_with_the_srk() {
-        // The SRK is restricted, so anyone who recreates it from its
-        // public template still can't use it to recover a session's salt:
-        // the TPM itself refuses ECDH_ZGen with it. A service key, for
-        // contrast, accepts the same point.
+    fn the_tpm_refuses_hmac_with_the_srk() {
+        // The SRK is restricted and not a keyed-hash key, so anyone who
+        // recreates it from its public template still can't use it as a
+        // PRF. A service key, for contrast, accepts the same input.
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
             let file = read_key_file(SERVICE).unwrap().unwrap();
-            let point = encode_peer_point(&crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap()).unwrap();
             let (refused, accepted) = with_tpm_context(|ctx| {
                 let srk = create_srk(ctx)?;
-                let refused = ctx.execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(srk, point.clone())).is_err();
+                let refused = tpm_hmac(ctx, None, srk, b"input").is_err();
                 let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private)?;
-                let accepted = ctx.execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(key, point.clone())).is_ok();
+                let accepted = tpm_hmac(ctx, None, key, b"input").is_ok();
                 let _ = ctx.flush_context(key.into());
                 let _ = ctx.flush_context(srk.into());
                 Ok((refused, accepted))
             })
             .unwrap();
-            assert!(refused, "TPM2_ECDH_ZGen with the restricted SRK must be refused by the TPM");
-            assert!(accepted, "the control: a service key accepts the same point");
+            assert!(refused, "TPM2_HMAC with the restricted SRK must be refused by the TPM");
+            assert!(accepted, "the control: a service key accepts the same input");
         });
     }
 
@@ -2229,16 +2252,15 @@ mod tests {
 
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
-            let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
             let policy_for = |name_hex: &str| {
                 format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{name_hex}\"\n")
             };
-            with_policy(&policy_for(&hex(&real)), || ecdh_secret(SERVICE, false, &h))
+            with_policy(&policy_for(&hex(&real)), || prf_output(SERVICE, false, b"input"))
                 .expect("a correctly pinned SRK must work");
 
             let mut wrong = real.clone();
             wrong[2] ^= 0xff;
-            match with_policy(&policy_for(&hex(&wrong)), || ecdh_secret(SERVICE, false, &h)) {
+            match with_policy(&policy_for(&hex(&wrong)), || prf_output(SERVICE, false, b"input")) {
                 Err(Error::Provider(msg)) => assert!(msg.contains("storage root key Name"), "{msg}"),
                 other => panic!("an SRK whose Name doesn't match the pin must be refused, got {other:?}"),
             }
@@ -2251,7 +2273,7 @@ mod tests {
     fn auto_mode_skips_encryption_on_an_internal_tpm_unless_pinned_and_required_forces_it() {
         // swtpm and firmware TPMs report a known no-bus manufacturer, so
         // `auto` (the default, no policy file) skips encryption; `required`
-        // still encrypts. Both paths must still produce a working ECDH.
+        // still encrypts. Both paths must still produce a working HMAC.
         let (auto, reported) = with_tpm_context(|ctx| {
             let reported = ctx
                 .get_tpm_property(PropertyTag::Manufacturer)
@@ -2283,10 +2305,9 @@ mod tests {
         );
         with_policy(&required, || {
             assert!(with_tpm_context(session_encryption_enabled).unwrap(), "required must encrypt regardless of manufacturer");
-            // And the full production path -- load_kek + ecdh -- works under it.
+            // And the full production path -- load_kek + prf -- works under it.
             with_key_dir(|_| {
-                let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
-                assert_ne!(ecdh_secret(SERVICE, true, &h).unwrap(), [0u8; 32], "ECDH through the encrypted session must succeed");
+                assert_ne!(prf_output(SERVICE, true, b"input").unwrap(), [0u8; 32], "HMAC through the encrypted session must succeed");
             });
         });
     }
@@ -2356,8 +2377,7 @@ mod tests {
                 let tpm = provider();
                 assert!(tpm.kek_exists(service).unwrap(), "a pinned service must exist");
                 tpm.load_kek(service, true).unwrap();
-                let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
-                assert_ne!(*tpm.load_kek(service, false).unwrap().ecdh(&h).unwrap(), [0u8; 32]);
+                assert_ne!(*tpm.load_kek(service, false).unwrap().prf(&[b"input"]).unwrap()[0], [0u8; 32]);
                 assert!(!tpm.kek_exists("com.company.notpinned").unwrap(), "other services are still refused");
             });
         });
@@ -2370,16 +2390,15 @@ mod tests {
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
             let actual = computed_name(&read_key_file(SERVICE).unwrap().unwrap().public).unwrap();
-            let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
             let pin = |name: &[u8]| format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"{SERVICE}\" = \"{}\"\n", hex(name));
 
-            with_policy(&pin(&actual), || ecdh_secret(SERVICE, false, &h)).expect("a correctly pinned Name must be accepted");
+            with_policy(&pin(&actual), || prf_output(SERVICE, false, b"input")).expect("a correctly pinned Name must be accepted");
 
             // Pinned to anything else: refused, and refused before the key
-            // is ever loaded for ECDH.
+            // is ever used for HMAC.
             let mut wrong = actual.clone();
             wrong[2] ^= 0xff; // corrupt the digest, keeping the alg prefix valid
-            assert!(with_policy(&pin(&wrong), || ecdh_secret(SERVICE, false, &h)).is_err());
+            assert!(with_policy(&pin(&wrong), || prf_output(SERVICE, false, b"input")).is_err());
         });
     }
 }

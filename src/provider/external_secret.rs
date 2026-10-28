@@ -1,7 +1,7 @@
 //! Provider 3: External Secret Provider.
 //!
-//! Used when TPM2 and PKCS#11 are both unavailable. Reads a persistent P-256
-//! KEK that has been provisioned *outside* this process by the deployment
+//! Used when TPM2 and PKCS#11 are both unavailable. Reads a persistent
+//! 256-bit HMAC KEK that has been provisioned *outside* this process by the deployment
 //! platform -- a Kubernetes Secret, a Docker secret, a Vault Agent
 //! sink, a CSI Secret Store volume, a systemd credential, or any other
 //! mounted-file secret mechanism -- rather than generating one itself.
@@ -10,9 +10,11 @@
 //! the root-owned policy when set; otherwise the first of a list of
 //! conventional secret mount points that exists.
 //!
-//! The secret file's contents must be a P-256 private key, as exactly 32
-//! raw big-endian scalar bytes, PKCS#8 DER, or SEC1 DER (`ECPrivateKey`,
-//! what `openssl genpkey -outform DER` writes).
+//! The secret file's contents must be exactly 32 random bytes, used as the
+//! HMAC-SHA-256 key: `head -c 32 /dev/urandom`, or `openssl rand 32`.
+//! Nothing else is accepted -- not base64 or hex text, and no trailing
+//! newline -- so a key in the wrong form is refused rather than silently
+//! used as some other key.
 //!
 //! This provider never creates or writes a secret: if no file exists for a
 //! given service it declines with [`Error::KeyNotProvisioned`]. A file that
@@ -21,7 +23,7 @@
 //!
 //! ## What the file must satisfy
 //!
-//! For this provider the file *is* the KEK private key -- not a PIN or a
+//! For this provider the file *is* the KEK -- not a PIN or a
 //! defensive input -- so it is held to the same standard as every other
 //! secret this crate reads from disk:
 //!
@@ -71,21 +73,20 @@
 //! secrets sidecar, a shared `emptyDir`). They say nothing about *which*
 //! key it holds, and any of those writers can mount a valid key of its own
 //! before the real one arrives. With `external_secret.pinned_keys` naming
-//! a service, the key's fingerprint (SHA-256 of its public point, see
-//! [`crate::crypto::kek_fingerprint`]) must be one of the pinned values, or
+//! a service, the key's fingerprint (see [`crate::crypto::kek_fingerprint`])
+//! must be one of the pinned values, or
 //! the key is refused -- an error, never "not provisioned". With
 //! `external_secret.require_pinned_keys`, a service with no pin has no KEK
 //! here, whatever is mounted for it; `provision` then reports the mounted
 //! key's fingerprint and the policy line that would accept it.
 
-use crate::crypto::kek_fingerprint; // the fingerprint every payload carries, and policy pins
+use crate::crypto::software_kek_fingerprint; // the fingerprint every payload carries, and policy pins
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::payload::FINGERPRINT_LEN;
-use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
+use crate::provider::{Backend, KekHandle, KekProvider, PrfOutput, ProviderType, KEK_LEN}; // traits/types this module implements
 use crate::secure_file::{open_checked, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_ACCESS}; // descriptor-based trust checks and a self-wiping read buffer
-use elliptic_curve::pkcs8::DecodePrivateKey; // lets `SecretKey` parse from PKCS#8 DER (SEC1 DER is an inherent method)
-use p256::{PublicKey, SecretKey}; // P-256 key types
 use std::fs::File;
+use zeroize::Zeroizing;
 use std::path::{Path, PathBuf}; // filesystem path types
 
 // Conventional mount points used by common secret-injection mechanisms,
@@ -150,8 +151,8 @@ impl Default for ExternalSecretProvider {
 // Handle type returned from `load_kek`; holds the key parsed from the
 // mounted secret file.
 struct ExternalSecretHandle {
-    key_id: Vec<u8>,       // diagnostic-only tag embedded in the wrapped payload
-    secret_key: SecretKey, // the key loaded from the externally provisioned file
+    key_id: Vec<u8>,          // diagnostic-only tag embedded in the wrapped payload
+    key: Zeroizing<[u8; KEK_LEN]>, // the key loaded from the externally provisioned file
 }
 
 impl KekHandle for ExternalSecretHandle {
@@ -159,12 +160,8 @@ impl KekHandle for ExternalSecretHandle {
         &self.key_id
     }
 
-    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
-        Ok(crate::provider::software_ecdh(&self.secret_key, point)) // point: the payload's hashed point H_salt (see crypto.rs)
-    }
-
-    fn public_key(&self) -> Result<PublicKey> {
-        Ok(self.secret_key.public_key()) // trivial: the public half is always derivable from the private key we already hold
+    fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
+        Ok(crate::provider::software_prf(&self.key, inputs))
     }
 }
 
@@ -230,38 +227,35 @@ impl KekProvider for ExternalSecretProvider {
                 "external_secret.require_pinned_keys is set and policy pins no key for this service",
             ));
         }
-        let secret_key = read_key(dir, service)?.ok_or(Error::KeyNotProvisioned(
+        let key = read_key(dir, service)?.ok_or(Error::KeyNotProvisioned(
             "no secret file provisioned for this service", // mount exists, but nothing provisioned for this service yet
         ))?;
         if matches!(pins, Pins::Unpinned) {
             // Provisioning here means a root-owned policy edit, which this
             // process can't make itself. Do the part it can: report the
             // fingerprint of the key that is mounted, ready to pin.
-            return Err(Error::Provider(unpinned_service_instructions(service, &secret_key)));
+            return Err(Error::Provider(unpinned_service_instructions(service, &key)));
         }
-        check_pins(&secret_key, &pins)?;
+        check_pins(&key, &pins)?;
         let key_id = format!("external:{service}").into_bytes();
 
-        Ok(Box::new(ExternalSecretHandle {
-            key_id,
-            secret_key,
-        }))
+        Ok(Box::new(ExternalSecretHandle { key_id, key }))
     }
 }
 
 /// Opens, checks, reads and parses `<mount>/<service>`. `Ok(None)` only when
 /// no such file exists (nothing provisioned); a file that is untrusted
 /// (escapes the mount, wrong owner, too broad a mode, not a regular file),
-/// unreadable, or not a valid P-256 key is an error, never "not
+/// unreadable, or not exactly [`KEK_LEN`] bytes is an error, never "not
 /// provisioned".
-fn read_key(mount: &Path, service: &str) -> Result<Option<SecretKey>> {
+fn read_key(mount: &Path, service: &str) -> Result<Option<Zeroizing<[u8; KEK_LEN]>>> {
     let mut file = match open_secret_within_mount(mount, service) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::Provider(format!("external secret for this service rejected: {e}"))),
     };
 
-    // Raw KEK private-key material read straight off disk into a
+    // Raw KEK material read straight off disk into a
     // `SecretBuffer`: one fixed allocation, never grown, zeroed on every
     // exit path below.
     let mut bytes = SecretBuffer::read_from(&mut file, MAX_SECRET_FILE_LEN)
@@ -297,11 +291,11 @@ fn service_pins(service: &str) -> Result<Pins> {
 /// is an error, not "not provisioned": something put a valid key that
 /// isn't the administrator's where the KEK belongs, and the chain must not
 /// move on to another provider as if nothing were there.
-fn check_pins(key: &SecretKey, pins: &Pins) -> Result<()> {
+fn check_pins(key: &[u8; KEK_LEN], pins: &Pins) -> Result<()> {
     let Pins::OneOf(accepted) = pins else {
         return Ok(());
     };
-    let fingerprint = kek_fingerprint(&key.public_key());
+    let fingerprint = software_kek_fingerprint(key);
     if accepted.contains(&fingerprint) {
         return Ok(());
     }
@@ -318,8 +312,8 @@ fn check_pins(key: &SecretKey, pins: &Pins) -> Result<()> {
 /// `external_secret.require_pinned_keys`: the mounted key's fingerprint, in
 /// the form to paste into policy. The fingerprint and service name are both
 /// public, so the message carries them as-is.
-fn unpinned_service_instructions(service: &str, key: &SecretKey) -> String {
-    let fingerprint = hex(&kek_fingerprint(&key.public_key()));
+fn unpinned_service_instructions(service: &str, key: &[u8; KEK_LEN]) -> String {
+    let fingerprint = hex(&software_kek_fingerprint(key));
     format!(
         "external_secret.require_pinned_keys is set and service \"{service}\" has no pinned key. The key \
          mounted for it has fingerprint {fingerprint}. If that is the key you generated, add this to the \
@@ -331,10 +325,10 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// Largest secret file accepted. A PKCS#8 DER P-256 key is ~138 bytes and
-// a raw scalar is 32; this leaves generous headroom (e.g. for a PKCS#8
-// encoding that also embeds optional attributes) while bounding the one
-// up-front allocation `SecretBuffer` makes.
+// Largest secret file read. A key is exactly KEK_LEN bytes; reading a
+// little more lets a file in the wrong form (base64 or hex text, a
+// trailing newline, a PEM or DER key) be refused with its actual length,
+// while bounding the one up-front allocation `SecretBuffer` makes.
 const MAX_SECRET_FILE_LEN: usize = 4096;
 
 /// What a mounted KEK file must satisfy -- identical to the PKCS#11 PIN
@@ -412,29 +406,24 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
     Ok(file)
 }
 
-// Accepts a 32-byte raw scalar, a PKCS#8 DER key, or a SEC1 DER
-// (`ECPrivateKey`) key, since different provisioning tools produce
-// different formats -- `openssl genpkey -outform DER` writes SEC1. Both DER
-// forms must name the P-256 curve when they name one at all; a key for
-// any other curve is refused.
-fn parse_secret_key(bytes: &[u8]) -> Result<SecretKey> {
-    if bytes.len() == 32 {
-        // exactly 32 bytes: treat as a raw big-endian P-256 private scalar
-        return SecretKey::from_slice(bytes)
-            .map_err(|e| Error::Provider(format!("invalid raw external KEK scalar: {e}")));
+// Accepts exactly KEK_LEN raw bytes. Any other length is refused with a
+// hint at the usual cause, never trimmed or decoded into some other key.
+fn parse_secret_key(bytes: &[u8]) -> Result<Zeroizing<[u8; KEK_LEN]>> {
+    if bytes.len() != KEK_LEN {
+        return Err(Error::Provider(format!(
+            "external secret is {} bytes; it must be exactly {KEK_LEN} raw random bytes (head -c {KEK_LEN} /dev/urandom), \
+             not base64 or hex text, a trailing newline, or a PEM/DER key",
+            bytes.len()
+        )));
     }
-    // A DER key: PKCS#8 (a PrivateKeyInfo, whose second field is the
-    // algorithm SEQUENCE) or SEC1 (an ECPrivateKey, whose second field is
-    // the key OCTET STRING). Errors are reported for the format that was
-    // tried last, with the accepted formats named, since a PEM file or a
-    // key for the wrong curve is the usual cause.
-    SecretKey::from_pkcs8_der(bytes)
-        .or_else(|_| SecretKey::from_sec1_der(bytes))
-        .map_err(|e| {
-            Error::Provider(format!(
-                "external secret is not a valid P-256 key (expected 32 raw bytes, PKCS#8 DER or SEC1 DER; PEM must be converted to DER): {e}"
-            ))
-        })
+    if bytes.iter().all(|b| *b == 0) {
+        // What reading /dev/zero, or a truncated-then-extended file, gives:
+        // a provisioning mistake, never a key anyone meant.
+        return Err(Error::Provider("external secret is all zero bytes; provision 32 random bytes".into()));
+    }
+    let mut key = Zeroizing::new([0u8; KEK_LEN]);
+    key.copy_from_slice(bytes);
+    Ok(key)
 }
 
 // Picks the secret mount directory: `external_secret.dir` from the policy,
@@ -462,8 +451,6 @@ fn resolve_dir() -> Backend<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*; // bring `ExternalSecretProvider` etc. into scope
-    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
-    use elliptic_curve::pkcs8::EncodePrivateKey; // lets the test encode a key to PKCS#8 DER for the "provisioned" fixture
     use serial_test::serial; // these tests mutate a shared env var, so they must not run concurrently
     use std::os::unix::fs::PermissionsExt;
 
@@ -484,6 +471,18 @@ mod tests {
         std::fs::write(&path, bytes.as_ref()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
+    }
+
+    // A fresh random key, as an operator would provision one.
+    fn random_key() -> [u8; KEK_LEN] {
+        let mut key = [0u8; KEK_LEN];
+        getrandom::fill(&mut key).unwrap();
+        key
+    }
+
+    // The fingerprint of the key a handle actually uses.
+    fn loaded_fingerprint(handle: &dyn KekHandle) -> [u8; FINGERPRINT_LEN] {
+        crate::crypto::kek_fingerprint(handle).unwrap()
     }
 
     #[test]
@@ -511,8 +510,8 @@ mod tests {
                 Err(Error::KeyNotProvisioned(_))
             ));
 
-            let secret_key = SecretKey::generate();
-            provision(dir, "com.company.orders", secret_key.to_bytes()); // simulate an operator provisioning it externally
+            let secret_key = random_key();
+            provision(dir, "com.company.orders", secret_key); // simulate an operator provisioning it externally
 
             assert!(provider.kek_exists("com.company.orders").unwrap());
             provider.load_kek("com.company.orders", false).unwrap(); // now loads fine
@@ -526,8 +525,8 @@ mod tests {
             // A real, valid key sitting at a hidden-file name in the
             // mount: reachable as a path, but the provider must still
             // refuse the name rather than load it.
-            let secret_key = SecretKey::generate();
-            provision(dir, ".hidden", secret_key.to_bytes());
+            let secret_key = random_key();
+            provision(dir, ".hidden", secret_key);
 
             for bad in [".hidden", ".", "..", "...", "com..orders", ""] {
                 assert!(!provider.kek_exists(bad).unwrap(), "kek_exists must be false for {bad:?}");
@@ -554,8 +553,8 @@ mod tests {
             let versioned = dir.join("..2026_09_28_00_00_00.000000000");
             std::fs::create_dir(&versioned).unwrap();
             std::fs::set_permissions(&versioned, std::fs::Permissions::from_mode(0o755)).unwrap(); // as kubelet makes it, whatever the umask
-            let key = SecretKey::generate();
-            provision(&versioned, "com.company.orders", key.to_bytes());
+            let key = random_key();
+            provision(&versioned, "com.company.orders", key);
             std::os::unix::fs::symlink(&versioned, dir.join("..data")).unwrap();
             std::os::unix::fs::symlink(
                 Path::new("..data").join("com.company.orders"),
@@ -565,7 +564,7 @@ mod tests {
 
             assert!(provider.kek_exists("com.company.orders").unwrap());
             let handle = provider.load_kek("com.company.orders", false).unwrap();
-            assert_eq!(handle.public_key().unwrap(), key.public_key());
+            assert_eq!(loaded_fingerprint(&*handle), software_kek_fingerprint(&key));
         });
     }
 
@@ -578,8 +577,8 @@ mod tests {
             // containment rule is the only thing standing between a
             // planted link and an attacker-chosen KEK.
             let outside = crate::secure_file::private_tempdir();
-            let secret_key = SecretKey::generate();
-            let real_path = provision(outside.path(), "real-secret", secret_key.to_bytes());
+            let secret_key = random_key();
+            let real_path = provision(outside.path(), "real-secret", secret_key);
             std::os::unix::fs::symlink(&real_path, dir.join("com.company.orders")).unwrap();
 
             match provider.load_kek("com.company.orders", true) {
@@ -596,8 +595,8 @@ mod tests {
     #[serial]
     fn refuses_group_or_world_accessible_files_as_errors_not_absence() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::generate();
-            let path = provision(dir, "com.company.orders", secret_key.to_bytes());
+            let secret_key = random_key();
+            let path = provision(dir, "com.company.orders", secret_key);
 
             // Group read is allowed only on a root-owned file, and the
             // fixture is owned by whoever runs the tests.
@@ -657,7 +656,7 @@ mod tests {
             // writable by others: they could swap the key underneath.
             let inner = dir.join("..2026_10_01");
             std::fs::create_dir(&inner).unwrap();
-            provision(&inner, "com.company.orders", SecretKey::generate().to_bytes());
+            provision(&inner, "com.company.orders", random_key());
             std::os::unix::fs::symlink("..2026_10_01/com.company.orders", dir.join("com.company.orders")).unwrap();
 
             std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -674,8 +673,8 @@ mod tests {
     #[serial]
     fn refuses_a_mount_others_can_write_to() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::generate();
-            provision(dir, "com.company.orders", secret_key.to_bytes());
+            let secret_key = random_key();
+            provision(dir, "com.company.orders", secret_key);
             provider.load_kek("com.company.orders", false).unwrap();
 
             for mode in [0o777u32, 0o770, 0o1777] {
@@ -701,7 +700,7 @@ mod tests {
         let mount = base.path().join("secrets");
         std::fs::create_dir(&mount).unwrap();
         std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700)).unwrap();
-        provision(&mount, "com.company.orders", SecretKey::generate().to_bytes());
+        provision(&mount, "com.company.orders", random_key());
         let _secret_mount = crate::policy::test_support::secret_mount(&mount);
         let provider = ExternalSecretProvider::new();
         provider.load_kek("com.company.orders", false).unwrap();
@@ -731,7 +730,7 @@ mod tests {
             std::fs::create_dir_all(&keys).unwrap();
             std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
-            provision(&keys, "com.company.orders", SecretKey::generate().to_bytes());
+            provision(&keys, "com.company.orders", random_key());
             std::os::unix::fs::symlink("..2026_10_02/keys/com.company.orders", dir.join("com.company.orders")).unwrap();
             provider.load_kek("com.company.orders", false).unwrap();
 
@@ -757,120 +756,77 @@ mod tests {
 
     #[test]
     #[serial]
-    fn different_provisioned_keys_produce_different_public_keys() {
+    fn different_provisioned_keys_produce_different_fingerprints() {
         with_dir(|provider, dir| {
-            let key_a = SecretKey::generate();
-            let key_b = SecretKey::generate();
-            provision(dir, "com.company.orders", key_a.to_bytes());
-            provision(dir, "com.company.billing", key_b.to_bytes());
+            let key_a = random_key();
+            let key_b = random_key();
+            provision(dir, "com.company.orders", key_a);
+            provision(dir, "com.company.billing", key_b);
 
-            let handle_a = provider.load_kek("com.company.orders", true).unwrap();
-            let handle_b = provider.load_kek("com.company.billing", true).unwrap();
+            let fingerprint_a = loaded_fingerprint(&*provider.load_kek("com.company.orders", true).unwrap());
+            let fingerprint_b = loaded_fingerprint(&*provider.load_kek("com.company.billing", true).unwrap());
 
-            let public_a = handle_a.public_key().unwrap();
-            let public_b = handle_b.public_key().unwrap();
-
-            // Each handle's reported public key must match its own
-            // provisioned secret, not just differ from the other one --
-            // guards against a regression where public_key() returns a
-            // stale, cached, or otherwise-mismatched value.
-            assert_eq!(public_a, key_a.public_key());
-            assert_eq!(public_b, key_b.public_key());
-            assert_ne!(public_a, public_b, "different provisioned keys must produce different public keys");
+            // Each handle must use its own provisioned secret, not just
+            // differ from the other one.
+            assert_eq!(fingerprint_a, software_kek_fingerprint(&key_a));
+            assert_eq!(fingerprint_b, software_kek_fingerprint(&key_b));
+            assert_ne!(fingerprint_a, fingerprint_b, "different provisioned keys must produce different fingerprints");
         });
-    }
-
-    // An ECPrivateKey (SEC1 DER) exactly as `openssl genpkey -algorithm EC
-    // -pkeyopt ec_paramgen_curve:P-256 -outform DER` writes it: version 1,
-    // the 32-byte key, the prime256v1 OID, and the public point, which is
-    // the last 65 bytes. A throwaway test key.
-    const OPENSSL_P256_SEC1_DER: &str = "30770201010420ea598655faab80ea2ed2b41d232b0e2ed6291ec86ee54ea2da6fb704ff2d77f9a00a06082a8648ce3d030107a1440342000418d2afa00d9d7ffb1f6514ff3b303b6c4b2b95f5b150b03e56a086f9f5d021f02d0fc482189427a10597d3a4e0b673d364d9a95915c0c3d05b389adc3ea0ffae";
-    // The same, for P-384 (secp384r1). A throwaway test key.
-    const OPENSSL_P384_SEC1_DER: &str = "3081a402010104301b8239a974c78597128424d8e0704b918c2191efe564110956c8f536b337de8c3255811434aaee8eed4d1b0cbf1dc1c9a00706052b81040022a16403620004e32b45d36c8cf4ac83aa5d3386fca1291f5892e079c687ac3c00a3b91d399057d308d7272f4eaf709412526ca7a131944e32bcb119dad9b4ca0effd743845860b040018c325b9e4ecda3fca57c502d702115507c25d577c03198e8d0c8c719b3";
-
-    fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
     #[test]
     #[serial]
-    fn loads_an_openssl_sec1_secret() {
-        use elliptic_curve::sec1::ToSec1Point;
+    fn the_prf_is_hmac_sha256_keyed_with_the_file_contents() {
+        use hmac::{Hmac, KeyInit, Mac};
         with_dir(|provider, dir| {
-            let der = unhex(OPENSSL_P256_SEC1_DER);
-            provision(dir, "com.company.orders", &der);
-
-            assert!(provider.kek_exists("com.company.orders").unwrap());
+            let key = random_key();
+            provision(dir, "com.company.orders", key);
             let handle = provider.load_kek("com.company.orders", false).unwrap();
-            // The key loaded is the one in the file: its public point is the
-            // one OpenSSL embedded alongside it.
-            let public = handle.public_key().unwrap().to_sec1_point(false);
-            assert_eq!(public.as_bytes(), &der[der.len() - 65..]);
+            let outputs = handle.prf(&[b"first", b"second"]).unwrap();
+            for (input, output) in [&b"first"[..], &b"second"[..]].iter().zip(&outputs) {
+                // Computed independently of `software_prf`.
+                let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&key).unwrap();
+                mac.update(input);
+                assert_eq!(output.as_slice(), mac.finalize().into_bytes().as_slice());
+            }
         });
     }
 
     #[test]
     #[serial]
-    fn refuses_a_sec1_key_for_another_curve() {
+    fn refuses_a_secret_in_any_form_but_32_raw_bytes() {
+        use base64::Engine as _;
+        let key = random_key();
+        let base64_text = base64::engine::general_purpose::STANDARD.encode(key);
+        let hex_text = hex(&key);
+        let with_newline = [&key[..], b"\n"].concat();
+        let cases: [(&str, &[u8]); 6] = [
+            ("too short", &key[..31]),
+            ("trailing newline", &with_newline),
+            ("base64 text", base64_text.as_bytes()),
+            ("hex text", hex_text.as_bytes()),
+            ("a PEM key", b"-----BEGIN EC PRIVATE KEY-----\nnot a key\n-----END EC PRIVATE KEY-----\n"),
+            ("empty", b""),
+        ];
         with_dir(|provider, dir| {
-            provision(dir, "com.company.orders", unhex(OPENSSL_P384_SEC1_DER));
+            for (what, contents) in cases {
+                provision(dir, "com.company.orders", contents);
+                // kek_exists is what `provision` asks; it must not report a
+                // key the first wrap would then reject.
+                let err = provider.kek_exists("com.company.orders").unwrap_err();
+                assert!(err.to_string().contains("exactly 32 raw random bytes"), "{what}: {err}");
+                assert!(matches!(provider.load_kek("com.company.orders", true), Err(Error::Provider(_))), "{what}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_an_all_zero_secret() {
+        with_dir(|provider, dir| {
+            provision(dir, "com.company.orders", [0u8; KEK_LEN]);
             let err = provider.kek_exists("com.company.orders").unwrap_err();
-            assert!(err.to_string().contains("not a valid P-256 key"), "{err}");
-            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Provider(_))));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn an_unparseable_secret_is_an_error_at_provisioning_not_a_kek() {
-        // kek_exists is what `provision` asks; it must not report a key
-        // the first wrap would then reject.
-        with_dir(|provider, dir| {
-            provision(dir, "com.company.orders", b"-----BEGIN EC PRIVATE KEY-----\nnot DER\n");
-            let err = provider.kek_exists("com.company.orders").unwrap_err();
-            assert!(err.to_string().contains("PEM must be converted to DER"), "{err}");
-            assert!(matches!(provider.load_kek("com.company.orders", true), Err(Error::Provider(_))));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn loads_provisioned_pkcs8_secret() {
-        with_dir(|provider, dir| {
-            let secret_key = SecretKey::generate(); // simulate an operator-provisioned key
-            let der = secret_key.to_pkcs8_der().unwrap();
-            provision(dir, "com.company.orders", der.as_bytes()); // "provision" it as a mounted file
-
-            let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let peer_key = SecretKey::generate(); // stand-in peer key
-            let expected = p256::ecdh::diffie_hellman(
-                secret_key.to_nonzero_scalar(),
-                peer_key.public_key().as_affine(),
-            ); // compute the expected shared secret directly, independent of the provider
-            let actual = handle.ecdh(&peer_key.public_key()).unwrap();
-            assert_eq!(actual.as_slice(), expected.raw_secret_bytes().as_slice()); // provider's result must match
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn loads_provisioned_raw_scalar_secret() {
-        with_dir(|provider, dir| {
-            let secret_key = SecretKey::generate();
-            provision(dir, "com.company.orders", secret_key.to_bytes()); // provision as raw 32-byte scalar this time
-
-            let handle = provider.load_kek("com.company.orders", true).unwrap();
-            let peer_key = SecretKey::generate();
-            let expected = p256::ecdh::diffie_hellman(
-                secret_key.to_nonzero_scalar(),
-                peer_key.public_key().as_affine(),
-            );
-            let actual = handle.ecdh(&peer_key.public_key()).unwrap();
-            assert_eq!(actual.as_slice(), expected.raw_secret_bytes().as_slice());
-            // Since we provisioned the file ourselves, we independently
-            // know the exact key -- `public_key()` must report that same
-            // key, not some other/derived value.
-            assert_eq!(handle.public_key().unwrap(), secret_key.public_key());
+            assert!(err.to_string().contains("all zero"), "{err}");
         });
     }
 
@@ -906,8 +862,8 @@ mod tests {
         }
     }
 
-    fn fingerprint_hex(key: &SecretKey) -> String {
-        hex(&kek_fingerprint(&key.public_key()))
+    fn fingerprint_hex(key: &[u8; KEK_LEN]) -> String {
+        hex(&software_kek_fingerprint(key))
     }
 
     // Layers `[external_secret.pinned_keys]` / `require_pinned_keys` over
@@ -922,19 +878,19 @@ mod tests {
     #[serial]
     fn a_pinned_key_loads_and_any_other_key_is_refused() {
         with_dir(|provider, dir| {
-            let real = SecretKey::generate();
+            let real = random_key();
             let _policy = pin_policy(false, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&real)));
 
-            provision(dir, "com.company.orders", real.to_bytes());
+            provision(dir, "com.company.orders", real);
             assert!(provider.kek_exists("com.company.orders").unwrap());
             let handle = provider.load_kek("com.company.orders", false).unwrap();
-            assert_eq!(handle.public_key().unwrap(), real.public_key());
+            assert_eq!(loaded_fingerprint(&*handle), software_kek_fingerprint(&real));
 
             // A well-formed key, correctly owned and moded -- what a writer
             // sharing the volume could mount first -- is still refused, and
             // as an error, so the chain doesn't move on to another provider.
-            let planted = SecretKey::generate();
-            provision(dir, "com.company.orders", planted.to_bytes());
+            let planted = random_key();
+            provision(dir, "com.company.orders", planted);
             for create_if_missing in [false, true] {
                 match provider.load_kek("com.company.orders", create_if_missing) {
                     Err(Error::Provider(msg)) => {
@@ -948,7 +904,7 @@ mod tests {
             assert!(provider.kek_exists("com.company.orders").is_err(), "an error, not absence");
 
             // Pins are per service: an unpinned one is unaffected without the allowlist.
-            provision(dir, "com.company.billing", planted.to_bytes());
+            provision(dir, "com.company.billing", planted);
             provider.load_kek("com.company.billing", false).unwrap();
         });
     }
@@ -957,17 +913,17 @@ mod tests {
     #[serial]
     fn a_list_of_pins_accepts_either_key_during_a_rotation() {
         with_dir(|provider, dir| {
-            let old = SecretKey::generate();
-            let new = SecretKey::generate();
+            let old = random_key();
+            let new = random_key();
             let _policy = pin_policy(
                 true,
                 &format!("\"com.company.orders\" = [\"{}\", \"{}\"]", fingerprint_hex(&old), fingerprint_hex(&new)),
             );
             for key in [&old, &new] {
-                provision(dir, "com.company.orders", key.to_bytes());
-                assert_eq!(provider.load_kek("com.company.orders", false).unwrap().public_key().unwrap(), key.public_key());
+                provision(dir, "com.company.orders", key);
+                assert_eq!(loaded_fingerprint(&*provider.load_kek("com.company.orders", false).unwrap()), software_kek_fingerprint(key));
             }
-            provision(dir, "com.company.orders", SecretKey::generate().to_bytes());
+            provision(dir, "com.company.orders", random_key());
             assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Provider(_))));
         });
     }
@@ -976,11 +932,11 @@ mod tests {
     #[serial]
     fn require_pinned_keys_serves_only_pinned_services_and_reports_the_pin_to_add() {
         with_dir(|provider, dir| {
-            let pinned = SecretKey::generate();
-            let unpinned = SecretKey::generate();
+            let pinned = random_key();
+            let unpinned = random_key();
             let _policy = pin_policy(true, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&pinned)));
-            provision(dir, "com.company.orders", pinned.to_bytes());
-            provision(dir, "com.company.billing", unpinned.to_bytes());
+            provision(dir, "com.company.orders", pinned);
+            provision(dir, "com.company.billing", unpinned);
 
             provider.load_kek("com.company.orders", false).unwrap();
 
@@ -1003,16 +959,19 @@ mod tests {
 
     #[test]
     #[serial]
-    fn the_fingerprint_is_sha256_of_the_uncompressed_public_point() {
-        // What the documented OpenSSL pipeline computes:
-        //   openssl pkey -inform DER -pubout -outform DER | tail -c 65 | sha256sum
-        // The SEC1 DER below ends with that same 65-byte point.
-        use sha2::{Digest, Sha256};
+    fn the_fingerprint_is_the_documented_hmac() {
+        // What the documented OpenSSL command computes from the secret file:
+        //   printf '\0\0\0\001hkdfguard-kek-fingerprint-v2\0\0\0\001\0' |
+        //     openssl dgst -sha256 -mac HMAC -macopt hexkey:$(od -An -v -tx1 <file> | tr -d ' \n')
+        // i.e. HMAC-SHA-256 over the SP 800-108 block, built here by hand.
+        use hmac::{Hmac, KeyInit, Mac};
         with_dir(|provider, dir| {
-            let der = unhex(OPENSSL_P256_SEC1_DER);
-            let expected = hex(&Sha256::digest(&der[der.len() - 65..]));
+            let key = random_key();
+            let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&key).unwrap();
+            mac.update(b"\x00\x00\x00\x01hkdfguard-kek-fingerprint-v2\x00\x00\x00\x01\x00");
+            let expected = hex(&mac.finalize().into_bytes());
             let _policy = pin_policy(true, &format!("\"com.company.orders\" = \"{expected}\""));
-            provision(dir, "com.company.orders", &der);
+            provision(dir, "com.company.orders", key);
             provider.load_kek("com.company.orders", false).unwrap();
         });
     }
@@ -1021,7 +980,7 @@ mod tests {
     #[serial]
     fn a_broken_policy_refuses_rather_than_dropping_the_pins() {
         let mount = crate::secure_file::private_tempdir();
-        provision(mount.path(), "com.company.orders", SecretKey::generate().to_bytes());
+        provision(mount.path(), "com.company.orders", random_key());
         let _secret_mount = crate::policy::test_support::secret_mount(mount.path());
         let provider = ExternalSecretProvider::new();
         // Read per call, so a policy that breaks after construction must
@@ -1047,27 +1006,11 @@ mod tests {
     #[serial]
     fn key_id_format() {
         with_dir(|provider, dir| {
-            let secret_key = SecretKey::generate();
-            provision(dir, "com.company.orders", secret_key.to_bytes());
+            let secret_key = random_key();
+            provision(dir, "com.company.orders", secret_key);
 
             let handle = provider.load_kek("com.company.orders", true).unwrap();
             assert_eq!(handle.key_id(), b"external:com.company.orders");
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn rejects_corrupted_secret_file() {
-        with_dir(|provider, dir| {
-            // A corrupt 32-byte scalar (all zeros is not a valid P-256 scalar).
-            provision(dir, "com.company.orders", [0u8; 32]);
-            let res = provider.load_kek("com.company.orders", true);
-            assert!(matches!(res, Err(Error::Provider(_))));
-
-            // Garbage of a non-32 length, which fails PKCS#8 parsing.
-            provision(dir, "com.company.billing", b"invalid-pkcs8-data");
-            let res2 = provider.load_kek("com.company.billing", true);
-            assert!(matches!(res2, Err(Error::Provider(_))));
         });
     }
 }

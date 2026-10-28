@@ -92,7 +92,7 @@ if [ -n "$TCTI" ] && command -v tpm2_getcap >/dev/null 2>&1 && [ "$FAILED" -eq 0
                 ok "virtual/software TPM: no external bus -> 'auto' will SKIP parameter encryption"
                 ;;
             IFX|STM|NTC|ATML|NSM|NSG|SMSC)
-                ok "discrete TPM chip: 'auto' will ENCRYPT ECDH sessions (salted HMAC, AES-128-CFB). Pin the salt key Name for full protection -- see README"
+                ok "discrete TPM chip: 'auto' will ENCRYPT TPM2_HMAC sessions (salted HMAC, AES-128-CFB). Pin the salt key Name for full protection -- see README"
                 warn "one conformance test assumes an fTPM and will be skipped by native-tpm-test.sh on this hardware"
                 ;;
             "")

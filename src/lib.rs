@@ -1,5 +1,5 @@
-//! hkdfguard-native-linux: `ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM` DEK
-//! wrapping backed by a priority-ordered chain of KEK providers (TPM2,
+//! hkdfguard-native-linux: `HMAC-SHA-256 KDF (SP 800-108) -> AES-256-GCM`
+//! DEK wrapping backed by a priority-ordered chain of KEK providers (TPM2,
 //! PKCS#11, external secret, ephemeral).
 //!
 //! This crate's only public interface is the stable C ABI below. No
@@ -9,7 +9,7 @@
 //! and [`hkdfguard_generate_and_wrap_dek`].
 
 mod audit; // the audit trail: syslog (authpriv) records, the Windows build's Event Log events
-mod crypto; // ECDH -> HKDF -> AES-GCM protocol
+mod crypto; // KEK PRF -> AES-GCM protocol
 mod error; // internal error type + public status codes
 mod key_file; // reading and checking a wrapped-DEK key file (hkdfguard_open_file)
 mod payload; // wrapped-payload wire format
@@ -83,7 +83,7 @@ pub mod admin {
                 return Err(error::Error::AccessDenied("under the production security model only root retires a KEK"));
             }
             let (provider, handle) = provider::select_existing(&service)?;
-            if crypto::kek_fingerprint(&handle.public_key()?) != *expected_fingerprint {
+            if crypto::kek_fingerprint(&*handle)? != *expected_fingerprint {
                 return Err(error::Error::KekFingerprintMismatch);
             }
             drop(handle);
@@ -394,9 +394,10 @@ pub extern "C" fn hkdfguard_kek_exists(service: *const c_char, exists: *mut c_in
 }
 
 /// Writes the 32-byte fingerprint of the KEK `service` currently resolves to:
-/// SHA-256 of its public key, SEC1-uncompressed (`0x04 || X || Y`) -- the
+/// a fixed HMAC output under the KEK (see `docs/why-hmac-prf.md`) -- the
 /// same value every payload wrapped under it carries, and that
-/// [`hkdfguard_unwrap_dek`] checks. Public-key material, not a secret. Lets
+/// [`hkdfguard_unwrap_dek`] checks. Public, not a secret: it reveals
+/// nothing about the KEK. Lets
 /// an operator record which KEK a service uses after provisioning, and
 /// confirm it before retiring it. Never creates a KEK.
 ///
@@ -775,7 +776,7 @@ fn kek_fingerprint_impl(service: *const c_char, out: *mut u8, out_len: *mut c_in
     let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     let fingerprint = gated_setup(|| {
         let (_provider, handle) = provider::select_existing(&service_str)?;
-        Ok(crypto::kek_fingerprint(&handle.public_key()?))
+        crypto::kek_fingerprint(&*handle)
     });
     match fingerprint {
         Ok(fingerprint) => {
@@ -848,7 +849,7 @@ fn wrap_impl(
     dek_array.copy_from_slice(dek_slice);
 
     let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
-    let result = crypto::wrap(&service_str, &dek_array); // do the actual ECDH -> HKDF -> AES-GCM work
+    let result = crypto::wrap(&service_str, &dek_array); // do the actual KEK PRF -> AES-GCM work
     dek_array.zeroize(); // our local copy of the plaintext DEK is no longer needed; scrub it now
 
     let wrapped = match result {
@@ -1266,7 +1267,6 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
 #[cfg(test)]
 mod ffi_tests {
     use super::*; // bring the exported functions + `status` into scope
-    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
     use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
     // Disables the external-secret provider so tests deterministically
@@ -2358,8 +2358,7 @@ mod ffi_tests {
         let secret_path = ext_dir.path().join(service_str);
         let service = CString::new(service_str).unwrap();
 
-        let key_a = p256::SecretKey::generate();
-        std::fs::write(&secret_path, key_a.to_bytes()).unwrap();
+        std::fs::write(&secret_path, provider::random_kek_for_tests()).unwrap();
         // Owner-only, as the provider requires of a KEK file. The rotation
         // rewrite below preserves this mode, so it's set once.
         std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
@@ -2376,8 +2375,7 @@ mod ffi_tests {
         // Simulate an out-of-band KEK rotation: the deployment platform
         // rewrites the mounted secret file with a brand new, unrelated
         // key under the exact same service name.
-        let key_b = p256::SecretKey::generate();
-        std::fs::write(&secret_path, key_b.to_bytes()).unwrap();
+        std::fs::write(&secret_path, provider::random_kek_for_tests()).unwrap();
 
         let mut out = [0xAAu8; 32]; // recognizable non-zero pattern
         let mut out_len: c_int = out.len() as c_int;
@@ -2536,7 +2534,7 @@ mod ffi_tests {
         let mut long = valid.clone();
         long.push(0);
         let mut bad_version = valid.clone();
-        bad_version[0] = 2;
+        bad_version[0] = 1; // the pre-release ECDH format
         let b64_dek = {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode([9u8; 32]) + "\n"

@@ -17,7 +17,7 @@ and the host is configured ([configuration.md](configuration.md)).
 | Term | Meaning |
 |---|---|
 | **DEK** (data encryption key) | Exactly 32 bytes that your application uses to encrypt its own data. HKDFGuard protects it; it doesn't use it. |
-| **KEK** (key encryption key) | A per-service P-256 key held by the provider (TPM, HSM or secret file). It never leaves the provider. |
+| **KEK** (key encryption key) | A per-service 256-bit HMAC-SHA-256 key held by the provider (TPM, HSM or secret file). It never leaves the provider. Each payload is encrypted with its own AES-256-GCM key, which the provider derives from the KEK. |
 | **Service name** | Names the KEK, e.g. `com.company.orders`. |
 | **Wrapped DEK** | The DEK encrypted under the service's KEK: up to 276 bytes, safe to store on disk. |
 
@@ -68,7 +68,7 @@ What `provision` does depends on the provider:
 | Provider | What `provision` does |
 |---|---|
 | TPM | Has the TPM generate the key and saves it as the service's key file, once; later runs load it into the TPM, check any pinned Name, and report "already provisioned". With `require_pinned_names`, it creates the key file for an unlisted service, then fails and prints the policy line to add. **Back up the key file**: a lost key file is a lost KEK. |
-| PKCS#11 | Generates the key pair on the token, once; later runs find it there and report "already provisioned". |
+| PKCS#11 | Generates the HMAC secret key on the token, once; later runs find it there and report "already provisioned". |
 | External secret | Checks the delivered file, that it holds a valid key, and that its fingerprint matches any pin: the file itself is the provisioning. With `require_pinned_keys`, it fails for an unpinned service and prints the policy line for the mounted key. |
 | Ephemeral | Refused by the CLI, for `provision` and `wrap` alike: an ephemeral key lives only in the process that creates it, so the application must wrap its own DEKs. |
 

@@ -4,11 +4,10 @@
 //!  ______________________________________________________________________
 //! | HARDWARE/MODULE-DEPENDENT CODE                                        |
 //! |                                                                        |
-//! | Verified (see docker/): natively built against real `cryptoki` 0.6.2  |
-//! | on Ubuntu 24.04 (x86_64 and aarch64), and the `#[ignore]`d tests pass |
-//! | against a real SoftHSM2 token -- C_GenerateKeyPair + CKM_ECDH1_DERIVE |
-//! | executed for real and produced the same key deterministically across |
-//! | two calls. Not yet exercised against a hardware HSM/YubiHSM; re-run  |
+//! | Verified: built against `cryptoki` 0.12, and the `#[ignore]`d tests  |
+//! | pass against a real SoftHSM2 token -- C_GenerateKey +               |
+//! | CKM_SHA256_HMAC executed for real, matching software HMAC-SHA-256.  |
+//! | Not yet exercised against a hardware HSM/YubiHSM; re-run             |
 //! | `docker/run-tests.sh` after any change here, and re-test against     |
 //! | your production module/HSM before relying on this with it.           |
 //! |______________________________________________________________________|
@@ -48,41 +47,39 @@
 //! ## Design
 //!
 //! For each service, finds (or generates, if absent) a **non-extractable**
-//! token-persistent EC P-256 key pair labelled `hkdfguard:<service>`
-//! (`CKA_TOKEN=true`, `CKA_SENSITIVE=true`, `CKA_EXTRACTABLE=false`,
-//! `CKA_DERIVE=true`, and `CKA_MODIFIABLE=false` / `CKA_COPYABLE=false`, so
-//! those can't be relaxed afterwards). Exactly one object of each class may
-//! carry that label, with the `CKA_ID` hkdfguard gives it: anything else
-//! is refused rather than guessed between. The session is read-only; a
-//! read/write one is opened only for the moment it takes to generate a
-//! key pair. ECDH is performed on-token via `CKM_ECDH1_DERIVE`
-//! (`CKD_NULL` -- no token-side KDF; this crate does its own HKDF-SHA512
-//! outside, per the shared protocol), which derives a session-local,
-//! extractable generic-secret object holding the raw shared X-coordinate.
-//! That value is read out, the temporary derived object is destroyed
-//! immediately, and the raw bytes are wrapped in a zeroizing buffer before
-//! returning -- the *persistent* private key never leaves the token.
+//! token-persistent 256-bit generic secret key labelled
+//! `hkdfguard:<service>` (`CKA_TOKEN=true`, `CKA_SENSITIVE=true`,
+//! `CKA_EXTRACTABLE=false`, `CKA_SIGN=true` and no other use, and
+//! `CKA_MODIFIABLE=false` / `CKA_COPYABLE=false`, so those can't be
+//! relaxed afterwards). Exactly one such object may carry that label, with
+//! the `CKA_ID` hkdfguard gives it: anything else is refused rather than
+//! guessed between. The session is read-only; a read/write one is opened
+//! only for the moment it takes to generate a key. The PRF is a
+//! single-part `C_Sign` with `CKM_SHA256_HMAC`, which returns only the
+//! HMAC: the key never leaves the token. Every PKCS#11 token since v2.20
+//! supports both mechanisms; SoftHSM2 needs the key to be at least 32
+//! bytes, as it is.
 //!
 //! A key found under a service's label is used only if it still carries
 //! those protections, including `CKA_ALWAYS_SENSITIVE` and
 //! `CKA_NEVER_EXTRACTABLE`, which the token sets only on a key generated
-//! on it and never exposed -- so an imported key with a known scalar,
+//! on it and never exposed -- so an imported key with a known value,
 //! labelled and tagged to match, is refused (see `check_protections`).
-//! Both halves are `CKA_PRIVATE`, and only private objects are ever looked
-//! up, so nothing made by a session without the PIN is seen at all (see
-//! `find_unique`).
+//! It is `CKA_PRIVATE`, and only private objects are ever looked up, so
+//! nothing made by a session without the PIN is seen at all (see
+//! `labelled_template`).
 //!
 //! A wrong PIN is tried once: after the token rejects it, this process
 //! attempts no further login with that PIN file until the file changes,
 //! and a token that reports its user PIN locked or on its final attempt is
 //! refused before any login -- so this library never locks the HSM user
-//! out (see [`PIN_LATCHES`]). Two processes generating a service's pair at
+//! out (see [`PIN_LATCHES`]). Two processes generating a service's key at
 //! the same moment is detected after the fact, and the later one discards
-//! its own pair rather than leaving two under the label (see
-//! `generate_key_pair`).
+//! its own key rather than leaving two under the label (see
+//! `generate_key`).
 //!
-//! `load_kek` locates the pair (or generates it, when creation was asked
-//! for) up front and hands back a handle holding both object handles, so
+//! `load_kek` locates the key (or generates it, when creation was asked
+//! for) up front and hands back a handle holding its object handle, so
 //! `hkdfguard_create_kek` really creates, `hkdfguard_kek_exists` reports
 //! what it created, and a load without creation declines with
 //! `KeyNotProvisioned` when nothing is there -- letting the provider chain
@@ -102,34 +99,22 @@
 //! last session on the token closes.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
-use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
-use elliptic_curve::sec1::ToSec1Point; // encodes the payload's point into the raw bytes the token expects
-use p256::PublicKey; // the P-256 point type `ecdh` takes
+use crate::provider::{Backend, KekHandle, KekProvider, PrfOutput, ProviderType, KEK_LEN}; // traits/types this module implements
 use sha2::{Digest as ShaDigest, Sha256}; // used for the CKA_ID tag (aliased to avoid clashing with cryptoki's own naming)
 use std::path::{Path, PathBuf}; // module-path validation and PIN-file location
 use std::sync::{Arc, Mutex, PoisonError}; // shared, lock-protected PKCS#11 session, and the process-wide module registry
-use zeroize::Zeroizing; // scrubs the shared secret read off the token as soon as it's no longer needed
+use zeroize::Zeroizing; // scrubs each HMAC output read off the token as soon as it's no longer needed
 
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11}; // loads the PKCS#11 module and initializes the library
 use cryptoki::error::{Error as CryptokiError, RvError}; // to recognize the two return codes that mean "already done" rather than failure
-use cryptoki::mechanism::elliptic_curve::{EcKdf, Ecdh1DeriveParams}; // parameters for the CKM_ECDH1_DERIVE mechanism
-use cryptoki::mechanism::Mechanism; // the mechanism enum (EccKeyPairGen, Ecdh1Derive, ...)
+use cryptoki::mechanism::Mechanism; // the mechanism enum (GenericSecretKeyGen, Sha256Hmac, ...)
 use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle}; // PKCS#11 object attributes/handles
 use cryptoki::session::{Session, UserType}; // an open session against a slot/token, and the login role
 use cryptoki::slot::Slot; // identifies a PKCS#11 slot
 use cryptoki::types::AuthPin; // wraps a PIN for login
 
-// DER encoding of the secp256r1 (P-256 / prime256v1) OID, as required for
-// CKA_EC_PARAMS.
-const P256_EC_PARAMS: &[u8] = &[
-    0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
-];
-
-// SEC1 uncompressed P-256 point: 1 tag byte (0x04) + 32-byte X + 32-byte Y.
-const UNCOMPRESSED_POINT_LEN: usize = 65;
-
 // The open, logged-in, read-only session, plus what it takes to open a
-// short-lived read/write one on the same token when a key pair has to be
+// short-lived read/write one on the same token when a key has to be
 // generated (a login applies to every session the process has open on a
 // token, so that one needs no PIN). Dropped with the provider, i.e. at the
 // end of the C ABI call that constructed it: the session is closed, and
@@ -523,13 +508,13 @@ fn open_session() -> Backend<OpenSession> {
         Err(e) => return refuse("could not read token info", &e),
     }
 
-    // Read-only: finding keys and ECDH need nothing more, and only key
-    // generation opens a read/write session (see `generate_key_pair`).
+    // Read-only: finding keys and HMAC need nothing more, and only key
+    // generation opens a read/write session (see `generate_key`).
     let session = match pkcs11.open_ro_session(slot) {
         Ok(session) => session,
         Err(e) => return refuse("could not open a session", &e),
     };
-    // C_Login as the normal user role, required before key generation/derivation.
+    // C_Login as the normal user role, required before key generation or use.
     // A login is per application per token, not per session: while another
     // call's session is still open on this token, the process is already
     // logged in and C_Login says so. That is success, not an error -- and
@@ -557,14 +542,14 @@ fn open_session() -> Backend<OpenSession> {
     Backend::Ready(OpenSession { session, pkcs11, slot })
 }
 
-// Handle type returned from `load_kek`: the service's key pair, already
-// located on the token (or just generated there), plus a shared reference
-// to the session those object handles belong to. PKCS#11 object handles
-// stay valid for as long as the session that produced them is open, and
-// that session lives in `state`, which this handle keeps alive.
+// Handle type returned from `load_kek`: the service's key, already located
+// on the token (or just generated there), plus a shared reference to the
+// session that object handle belongs to. PKCS#11 object handles stay valid
+// for as long as the session that produced them is open, and that session
+// lives in `state`, which this handle keeps alive.
 struct Pkcs11Handle {
-    key_id: Vec<u8>, // diagnostic-only tag embedded in the wrapped payload
-    keys: KeyPair,   // the private key `ecdh` derives with, and the public half `public_key` reads
+    key_id: Vec<u8>,     // diagnostic-only tag embedded in the wrapped payload
+    key: ObjectHandle,   // the service's HMAC key on the token
     state: Arc<Mutex<Option<OpenSession>>>, // shared handle back to the open PKCS#11 session
 }
 
@@ -573,7 +558,7 @@ impl KekHandle for Pkcs11Handle {
         &self.key_id
     }
 
-    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret> {
+    fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
         let mut guard = self
             .state
             .lock() // only one caller may drive the session at a time
@@ -581,60 +566,41 @@ impl KekHandle for Pkcs11Handle {
         let open = guard
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?; // session setup failed at construction time
+        inputs.iter().map(|input| token_hmac(&open.session, self.key, input)).collect()
+    }
+}
 
-        let peer_point_bytes = point.to_sec1_point(false).as_bytes().to_vec(); // raw uncompressed point bytes the token expects as CKM_ECDH1_DERIVE's public data
+/// One `C_Sign` with `CKM_SHA256_HMAC`: a single-part HMAC on the token,
+/// the key never leaving it. The output is wrapped in a zeroizing buffer
+/// straight away: `sign` returns it in a heap `Vec`.
+fn token_hmac(session: &Session, key: ObjectHandle, input: &[u8]) -> Result<PrfOutput> {
+    let mac = Zeroizing::new(
+        session
+            .sign(&Mechanism::Sha256Hmac, key, input)
+            .map_err(|e| Error::Provider(format!("PKCS#11 C_Sign (CKM_SHA256_HMAC) failed: {e}")))?,
+    );
+    if mac.len() != 32 {
+        return Err(Error::Provider(format!("PKCS#11 token returned a {}-byte HMAC-SHA-256", mac.len())));
+    }
+    let mut out = PrfOutput::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
+    out.copy_from_slice(&mac);
+    Ok(out)
+}
 
-        let params = Ecdh1DeriveParams::new(EcKdf::null(), &peer_point_bytes); // CKD_NULL: no extra KDF on-token, we do HKDF ourselves afterward
-        let derive_template = [
-            // attributes for the *temporary* object the derive operation will create
-            Attribute::Class(ObjectClass::SECRET_KEY),
-            Attribute::KeyType(KeyType::GENERIC_SECRET),
-            Attribute::Token(false),      // session object only, never written to the token's persistent storage
-            Attribute::Sensitive(false),  // must be readable, since we need to read the shared secret back out
-            Attribute::Extractable(true), // ditto
-            Attribute::ValueLen(32.into()), // we want exactly 32 bytes (the X-coordinate size for P-256)
-        ];
+/// A handle around `key` on `session`, for computing its fingerprint
+/// outside a provider-held session (see `retire_kek`).
+struct SessionKey<'a> {
+    session: &'a Session,
+    key: ObjectHandle,
+}
 
-        let derived = open
-            .session
-            .derive_key(
-                &Mechanism::Ecdh1Derive(params), // C_DeriveKey with CKM_ECDH1_DERIVE
-                self.keys.private,                // our service's non-extractable persistent private key
-                &derive_template,
-            )
-            .map_err(|e| Error::Provider(format!("CKM_ECDH1_DERIVE failed: {e}")))?;
-
-        // Read the raw shared-secret bytes out of the temporary object,
-        // then remove that object at once -- whether or not the read worked,
-        // so a failed read never leaves an extractable copy of the secret on
-        // the token for the rest of the session.
-        let value = read_value(&open.session, derived, 32); // already Zeroizing-wrapped
-        let _ = open.session.destroy_object(derived); // best-effort; the session closing later would clean it up anyway
-        let value = value?;
-
-        if value.len() != 32 {
-            return Err(Error::Provider(
-                "PKCS#11 token returned unexpected shared secret length".into(), // defensive; should always be 32 given ValueLen above
-            ));
-        }
-        let mut secret = SharedSecret::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
-        secret.copy_from_slice(&value);
-        Ok(secret) // `value` (the heap copy) is dropped and scrubbed right after this line
+impl KekHandle for SessionKey<'_> {
+    fn key_id(&self) -> &[u8] {
+        &[]
     }
 
-    fn public_key(&self) -> Result<PublicKey> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| Error::Provider("PKCS#11 session lock poisoned".into()))?;
-        let open = guard
-            .as_mut()
-            .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
-
-        // The public half of the exact pair `load_kek` located, so the
-        // fingerprint always describes the key `ecdh` derives with.
-        let point_bytes = read_ec_point(&open.session, self.keys.public)?;
-        parse_ec_point(&point_bytes)
+    fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
+        inputs.iter().map(|input| token_hmac(self.session, self.key, input)).collect()
     }
 }
 
@@ -647,10 +613,10 @@ impl KekProvider for Pkcs11Provider {
         self.refused.is_some() || self.connected()
     }
 
-    // Side-effect-free: asks the token whether the service's private key
-    // is there, without creating anything. A refused provider, or a
-    // duplicate or foreign object under the label, is an error -- never
-    // read as "no key", see `provider::kek_exists`.
+    // Side-effect-free: asks the token whether the service's key is there,
+    // without creating anything. A refused provider, or a duplicate or
+    // foreign object under the label, is an error -- never read as "no
+    // key", see `provider::kek_exists`.
     fn kek_exists(&self, service: &str) -> Result<bool> {
         self.check_not_refused()?;
         let mut guard = self
@@ -660,16 +626,16 @@ impl KekProvider for Pkcs11Provider {
         let open = guard
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
-        Ok(find_key_pair(&open.session, service)?.is_some())
+        Ok(find_key(&open.session, service)?.is_some())
     }
 
-    // Locates the service's key pair on the token now -- generating it if
+    // Locates the service's key on the token now -- generating it if
     // `create_if_missing` and none exists -- and returns a handle holding
-    // both object handles. With `create_if_missing` false and no pair
+    // its object handle. With `create_if_missing` false and no key
     // present, declines with `KeyNotProvisioned`: that is what lets the
     // provider chain move on to a provider that does hold the service's
     // key, and what keeps `hkdfguard_create_kek` the only path that creates
-    // one. (Deferring all of this to `ecdh` would let create_kek report
+    // one. (Deferring all of this to `prf` would let create_kek report
     // success without creating anything, and the chain could never move
     // past PKCS#11.)
     fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
@@ -682,9 +648,9 @@ impl KekProvider for Pkcs11Provider {
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
 
-        let keys = match find_key_pair_handles(&open.session, service)? {
-            Some(keys) => keys,
-            None if create_if_missing => generate_key_pair(open, service)?, // none exists yet and creation was requested
+        let key = match find_key(&open.session, service)? {
+            Some(key) => key,
+            None if create_if_missing => generate_key(open, service)?, // none exists yet and creation was requested
             None => {
                 return Err(Error::KeyNotProvisioned(
                     "no PKCS#11 KEK created yet for this service",
@@ -693,24 +659,19 @@ impl KekProvider for Pkcs11Provider {
         };
         Ok(Box::new(Pkcs11Handle {
             key_id: format!("hkdfguard:{service}").into_bytes(),
-            keys,
+            key,
             state: Arc::clone(&self.state), // cheap refcount bump, not a clone of the underlying session
         }))
     }
 
-    // Deletes the service's key pair from the token, after confirming the
-    // fingerprint on the very objects deleted. Everything runs through one
-    // read/write session -- find, read the public point, destroy -- so the
-    // handles checked are the handles destroyed. The pair must be exactly
-    // what `load_kek` would use (one of each half, hkdfguard's label and ID,
-    // its protections; see `find_key_pair_handles`): a duplicate, foreign or
-    // half-present pair is refused here as it is everywhere else, and left
-    // for an operator to inspect, rather than guessed between.
-    //
-    // The private key goes first: once it is gone the KEK is unusable,
-    // whatever happens next. If the public half then can't be removed, the
-    // error says so; the token is left in the "public key without its
-    // private key" state `find_key_pair_handles` already reports.
+    // Deletes the service's key from the token, after confirming the
+    // fingerprint with the very object deleted. Everything runs through one
+    // read/write session -- find, compute the fingerprint, destroy -- so the
+    // handle checked is the handle destroyed. The key must be exactly what
+    // `load_kek` would use (one object, hkdfguard's label and ID, its
+    // protections; see `find_unique`): a duplicate or foreign key is refused
+    // here as it is everywhere else, and left for an operator to inspect,
+    // rather than guessed between.
     fn retire_kek(&self, service: &str, expected_fingerprint: &[u8; crate::payload::FINGERPRINT_LEN]) -> Result<()> {
         self.check_not_refused()?;
         let guard = self
@@ -723,119 +684,73 @@ impl KekProvider for Pkcs11Provider {
             .open_rw_session(open.slot)
             .map_err(|e| Error::Provider(format!("PKCS#11 could not open a read/write session to retire a key: {e}")))?;
 
-        let keys = find_key_pair_handles(&rw, service)?.ok_or(Error::KekNotFound)?;
-        let public = parse_ec_point(&read_ec_point(&rw, keys.public)?)?;
-        if crate::crypto::kek_fingerprint(&public) != *expected_fingerprint {
+        let key = find_key(&rw, service)?.ok_or(Error::KekNotFound)?;
+        if crate::crypto::kek_fingerprint(&SessionKey { session: &rw, key })? != *expected_fingerprint {
             return Err(Error::KekFingerprintMismatch);
         }
 
-        rw.destroy_object(keys.private)
-            .map_err(|e| Error::Provider(format!("PKCS#11 could not delete this service's private key: {e}; nothing was removed")))?;
-        rw.destroy_object(keys.public).map_err(|e| {
-            Error::Provider(format!(
-                "PKCS#11 deleted this service's private key -- the KEK is retired -- but not its public key: {e}; \
-                 remove that public key from the token by hand"
-            ))
-        })?;
+        rw.destroy_object(key)
+            .map_err(|e| Error::Provider(format!("PKCS#11 could not delete this service's key: {e}; nothing was removed")))?;
 
         // Confirmed gone, as the token itself reports it.
-        if count_labelled(&rw, ObjectClass::PRIVATE_KEY, service)? != 0 || count_labelled(&rw, ObjectClass::PUBLIC_KEY, service)? != 0 {
+        if count_labelled(&rw, service)? != 0 {
             return Err(Error::Provider(
-                "PKCS#11 reported this service's key pair deleted, but objects under its label remain on the token".into(),
+                "PKCS#11 reported this service's key deleted, but objects under its label remain on the token".into(),
             ));
         }
         Ok(())
     }
 }
 
-// The CKA_LABEL used to identify a service's key pair on the token.
+// The CKA_LABEL used to identify a service's key on the token.
 fn key_label(service: &str) -> String {
     format!("hkdfguard:{service}")
 }
 
-// The CKA_ID hkdfguard gives a service's key pair: a non-secret tag that,
-// with the label, identifies objects this crate created.
+// The CKA_ID hkdfguard gives a service's key: a non-secret tag that, with
+// the label, identifies objects this crate created.
 fn key_id(service: &str) -> Vec<u8> {
     Sha256::digest(service.as_bytes()).to_vec()
 }
 
-// Looks up the service's private key object, without creating anything.
-// `None` means no key pair has been generated for this service yet.
-fn find_key_pair(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
-    find_unique(session, ObjectClass::PRIVATE_KEY, service)
-}
-
-// The public half -- used only by `Pkcs11Handle::public_key` (the private
-// key it pairs with is never extractable, so the fingerprint has to come
-// from this object instead).
-fn find_public_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
-    find_unique(session, ObjectClass::PUBLIC_KEY, service)
-}
-
-/// The two halves of a service's key pair, as object handles valid for the
-/// session that found them.
-#[derive(Clone, Copy)]
-struct KeyPair {
-    private: ObjectHandle,
-    public: ObjectHandle,
-}
-
-// Locates both halves of the service's key pair. `None` means neither is
-// present: nothing provisioned. One half without the other is an error,
-// not "absent": the token is not in a state hkdfguard produced, and
-// generating a fresh pair over it would either leave two objects under the
-// label (which `find_unique` then refuses) or report a fingerprint for a
-// key `ecdh` does not use.
-fn find_key_pair_handles(session: &Session, service: &str) -> Result<Option<KeyPair>> {
-    match (find_key_pair(session, service)?, find_public_key(session, service)?) {
-        (Some(private), Some(public)) => Ok(Some(KeyPair { private, public })),
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(Error::Provider(
-            "PKCS#11: this service's private key is on the token but its public key is missing; \
-             the pair is unusable until an operator removes or restores it"
-                .into(),
-        )),
-        (None, Some(_)) => Err(Error::Provider(
-            "PKCS#11: this service's public key is on the token without its private key; \
-             remove it before provisioning the service again"
-                .into(),
-        )),
-    }
-}
-
-// Finds the one EC object of `class` labelled for `service`. More than one
-// is an error, not a pick: which one the token lists first is up to the
-// token, so the same service could get a different key from one call to
-// the next -- or one planted alongside the real one. The match must also
-// carry the CKA_ID `generate_key_pair` gives it. Errors never name the
-// service: the C ABI logs them, and service names stay out of the log.
+// The search template for a service's key: hkdfguard's label, and the
+// class and key type it generates.
 //
-// Only `CKA_PRIVATE = true` objects are ever enumerated, both halves.
-// Creating a private object needs a login; a session that isn't logged in
-// can still create *public* ones (`CKA_PRIVATE = false`) on most tokens.
-// Without this filter, someone with access to the token but not the PIN
-// could plant a key pair under the service's label before it is
-// provisioned -- generated on the token, so it passes every protection
-// check -- and then, with no login, run ECDH with it for every payload. Or
-// plant one public-key object under the label and make the lookup fail as a
+// Only `CKA_PRIVATE = true` objects are ever enumerated. Creating a
+// private object needs a login; a session that isn't logged in can still
+// create *public* ones (`CKA_PRIVATE = false`) on most tokens. Without
+// this filter, someone with access to the token but not the PIN could
+// plant a key under the service's label before it is provisioned --
+// generated on the token, so it passes every protection check -- and
+// then, with no login, compute every payload's wrapping key with it. Or
+// plant a second object under the label and make the lookup fail as a
 // duplicate. Filtered, objects made without the PIN are invisible here.
-fn find_unique(session: &Session, class: ObjectClass, service: &str) -> Result<Option<ObjectHandle>> {
-    let what = if class == ObjectClass::PRIVATE_KEY { "private key" } else { "public key" };
-    let find_template = [
-        Attribute::Class(class),
-        Attribute::KeyType(KeyType::EC),
+fn labelled_template(service: &str) -> [Attribute; 4] {
+    [
+        Attribute::Class(ObjectClass::SECRET_KEY),
+        Attribute::KeyType(KeyType::GENERIC_SECRET),
         Attribute::Label(key_label(service).into_bytes()),
         Attribute::Private(true),
-    ];
+    ]
+}
+
+// Finds the one key labelled for `service`, without creating anything.
+// `None` means none has been generated for this service yet. More than
+// one is an error, not a pick: which one the token lists first is up to
+// the token, so the same service could get a different key from one call
+// to the next -- or one planted alongside the real one. The match must
+// also carry the CKA_ID `generate_key` gives it. Errors never name the
+// service: the C ABI logs them, and service names stay out of the log.
+fn find_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
     let found = session
-        .find_objects(&find_template) // C_FindObjects
+        .find_objects(&labelled_template(service)) // C_FindObjects
         .map_err(|e| Error::Provider(format!("PKCS#11 find_objects failed: {e}")))?;
     let handle = match found.as_slice() {
         [] => return Ok(None),
         [one] => *one,
         many => {
             return Err(Error::Provider(format!(
-                "{} EC {what} objects on the token carry this service's label; refusing to choose \
+                "{} secret-key objects on the token carry this service's label; refusing to choose \
                  between them -- delete the ones hkdfguard did not create",
                 many.len()
             )))
@@ -846,35 +761,36 @@ fn find_unique(session: &Session, class: ObjectClass, service: &str) -> Result<O
         .map_err(|e| Error::Provider(format!("PKCS#11 get_attributes (ID) failed: {e}")))?;
     let expected = key_id(service);
     if !attrs.iter().any(|a| matches!(a, Attribute::Id(id) if *id == expected)) {
-        return Err(Error::Provider(format!(
-            "the EC {what} carrying this service's label does not have the CKA_ID hkdfguard gives \
+        return Err(Error::Provider(
+            "the secret key carrying this service's label does not have the CKA_ID hkdfguard gives \
              its keys; refusing to use an object it did not create"
-        )));
+                .into(),
+        ));
     }
-    check_protections(session, handle, class)?;
+    check_protections(session, handle)?;
     Ok(Some(handle))
 }
 
-/// The attribute values every object `generate_key_pair` makes carries, by
-/// class. For the private key this is more than "locked down now":
-/// `CKA_ALWAYS_SENSITIVE` and `CKA_NEVER_EXTRACTABLE` are set by the token,
-/// and are true only for a key that was generated on it and never had its
-/// value exposed. A key imported from outside (`C_CreateObject`,
-/// `C_UnwrapKey`) has them false, whatever else its template says.
-fn required_protections(class: ObjectClass) -> Vec<Attribute> {
+/// The attribute values every key `generate_key` makes carries. This is
+/// more than "locked down now": `CKA_ALWAYS_SENSITIVE` and
+/// `CKA_NEVER_EXTRACTABLE` are set by the token, and are true only for a
+/// key that was generated on it and never had its value exposed. A key
+/// imported from outside (`C_CreateObject`, `C_UnwrapKey`) has them false,
+/// whatever else its template says.
+fn required_protections() -> Vec<Attribute> {
     // CKA_PRIVATE again after the find template: a token that ignores an
     // attribute in a search template must not slip a public object through.
-    let mut required = vec![Attribute::EcParams(P256_EC_PARAMS.to_vec()), Attribute::Token(true), Attribute::Private(true)];
-    if class == ObjectClass::PRIVATE_KEY {
-        required.extend([
-            Attribute::Derive(true),
-            Attribute::Sensitive(true),
-            Attribute::Extractable(false),
-            Attribute::AlwaysSensitive(true),
-            Attribute::NeverExtractable(true),
-        ]);
-    }
-    required
+    vec![
+        Attribute::Token(true),
+        Attribute::Private(true),
+        Attribute::ValueLen((KEK_LEN as u64).into()),
+        Attribute::Sign(true),
+        Attribute::Derive(false),
+        Attribute::Sensitive(true),
+        Attribute::Extractable(false),
+        Attribute::AlwaysSensitive(true),
+        Attribute::NeverExtractable(true),
+    ]
 }
 
 // Refuses an object under the service's label that lacks the protections
@@ -882,14 +798,13 @@ fn required_protections(class: ObjectClass) -> Vec<Attribute> {
 //
 // The `CKA_ID` check before this proves nothing about provenance: the ID
 // is SHA-256 of the service name, which anyone can compute. Without this
-// check, anyone holding the user PIN could replace the pair with one whose
-// private scalar they know, labelled and tagged to match; every new wrap
-// would then go to a key they can use off the token. A PIN holder can
-// already use the real key *on* the token, so this does not create a new
-// boundary -- it keeps "the key never leaves the HSM" true.
-fn check_protections(session: &Session, handle: ObjectHandle, class: ObjectClass) -> Result<()> {
-    let what = if class == ObjectClass::PRIVATE_KEY { "private key" } else { "public key" };
-    let required = required_protections(class);
+// check, anyone holding the user PIN could replace the key with one whose
+// value they know, labelled and tagged to match; every new wrap would then
+// go to a key they can use off the token. A PIN holder can already use the
+// real key *on* the token, so this does not create a new boundary -- it
+// keeps "the key never leaves the HSM" true.
+fn check_protections(session: &Session, handle: ObjectHandle) -> Result<()> {
+    let required = required_protections();
     let types: Vec<AttributeType> = required.iter().map(Attribute::attribute_type).collect();
     let present = session
         .get_attributes(handle, &types)
@@ -903,7 +818,7 @@ fn check_protections(session: &Session, handle: ObjectHandle, class: ObjectClass
         .collect();
     if !failing.is_empty() {
         return Err(Error::Provider(format!(
-            "the EC {what} carrying this service's label lacks the protections hkdfguard generates its keys \
+            "the secret key carrying this service's label lacks the protections hkdfguard generates its keys \
              with ({}); it may have been imported or altered -- refusing to use it",
             failing.join(", ")
         )));
@@ -911,53 +826,44 @@ fn check_protections(session: &Session, handle: ObjectHandle, class: ObjectClass
     Ok(())
 }
 
-// Generates a new, non-extractable EC key pair on the token for `service`
-// and returns both halves' handles, as found again through the read-only
-// session -- so a pair that somehow isn't unique or doesn't match is
-// refused here, at creation, rather than on a later call. Callers check
-// (via `find_key_pair_handles`) that none exists yet -- this always
-// generates a fresh pair.
+// Generates a new, non-extractable HMAC key on the token for `service` and
+// returns its handle, as found again through the read-only session -- so a
+// key that somehow isn't unique or doesn't match is refused here, at
+// creation, rather than on a later call. Callers check (via `find_key`)
+// that none exists yet -- this always generates a fresh key.
 //
 // The read/write session it needs is opened here and closed again on
 // return. It shares the read-only session's login, and that session stays
 // open, so closing this one doesn't log the process out.
-fn generate_key_pair(open: &OpenSession, service: &str) -> Result<KeyPair> {
-    let label = key_label(service);
-    let key_id = key_id(service);
-
-    let public_template = [
-        Attribute::Class(ObjectClass::PUBLIC_KEY),
-        Attribute::KeyType(KeyType::EC),
-        Attribute::Token(true),  // persist on the token, not just this session
-        Attribute::Private(true),  // only a logged-in session can create one -- see `find_unique`
-        Attribute::Verify(false),  // this key pair is for ECDH, not signing/verification
-        Attribute::Modifiable(false), // its label, ID and point can't be changed afterwards
-        Attribute::EcParams(P256_EC_PARAMS.to_vec()), // selects the P-256 curve
-        Attribute::Label(label.clone().into_bytes()),
-        Attribute::Id(key_id.clone()),
-    ];
-    let private_template = [
-        Attribute::Class(ObjectClass::PRIVATE_KEY),
-        Attribute::KeyType(KeyType::EC),
-        Attribute::Token(true),        // persist on the token
-        Attribute::Private(true),      // requires login to use
+fn generate_key(open: &OpenSession, service: &str) -> Result<ObjectHandle> {
+    let template = [
+        Attribute::Class(ObjectClass::SECRET_KEY),
+        Attribute::KeyType(KeyType::GENERIC_SECRET),
+        Attribute::ValueLen((KEK_LEN as u64).into()), // 256 bits; SoftHSM2 refuses HMAC-SHA-256 keys shorter than this
+        Attribute::Token(true),        // persist on the token, not just this session
+        Attribute::Private(true),      // only a logged-in session can create or use one -- see `labelled_template`
         Attribute::Sensitive(true),    // value can never be read out
         Attribute::Extractable(false), // and can never be wrapped/exported either
-        Attribute::Derive(true),       // required: we need to use this key with C_DeriveKey (ECDH)
-        Attribute::Sign(false),        // must not be usable for signing
-        Attribute::Modifiable(false),  // none of the above can be changed afterwards (e.g. CKA_SIGN)
+        Attribute::Sign(true),         // required: C_Sign with CKM_SHA256_HMAC is the PRF
+        Attribute::Verify(false),
+        Attribute::Derive(false),      // no other use: not a base key for C_DeriveKey
+        Attribute::Encrypt(false),
+        Attribute::Decrypt(false),
+        Attribute::Wrap(false),
+        Attribute::Unwrap(false),
+        Attribute::Modifiable(false),  // none of the above can be changed afterwards
         Attribute::Copyable(false),    // nor carried into a copy made with different attributes
-        Attribute::Label(label.into_bytes()),
-        Attribute::Id(key_id),
+        Attribute::Label(key_label(service).into_bytes()),
+        Attribute::Id(key_id(service)),
     ];
 
     // PKCS#11 has no create-if-absent: two processes (two hosts sharing a
     // network HSM, two services on one host) that both find no key for the
-    // service can both generate one. The token then holds two pairs under
-    // the label, `find_unique` refuses the service for good, and deleting
-    // the wrong pair would lose whatever the other process already wrapped
+    // service can both generate one. The token then holds two keys under
+    // the label, `find_key` refuses the service for good, and deleting the
+    // wrong one would lose whatever the other process already wrapped
     // under it. So after generating, look again: if the label is no longer
-    // unique, this process yields -- it destroys the pair *it* made and
+    // unique, this process yields -- it destroys the key *it* made and
     // uses the one the other process left. Should both yield at once, the
     // second attempt generates again; if that collides too, the operator
     // sees an error and reruns provision.
@@ -967,136 +873,49 @@ fn generate_key_pair(open: &OpenSession, service: &str) -> Result<KeyPair> {
                 .pkcs11
                 .open_rw_session(open.slot)
                 .map_err(|e| Error::Provider(format!("PKCS#11 could not open a read/write session to generate a key: {e}")))?;
-            let (public, private) = rw
-                .generate_key_pair(
-                    &Mechanism::EccKeyPairGen, // C_GenerateKeyPair with the EC key pair generation mechanism
-                    &public_template,
-                    &private_template,
-                )
-                .map_err(|e| Error::Provider(format!("PKCS#11 EC key pair generation failed: {e}")))?;
+            let ours = rw
+                .generate_key(&Mechanism::GenericSecretKeyGen, &template) // C_GenerateKey
+                .map_err(|e| Error::Provider(format!("PKCS#11 HMAC key generation failed: {e}")))?;
 
-            let unique = count_labelled(&rw, ObjectClass::PRIVATE_KEY, service)? == 1
-                && count_labelled(&rw, ObjectClass::PUBLIC_KEY, service)? == 1;
-            if !unique {
-                for ours in [private, public] {
-                    rw.destroy_object(ours).map_err(|e| {
-                        Error::Provider(format!(
-                            "PKCS#11: another process created this service's key pair concurrently, and this \
-                             process's duplicate could not be removed: {e}; delete it by hand"
-                        ))
-                    })?;
-                }
+            if count_labelled(&rw, service)? != 1 {
+                rw.destroy_object(ours).map_err(|e| {
+                    Error::Provider(format!(
+                        "PKCS#11: another process created this service's key concurrently, and this \
+                         process's duplicate could not be removed: {e}; delete it by hand"
+                    ))
+                })?;
                 log::warn!(
-                    "hkdfguard: another process created this service's PKCS#11 key pair at the same time \
-                     (attempt {attempt}); this process discarded its own pair in favor of that one"
+                    "hkdfguard: another process created this service's PKCS#11 key at the same time \
+                     (attempt {attempt}); this process discarded its own key in favor of that one"
                 );
             }
         } // the read/write session closes here; its object handles are no longer valid
 
-        // Through the read-only session, whose handles the caller keeps.
-        if let Some(keys) = find_key_pair_handles(&open.session, service)? {
-            return Ok(keys);
+        // Through the read-only session, whose handle the caller keeps.
+        if let Some(key) = find_key(&open.session, service)? {
+            return Ok(key);
         }
         // Nothing left: the other process yielded at the same moment. Generate again.
     }
     Err(Error::Provider(
-        "PKCS#11: the key pair just generated could not be found (repeated concurrent creation); run provision again".into(),
+        "PKCS#11: the key just generated could not be found (repeated concurrent creation); run provision again".into(),
     ))
 }
 
-// How many private (CKA_PRIVATE = true) EC objects of `class` carry the
-// service's label: the same set `find_unique` considers. Counting public
-// objects too would let one planted without the PIN look like a concurrent
-// creation, so that this process destroys the pair it just generated.
-fn count_labelled(session: &Session, class: ObjectClass, service: &str) -> Result<usize> {
+// How many private (CKA_PRIVATE = true) secret keys carry the service's
+// label: the same set `find_key` considers. Counting public objects too
+// would let one planted without the PIN look like a concurrent creation,
+// so that this process destroys the key it just generated.
+fn count_labelled(session: &Session, service: &str) -> Result<usize> {
     session
-        .find_objects(&[
-            Attribute::Class(class),
-            Attribute::KeyType(KeyType::EC),
-            Attribute::Label(key_label(service).into_bytes()),
-            Attribute::Private(true),
-        ])
+        .find_objects(&labelled_template(service))
         .map(|found| found.len())
         .map_err(|e| Error::Provider(format!("PKCS#11 find_objects failed: {e}")))
-}
-
-// Reads a single attribute (here, always CKA_VALUE) off a PKCS#11 object
-// and returns its raw bytes, validating the expected length. The bytes
-// are wrapped in `Zeroizing` immediately -- `get_attributes` necessarily
-// returns a heap `Vec<u8>` (the cryptoki crate allocates it to marshal
-// the C_GetAttributeValue result), and since it holds live key-derivation
-// output (the ECDH shared secret, in this module's only caller), it must
-// not be dropped un-scrubbed.
-fn read_value(session: &Session, handle: ObjectHandle, expected_len: usize) -> Result<Zeroizing<Vec<u8>>> {
-    let attrs = session
-        .get_attributes(handle, &[AttributeType::Value]) // C_GetAttributeValue for just CKA_VALUE
-        .map_err(|e| Error::Provider(format!("PKCS#11 get_attributes failed: {e}")))?;
-
-    for attr in attrs {
-        if let Attribute::Value(bytes) = attr {
-            // Wrap every CKA_VALUE the moment it's taken out of the
-            // attribute list, so one of an unexpected size is still
-            // zeroed as it's dropped here rather than freed with the
-            // derived secret still in it.
-            let bytes = Zeroizing::new(bytes);
-            if bytes.len() == expected_len {
-                return Ok(bytes); // found a CKA_VALUE of the expected size
-            }
-        }
-    }
-    Err(Error::Provider(
-        "PKCS#11 token did not return a CKA_VALUE for derived secret".into(), // shouldn't happen given how `derive_template` was built
-    ))
-}
-
-// Reads the CKA_EC_POINT attribute off a public-key object -- unlike
-// CKA_VALUE on a private key, this is never sensitive (it's the whole
-// point of a public key), so no `Zeroizing` wrapper is needed here.
-fn read_ec_point(session: &Session, handle: ObjectHandle) -> Result<Vec<u8>> {
-    let attrs = session
-        .get_attributes(handle, &[AttributeType::EcPoint]) // C_GetAttributeValue for CKA_EC_POINT
-        .map_err(|e| Error::Provider(format!("PKCS#11 get_attributes (EC_POINT) failed: {e}")))?;
-
-    for attr in attrs {
-        if let Attribute::EcPoint(bytes) = attr {
-            return Ok(bytes);
-        }
-    }
-    Err(Error::Provider(
-        "PKCS#11 token did not return a CKA_EC_POINT for the public key".into(),
-    ))
-}
-
-// Parses a PKCS#11 CKA_EC_POINT attribute value into a `p256::PublicKey`.
-// The PKCS#11 spec defines this as the ANSI X9.62 ECPoint encoding, which
-// for an uncompressed point *is* the raw `0x04 || X || Y` bytes -- but some
-// tokens/implementations additionally DER-wrap that in an OCTET STRING
-// (tag 0x04, length 0x41 = 65), which happens to share its leading byte
-// with the uncompressed-point marker, so length (65 vs 67) is what
-// actually disambiguates the two rather than the leading byte.
-fn parse_ec_point(bytes: &[u8]) -> Result<PublicKey> {
-    let raw: &[u8] = match bytes.len() {
-        UNCOMPRESSED_POINT_LEN => bytes,
-        n if n == UNCOMPRESSED_POINT_LEN + 2
-            && bytes[0] == 0x04
-            && bytes[1] as usize == UNCOMPRESSED_POINT_LEN =>
-        {
-            &bytes[2..] // strip the outer DER OCTET STRING tag + length byte
-        }
-        n => {
-            return Err(Error::Provider(format!(
-                "PKCS#11 token returned an EC point of unexpected length {n}"
-            )))
-        }
-    };
-    PublicKey::from_sec1_bytes(raw)
-        .map_err(|_| Error::Provider("PKCS#11 token returned an invalid EC point".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*; // bring `Pkcs11Provider` etc. into scope
-    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use secrecy::ExposeSecret;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1290,26 +1109,54 @@ mod tests {
         assert!(checked.is_absolute());
     }
 
+    // One PRF output, for comparing keys.
+    fn prf_of(handle: &dyn KekHandle, input: &[u8]) -> [u8; 32] {
+        *handle.prf(&[input]).unwrap()[0]
+    }
+
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"] // skipped by default; run explicitly with `-- --ignored`
-    fn same_service_reuses_same_key_pair() {
+    fn same_service_reuses_same_key() {
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
 
-        let peer_key = p256::SecretKey::generate(); // a stand-in peer key for this test
-        let peer = peer_key.public_key();
-
-        let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call: generates the key pair on the token
+        let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call: generates the key on the token
         let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second call: must find and reuse the same one
-        assert_eq!(*h1.ecdh(&peer).unwrap(), *h2.ecdh(&peer).unwrap()); // same underlying key -> same shared secret
+        assert_eq!(prf_of(&*h1, b"input"), prf_of(&*h2, b"input")); // same underlying key -> same PRF output
+    }
 
-        // `public_key()` must report the exact key `ecdh` actually used --
-        // verified independently, by doing ECDH from the ephemeral side
-        // against the reported public key and checking it agrees with
-        // `h1.ecdh` above.
-        let reported_public = h1.public_key().unwrap();
-        let via_reported = p256::ecdh::diffie_hellman(peer_key.to_nonzero_scalar(), reported_public.as_affine());
-        assert_eq!(h1.ecdh(&peer).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn token_hmac_is_standard_hmac_sha256() {
+        // The PRF must be HMAC-SHA-256 exactly, not some token-specific
+        // variant: checked with a key whose value is known, imported for
+        // this test only (hkdfguard itself never imports keys, and refuses
+        // one -- see `check_protections`).
+        use hmac::{Hmac, KeyInit, Mac};
+        let service = "com.hkdfguard.test.hmac-kat";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        let key_value = *b"hkdfguard-pkcs11-known-answer-ky";
+        let input = crate::crypto::MAX_PRF_INPUT_LEN; // the longest input a provider is ever given
+        let input = vec![0x5a; input];
+        let on_token = with_open(&provider, |open| {
+            destroy_all_for(open, service);
+            let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
+            let key = rw
+                .create_object(&[
+                    Attribute::Class(ObjectClass::SECRET_KEY),
+                    Attribute::KeyType(KeyType::GENERIC_SECRET),
+                    Attribute::Token(false),
+                    Attribute::Sign(true),
+                    Attribute::Value(key_value.to_vec()),
+                ])
+                .unwrap();
+            *token_hmac(&rw, key, &input).unwrap()
+        });
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key_value).unwrap();
+        mac.update(&input);
+        assert_eq!(on_token.as_slice(), mac.finalize().into_bytes().as_slice());
     }
 
     #[test]
@@ -1317,7 +1164,7 @@ mod tests {
     #[serial_test::serial]
     fn load_kek_creates_only_when_asked_and_kek_exists_tracks_it() {
         // The create_kek -> kek_exists -> wrap sequence the C ABI drives, at
-        // the provider level. Deferring the token lookup to `ecdh` would
+        // the provider level. Deferring the token lookup to `prf` would
         // make `load_kek(_, true)` create nothing (create_kek reporting
         // success with no key) and `load_kek(_, false)` never decline (the
         // chain could not move past PKCS#11).
@@ -1336,9 +1183,7 @@ mod tests {
         let created = provider.load_kek(service, true).unwrap(); // hkdfguard_create_kek's path
         assert!(provider.kek_exists(service).unwrap(), "create must leave a key the token reports");
         let loaded = provider.load_kek(service, false).unwrap(); // hkdfguard_wrap_dek's path
-        let peer = p256::SecretKey::generate().public_key();
-        assert_eq!(*created.ecdh(&peer).unwrap(), *loaded.ecdh(&peer).unwrap(), "both handles must drive the same key");
-        assert_eq!(created.public_key().unwrap(), loaded.public_key().unwrap());
+        assert_eq!(prf_of(&*created, b"input"), prf_of(&*loaded, b"input"), "both handles must drive the same key");
 
         with_open(&provider, |open| destroy_all_for(open, service));
     }
@@ -1346,7 +1191,7 @@ mod tests {
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
     #[serial_test::serial]
-    fn retire_kek_deletes_the_pair_only_with_its_fingerprint() {
+    fn retire_kek_deletes_the_key_only_with_its_fingerprint() {
         let service = "com.hkdfguard.test.retire";
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
@@ -1355,7 +1200,7 @@ mod tests {
         assert!(matches!(provider.retire_kek(service, &[0x11; 32]), Err(Error::KekNotFound)));
 
         let handle = provider.load_kek(service, true).unwrap();
-        let fingerprint = crate::crypto::kek_fingerprint(&handle.public_key().unwrap());
+        let fingerprint = crate::crypto::kek_fingerprint(&*handle).unwrap();
         drop(handle);
 
         assert!(
@@ -1367,14 +1212,13 @@ mod tests {
         provider.retire_kek(service, &fingerprint).unwrap();
         assert!(!provider.kek_exists(service).unwrap(), "gone");
         with_open(&provider, |open| {
-            assert_eq!(count_labelled(&open.session, ObjectClass::PRIVATE_KEY, service).unwrap(), 0);
-            assert_eq!(count_labelled(&open.session, ObjectClass::PUBLIC_KEY, service).unwrap(), 0);
+            assert_eq!(count_labelled(&open.session, service).unwrap(), 0);
         });
         assert!(matches!(provider.retire_kek(service, &fingerprint), Err(Error::KekNotFound)), "nothing left to retire");
 
         // The service can be provisioned again, under a new key.
         let again = provider.load_kek(service, true).unwrap();
-        assert_ne!(crate::crypto::kek_fingerprint(&again.public_key().unwrap()), fingerprint);
+        assert_ne!(crate::crypto::kek_fingerprint(&*again).unwrap(), fingerprint);
         drop(again);
         with_open(&provider, |open| destroy_all_for(open, service));
     }
@@ -1382,22 +1226,22 @@ mod tests {
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
     #[serial_test::serial]
-    fn retire_kek_refuses_a_duplicate_pair_rather_than_choosing_one_to_delete() {
+    fn retire_kek_refuses_a_duplicate_key_rather_than_choosing_one_to_delete() {
         let service = "com.hkdfguard.test.retire.duplicate";
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| destroy_all_for(open, service));
 
         let handle = provider.load_kek(service, true).unwrap();
-        let fingerprint = crate::crypto::kek_fingerprint(&handle.public_key().unwrap());
+        let fingerprint = crate::crypto::kek_fingerprint(&*handle).unwrap();
         drop(handle);
-        with_open(&provider, |open| plant_key_pair(open, service, key_id(service)));
+        with_open(&provider, |open| plant_key(open, service, key_id(service)));
 
         let err = provider.retire_kek(service, &fingerprint).expect_err("a duplicate label must be refused");
         assert!(err.to_string().contains("refusing to choose"), "unexpected error: {err}");
         assert!(!err.to_string().contains(service), "errors must not name the service: {err}");
         with_open(&provider, |open| {
-            assert_eq!(count_labelled(&open.session, ObjectClass::PRIVATE_KEY, service).unwrap(), 2, "nothing deleted");
+            assert_eq!(count_labelled(&open.session, service).unwrap(), 2, "nothing deleted");
         });
         with_open(&provider, |open| destroy_all_for(open, service));
     }
@@ -1411,11 +1255,10 @@ mod tests {
         // overlapping calls finalize the module under each other's open
         // sessions and fail (or crash the module).
         let service = "com.company.orders";
-        let peer = p256::SecretKey::generate().public_key();
         let expected = {
             let setup = Pkcs11Provider::new();
             assert!(setup.probe(), "no PKCS#11 session available");
-            *setup.load_kek(service, true).unwrap().ecdh(&peer).unwrap()
+            prf_of(&*setup.load_kek(service, true).unwrap(), b"input")
         };
 
         let threads: Vec<_> = (0..4)
@@ -1424,7 +1267,7 @@ mod tests {
                     (0..8)
                         .map(|_| {
                             let provider = Pkcs11Provider::new();
-                            provider.load_kek(service, false).and_then(|h| h.ecdh(&peer)).map(|z| *z)
+                            provider.load_kek(service, false).and_then(|h| h.prf(&[b"input"])).map(|out| *out[0])
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1491,35 +1334,29 @@ mod tests {
         }
     }
 
-    // Generates an EC key pair labelled for `service` straight on the
-    // token, the way something other than hkdfguard might, with `id`.
-    fn plant_key_pair(open: &OpenSession, service: &str, id: Vec<u8>) {
-        plant_key_pair_with(open, service, id, &[]);
+    // Generates a secret key labelled for `service` straight on the token,
+    // the way something other than hkdfguard might, with `id`.
+    fn plant_key(open: &OpenSession, service: &str, id: Vec<u8>) -> ObjectHandle {
+        plant_key_with(open, service, id, &[])
     }
 
-    // As `plant_key_pair`, with `extra_private` added to the private key's template.
-    fn plant_key_pair_with(open: &OpenSession, service: &str, id: Vec<u8>, extra_private: &[Attribute]) {
+    // As `plant_key`, with `extra` added to the key's template.
+    fn plant_key_with(open: &OpenSession, service: &str, id: Vec<u8>, extra: &[Attribute]) -> ObjectHandle {
         let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
-        let label = key_label(service).into_bytes();
-        let mut private = vec![
+        let mut template = vec![
+            Attribute::Class(ObjectClass::SECRET_KEY),
+            Attribute::KeyType(KeyType::GENERIC_SECRET),
+            Attribute::ValueLen((KEK_LEN as u64).into()),
             Attribute::Token(true),
-            Attribute::Private(true),
-            Attribute::Derive(true),
-            Attribute::Label(label.clone()),
-            Attribute::Id(id.clone()),
+            Attribute::Sign(true),
+            Attribute::Label(key_label(service).into_bytes()),
+            Attribute::Id(id),
         ];
-        private.extend_from_slice(extra_private);
-        rw.generate_key_pair(
-            &Mechanism::EccKeyPairGen,
-            &[
-                Attribute::Token(true),
-                Attribute::EcParams(P256_EC_PARAMS.to_vec()),
-                Attribute::Label(label),
-                Attribute::Id(id),
-            ],
-            &private,
-        )
-        .unwrap();
+        template.extend_from_slice(extra);
+        if !extra.iter().any(|a| a.attribute_type() == AttributeType::Private) {
+            template.push(Attribute::Private(true));
+        }
+        rw.generate_key(&Mechanism::GenericSecretKeyGen, &template).unwrap()
     }
 
     #[test]
@@ -1534,7 +1371,7 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| {
             destroy_all_for(open, service);
-            plant_key_pair_with(open, service, key_id(service), &[Attribute::Sensitive(false), Attribute::Extractable(true)]);
+            plant_key_with(open, service, key_id(service), &[Attribute::Sensitive(false), Attribute::Extractable(true)]);
         });
 
         let err = provider.load_kek(service, true).err().expect("a weakly protected key must be refused");
@@ -1547,67 +1384,37 @@ mod tests {
         with_open(&provider, |open| destroy_all_for(open, service));
     }
 
-    // The objects someone with access to the token but not the PIN can make:
-    // CKA_PRIVATE = false, which a session that isn't logged in may create.
-    // (Made here from the provider's logged-in session -- login is
-    // per-application, so a test process can't hold an unauthenticated one
-    // -- but an object's CKA_PRIVATE, not who made it, is what matters.)
-    fn plant_public_key_pair(open: &OpenSession, service: &str) -> ObjectHandle {
-        let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
-        let label = key_label(service).into_bytes();
-        let (public, _private) = rw
-            .generate_key_pair(
-                &Mechanism::EccKeyPairGen,
-                &[
-                    Attribute::Token(true),
-                    Attribute::Private(false),
-                    Attribute::EcParams(P256_EC_PARAMS.to_vec()),
-                    Attribute::Label(label.clone()),
-                    Attribute::Id(key_id(service)),
-                ],
-                &[
-                    Attribute::Token(true),
-                    Attribute::Private(false),
-                    Attribute::Sensitive(true),
-                    Attribute::Extractable(false),
-                    Attribute::Derive(true),
-                    Attribute::Label(label),
-                    Attribute::Id(key_id(service)),
-                ],
-            )
-            .unwrap();
-        public
-    }
-
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
     #[serial_test::serial]
-    fn a_key_pair_made_without_the_pin_is_never_used() {
-        // Generated on the token, so it passes every other protection
-        // check -- yet its planter could ECDH with it with no login. It
-        // must be invisible: provisioning makes hkdfguard's own pair.
-        let service = "com.hkdfguard.test.publicpair";
+    fn an_imported_key_with_every_attribute_right_is_refused() {
+        // A key whose value its importer knows, with hkdfguard's whole
+        // template: only CKA_ALWAYS_SENSITIVE / CKA_NEVER_EXTRACTABLE,
+        // which the token sets itself, give it away.
+        let service = "com.hkdfguard.test.importedkey";
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
-        let planted_point = with_open(&provider, |open| {
+        with_open(&provider, |open| {
             destroy_all_for(open, service);
-            let planted = plant_public_key_pair(open, service);
-            let attrs = open.session.get_attributes(planted, &[AttributeType::EcPoint]).unwrap();
-            match attrs.as_slice() {
-                [Attribute::EcPoint(point)] => point.clone(),
-                other => panic!("planted public key has no EC point: {other:?}"),
-            }
+            let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
+            rw.create_object(&[
+                Attribute::Class(ObjectClass::SECRET_KEY),
+                Attribute::KeyType(KeyType::GENERIC_SECRET),
+                Attribute::Value(vec![0x42; KEK_LEN]),
+                Attribute::Token(true),
+                Attribute::Private(true),
+                Attribute::Sensitive(true),
+                Attribute::Extractable(false),
+                Attribute::Sign(true),
+                Attribute::Derive(false),
+                Attribute::Label(key_label(service).into_bytes()),
+                Attribute::Id(key_id(service)),
+            ])
+            .unwrap();
         });
-        assert!(!provider.kek_exists(service).unwrap(), "the planted pair must not count as provisioned");
 
-        let handle = provider.load_kek(service, true).expect("provisioning must make its own pair, not refuse");
-        let ours = handle.public_key().unwrap().to_sec1_point(false);
-        assert!(
-            !planted_point.ends_with(ours.as_bytes()),
-            "the service's KEK must be hkdfguard's pair, not the one planted without the PIN"
-        );
-        let peer = p256::SecretKey::generate().public_key();
-        handle.ecdh(&peer).unwrap();
+        let err = provider.load_kek(service, true).err().expect("an imported key must be refused");
+        assert!(err.to_string().contains("AlwaysSensitive") || err.to_string().contains("NeverExtractable"), "{err}");
 
         with_open(&provider, |open| destroy_all_for(open, service));
     }
@@ -1615,34 +1422,32 @@ mod tests {
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
     #[serial_test::serial]
-    fn a_public_key_planted_without_the_pin_cannot_block_provisioning() {
-        // Without the CKA_PRIVATE filter, one public object under the label
-        // makes the pair look half-present, and provisioning refuses forever.
-        let service = "com.hkdfguard.test.publicblock";
+    fn a_key_made_without_the_pin_is_never_used() {
+        // Generated on the token, so it passes every other protection
+        // check -- yet its planter could compute HMACs with it with no
+        // login. It must be invisible: provisioning makes hkdfguard's own key.
+        // (Made here from the provider's logged-in session -- login is
+        // per-application, so a test process can't hold an unauthenticated
+        // one -- but an object's CKA_PRIVATE, not who made it, is what
+        // matters.)
+        let service = "com.hkdfguard.test.publickey";
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
-        with_open(&provider, |open| {
+        let planted_mac = with_open(&provider, |open| {
             destroy_all_for(open, service);
-            let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
-            let point = p256::SecretKey::generate().public_key().to_sec1_point(false);
-            let mut ec_point = vec![0x04, point.as_bytes().len() as u8]; // DER OCTET STRING around the point
-            ec_point.extend_from_slice(point.as_bytes());
-            rw.create_object(&[
-                Attribute::Class(ObjectClass::PUBLIC_KEY),
-                Attribute::KeyType(KeyType::EC),
-                Attribute::Token(true),
-                Attribute::Private(false),
-                Attribute::EcParams(P256_EC_PARAMS.to_vec()),
-                Attribute::EcPoint(ec_point),
-                Attribute::Label(key_label(service).into_bytes()),
-                Attribute::Id(key_id(service)),
-            ])
-            .unwrap();
+            let planted = plant_key_with(
+                open,
+                service,
+                key_id(service),
+                &[Attribute::Private(false), Attribute::Sensitive(true), Attribute::Extractable(false)],
+            );
+            *token_hmac(&open.session, planted, b"input").unwrap()
         });
+        assert!(!provider.kek_exists(service).unwrap(), "the planted key must not count as provisioned");
 
-        let peer = p256::SecretKey::generate().public_key();
-        provider.load_kek(service, true).expect("a planted public object must not block provisioning").ecdh(&peer).unwrap();
-        provider.load_kek(service, false).expect("nor the lookups after it").ecdh(&peer).unwrap();
+        let handle = provider.load_kek(service, true).expect("provisioning must make its own key, not refuse");
+        assert_ne!(prf_of(&*handle, b"input"), planted_mac, "the service's KEK must be hkdfguard's, not the planted one");
+        provider.load_kek(service, false).expect("nor block the lookups after it");
 
         with_open(&provider, |open| destroy_all_for(open, service));
     }
@@ -1656,32 +1461,35 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| destroy_all_for(open, service));
 
-        let peer = p256::SecretKey::generate().public_key();
-        provider.load_kek(service, true).unwrap().ecdh(&peer).unwrap(); // generates the pair
+        provider.load_kek(service, true).unwrap(); // generates the key
 
         with_open(&provider, |open| {
             let info = open.session.get_session_info().unwrap();
             assert!(!info.read_write(), "the provider's own session must be read-only");
 
-            let private = find_key_pair(&open.session, service).unwrap().unwrap();
-            let attrs = open
-                .session
-                .get_attributes(
-                    private,
-                    &[AttributeType::Modifiable, AttributeType::Copyable, AttributeType::Sensitive, AttributeType::Extractable],
-                )
-                .unwrap();
-            for expected in [
+            let key = find_key(&open.session, service).unwrap().unwrap();
+            let wanted = [
                 Attribute::Modifiable(false),
                 Attribute::Copyable(false),
                 Attribute::Sensitive(true),
                 Attribute::Extractable(false),
-            ] {
-                assert!(attrs.contains(&expected), "private key must have {expected:?}; has {attrs:?}");
+                Attribute::Verify(false),
+                Attribute::Encrypt(false),
+                Attribute::Decrypt(false),
+                Attribute::Wrap(false),
+                Attribute::Unwrap(false),
+                Attribute::Derive(false),
+            ];
+            let types: Vec<AttributeType> = wanted.iter().map(Attribute::attribute_type).collect();
+            let attrs = open.session.get_attributes(key, &types).unwrap();
+            for expected in wanted {
+                assert!(attrs.contains(&expected), "the key must have {expected:?}; has {attrs:?}");
             }
-            let public = find_public_key(&open.session, service).unwrap().unwrap();
-            let attrs = open.session.get_attributes(public, &[AttributeType::Modifiable]).unwrap();
-            assert!(attrs.contains(&Attribute::Modifiable(false)), "public key must be unmodifiable; has {attrs:?}");
+            let value = open.session.get_attributes(key, &[AttributeType::Value]);
+            assert!(
+                !matches!(&value, Ok(v) if v.iter().any(|a| matches!(a, Attribute::Value(_)))),
+                "the key's value must not be readable"
+            );
 
             destroy_all_for(open, service);
         });
@@ -1696,11 +1504,10 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| destroy_all_for(open, service));
 
-        let peer = p256::SecretKey::generate().public_key();
-        provider.load_kek(service, true).unwrap().ecdh(&peer).unwrap();
-        with_open(&provider, |open| plant_key_pair(open, service, key_id(service)));
+        provider.load_kek(service, true).unwrap();
+        with_open(&provider, |open| plant_key(open, service, key_id(service)));
 
-        // Refused when the key is loaded -- before any ECDH is attempted.
+        // Refused when the key is loaded -- before any HMAC is computed.
         let err = provider.load_kek(service, false).err().expect("a duplicate label must be refused");
         assert!(err.to_string().contains("refusing to choose"), "unexpected error: {err}");
         assert!(!err.to_string().contains(service), "errors must not name the service: {err}");
@@ -1718,7 +1525,7 @@ mod tests {
         assert!(provider.probe(), "no PKCS#11 session available");
         with_open(&provider, |open| {
             destroy_all_for(open, service);
-            plant_key_pair(open, service, b"not hkdfguard's".to_vec());
+            plant_key(open, service, b"not hkdfguard's".to_vec());
         });
 
         // Refused when the key is loaded, even with creation allowed: a
@@ -1731,31 +1538,16 @@ mod tests {
 
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
-    fn token_accepts_hashed_payload_points() {
-        // Same check as the TPM2 provider's own version: the
-        // forgery-resistant protocol needs CKM_ECDH1_DERIVE against a
-        // caller-supplied point hashed from the payload salt, so confirm
-        // this module accepts such points rather than assuming. A module
-        // that rejected them would make the construction unusable on
-        // that HSM.
+    fn different_keys_and_inputs_give_different_outputs() {
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
 
-        let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
-
         let handle = provider.load_kek("com.company.orders", true).unwrap();
-        let z1 = handle.ecdh(&h).unwrap();
-        let z2 = handle.ecdh(&h).unwrap();
-        assert_eq!(*z1, *z2, "ECDH against the same point must be repeatable for the same key");
-        assert_ne!(z1.as_slice(), [0u8; 32], "shared secret must not be all zeroes");
+        let first = prf_of(&*handle, b"salt-1");
+        assert_eq!(first, prf_of(&*handle, b"salt-1"), "the PRF must be repeatable for the same key and input");
+        assert_ne!(first, prf_of(&*handle, b"salt-2"), "different inputs must yield different outputs");
 
-        // A different service's key must yield a different Z against the
-        // same point.
         let other = provider.load_kek("com.company.billing", true).unwrap();
-        assert_ne!(*z1, *other.ecdh(&h).unwrap(), "different keys must yield different Z against the same point");
-
-        // A different salt's point yields a different Z for the same key.
-        let h2 = crate::crypto::payload_ecdh_point(&[0x43u8; 32]).unwrap();
-        assert_ne!(*z1, *handle.ecdh(&h2).unwrap(), "different salts must yield different Z");
+        assert_ne!(first, prf_of(&*other, b"salt-1"), "different keys must yield different outputs");
     }
 }

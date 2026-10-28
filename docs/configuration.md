@@ -87,8 +87,8 @@ call, so there is nothing to restart.
 
 ### TPM 2.0
 
-Each service's KEK is a key the TPM generates and never exports. It is
-stored as a **key file**, `/var/lib/hkdfguard/tpm/<service>.tpmkey`, whose
+Each service's KEK is a 256-bit HMAC-SHA-256 key the TPM generates and
+never exports. It is stored as a **key file**, `/var/lib/hkdfguard/tpm/<service>.tpmkey`, whose
 private half is encrypted by the TPM: the file is useless on any other
 TPM. Each operation loads the key file into the TPM, uses it, and flushes
 it, so nothing stays on the TPM.
@@ -165,8 +165,8 @@ Add the line as printed, then run `provision` again; it reports "already
 provisioned".
 
 **4. Encrypt the TPM bus traffic where it matters.** On a *discrete* TPM
-(a separate chip), the shared secret each unwrap computes crosses the
-motherboard bus. `session_encryption` controls whether it is encrypted:
+(a separate chip), the wrapping key each wrap and unwrap computes (the
+output of `TPM2_HMAC`) crosses the motherboard bus. `session_encryption` controls whether it is encrypted:
 
 | Value | Behaviour | Use for |
 |---|---|---|
@@ -244,28 +244,30 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   file changes, so a wrong PIN can't run the token's retry counter down to a
   lockout.
 
-`provision` generates the key pair on the token: non-extractable, usable only
-for key derivation, and labelled with the service name. Both halves are
-private objects (`CKA_PRIVATE`), and only private objects are ever looked up,
-so nothing someone creates on the token without the PIN is ever used. A pair
-provisioned before this rule existed has a public half that isn't private: it
-is reported as a private key whose public key is missing; delete both halves
-and run `provision` again (this changes that service's KEK).
+`provision` generates one secret key on the token (`CKO_SECRET_KEY`,
+`CKK_GENERIC_SECRET`, 32 bytes, with `CKM_GENERIC_SECRET_KEY_GEN`),
+labelled `hkdfguard:<service>`, with `CKA_ID` set to the SHA-256 of the
+service name. It is a token object, private (`CKA_PRIVATE`), sensitive and
+non-extractable, usable only to sign (`CKA_SIGN`; no verify, derive,
+encrypt, decrypt, wrap or unwrap), and neither modifiable nor copyable, so
+none of that can be relaxed later. Only private objects are ever looked up,
+so nothing someone creates on the token without the PIN is ever used. A key
+found under a service's label is used only if it still has all of these
+protections, and also `CKA_ALWAYS_SENSITIVE` and `CKA_NEVER_EXTRACTABLE`,
+which a token sets only on a key generated on it: an imported key, whose
+value someone may know, is refused. Only secret keys are looked up, so an
+EC key pair left under the same label by the pre-release ECDH format is
+ignored, not used or refused; delete it from the token by hand.
 
-**What the HSM must allow.** Each wrap and unwrap runs ECDH on the token
-with `CKM_ECDH1_DERIVE` and no token-side KDF (`CKD_NULL`), into a
-temporary session object that is *extractable* and *not sensitive*
-(`CKA_EXTRACTABLE=true`, `CKA_SENSITIVE=false`). The library reads the
-shared secret out of it, destroys it, and runs HKDF-SHA512 itself, since
-that is the same key derivation every provider uses. The service's private
-key never leaves the token, and each shared secret it exports covers only
-one payload (see [Why ECDH](why-ecdh.md)). Some HSMs refuse this in their
-FIPS-approved mode: they reject `CKD_NULL`, or any derived key that is
-extractable or not sensitive. If yours does, `provision` succeeds (it only
-generates the key pair) but the first wrap fails with
-`HKDFGUARD_ERR_PROVIDER_ERROR` (-4), and the log names `CKM_ECDH1_DERIVE`.
-Check the HSM's policy, and run the PKCS#11 test suite against it before
-relying on it: so far it has only been run against SoftHSM2.
+**What the HSM must allow.** Each wrap and unwrap is a single-part
+`C_Sign` with `CKM_SHA256_HMAC` on that key, which returns only the HMAC:
+the key never leaves the token, and each wrapping key it returns covers
+only one payload (see [Why an HMAC PRF](why-hmac-prf.md)). Any PKCS#11
+v2.20 or later token supports `CKM_GENERIC_SECRET_KEY_GEN` and
+`CKM_SHA256_HMAC`; SoftHSM2 needs HMAC keys of at least 32 bytes, which
+these are. No token-side KDF and no extractable session object are needed.
+Still, run the PKCS#11 test suite against your HSM before relying on it:
+so far it has only been run against SoftHSM2.
 
 ### External secret (file)
 
@@ -286,32 +288,33 @@ Otherwise the first of these that exists:
 Each service's KEK is the file `<dir>/<service-name>`, e.g.
 `/run/secrets/hkdfguard/com.company.orders`.
 
-**The key file** holds a P-256 private key. Use DER, generated with
-OpenSSL:
+**The key file** holds exactly 32 random bytes, used directly as the
+service's HMAC-SHA-256 key. Generate it with either:
 
 ```sh
-# Generate the key (SEC1 DER), readable only by you:
-( umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-    -outform DER -out com.company.orders )
+# Generate the key, readable only by you:
+( umask 077; head -c 32 /dev/urandom > com.company.orders )
+# or
+( umask 077; openssl rand -out com.company.orders 32 )
 
 # Its fingerprint, to pin in policy (see "Pin each key's fingerprint" below):
-openssl pkey -inform DER -in com.company.orders -pubout -outform DER \
-    | tail -c 65 | sha256sum | cut -d' ' -f1
+printf '\0\0\0\001hkdfguard-kek-fingerprint-v2\0\0\0\001\0' \
+    | openssl dgst -sha256 -mac HMAC \
+        -macopt hexkey:$(od -An -v -tx1 com.company.orders | tr -d ' \n')
 ```
 
 Run both on the machine where you create the key, then load the file into
 your secret store (Vault, AWS Secrets Manager, Google Secret Manager, Azure
 Key Vault, a Kubernetes Secret) and record the fingerprint in the policy.
-A DER file names its curve, so a key for the wrong curve is caught, and
-OpenSSL can compute its fingerprint without any other tool.
+Stores that hold text, such as a Kubernetes Secret's `data` or a Vault KV
+entry, take the 32 bytes base64-encoded, as they require; the file mounted
+on the host must be the 32 raw bytes again, not the base64.
 
-PKCS#8 DER is accepted too, and so is a bare 32-byte private scalar, but
-use DER: OpenSSL can't read a bare scalar, so there is no simple way to
-fingerprint one before it is delivered. PEM (text starting `-----BEGIN`)
-isn't accepted: convert it with
-`openssl pkey -in key.pem -outform DER -out com.company.orders`. A key for
-any curve other than P-256 is refused. `provision` reads and checks the
-key, so a wrong format is reported when you provision, not later.
+The file is the raw bytes only: not base64 or hex text, no trailing
+newline, not PEM or DER. A file of any other length is refused with an
+error giving its length, and so is an all-zero file. `provision` reads and
+checks the key, so a wrong format is reported when you provision, not
+later.
 
 **File rules.** The file must:
 - be owned by root or by the service's user, with no group or other access
@@ -361,21 +364,24 @@ error, so the library never moves on to another provider. Without
 `require_pinned_keys`, services you haven't pinned work as before. Service
 names must be quoted, as in `[tpm.pinned_names]`.
 
-The fingerprint is the SHA-256 of the key's uncompressed public point. It's
-the same value `provision` prints, every wrapped payload carries, and
-`retire --fingerprint` takes. It isn't secret, so it can live in the policy
-file wherever that's kept. Compute it where you generate the key, before
-the key goes into your secret store:
+The fingerprint is one HMAC-SHA-256 output of the key over a fixed
+input, `HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v2" || 0x00 || [256]_32)`
+(an NIST SP 800-108 counter-mode KDF block). It's the same value
+`provision` prints, every wrapped payload carries, and
+`retire --fingerprint` takes. It isn't secret and reveals nothing about the
+key, so it can live in the policy file wherever that's kept. Compute it
+where you generate the key, before the key goes into your secret store:
 
 ```sh
-openssl pkey -inform DER -in com.company.orders -pubout -outform DER \
-    | tail -c 65 | sha256sum | cut -d' ' -f1
+printf '\0\0\0\001hkdfguard-kek-fingerprint-v2\0\0\0\001\0' \
+    | openssl dgst -sha256 -mac HMAC \
+        -macopt hexkey:$(od -An -v -tx1 com.company.orders | tr -d ' \n')
 ```
 
-`-pubout` writes the public key as a SubjectPublicKeyInfo structure, which
-ends with the 65-byte uncompressed point `04 || X || Y`; `tail -c 65` keeps
-just that point, and its SHA-256 is the fingerprint. The output is 64 hex
-characters, ready to paste into `pinned_keys`.
+`printf` writes that fixed input (the counter `00000001`, the label, a zero
+byte and the output length `00000100`, 256 bits); `od` turns the key file
+into hex for `-macopt hexkey:`. The 64 hex characters after `= ` are the
+fingerprint, ready to paste into `pinned_keys`.
 
 With `require_pinned_keys` on, `provision` also refuses an unpinned service
 and prints the policy line for the key that is mounted. That tells you
@@ -508,7 +514,7 @@ Under **production**:
   to return. An ephemeral KEK is the exception: it lives only in the
   process that makes it. Retiring a KEK takes root too. On TPM2 and
   PKCS#11 this is enforced directly (only root creates a key file, or
-  generates a key pair on the token); external-secret never creates a KEK
+  generates an HMAC secret key on the token); external-secret never creates a KEK
   (the delivered file is the provisioning). With
   `tpm.require_pinned_names = true`, a TPM service also needs its key's
   Name in the root-owned policy: `provision` prints it.
@@ -537,7 +543,7 @@ key file read under it in each process is audited as event 1005
 Wrapping and unwrapping are the same in both models. Who may use a KEK at
 all is still the provider's own access control (TPM access and the key
 file's mode, the PIN file, the secret file's mode): wrap and unwrap
-are the same ECDH operation on the KEK, so nothing can grant one without
+are the same HMAC operation on the KEK, so nothing can grant one without
 the other. What the model decides is whose key files are believed.
 
 A deployment, as root:
