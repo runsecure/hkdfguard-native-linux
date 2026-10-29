@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fails unless Cargo.toml, debian/changelog and the RPM spec (Version and
 # newest %changelog entry) carry the same version -- and, given a release
-# tag such as v0.9.0, unless the tag names it too.
+# tag such as v0.9.1, unless the tag names it too.
 #
 # Releasing a new version means bumping all three together: `version` in
 # Cargo.toml, a new top entry in debian/changelog, and Version plus a new

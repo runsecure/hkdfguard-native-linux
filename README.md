@@ -802,7 +802,7 @@ target.
 
 One `debian/` directory serves both Debian-family targets. Built on
 Ubuntu, `packaging/build-deb.sh` adds the customary backport changelog
-entry, so the Ubuntu packages are versioned `0.9.0-1~ubuntu24.04.1` for
+entry, so the Ubuntu packages are versioned `0.9.1-1~ubuntu24.04.1` for
 release `noble`. One spec serves all three RPM targets. On SUSE it follows
 SUSE's naming policy and runs `ldconfig` from scriptlets:
 
@@ -895,7 +895,7 @@ taken out of one -- with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify hkdfguard_0.9.0-1_amd64.deb \
+gh attestation verify hkdfguard_0.9.1-1_amd64.deb \
     --repo runsecure/hkdfguard-native-linux \
     --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
 ```
@@ -911,11 +911,11 @@ workflow and tag:
 
 ```sh
 cosign verify-blob-attestation --new-bundle-format \
-    --bundle hkdfguard-0.9.0.sigstore.json \
+    --bundle hkdfguard-0.9.1.sigstore.json \
     --type https://slsa.dev/provenance/v1 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0 \
-    hkdfguard_0.9.0-1_amd64.deb
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.1 \
+    hkdfguard_0.9.1-1_amd64.deb
 ```
 
 [docs/installation.md](docs/installation.md#download-and-verify) has a
@@ -957,7 +957,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-tctildr0t64 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.0 / /
+COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.1 / /
 ```
 
 - **Debian-family images only**, with glibc 2.39 or newer: Ubuntu 24.04+
@@ -987,12 +987,12 @@ Sigstore, and signs each with cosign (keyless, as the release workflow;
 the job fails unless the signature then verifies). To verify one:
 
 ```sh
-gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
+gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.1 \
     --repo runsecure/hkdfguard-native-linux
 # or the cosign signature, with cosign 3.0+:
-cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
+cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.1 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.1
 ```
 
 In a build, verify the image's digest and copy from that digest, not the
@@ -1137,16 +1137,25 @@ readable by any process running as the same user (`/proc/<pid>/cmdline`,
 `/proc/<pid>/environ`). `printf` is a shell builtin, so the DEK never
 reaches any argv.
 
-`wrap --force` completes the wrap in memory *before* it securely
-overwrites and replaces the existing key file, so a wrap that fails — no
-KEK, provider unavailable, bad input — never destroys the key file that
-was already there. It only ever overwrites a regular file at that exact
-path: a symlink there is refused rather than followed (following it would
-overwrite whatever it points to), as are a directory, FIFO, or device, any
-file far larger than a wrapped key, and a file with more than one hard link
-(overwriting it would also destroy the file at its other name). The overwrite is best-effort: on
-copy-on-write or log-structured filesystems (btrfs, ZFS) and on flash
-storage, old blocks can survive it.
+`wrap` never writes a key file in place. It completes the wrap in memory,
+writes the payload to a hidden temporary file in the same folder, syncs
+it, and only then gives it the key file's name. With `--force` that last
+step is a `rename(2)` over the existing file, so the path holds the old
+key file or the new one at every moment. Whatever fails before then (no
+KEK, provider unavailable, bad input, a full disk, a folder that refuses
+the write) leaves the existing key file exactly as it was, and no
+temporary file behind.
+
+The replaced file is then securely overwritten through a descriptor
+opened before the rename. `--force` only ever replaces a regular file at
+that exact path: a symlink there is refused rather than followed, as are a
+directory, FIFO, or device, any file far larger than a wrapped key, and a
+file with more than one hard link (overwriting it would also destroy the
+file at its other name). A replaced file that still turns out to have a
+name, because something moved it during the wrap, is left alone, with a
+warning. The overwrite is best-effort: on copy-on-write or
+log-structured filesystems (btrfs, ZFS) and on flash storage, old blocks
+can survive it.
 
 The key file's folder must be a real folder at the path spelled: a
 `--key-file-path` that goes through a symbolic link anywhere above the file

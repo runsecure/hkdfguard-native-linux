@@ -94,7 +94,7 @@ hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 | `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600`, in a folder that -- with every folder above it, up to `/` -- is owned by root or you and not writable by group or others, sticky folders such as `/tmp` included (a read-only mount is exempt) |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
 | `--fingerprint`, `-fp` | The KEK's fingerprint, as `provision` printed it (64 hex characters). For `wrap`: nothing is written unless the DEK was wrapped under that KEK. For `retire`: required; nothing is deleted unless it matches. |
-| `--force`, `-f` | Replace an existing key file. The new wrap completes first, so a failed wrap never destroys the old file; the old file is then overwritten and removed. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
+| `--force`, `-f` | Replace an existing key file. The new payload is written to a temporary file in the same folder first and renamed over the old one, so a failed wrap or write never touches the old file; the replaced file is then overwritten. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
 
 Exit status: `0` success, `1` the operation failed, `2` invalid command line.
 

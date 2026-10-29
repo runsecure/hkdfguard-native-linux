@@ -1,3 +1,15 @@
+hkdfguard (0.9.1-1) trixie; urgency=medium
+
+  * Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1).
+  * TPM keys carry a per-service authValue (<service>.tpmauth) that keys
+    session encryption; tpm.session_encryption is now "on" or "off".
+  * A configured provider that is failing no longer hands KEKs to a weaker
+    one.
+  * wrap --force replaces a key file atomically.
+  * TPM key files from 0.9.0 must be provisioned again.
+
+ -- runsecure <torin@torinblair.com>  Thu, 29 Oct 2026 12:00:00 +0000
+
 hkdfguard (0.9.0-1) trixie; urgency=medium
 
   * Initial packaging.
