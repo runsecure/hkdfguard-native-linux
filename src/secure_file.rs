@@ -117,7 +117,9 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
     // it, the open returns at once and the regular-file check below refuses
     // it. It has no effect on reading a regular file. O_NOCTTY: a terminal
     // device must not become this process's controlling terminal.
-    let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY;
+    // Miri, which runs the tests to check `unsafe` code, can't open with
+    // these two flags; neither changes what a regular file's open does.
+    let mut flags = if cfg!(miri) { 0 } else { libc::O_NONBLOCK | libc::O_NOCTTY };
     if !req.follow_symlinks {
         flags |= libc::O_NOFOLLOW;
     }
@@ -402,9 +404,11 @@ fn on_read_only_mount(path: &Path) -> bool {
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
-    // SAFETY: c_path is a valid NUL-terminated string; `st` is a properly
-    // sized out-parameter that statvfs fully initializes on success.
+    // SAFETY: an all-zero `statvfs` is a valid out-parameter (plain integers).
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated string; `st` is a properly
+    // sized out-parameter that statvfs fully initializes on success, and
+    // is read only then.
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
         return false;
     }

@@ -679,8 +679,11 @@ fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [
             // that is a BufReader whose 8 KiB heap buffer would receive the
             // DEK first and keep it, unwiped and unlocked, for the life of
             // the process. ManuallyDrop: the File must not close stdin.
-            // SAFETY: descriptor 0 stays open for the process's lifetime,
-            // and nothing else in this program reads it.
+            // SAFETY: descriptor 0 is open -- Rust's runtime reopens
+            // /dev/null on any standard descriptor that is closed when the
+            // process starts, so it can't be a file this program opened --
+            // and stays open for the process's lifetime; nothing else in
+            // this program reads it, and ManuallyDrop never closes it.
             let mut fd0 = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDIN_FILENO) });
             read_bounded(&mut *fd0, "the DEK on stdin", &mut scratch.text)?
         }
@@ -843,6 +846,8 @@ fn lookup_group_from(spec: &str, initial_buf: usize) -> Result<Option<(libc::gid
 
     let mut size = initial_buf.max(1);
     loop {
+        // SAFETY: an all-zero `group` (null pointers, zero ids) is a valid
+        // out-parameter; getgr*_r fills it.
         let mut grp: libc::group = unsafe { std::mem::zeroed() };
         let mut result: *mut libc::group = std::ptr::null_mut();
         let mut buf = vec![0u8; size];

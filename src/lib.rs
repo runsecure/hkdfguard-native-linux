@@ -609,16 +609,22 @@ pub(crate) fn harden_process_impl(flags: c_uint) -> c_int {
     // non-dumpable flag below is what stops same-user debuggers, and it is
     // applied (or this fails) either way.
 
-    // SAFETY (all three): prctl with PR_GET_DUMPABLE takes no further
-    // arguments; PR_SET_DUMPABLE takes one integer; setrlimit reads a
-    // valid, fully initialized rlimit.
+    // Under Miri, which can't make these system calls, the same steps run
+    // with nothing to change.
+    if cfg!(miri) {
+        return harden_steps(None, &|| 0);
+    }
+
     #[cfg(target_os = "linux")]
     let dumpable = (
+        // SAFETY: PR_GET_DUMPABLE takes no further arguments and returns the flag.
         || unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
+        // SAFETY: PR_SET_DUMPABLE takes one integer argument; the rest are ignored.
         |value: libc::c_ulong| unsafe { libc::prctl(libc::PR_SET_DUMPABLE, value, 0, 0, 0) },
     );
     let no_core = || {
         let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: setrlimit reads a valid, fully initialized rlimit.
         unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }
     };
     #[cfg(target_os = "linux")]

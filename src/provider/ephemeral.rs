@@ -90,7 +90,10 @@ impl KeyPage {
                 std::io::Error::last_os_error()
             )));
         }
-        #[cfg(target_os = "linux")]
+        // Advice and locking only: under Miri, which runs the tests to check
+        // the `unsafe` code here and supports neither, the page is used as
+        // mapped.
+        #[cfg(all(target_os = "linux", not(miri)))]
         {
             // SAFETY: `base..base+len` is the mapping just created.
             if unsafe { libc::madvise(base, len, libc::MADV_DONTDUMP) } != 0 {
@@ -120,7 +123,7 @@ impl KeyPage {
             }
         }
         // SAFETY: as above.
-        if unsafe { libc::mlock(base, len) } != 0 {
+        if !cfg!(miri) && unsafe { libc::mlock(base, len) } != 0 {
             crate::provider::log_once(
                 log::Level::Warn,
                 format!(
