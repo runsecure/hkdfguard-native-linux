@@ -102,24 +102,41 @@ const FACILITY_AUTHPRIV: u8 = 10 << 3;
 #[cfg(not(test))]
 const SYSLOG_SOCKET: &str = "/dev/log";
 
-/// A KEK was created (not merely found). `preferred` is the policy's first
-/// choice of provider: created anywhere else, the event is 1001 (Warning),
-/// the counterpart of the Windows build's "created in software because the
-/// TPM attempt failed".
-pub(crate) fn kek_created(service: &str, provider: ProviderType, preferred: Option<ProviderType>) {
+/// Whether `hkdfguard_create_kek` knows it created the KEK it returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Creation {
+    /// None existed beforehand: this call created it.
+    Created,
+    /// Whether one existed beforehand couldn't be determined (the check
+    /// itself failed), so the call may have found an existing KEK.
+    Unconfirmed,
+}
+
+/// A KEK was created (not merely found) -- or, `Unconfirmed`, may have
+/// been. `preferred` is the policy's first choice of provider: created
+/// anywhere else, the event is 1001 (Warning), the counterpart of the
+/// Windows build's "created in software because the TPM attempt failed".
+pub(crate) fn kek_created(service: &str, provider: ProviderType, preferred: Option<ProviderType>, creation: Creation) {
     let fields = format!("op={} service={} provider={}", Op::CreateKek.name(), quote(service.as_bytes()), provider.as_str());
+    let (fields, created) = match creation {
+        Creation::Created => (fields, "KEK created"),
+        Creation::Unconfirmed => (
+            format!("{fields} existed_before=unknown"),
+            "KEK created, or an existing one found (whether one existed beforehand could not be checked)",
+        ),
+    };
     match preferred {
         Some(first) if first != provider => emit(
             Severity::Warning,
             KEK_CREATED_FALLBACK,
             &format!("{fields} preferred={}", first.as_str()),
             &format!(
-                "KEK created on {}, not on the policy's first choice {}, which was unavailable or declined",
+                "{created} on {}, not on the policy's first choice {}, which was unavailable or declined",
                 provider.as_str(),
                 first.as_str()
             ),
         ),
-        _ => emit(Severity::Info, KEK_CREATED, &fields, &format!("KEK created on {}", provider.as_str())),
+        _ => emit(Severity::Info, KEK_CREATED, &fields, &format!("{created} on {}", provider.as_str())),
     }
 }
 
@@ -238,6 +255,34 @@ pub(crate) fn plaintext_key_file(path: &Path) {
     );
 }
 
+/// hkdfguard_open_file refused `path` for a reason that points at tampering
+/// rather than a setup mistake: `FILE_UNTRUSTED` (someone else could have
+/// replaced it -- an untrusted owner, a writable file or directory, a
+/// symlink in a directory others control, or a swap mid-open) or a file
+/// that isn't a well-formed payload (`FILE_MALFORMED`, `FILE_TOO_SHORT`,
+/// `FILE_TOO_LONG`). Event 2003, as for a payload that fails at unwrap.
+/// Anything else -- missing, unreadable, not a regular file -- isn't
+/// audited, and `FILE_PLAINTEXT_KEY` has its own event
+/// ([`plaintext_key_file`]). Names the file; none of its contents are logged.
+pub(crate) fn key_file_refused(path: &Path, code: i32) {
+    let meaning = match code {
+        status::FILE_UNTRUSTED => {
+            "the key file, or a directory deciding what its path names, could have been replaced by someone the \
+             security model doesn't trust; it was not read"
+        }
+        status::FILE_MALFORMED | status::FILE_TOO_SHORT | status::FILE_TOO_LONG => {
+            "the key file is not a well-formed wrapped DEK (truncated, corrupted, or tampered with)"
+        }
+        _ => return,
+    };
+    emit(
+        Severity::Warning,
+        INTEGRITY_FAILURE,
+        &format!("op={} result={}({code}) path={}", Op::OpenFile.name(), code_name(code), quote(path.as_os_str().as_bytes())),
+        &format!("{} refused a key file: {meaning}", Op::OpenFile.name()),
+    );
+}
+
 /// hkdfguard_open_file accepted `path` under the developer security model,
 /// which trusts key files the application's own account owns -- so the
 /// application could have planted it. Written once per process (the first
@@ -346,6 +391,10 @@ fn code_name(code: i32) -> &'static str {
         status::KEK_INVALID => "KEK_INVALID",
         status::PROCESS_HARDENING_FAILED => "PROCESS_HARDENING_FAILED",
         status::FILE_PLAINTEXT_KEY => "FILE_PLAINTEXT_KEY",
+        status::FILE_UNTRUSTED => "FILE_UNTRUSTED",
+        status::FILE_MALFORMED => "FILE_MALFORMED",
+        status::FILE_TOO_SHORT => "FILE_TOO_SHORT",
+        status::FILE_TOO_LONG => "FILE_TOO_LONG",
         status::LINUX_GROUP_INVALID => "LINUX_GROUP_INVALID",
         _ => "UNKNOWN",
     }
@@ -388,7 +437,7 @@ mod tests {
         assert!(record.starts_with(&format!("<84>hkdfguard[{}]: event=2003 ", std::process::id())), "{record}");
         operation_failed(Op::Wrap, "audit.test.framing.err", status::PROVIDER_ERROR);
         assert!(last_with("audit.test.framing.err").starts_with("<83>"), "error severity");
-        kek_created("audit.test.framing.info", ProviderType::Tpm2, Some(ProviderType::Tpm2));
+        kek_created("audit.test.framing.info", ProviderType::Tpm2, Some(ProviderType::Tpm2), Creation::Created);
         assert!(last_with("audit.test.framing.info").starts_with("<86>"), "info severity");
     }
 
@@ -447,7 +496,7 @@ mod tests {
 
     #[test]
     fn a_kek_off_the_first_choice_is_a_fallback_warning() {
-        kek_created("audit.test.fallback", ProviderType::ExternalSecret, Some(ProviderType::Tpm2));
+        kek_created("audit.test.fallback", ProviderType::ExternalSecret, Some(ProviderType::Tpm2), Creation::Created);
         let record = last_with("audit.test.fallback");
         assert!(record.starts_with("<84>"), "{record}");
         assert!(
@@ -474,6 +523,36 @@ mod tests {
             "{record}"
         );
         assert!(!record.contains('\n'));
+    }
+
+    #[test]
+    fn key_file_refusals_that_point_at_tampering_are_audited_and_setup_mistakes_are_not() {
+        for (code, name, says) in [
+            (status::FILE_UNTRUSTED, "FILE_UNTRUSTED", "could have been replaced"),
+            (status::FILE_MALFORMED, "FILE_MALFORMED", "not a well-formed wrapped DEK"),
+            (status::FILE_TOO_SHORT, "FILE_TOO_SHORT", "not a well-formed wrapped DEK"),
+            (status::FILE_TOO_LONG, "FILE_TOO_LONG", "not a well-formed wrapped DEK"),
+        ] {
+            let path = format!("/srv/audit-test/refused-{name}.key");
+            key_file_refused(Path::new(&path), code);
+            let record = last_with(&path);
+            assert!(record.starts_with("<84>"), "a Warning: {record}");
+            assert!(record.contains(&format!("event=2003 op=hkdfguard_open_file result={name}({code})")), "{record}");
+            assert!(record.contains(says), "{record}");
+        }
+        for code in [status::FILE_NOT_FOUND, status::FILE_ACCESS_DENIED, status::FILE_IO, status::FILE_PLAINTEXT_KEY] {
+            let path = format!("/srv/audit-test/quiet-{code}.key");
+            key_file_refused(Path::new(&path), code);
+            assert!(captured_containing(&path).is_empty(), "code {code} is not audited here");
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_creation_says_so() {
+        kek_created("audit.test.unconfirmed", ProviderType::Tpm2, Some(ProviderType::Tpm2), Creation::Unconfirmed);
+        let record = last_with("audit.test.unconfirmed");
+        assert!(record.contains("event=1000") && record.contains("existed_before=unknown"), "{record}");
+        assert!(record.contains("could not be checked"), "{record}");
     }
 
     #[test]

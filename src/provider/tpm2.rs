@@ -697,6 +697,9 @@ fn open_context() -> Backend<Context> {
         Ok(tcti) => tcti,
         Err(e) => return Backend::Refused(e.to_string()),
     };
+    // Which TPM this is, for the conformance verdict below: the TCTI as
+    // policy names it (resolve_tcti has just accepted it), or the default.
+    let tcti_key = crate::policy::tpm_tcti().ok().flatten().unwrap_or_else(|| DEFAULT_TCTI.to_string());
     let mut ctx = match Context::new(tcti) {
         Ok(ctx) => ctx,
         // The default device failing to open is the normal state of a host
@@ -747,15 +750,17 @@ fn open_context() -> Backend<Context> {
     }
 
     // The conformance verdict is a fact about the TPM's *behavior*, not a
-    // credential, so it's established once per process rather than on
-    // every connection -- providers are constructed (and this runs) per
-    // call. Only a definitive verdict is cached; a self-test that couldn't
-    // run at all (TPM busy, command error) refuses the TPM for *this* call
-    // only and is retried next time.
-    let compatible = match TPM_CONFORMANCE_VERDICT.get() {
-        Some(verdict) => *verdict,
+    // credential, so it's established once per process for each TPM rather
+    // than on every connection -- providers are constructed (and this runs)
+    // per call. Keyed by the TCTI that reached it: the policy is re-read on
+    // every call, and one pointed at another TPM gets that TPM's own
+    // verdict. Only a definitive verdict is cached; a self-test that
+    // couldn't run at all (TPM busy, command error) refuses the TPM for
+    // *this* call only and is retried next time.
+    let compatible = match cached_verdict(&tcti_key) {
+        Some(verdict) => verdict,
         None => match validate_tpm_compatibility(&mut ctx) {
-            Ok(verdict) => *TPM_CONFORMANCE_VERDICT.get_or_init(|| verdict), // first definitive verdict wins; a concurrent one agrees
+            Ok(verdict) => record_verdict(tcti_key, verdict), // first definitive verdict wins; a concurrent one agrees
             Err(e) => return Backend::Refused(format!("conformance self-test could not run ({e})")),
         },
     };
@@ -783,10 +788,28 @@ fn tss2_log_exposes_secrets(value: &str) -> bool {
     })
 }
 
-/// Once-per-process result of `validate_tpm_compatibility`: `true` if the
-/// TPM this process talks to behaves as hkdfguard requires, `false` if it
-/// definitively doesn't. Unset until a self-test has actually completed.
-static TPM_CONFORMANCE_VERDICT: OnceLock<bool> = OnceLock::new();
+/// Results of `validate_tpm_compatibility`, once per process for each TPM,
+/// by the TCTI that reaches it: `true` if that TPM behaves as hkdfguard
+/// requires, `false` if it definitively doesn't. A TPM is absent until a
+/// self-test on it has actually completed. Bounded by the TCTIs a policy
+/// has named during the process's life.
+static TPM_CONFORMANCE_VERDICTS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
+fn cached_verdict(tcti: &str) -> Option<bool> {
+    let verdicts = TPM_CONFORMANCE_VERDICTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    verdicts.iter().find(|(t, _)| t == tcti).map(|(_, v)| *v)
+}
+
+/// Records `verdict` for `tcti`, unless a concurrent self-test recorded one
+/// first; returns the verdict in force.
+fn record_verdict(tcti: String, verdict: bool) -> bool {
+    let mut verdicts = TPM_CONFORMANCE_VERDICTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, existing)) = verdicts.iter().find(|(t, _)| *t == tcti) {
+        return *existing;
+    }
+    verdicts.push((tcti, verdict));
+    verdict
+}
 
 /// Empirically validates, against the real TPM this process just
 /// connected to, the two behaviors the key files depend on. Called once,
@@ -1529,7 +1552,10 @@ impl KekProvider for Tpm2Provider {
         }
         let dir = key_dir()?;
         let path = key_file_path(&dir, service);
-        if FileIdentity::of(&path) != Some(file.identity) {
+        // Not following a symlink, as the read didn't: a link put at the
+        // name pointing back at the same file is a change, and the unlink
+        // below would remove the link, not the key file.
+        if FileIdentity::of_entry(&path) != Some(file.identity) {
             return Err(Error::Provider("the TPM key file changed while it was being retired; nothing was deleted".into()));
         }
         std::fs::remove_file(&path)
@@ -2141,6 +2167,19 @@ mod tests {
     }
 
     #[test]
+    fn conformance_verdicts_are_kept_per_tpm() {
+        let a = "swtpm:host=verdict-test-a".to_string();
+        let b = "swtpm:host=verdict-test-b".to_string();
+        assert_eq!(cached_verdict(&a), None);
+        assert!(!record_verdict(a.clone(), false));
+        assert!(!record_verdict(a.clone(), true), "the first definitive verdict for a TPM stands");
+        assert_eq!(cached_verdict(&a), Some(false));
+        assert_eq!(cached_verdict(&b), None, "another TPM is tested on its own");
+        assert!(record_verdict(b.clone(), true));
+        assert_eq!(cached_verdict(&b), Some(true));
+    }
+
+    #[test]
     fn only_a_device_that_exists_counts_as_unreachable() {
         let device = crate::secure_file::private_tempdir();
         let reason = unreachable_default_device(device.path()).expect("the device exists");
@@ -2431,6 +2470,31 @@ mod tests {
             assert!(!dir.join("com.company.orders.tpmkey").exists());
             assert!(!tpm.kek_exists(SERVICE).unwrap());
             assert!(matches!(tpm.retire_kek(SERVICE, &right), Err(Error::KekNotFound)));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn retiring_refuses_a_key_file_name_swapped_for_a_symlink_to_it() {
+        // The key file is moved aside and a symlink to it put at its name:
+        // following the link, the file looks unchanged, but deleting the
+        // name would remove only the link and leave the key loadable.
+        with_key_dir(|dir| {
+            let tpm = provider();
+            let right = fingerprint(&*tpm.load_kek(SERVICE, true).unwrap());
+            let name = dir.join("com.company.orders.tpmkey");
+            let moved = dir.join("moved-aside.tpmkey");
+            std::fs::rename(&name, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &name).unwrap();
+            // Reading refuses the symlink outright, so retire can't proceed either.
+            match tpm.retire_kek(SERVICE, &right) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("can't be trusted") || msg.contains("changed"), "{msg}"),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert!(moved.exists(), "the key file itself is untouched");
+            assert_eq!(FileIdentity::of(&name), FileIdentity::of(&moved));
+            assert_ne!(FileIdentity::of_entry(&name), FileIdentity::of_entry(&moved), "what retire compares tells them apart");
         });
     }
 

@@ -379,7 +379,10 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
     // them holding the key to everything wrapped under it. The service's
     // own uid may own it: that uid can read every KEK here anyway.
     crate::secure_file::check_dir_chain(&mount_real, Owner::RootOrCurrentUser)?;
-    let target_real = std::fs::canonicalize(mount.join(service))?; // NotFound if nothing is provisioned; follows a symlink chain
+    // Resolved with every directory a lookup happens in checked, including
+    // any a symlink on the way lives in: NotFound if nothing is provisioned.
+    let target_real = crate::secure_file::resolve_trusted(&mount.join(service), &Owner::RootOrCurrentUser)?
+        .ok_or_else(|| IoError::new(ErrorKind::NotFound, "no secret file provisioned for this service"))?;
 
     if !target_real.starts_with(&mount_real) {
         // Component-wise comparison, so `<mount>-evil/x` does not pass for `<mount>`.

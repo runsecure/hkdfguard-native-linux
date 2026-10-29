@@ -465,9 +465,22 @@ pub(crate) struct FileIdentity {
 
 #[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11")), allow(dead_code))]
 impl FileIdentity {
+    /// The identity of the file `path` resolves to, symlinks followed: for
+    /// a credential file, where a Kubernetes-style link swap is a change.
     pub(crate) fn of(path: &Path) -> Option<Self> {
-        let m = std::fs::metadata(path).ok()?;
-        Some(FileIdentity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()) })
+        Some(Self::from_meta(&std::fs::metadata(path).ok()?))
+    }
+
+    /// The identity of the directory entry `path` itself, a symlink not
+    /// followed: for checking a file read with `O_NOFOLLOW` is still the
+    /// one at that name before it is deleted.
+    #[cfg_attr(not(any(feature = "tpm2", test)), allow(dead_code))]
+    pub(crate) fn of_entry(path: &Path) -> Option<Self> {
+        Some(Self::from_meta(&std::fs::symlink_metadata(path).ok()?))
+    }
+
+    fn from_meta(m: &Metadata) -> Self {
+        FileIdentity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()) }
     }
 }
 
@@ -649,6 +662,18 @@ mod tests {
         }
         chmod(&outer, 0o700);
         check_dir_chain(&inner, Owner::RootOrCurrentUser).unwrap();
+    }
+
+    #[test]
+    fn a_file_identity_by_entry_does_not_follow_a_symlink() {
+        let dir = private_tempdir();
+        let file = dir.path().join("key");
+        std::fs::write(&file, b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(FileIdentity::of(&link), FileIdentity::of(&file), "followed: the same file");
+        assert_ne!(FileIdentity::of_entry(&link), FileIdentity::of_entry(&file), "by entry: a link is not the file");
+        assert_eq!(FileIdentity::of_entry(&file), FileIdentity::of(&file));
     }
 
     #[test]

@@ -168,7 +168,9 @@ int hkdfguard_harden_process(void);
  * Returns HKDFGUARD_OK; HKDFGUARD_ERR_INVALID_ARGUMENT if `flags` has a
  * bit this library doesn't know (checked before anything is changed, so a
  * newer flag is never silently ignored); or
- * HKDFGUARD_ERR_PROCESS_HARDENING_FAILED.
+ * HKDFGUARD_ERR_PROCESS_HARDENING_FAILED, with the process left as it was:
+ * the dumpable flag is cleared first and restored if disabling core dumps
+ * then fails, since a lowered RLIMIT_CORE hard limit can't be raised again.
  */
 int hkdfguard_harden_process_with_flags(unsigned int flags);
 

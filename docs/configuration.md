@@ -234,7 +234,20 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
 
 - **The module**, its directory and every directory above it must be owned
   by root and not writable by group or others, sticky or not (so never under
-  `/tmp`). Nothing on that path can then be swapped for another library.
+  `/tmp`). Nothing on that path can then be swapped for another library. A
+  directory on a read-only mount passes whatever its mode, so if the module
+  is bind-mounted read-only from somewhere writable, make sure the original
+  directories are root-owned and unwritable as well: the module is code
+  this process runs.
+- **The module's own configuration** is not checked. Most modules find
+  their token through an environment variable (`SOFTHSM2_CONF`,
+  `YUBIHSM_PKCS11_CONF`, `ChrystokiConfigurationPath`, `OPENSC_CONF`,
+  `CKNFAST_*`). For a network HSM that names the host the PIN is sent to:
+  whoever controls the service's environment (a unit's `Environment=` or
+  `EnvironmentFile=`, a pod spec) can point the module at a token they run
+  and receive the root-only PIN. Fix the module's configuration in a
+  root-owned file, and don't let lower-trust configuration set those
+  variables for the service.
 - **The PIN file** holds the token's user PIN (one trailing newline is
   ignored). It must be root-owned, mode `0400`, or `0440` with the service's
   group, in directories only root can change, up to `/`. Setting

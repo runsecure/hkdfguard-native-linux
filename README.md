@@ -312,7 +312,7 @@ same IDs, meanings and severities (1004 aside), so one set of alerts covers both
 
 | ID | Severity | When |
 |---|---|---|
-| 1000 | info | A KEK was created (not merely found). |
+| 1000 | info | A KEK was created (not merely found). If whether one already existed couldn't be checked first, the record carries `existed_before=unknown` and says it may have been found instead. |
 | 1001 | warning | A KEK was created on a provider other than the policy's first choice, which was unavailable or declined. |
 | 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | info | A DEK was unwrapped. |
@@ -320,7 +320,7 @@ same IDs, meanings and severities (1004 aside), so one set of alerts covers both
 | 1005 | warning | A key file was read under the developer security model, which trusts files the calling account owns. Logged once per process; names the file. |
 | 2000 | warning | `KEK_ACCESS_DENIED`: under the production security model, a non-root caller tried to create a KEK that doesn't exist, or to retire one. |
 | 2002 | error | `KEK_INVALID`. |
-| 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. Or `hkdfguard_open_file` refused a key file someone else could have replaced (`FILE_UNTRUSTED`), or one that isn't a well-formed payload (`FILE_MALFORMED`, `FILE_TOO_SHORT`, `FILE_TOO_LONG`); names the file. |
 | 2004 | error | `POLICY_INVALID`: every call fails closed until the policy is fixed. |
 | 2005 | error | `PROVIDER_UNAVAILABLE`, `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`. |
 | 2006 | error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |

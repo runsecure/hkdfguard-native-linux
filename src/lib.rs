@@ -23,8 +23,14 @@ mod test_tmp; // where tests make temp dirs: a private root, not the sticky /tmp
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
 /// Administration for the `hkdfguard` CLI: operations deliberately kept
-/// out of the C ABI, so no application linking the library can call them.
-/// Rust-only and not a stable interface.
+/// out of the C ABI, so no C, Python or .NET application linking the
+/// shared library can call them. Rust-only and not a stable interface.
+///
+/// Not a security boundary for Rust code: a Rust program that depends on
+/// this crate can call these as the CLI does. What protects them is what
+/// they check themselves -- `retire_kek` refuses anyone but root under the
+/// production security model, and deletes nothing without the KEK's exact
+/// fingerprint -- not who can reach them.
 #[doc(hidden)]
 pub mod admin {
     use super::*;
@@ -603,20 +609,41 @@ pub(crate) fn harden_process_impl(flags: c_uint) -> c_int {
     // non-dumpable flag below is what stops same-user debuggers, and it is
     // applied (or this fails) either way.
 
-    let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    // SAFETY: setrlimit reads a valid, fully initialized rlimit.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
-        log::error!(
-            "hkdfguard: could not disable core dumps (setrlimit RLIMIT_CORE): {}",
-            std::io::Error::last_os_error()
-        );
-        return status::PROCESS_HARDENING_FAILED;
-    }
-
+    // SAFETY (all three): prctl with PR_GET_DUMPABLE takes no further
+    // arguments; PR_SET_DUMPABLE takes one integer; setrlimit reads a
+    // valid, fully initialized rlimit.
     #[cfg(target_os = "linux")]
-    {
-        // SAFETY: PR_SET_DUMPABLE takes one integer argument; the rest are ignored.
-        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong, 0, 0, 0) } != 0 {
+    let dumpable = (
+        || unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
+        |value: libc::c_ulong| unsafe { libc::prctl(libc::PR_SET_DUMPABLE, value, 0, 0, 0) },
+    );
+    let no_core = || {
+        let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }
+    };
+    #[cfg(target_os = "linux")]
+    let dumpable_calls: Option<DumpableCalls> = Some((&dumpable.0, &dumpable.1));
+    #[cfg(not(target_os = "linux"))]
+    let dumpable_calls: Option<DumpableCalls> = None;
+    harden_steps(dumpable_calls, &no_core)
+}
+
+/// The dumpable flag's getter and setter (Linux's `prctl`), for
+/// [`harden_steps`].
+type DumpableCalls<'a> = (&'a dyn Fn() -> c_int, &'a dyn Fn(libc::c_ulong) -> c_int);
+
+/// `harden_process_impl`'s steps, with the system calls passed in so the
+/// order, and the undo, can be tested.
+///
+/// The reversible step first. Lowering RLIMIT_CORE's hard limit can never
+/// be undone by an unprivileged process, so it comes last: if it fails, the
+/// dumpable flag is put back, and a failed call leaves the process exactly
+/// as it found it.
+fn harden_steps(dumpable: Option<DumpableCalls>, no_core: &dyn Fn() -> c_int) -> c_int {
+    let mut was_dumpable = 0;
+    if let Some((get, set)) = dumpable {
+        was_dumpable = get();
+        if set(0) != 0 {
             log::error!(
                 "hkdfguard: could not mark the process non-dumpable (prctl PR_SET_DUMPABLE): {}",
                 std::io::Error::last_os_error()
@@ -624,7 +651,18 @@ pub(crate) fn harden_process_impl(flags: c_uint) -> c_int {
             return status::PROCESS_HARDENING_FAILED;
         }
     }
-
+    if no_core() != 0 {
+        log::error!(
+            "hkdfguard: could not disable core dumps (setrlimit RLIMIT_CORE): {}",
+            std::io::Error::last_os_error()
+        );
+        if let Some((_, set)) = dumpable {
+            if was_dumpable > 0 {
+                set(was_dumpable as libc::c_ulong); // restores the flag this call cleared
+            }
+        }
+        return status::PROCESS_HARDENING_FAILED;
+    }
     status::OK
 }
 
@@ -737,8 +775,9 @@ fn create_kek_impl(service: *const c_char) -> c_int {
     gated_setup(|| {
         // Asked first, so the audit trail records a KEK being *created*
         // (1000/1001), not every idempotent re-run. If the question itself
-        // fails, the create below reports the real error.
-        let existed = provider::kek_exists(&service_str).unwrap_or(false);
+        // fails, the create below reports the real error -- and if the
+        // create succeeds anyway, the record says it may have found one.
+        let existed = provider::kek_exists(&service_str).ok();
         // Under the production model only root creates a persistent KEK;
         // anyone else gets the existing one, or KEK_ACCESS_DENIED.
         let created = security_model::current().and_then(|model| {
@@ -750,8 +789,13 @@ fn create_kek_impl(service: *const c_char) -> c_int {
         });
         match created {
             Ok((provider, _handle)) => {
-                if !existed {
-                    audit::kek_created(&service_str, provider.provider_type(), provider::preferred_type());
+                let creation = match existed {
+                    Some(true) => None,
+                    Some(false) => Some(audit::Creation::Created),
+                    None => Some(audit::Creation::Unconfirmed),
+                };
+                if let Some(creation) = creation {
+                    audit::kek_created(&service_str, provider.provider_type(), provider::preferred_type(), creation);
                 }
                 status::OK
             }
@@ -1289,10 +1333,12 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
         Err(e) => {
             log::error!("hkdfguard: hkdfguard_open_file refused key file {}: {}", path.display(), e.describe());
             let code = e.status_code();
-            // The one open_file failure that is audited: a possible key
-            // exposure an administrator needs to hear about (event 2006).
+            // Audited: a possible key exposure (event 2006), and a file
+            // that could have been replaced or isn't a payload (2003).
             if code == status::FILE_PLAINTEXT_KEY {
                 audit::plaintext_key_file(&path);
+            } else {
+                audit::key_file_refused(&path, code);
             }
             return fail(code);
         }
@@ -1312,6 +1358,52 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
 
 #[cfg(test)]
 mod ffi_tests {
+    #[test]
+    fn hardening_clears_the_dumpable_flag_first_and_restores_it_if_core_dumps_cant_be_disabled() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let get = || {
+            calls.borrow_mut().push("get".to_string());
+            1
+        };
+        let set = |v: libc::c_ulong| {
+            calls.borrow_mut().push(format!("set {v}"));
+            0
+        };
+        let fail_core = || {
+            calls.borrow_mut().push("no_core".to_string());
+            -1
+        };
+        assert_eq!(super::harden_steps(Some((&get, &set)), &fail_core), super::status::PROCESS_HARDENING_FAILED);
+        assert_eq!(*calls.borrow(), ["get", "set 0", "no_core", "set 1"], "reversible first, and undone on failure");
+
+        calls.borrow_mut().clear();
+        let ok_core = || {
+            calls.borrow_mut().push("no_core".to_string());
+            0
+        };
+        assert_eq!(super::harden_steps(Some((&get, &set)), &ok_core), super::status::OK);
+        assert_eq!(*calls.borrow(), ["get", "set 0", "no_core"]);
+
+        // Already non-dumpable: nothing to restore.
+        calls.borrow_mut().clear();
+        let get0 = || {
+            calls.borrow_mut().push("get".to_string());
+            0
+        };
+        assert_eq!(super::harden_steps(Some((&get0, &set)), &fail_core), super::status::PROCESS_HARDENING_FAILED);
+        assert_eq!(*calls.borrow(), ["get", "set 0", "no_core"]);
+
+        // The flag can't be cleared: core dumps are never touched.
+        calls.borrow_mut().clear();
+        let set_fails = |v: libc::c_ulong| {
+            calls.borrow_mut().push(format!("set {v}"));
+            -1
+        };
+        assert_eq!(super::harden_steps(Some((&get, &set_fails)), &ok_core), super::status::PROCESS_HARDENING_FAILED);
+        assert_eq!(*calls.borrow(), ["get", "set 0"], "the irreversible step is not taken");
+    }
+
     use super::*; // bring the exported functions + `status` into scope
     use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
     use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
@@ -2653,6 +2745,36 @@ mod ffi_tests {
         assert_eq!((rc, out_len), (status::FILE_UNTRUSTED, crypto::MAX_WRAPPED_LEN as c_int), "writable directory");
         assert!(out.iter().all(|&b| b == 0));
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Each refusal left an integrity record (2003) naming the file.
+        let records = audit::captured_containing(&format!("path={}", audit_quote_for_tests(&file)));
+        assert!(
+            records.iter().filter(|r| r.contains("event=2003") && r.contains("result=FILE_UNTRUSTED(-39)")).count() >= 3,
+            "{records:#?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn open_file_audits_a_malformed_key_file_but_not_a_missing_one() {
+        let _policy = developer_policy();
+        let mut bytes = sample_wrapped_bytes();
+        bytes[0] = 0x7f; // not a version any wrap writes
+        let (dir, path) = key_file_with(&bytes);
+        assert_eq!(open_file(&path, crypto::MAX_WRAPPED_LEN).0, status::FILE_MALFORMED);
+        let file = dir.path().join("wrapped.key");
+        let records = audit::captured_containing(&format!("path={}", audit_quote_for_tests(&file)));
+        assert!(records.iter().any(|r| r.contains("event=2003") && r.contains("result=FILE_MALFORMED(-38)")), "{records:#?}");
+
+        let missing = dir.path().join("missing.key");
+        let c_missing = CString::new(missing.to_str().unwrap()).unwrap();
+        assert_eq!(open_file(&c_missing, crypto::MAX_WRAPPED_LEN).0, status::FILE_NOT_FOUND);
+        assert!(audit::captured_containing(&format!("path={}", audit_quote_for_tests(&missing))).is_empty());
+    }
+
+    // A path as the audit trail quotes it (plain ASCII paths only).
+    fn audit_quote_for_tests(path: &std::path::Path) -> String {
+        format!("\"{}\"", path.display())
     }
 
     #[test]

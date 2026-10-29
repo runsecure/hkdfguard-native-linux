@@ -31,6 +31,22 @@
 //!   boundary this crate draws -- whoever controls the process's
 //!   environment already controls what runs in it -- but keep a vendor
 //!   module's dependencies in root-owned locations too.
+//!
+//!   Two limits of that check. **The module's own configuration is not
+//!   covered.** Most modules find their token through the environment
+//!   (`SOFTHSM2_CONF`, `YUBIHSM_PKCS11_CONF`, `ChrystokiConfigurationPath`,
+//!   `OPENSC_CONF`, the `CKNFAST_*` variables, ...), and for a network HSM
+//!   that names the host the PIN is sent to. Whoever sets the service's
+//!   environment can point the module at a token they run, and `C_Login`
+//!   then hands it the root-only PIN; the token's label and serial are its
+//!   own claims, so they can't tell. Set the module's configuration in a
+//!   root-owned file the service's environment can't override. **A
+//!   directory on a read-only mount passes whatever its mode**, as
+//!   everywhere in this crate: a read-only mount's mode bits don't say who
+//!   can write the same directory through another, writable mount of it
+//!   (a read-only bind mount of a host directory, say). For code that is
+//!   loaded and run, keep the module's directories root-owned and
+//!   unwritable on every mount, not only the one this process sees.
 //! - `token_label` / `token_serial`: which token to use, among initialized
 //!   ones. Exactly one must match. With neither set, there must be exactly
 //!   one initialized token. Slot numbers are never used: they can change

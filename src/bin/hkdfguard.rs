@@ -8,10 +8,13 @@
 //!   the library's setup-call latency floor) and meant to run once, at
 //!   deployment time.
 //! - `retire` -- permanently delete a service's KEK, given the fingerprint
-//!   `provision` printed for it. PKCS#11 only (see `admin::retire_kek`); it
-//!   goes through the library's Rust-only admin API, the one deliberate
-//!   exception to the C-ABI-only rule below, so that no application
-//!   linking the library can delete a KEK.
+//!   `provision` printed for it. TPM2 and PKCS#11 only (see
+//!   `admin::retire_kek`); it goes through the library's Rust-only admin
+//!   API, the one deliberate exception to the C-ABI-only rule below, so
+//!   that no application linking the shared library through its C ABI can
+//!   delete a KEK. A Rust program depending on the crate could call it
+//!   too; what stops it is the API's own checks (root only under the
+//!   production model, and the exact fingerprint), not reachability.
 //! - `wrap` -- wrap a caller-supplied Data Encryption Key (DEK) under the
 //!   service's KEK and write the wrapped payload to a file. It never
 //!   creates a KEK: if none is provisioned, it fails and says to run
