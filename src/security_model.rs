@@ -263,6 +263,11 @@ const LOOKUP_MAX_BUF: usize = 1024 * 1024;
 
 // The group named `name`, with its member list; `None` if there is none.
 fn lookup_group(name: &str) -> std::io::Result<Option<Group>> {
+    // Miri, which runs the tests to check `unsafe` code, can't call into
+    // NSS: under it no group exists.
+    if cfg!(miri) {
+        return Ok(None);
+    }
     let c_name = CString::new(name).map_err(|_| std::io::Error::other("a group name must not contain a NUL byte"))?;
     let mut size = LOOKUP_INITIAL_BUF;
     loop {
@@ -302,6 +307,9 @@ fn lookup_group(name: &str) -> std::io::Result<Option<Group>> {
 // The user name (raw bytes) and primary gid of `uid`; `None` if it has no
 // passwd entry.
 fn lookup_user(uid: libc::uid_t) -> std::io::Result<Option<(Vec<u8>, libc::gid_t)>> {
+    if cfg!(miri) {
+        return Ok(None); // see lookup_group
+    }
     let mut size = LOOKUP_INITIAL_BUF;
     loop {
         // SAFETY: an all-zero `passwd` is a valid out-parameter; getpwuid_r fills it.
@@ -328,6 +336,9 @@ fn lookup_user(uid: libc::uid_t) -> std::io::Result<Option<(Vec<u8>, libc::gid_t
 
 // The uid the user name `name` resolves to; `None` if no passwd entry has it.
 fn lookup_uid(name: &[u8]) -> std::io::Result<Option<libc::uid_t>> {
+    if cfg!(miri) {
+        return Ok(None); // see lookup_group
+    }
     let Ok(name) = std::ffi::CString::new(name) else {
         return Ok(None); // an interior NUL names nobody
     };
