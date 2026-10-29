@@ -78,6 +78,8 @@ pub const fn config_owner() -> Owner {
 /// Permission bits that must be clear: nobody but the owner may write.
 pub const FORBID_GROUP_OTHER_WRITE: u32 = 0o022;
 /// Permission bits that must be clear: nobody but the owner may read, write, or execute.
+/// Used by the secret-reading providers; a build with none of them leaves it unused.
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11", feature = "external-secret")), allow(dead_code))]
 pub const FORBID_GROUP_OTHER_ACCESS: u32 = 0o077;
 
 const GROUP_READ: u32 = 0o040;
@@ -161,6 +163,7 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
 /// `dir` must be canonical (no symlinks). Every failure, including one
 /// from a directory vanishing mid-walk, is `PermissionDenied` -- never
 /// `NotFound`, which callers reserve for "the file isn't there".
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11", feature = "external-secret")), allow(dead_code))]
 pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
     check_dir_chain_trusting(dir, &owner)
 }

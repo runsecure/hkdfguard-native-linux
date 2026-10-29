@@ -53,6 +53,7 @@ use zeroize::Zeroizing; // wrapper that scrubs its contents from memory when dro
 /// Length of a KEK held in software (the external-secret and ephemeral
 /// providers), and of every key a provider generates: 256 bits, the
 /// HMAC-SHA-256 output size.
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11", feature = "external-secret", feature = "ephemeral")), allow(dead_code))]
 pub const KEK_LEN: usize = 32;
 
 /// One HMAC-SHA-256 output under a KEK, zeroized on drop. Never logged,
@@ -73,7 +74,8 @@ pub(crate) fn random_kek_for_tests() -> [u8; KEK_LEN] {
 /// derives from the key are beyond this crate's reach (`hmac` 0.13 has no
 /// zeroize support); the SHA-256 states keyed with them are wiped on drop
 /// by `sha2`'s `zeroize` feature.
-#[cfg(any(feature = "external-secret", feature = "ephemeral", test))]
+// Also the TPM provider's: its self-test checks TPM2_HMAC against it.
+#[cfg(any(feature = "external-secret", feature = "ephemeral", feature = "tpm2", test))]
 pub(crate) fn software_prf(key: &[u8; KEK_LEN], inputs: &[&[u8]]) -> Vec<PrfOutput> {
     use hmac::{Hmac, KeyInit, Mac};
     inputs
@@ -345,7 +347,8 @@ pub(crate) fn log_once(level: log::Level, message: String) {
 }
 
 /// Test-only: forget which warnings were logged, so a test can see its own.
-#[cfg(test)]
+/// Gated like its one caller.
+#[cfg(all(test, feature = "external-secret", feature = "ephemeral"))]
 fn reset_warn_once() {
     WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
@@ -580,6 +583,7 @@ mod tests {
     // reachable TPM or PKCS#11 token that provider legitimately serves
     // the key. Asserting either one specifically would make the test
     // track hardware presence instead of the invariant.
+    #[cfg(feature = "ephemeral")] // as its callers are
     fn assert_never_ephemeral(result: Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)>) {
         match result {
             Ok((provider, _handle)) => assert_ne!(
@@ -901,8 +905,11 @@ mod tests {
 
     // ---- each provider failure is logged exactly once ----
 
+    // The log capture below is used only by the external-secret tests.
+    #[cfg(feature = "external-secret")]
     struct CapturingLogger(std::sync::Mutex<Vec<String>>);
 
+    #[cfg(feature = "external-secret")]
     impl log::Log for CapturingLogger {
         fn enabled(&self, metadata: &log::Metadata) -> bool {
             metadata.level() <= log::Level::Warn
@@ -915,10 +922,12 @@ mod tests {
         fn flush(&self) {}
     }
 
+    #[cfg(feature = "external-secret")]
     static CAPTURED: CapturingLogger = CapturingLogger(std::sync::Mutex::new(Vec::new()));
 
     // Runs `f` and returns every warn/error line it logged that contains
     // `marker`. `#[serial]` callers keep other tests' lines out.
+    #[cfg(feature = "external-secret")]
     fn logged_lines_containing(marker: &str, f: impl FnOnce()) -> Vec<String> {
         if log::set_logger(&CAPTURED).is_ok() {
             log::set_max_level(log::LevelFilter::Warn);
@@ -932,6 +941,7 @@ mod tests {
     // a hard provider failure ("permissions too broad"), not a soft decline.
     // Both halves must stay bound for the test's duration: the mount
     // directory, and the policy layer pointing the provider at it.
+    #[cfg(feature = "external-secret")]
     fn mount_with_untrusted_secret(service: &str) -> (tempfile::TempDir, crate::policy::test_support::TestPolicy) {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::secure_file::private_tempdir();
