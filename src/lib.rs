@@ -1548,6 +1548,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "asserts wall-clock speed, which Miri's interpreter can't reproduce")]
     fn kek_fingerprint_pays_the_setup_floor_but_argument_errors_do_not() {
         with_isolated_ephemeral_provider(|| {
             with_setup_delay(Some(Duration::from_millis(50)), || {
@@ -1615,6 +1616,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "asserts wall-clock speed, which Miri's interpreter can't reproduce")]
     fn invalid_arguments_are_rejected_before_the_floor() {
         // Validation failures never reach a provider, so they shouldn't
         // pay for one: an obviously-bad call returns immediately.
