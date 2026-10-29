@@ -3151,4 +3151,32 @@ pub mod fuzz_support {
     pub fn payload_from_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
         crate::payload::Payload::from_bytes(bytes).ok().map(|p| (p.key_id.len(), p.ciphertext.len()))
     }
+
+    /// The TPM key file decoder (`tpm_key_file::decode`): the public and
+    /// private areas it carries, or why it was refused.
+    pub fn tpm_key_file_decode(text: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        crate::provider::tpm_key_file::decode(text).map(|blob| (blob.public, blob.private))
+    }
+
+    /// The TPM key file encoder (`tpm_key_file::encode`).
+    pub fn tpm_key_file_encode(public: &[u8], private: &[u8]) -> Result<String, String> {
+        crate::provider::tpm_key_file::encode(&crate::provider::tpm_key_file::KeyBlob {
+            public: public.to_vec(),
+            private: private.to_vec(),
+        })
+    }
+
+    /// The `.tpmauth` content rule (`tpm_key_file::check_auth_value`).
+    pub fn tpm_auth_value_check(bytes: &[u8]) -> Result<(), String> {
+        crate::provider::tpm_key_file::check_auth_value(bytes)
+    }
+
+    pub const TPM_AUTH_VALUE_LEN: usize = crate::provider::tpm_key_file::AUTH_VALUE_LEN;
+
+    /// `secure_file::resolve_trusted` under the developer-model rule for
+    /// configuration (root or this user, nothing group- or other-writable).
+    /// `Err` carries `raw_os_error` for an OS refusal and none for a trust one.
+    pub fn resolve_trusted(path: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+        crate::secure_file::resolve_trusted(path, &crate::secure_file::Owner::RootOrCurrentUser)
+    }
 }

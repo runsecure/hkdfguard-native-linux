@@ -42,6 +42,24 @@ const PEM_END: &str = "-----END TSS2 PRIVATE KEY-----";
 /// bytes; this is a sanity limit, not a format one.
 pub(crate) const MAX_KEY_FILE_LEN: usize = 4096;
 
+/// Length of every service key's authValue, the `.tpmauth` file beside its
+/// key file: the digest size of its name algorithm (SHA-256), the most a
+/// TPM accepts for an object's authValue.
+pub(crate) const AUTH_VALUE_LEN: usize = 32;
+
+/// Checks a `.tpmauth` file's contents: exactly [`AUTH_VALUE_LEN`] bytes,
+/// the last one not zero. The TPM drops trailing zero bytes from an
+/// authValue before using it, and refusing them keeps both ends agreeing
+/// without relying on every layer in between doing the same; this library
+/// never writes one. The error says what was wrong, never the contents.
+pub(crate) fn check_auth_value(bytes: &[u8]) -> Result<(), String> {
+    match bytes {
+        b if b.len() != AUTH_VALUE_LEN => Err(format!("is {} bytes, not {AUTH_VALUE_LEN}", b.len())),
+        [.., 0] => Err("ends in a zero byte, which the TPM would drop; it is not one this library wrote".to_string()),
+        _ => Ok(()),
+    }
+}
+
 const TAG_SEQUENCE: u8 = 0x30;
 const TAG_INTEGER: u8 = 0x02;
 const TAG_OCTET_STRING: u8 = 0x04;
@@ -63,10 +81,10 @@ pub(crate) fn encode(blob: &KeyBlob) -> Result<String, String> {
     body.extend_from_slice(LOADABLE_KEY_OID);
     body.extend_from_slice(&[TAG_INTEGER, 0x04]);
     body.extend_from_slice(&PARENT_OWNER_HIERARCHY.to_be_bytes()); // high bit clear: no leading zero needed
-    der_push(&mut body, TAG_OCTET_STRING, &tpm2b(&blob.public)?);
-    der_push(&mut body, TAG_OCTET_STRING, &tpm2b(&blob.private)?);
+    der_push(&mut body, TAG_OCTET_STRING, &tpm2b(&blob.public)?)?;
+    der_push(&mut body, TAG_OCTET_STRING, &tpm2b(&blob.private)?)?;
     let mut der = Vec::new();
-    der_push(&mut der, TAG_SEQUENCE, &body);
+    der_push(&mut der, TAG_SEQUENCE, &body)?;
 
     let encoded = STANDARD.encode(&der);
     let mut pem = String::with_capacity(encoded.len() + encoded.len() / 64 + PEM_BEGIN.len() + PEM_END.len() + 4);
@@ -159,18 +177,23 @@ fn from_tpm2b(bytes: &[u8], what: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-fn der_push(out: &mut Vec<u8>, tag: u8, contents: &[u8]) {
+// The decoder reads at most a two-byte DER length, so nothing longer is
+// written: a structure of 64 KiB or more is refused, never truncated. A
+// TPM's areas are a few hundred bytes, so only a caller passing something
+// else reaches this.
+fn der_push(out: &mut Vec<u8>, tag: u8, contents: &[u8]) -> Result<(), String> {
     out.push(tag);
     match contents.len() {
         n @ 0..=0x7f => out.push(n as u8),
         n @ 0x80..=0xff => out.extend_from_slice(&[0x81, n as u8]),
         n => {
-            let n = u16::try_from(n).expect("key file contents are bounded far below 64 KiB");
+            let n = u16::try_from(n).map_err(|_| "a key file structure is too large to encode".to_string())?;
             out.push(0x82);
             out.extend_from_slice(&n.to_be_bytes());
         }
     }
     out.extend_from_slice(contents);
+    Ok(())
 }
 
 /// A forward-only DER reader over one level of a structure.
@@ -311,6 +334,30 @@ mod tests {
         // Truncated anywhere.
         for cut in 1..good.len() {
             assert!(decode(pem_of(&good[..cut]).as_bytes()).is_err(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn oversized_areas_are_refused_not_a_panic() {
+        // One area at the TPM2B limit fits a two-byte DER length on its own,
+        // but the SEQUENCE around both no longer does.
+        let big = KeyBlob { public: vec![1; u16::MAX as usize], private: vec![2; 16] };
+        assert!(encode(&big).unwrap_err().contains("too large"));
+        let too_big = KeyBlob { public: vec![1; u16::MAX as usize + 1], private: vec![2; 16] };
+        assert!(encode(&too_big).unwrap_err().contains("TPM2B"));
+    }
+
+    #[test]
+    fn an_auth_value_is_exactly_32_bytes_not_ending_in_zero() {
+        assert!(check_auth_value(&[7u8; AUTH_VALUE_LEN]).is_ok());
+        let mut ends_in_zero = [7u8; AUTH_VALUE_LEN];
+        ends_in_zero[AUTH_VALUE_LEN - 1] = 0;
+        assert!(check_auth_value(&ends_in_zero).unwrap_err().contains("zero byte"));
+        let mut zero_inside = [7u8; AUTH_VALUE_LEN];
+        zero_inside[0] = 0;
+        assert!(check_auth_value(&zero_inside).is_ok(), "only a trailing zero matters");
+        for len in [0, 1, 31, 33, 64] {
+            assert!(check_auth_value(&vec![7u8; len]).unwrap_err().contains(&format!("is {len} bytes")), "{len}");
         }
     }
 

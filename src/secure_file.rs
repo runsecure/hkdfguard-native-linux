@@ -254,15 +254,25 @@ const MAX_SYMLINKS: usize = 40;
 pub fn resolve_trusted(path: &Path, trust: &dyn PrincipalTrust) -> io::Result<Option<std::path::PathBuf>> {
     use std::collections::{HashSet, VecDeque};
     use std::ffi::OsString;
-    use std::path::{Component, PathBuf};
+    use std::path::PathBuf;
 
-    // Components still to resolve; `..` kept as a name, `.` and `/` dropped.
+    // Components still to resolve, split on `/` as the kernel splits them.
+    // Not `Path::components`, which drops `.` and a trailing `/`: the
+    // kernel doesn't, and both mean the component before them must be a
+    // directory (`file/.` and `file/` are ENOTDIR). So each `.`, and each
+    // empty segment after the leading `/` (`a//b`, a trailing `/`), is kept
+    // as `.`: a step that does nothing itself, but that makes whatever
+    // precedes it a component with more to come.
     let components = |p: &Path| -> VecDeque<OsString> {
-        p.components()
-            .filter_map(|c| match c {
-                Component::Normal(name) => Some(name.to_os_string()),
-                Component::ParentDir => Some(OsString::from("..")),
-                Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        p.as_os_str()
+            .as_bytes()
+            .split(|b| *b == b'/')
+            .enumerate()
+            .filter_map(|(i, segment)| match segment {
+                b"" if i == 0 => None, // before the leading `/` of an absolute path
+                b"" => Some(OsString::from(".")),
+                other => Some(OsString::from_vec(other.to_vec())),
             })
             .collect()
     };
@@ -272,6 +282,9 @@ pub fn resolve_trusted(path: &Path, trust: &dyn PrincipalTrust) -> io::Result<Op
     let mut links = 0;
 
     while let Some(name) = pending.pop_front() {
+        if name == "." {
+            continue; // `current` is a directory already
+        }
         if name == ".." {
             current.pop(); // physical: the parent of the directory actually reached; `/` stays `/`
             continue;
@@ -696,6 +709,17 @@ mod tests {
         assert_eq!(resolve_trusted(&base.join("absent/deeper/file"), &me).unwrap(), None);
         // A file used as a directory, and a loop: the OS's own errors.
         assert_eq!(resolve_trusted(&base.join("real/file/x"), &me).unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+        // `file/.` and `file/` name a directory too, as the kernel reads
+        // them (found by fuzzing: `Path::components` drops both).
+        for spelled in ["real/file/.", "real/file/", "real/file//", "abs/."] {
+            let path = std::path::PathBuf::from(format!("{}/{spelled}", base.display()));
+            assert_eq!(std::fs::canonicalize(&path).unwrap_err().raw_os_error(), Some(libc::ENOTDIR), "kernel: {spelled}");
+            assert_eq!(resolve_trusted(&path, &me).unwrap_err().raw_os_error(), Some(libc::ENOTDIR), "walker: {spelled}");
+        }
+        // While a directory followed by them is just that directory.
+        let real_dot = std::path::PathBuf::from(format!("{}/real/./", base.display()));
+        assert_eq!(resolve_trusted(&real_dot, &me).unwrap(), Some(base.join("real")));
+        assert_eq!(resolve_trusted(Path::new("/"), &me).unwrap(), Some(std::path::PathBuf::from("/")));
         std::os::unix::fs::symlink(base.join("loop"), base.join("loop")).unwrap();
         assert_eq!(resolve_trusted(&base.join("loop"), &me).unwrap_err().raw_os_error(), Some(libc::ELOOP));
     }

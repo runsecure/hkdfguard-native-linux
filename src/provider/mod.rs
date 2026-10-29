@@ -39,9 +39,11 @@ pub mod pkcs11;
 pub mod tpm2;
 // The TPM provider's key file format. Pure Rust, so its tests run in every
 // build, not only those with the tpm2 feature.
-#[cfg(any(feature = "tpm2", test))]
+// Also in the fuzz harnesses' build (`hkdfguard_test_paths`), which fuzzes
+// it through `crate::fuzz_support` without linking tpm2-tss.
+#[cfg(any(feature = "tpm2", test, hkdfguard_test_paths))]
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
-mod tpm_key_file;
+pub(crate) mod tpm_key_file;
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::policy::PolicyEvaluator; // brings `.allowed_providers()` into scope on `crate::policy::Policy`

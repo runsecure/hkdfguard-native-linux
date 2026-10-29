@@ -113,9 +113,7 @@ const KEY_FILE_SUFFIX: &str = ".tpmkey";
 /// A service's authValue file sits beside its key file, named with this.
 const AUTH_FILE_SUFFIX: &str = ".tpmauth";
 
-/// Length of every service key's authValue: the digest size of its name
-/// algorithm (SHA-256), the most a TPM accepts for an object's authValue.
-const AUTH_VALUE_LEN: usize = 32;
+use tpm_key_file::AUTH_VALUE_LEN; // every service key's authValue length
 
 /// `tpm.key_dir` from policy, else [`DEFAULT_KEY_DIR`]. `Err` on a policy
 /// that exists but can't be trusted.
@@ -242,11 +240,9 @@ fn read_auth_file(service: &str) -> Result<Option<Auth>> {
         Err(e) => return Err(fail(format!("is present but can't be trusted: {e}"))),
     };
     let mut raw = SecretBuffer::read_from(&mut file, AUTH_VALUE_LEN).map_err(|e| fail(format!("could not be read: {e}")))?;
-    let checked = match raw.as_slice() {
-        bytes if bytes.len() != AUTH_VALUE_LEN => Err(fail(format!("is {} bytes, not {AUTH_VALUE_LEN}", bytes.len()))),
-        [.., 0] => Err(fail("ends in a zero byte, which the TPM would drop; it is not one this library wrote".to_string())),
-        bytes => Auth::try_from(bytes.to_vec()).map_err(|e| fail(format!("was rejected: {e}"))), // `Auth` wipes itself on drop
-    };
+    let checked = tpm_key_file::check_auth_value(raw.as_slice())
+        .map_err(fail)
+        .and_then(|()| Auth::try_from(raw.as_slice().to_vec()).map_err(|e| fail(format!("was rejected: {e}")))); // `Auth` wipes itself on drop
     raw.wipe();
     checked.map(Some)
 }

@@ -18,6 +18,8 @@ that cfg.
 | `wrap_round_trip` | `hkdfguard_wrap_dek` (any DEK length), `hkdfguard_generate_and_wrap_dek`, `hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`, `hkdfguard_security_model`, `hkdfguard_key_file_principal_trusted` | whatever wrap produces unwraps to the same DEK, under either spelling of the service, and parses; `BUFFER_TOO_SMALL` leaves the buffer untouched and asks for more than the capacity; a non-32-byte DEK is `INVALID_ARGUMENT`; the fingerprint matches the one payloads carry; `kek_exists` answers for exactly the created KEK; the calling uid and root are trusted under the developer model |
 | `open_file` | `hkdfguard_open_file` on arbitrary file contents under every file mode, and on arbitrary paths | `key_file::check`, the payload parser and `open_file` agree on what a key file is; a refused file's length never comes back through `BUFFER_TOO_SMALL`; a file writable by group or others is refused; `open_file`'s refusal code is `check`'s |
 | `policy` | `Policy::from_toml_str` on arbitrary text, and now and then the same text installed as the policy file and read through `hkdfguard_security_model` | whatever the parser refuses fails closed (`POLICY_INVALID`) through the file; whatever it accepts works |
+| `tpm_key_file` | the TPM key file decoder on arbitrary text, on what the encoder writes for arbitrary areas, and on mutated encodings; the `.tpmauth` content rule. No TPM needed: the format module is pure Rust | decode and encode agree (whatever decodes re-encodes and decodes the same; the encoder's output decodes to exactly its input whenever both areas are non-empty); an oversized structure is refused, never a panic; an authValue is accepted exactly when it is 32 bytes ending in a non-zero byte |
+| `path_walk` | `secure_file::resolve_trusted` -- the walk behind `hkdfguard_open_file` and the policy, PIN, TPM and external-secret files -- on random trees of directories (every mode from `0700` to `1777`), files and relative or absolute symlinks, and random paths through them, `.`, `..` and empty segments included | the kernel (`canonicalize`) and the walker agree on where a path leads, and on when it leads nowhere; a reference walk in the harness records every directory a lookup happens in, symlinks' own included, and the walker refuses exactly when one of them is writable by group or others |
 | `cli_args` | the CLI's private functions, with `src/bin/hkdfguard.rs` included into the harness: argument parsing (UTF-8 and raw argv), fingerprint hex, DEK base64 decoding, the bounded stdin read, service-name checks, group resolution, path spelling, status descriptions | no panic |
 
 Every harness aborts on any panic, including one the library would catch
@@ -50,6 +52,8 @@ cargo +nightly fuzz run wrap_round_trip -- -max_total_time=900 -timeout=10
 cargo +nightly fuzz run open_file -- -max_total_time=900 -timeout=10
 cargo +nightly fuzz run policy -- -max_total_time=900 -timeout=10 -dict=fuzz/policy.dict
 cargo +nightly fuzz run cli_args -- -max_total_time=900 -timeout=10 -dict=fuzz/cli.dict
+cargo +nightly fuzz run tpm_key_file -- -max_total_time=900 -timeout=10
+cargo +nightly fuzz run path_walk -- -max_total_time=900 -timeout=10
 ```
 
 A crash lands in `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run
