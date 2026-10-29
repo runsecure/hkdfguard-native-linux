@@ -19,14 +19,14 @@
 #   4. The #[ignore]d conformance suite against the REAL TPM: key files
 #      created, reloaded and refused when spliced, the storage root key's
 #      determinism, the Name formula, TPM2_HMAC known answers,
-#      salted/encrypted session correctness, auto-mode, pins, and retiring. Each test uses its own key directory.
+#      salted/encrypted session correctness, the authValue refusing a wrong
+#      or empty value, pins, and retiring. Each test uses its own key directory.
 #   5. Provisions com.company.orders with the CLI, then learns the storage
 #      root key's and that key file's Names (the operator helpers in
-#      src/provider/tpm2.rs) and writes a policy that REQUIRES encrypted
-#      sessions with both Names pinned.
+#      src/provider/tpm2.rs) and writes a policy with both Names pinned.
 #   6. C ABI round trip (examples/wrap_unwrap.c) against the .so
-#      with the KEK on the TPM -- once under `auto`, once under that
-#      `required` + pinned policy.
+#      with the KEK on the TPM -- once with session encryption off, once
+#      under that pinned policy with it on.
 #   7. CLI -> separate C consumer: hkdfguard wraps via stdin,
 #      cli_unwrap_check unwraps through the .so. Cross-process persistence
 #      on the real TPM.
@@ -78,11 +78,6 @@ source scripts/native-tpm-preflight.sh
 TCTI="${HKDFGUARD_TCTI:-$HKDFGUARD_PREFLIGHT_TCTI}"
 export TPM2TOOLS_TCTI="$TCTI" # for tpm2-tools only; the library takes its TCTI from policy
 MANUFACTURER="$HKDFGUARD_PREFLIGHT_MANUFACTURER"
-
-case "$MANUFACTURER" in
-    INTC|AMD|QCOM|MSFT|IBM|GOOG|VMW) NO_EXTERNAL_BUS=1 ;;
-    *) NO_EXTERNAL_BUS=0 ;;
-esac
 
 FEATURES="tpm2"
 HAVE_SOFTHSM=0
@@ -283,24 +278,15 @@ use_base_policy
 section "cargo build --features $FEATURES (real link against libtss2-esys${HAVE_SOFTHSM:+ + cryptoki})"
 cargo build --features "$FEATURES"
 
-section "cargo test --features tpm2 (unit tests: key files, templates, Name computation, manufacturer classification)"
+section "cargo test --features tpm2 (unit tests: key files, authValue files, templates, Name computation)"
 # HKDFGUARD_TEST_TPM: the integration tests that need a reachable TPM run too.
 HKDFGUARD_TEST_TPM=1 cargo test --features tpm2
 
 # ---------------------------------------------------------------------
 # 4. Conformance suite against the real TPM
 # ---------------------------------------------------------------------
-SKIP=()
-if [ "$NO_EXTERNAL_BUS" -eq 0 ]; then
-    # This test asserts `auto` SKIPS encryption, which is only true on an
-    # fTPM/vTPM. On a discrete chip `auto` correctly encrypts, so the
-    # assertion would fail for the right reason. Skip it, not the mechanism:
-    # an_encrypted_session_hmac_equals_a_plain_session_hmac still runs.
-    SKIP=(--skip auto_mode_skips_encryption_on_an_internal_tpm_unless_pinned_and_required_forces_it)
-    note "discrete TPM ($MANUFACTURER): skipping the fTPM-only auto-mode assertion"
-fi
 # The two operator helpers only print; keep them out of the pass/fail run.
-SKIP+=(--skip print_session_salt_key_name_for_pinning --skip print_service_key_name_for_pinning)
+SKIP=(--skip print_session_salt_key_name_for_pinning --skip print_service_key_name_for_pinning)
 
 section "cargo test --features tpm2 -- --ignored (conformance suite against the real TPM: $TCTI)"
 cargo test --features tpm2 -- --ignored --test-threads=1 "${SKIP[@]}"
@@ -316,14 +302,16 @@ build_c examples/cli_unwrap_check.c "$WORK/cli_unwrap_check"
 section "provisioning com.company.orders, then learning Names to pin (storage root key, and its key file)"
 "$BIN"/hkdfguard provision --service-name com.company.orders
 [ -f "$KEY_DIR/com.company.orders.tpmkey" ] || { echo "provision wrote no key file in $KEY_DIR" >&2; exit 1; }
-note "key file: $(stat -c '%n %U:%G %a' "$KEY_DIR/com.company.orders.tpmkey")"
+[ -f "$KEY_DIR/com.company.orders.tpmauth" ] || { echo "provision wrote no authValue file in $KEY_DIR" >&2; exit 1; }
+note "key file:       $(stat -c '%n %U:%G %a' "$KEY_DIR/com.company.orders.tpmkey")"
+note "authValue file: $(stat -c '%n %U:%G %a %s bytes' "$KEY_DIR/com.company.orders.tpmauth")"
 SALT_NAME=$(learn print_session_salt_key_name_for_pinning SALT_KEY_NAME)
 SVC_NAME=$(HKDFGUARD_PIN_SERVICE=com.company.orders learn print_service_key_name_for_pinning SERVICE_KEY_NAME)
 [ -n "$SALT_NAME" ] && [ -n "$SVC_NAME" ] || { echo "could not learn the Names to pin" >&2; exit 1; }
 note "storage root key Name: $SALT_NAME"
 note "service key Name:      $SVC_NAME (com.company.orders)"
 REQUIRED_SELECTION=$'[selection]\nmode = "require"\nprovider = "tpm2"'
-REQUIRED_TPM_KEYS="session_encryption = \"required\"
+REQUIRED_TPM_KEYS="session_encryption = \"on\"
 pinned_session_salt_key_name = \"$SALT_NAME\""
 REQUIRED_PINS="[tpm.pinned_names]
 \"com.company.orders\" = \"$SVC_NAME\""
@@ -334,14 +322,14 @@ policy "$REQUIRED_SELECTION" "$REQUIRED_TPM_KEYS" "$REQUIRED_PINS" | sed 's/^/  
 # ---------------------------------------------------------------------
 # 6. C ABI round trip on the TPM, under both policies
 # ---------------------------------------------------------------------
-section "C ABI round trip (examples/wrap_unwrap.c) -- KEK on the TPM, policy: require tpm2, session_encryption auto"
-use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"'
+section "C ABI round trip (examples/wrap_unwrap.c) -- KEK on the TPM, policy: require tpm2, session_encryption off"
+use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"' 'session_encryption = "off"'
 LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
 
-section "C ABI round trip -- policy: session_encryption REQUIRED with both Names pinned"
+section "C ABI round trip -- policy: session_encryption on (the default) with both Names pinned"
 use_policy "$REQUIRED_SELECTION" "$REQUIRED_TPM_KEYS" "$REQUIRED_PINS"
 LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
-note "every TPM2_HMAC in that run went through a salted, AES-128-CFB-encrypted session against a pinned storage root key"
+note "every TPM2_HMAC in that run went through a salted, AES-128-CFB-encrypted session keyed by the key's authValue, under a pinned storage root key"
 
 # ---------------------------------------------------------------------
 # 7. CLI -> separate C consumer, across processes, on the TPM

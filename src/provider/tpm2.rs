@@ -19,9 +19,11 @@
 //! keyed-hash object created by `TPM2_Create` under the Owner hierarchy's
 //! storage root key (SRK), and stored as a **key file**,
 //! `<tpm.key_dir>/<service>.tpmkey` (default `/var/lib/hkdfguard/tpm`).
-//! Every PRF call re-derives the SRK with `TPM2_CreatePrimary` from the
-//! standard TCG template, loads the key file under it with `TPM2_Load`,
-//! runs one `TPM2_HMAC` per input, and flushes both: nothing stays resident
+//! The key has a random 256-bit **authValue**, kept beside it in
+//! `<service>.tpmauth`. Every PRF call re-derives the SRK with
+//! `TPM2_CreatePrimary` from the standard TCG template, loads the key file
+//! under it with `TPM2_Load`, runs one `TPM2_HMAC` per input in a session
+//! keyed by the authValue, and flushes everything: nothing stays resident
 //! in the TPM, and no persistent handle has to be allocated, authorized,
 //! mapped to a service or kept from colliding.
 //!
@@ -46,17 +48,30 @@
 //!   TPM and never duplicated out: a key file can't hold a key
 //!   anyone knows.
 //!
-//! What it does not guarantee: the key has no password, so anyone who can
-//! read the key file *and* open the TPM can use the key. Reading the file
-//! is the access control, as the PKCS#11 PIN file is for that provider --
-//! hence its mode (`root:<key-users> 0440`, see [`write_key_file`]). And a
+//! What the authValue adds:
+//!
+//! - **Bus protection that needs no trusted public key.** Every session
+//!   that uses the key derives its parameter encryption and its response
+//!   HMAC from the authValue, so someone on a discrete TPM's bus can
+//!   neither read a wrapping key nor replace one without it. It is a
+//!   symmetric secret, so this holds against a quantum computer too. See
+//!   the "Session parameter encryption" section below.
+//! - **Access control per service.** Using the key takes the key file, the
+//!   authValue file and the TPM. Both files are `root:<key-users> 0440`
+//!   when written (see [`write_new_file`]); giving a service's authValue
+//!   file that service's own group keeps every other service in
+//!   `<key-users>` from using its key.
+//!
+//! What it does not guarantee: anyone who can read both files *and* open
+//! the TPM can use the key, as the PKCS#11 PIN is for that provider. And a
 //! `TPM2_Clear` replaces the Owner hierarchy's seed: the SRK changes, and
 //! every key file becomes permanently unloadable.
 //!
-//! Provisioning is real: `load_kek(service, true)` creates the key file if
-//! there is none, and a service with no key file has no KEK here
-//! ([`Error::KeyNotProvisioned`]), so the provider chain moves on.
-//! `retire_kek` deletes the file.
+//! Provisioning is real: `load_kek(service, true)` creates the authValue
+//! file and then the key file if there is none, and a service with no key
+//! file has no KEK here ([`Error::KeyNotProvisioned`]), so the provider
+//! chain moves on. A key file without its authValue file is an error.
+//! `retire_kek` deletes both.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::tpm_key_file::{self, KeyBlob}; // the key file's on-disk format
@@ -69,14 +84,14 @@ use std::str::FromStr; // brings `TctiNameConf::from_str` into scope
 use std::sync::{Arc, Mutex, OnceLock}; // shared, lock-protected TPM context; `OnceLock` for the per-process conformance verdict
 
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder}; // TPM object-attribute and session-attribute bitfields
-use tss_esapi::constants::{PropertyTag, SessionType}; // TPM_PT_MANUFACTURER lookup, and the HMAC session type
+use tss_esapi::constants::SessionType; // the HMAC session type
 use tss_esapi::handles::{KeyHandle, ObjectHandle, SessionHandle}; // opaque TPM-side handles to a loaded key / a started session
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm}; // enum constants for "SHA-256", "ECC" and "keyed hash"
 use tss_esapi::interface_types::ecc::EccCurve; // enum constant for "NIST P-256"
 use tss_esapi::interface_types::resource_handles::Hierarchy; // selects the Owner hierarchy for CreatePrimary
 use tss_esapi::interface_types::session_handles::AuthSession; // a started session, as passed to execute_with_session
 use tss_esapi::structures::{
-    Digest, EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme, MaxBuffer, Name, Private,
+    Auth, Digest, EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme, MaxBuffer, Name, Private,
     Public, PublicBuilder, PublicEccParametersBuilder, PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
     SymmetricDefinitionObject,
 }; // the TPM public-template types this module builds, the TPM Name value, the key file's private area, HMAC input and the session cipher
@@ -91,9 +106,16 @@ use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its c
 const DEFAULT_KEY_DIR: &str = "/var/lib/hkdfguard/tpm";
 
 /// A key file's name is the service name plus this. Service names never
-/// start with '.', so the hidden temporary files [`write_key_file`] makes
+/// start with '.', so the hidden temporary files [`write_new_file`] makes
 /// can never be mistaken for one.
 const KEY_FILE_SUFFIX: &str = ".tpmkey";
+
+/// A service's authValue file sits beside its key file, named with this.
+const AUTH_FILE_SUFFIX: &str = ".tpmauth";
+
+/// Length of every service key's authValue: the digest size of its name
+/// algorithm (SHA-256), the most a TPM accepts for an object's authValue.
+const AUTH_VALUE_LEN: usize = 32;
 
 /// `tpm.key_dir` from policy, else [`DEFAULT_KEY_DIR`]. `Err` on a policy
 /// that exists but can't be trusted.
@@ -103,6 +125,10 @@ fn key_dir() -> Result<PathBuf> {
 
 fn key_file_path(dir: &Path, service: &str) -> PathBuf {
     dir.join(format!("{service}{KEY_FILE_SUFFIX}"))
+}
+
+fn auth_file_path(dir: &Path, service: &str) -> PathBuf {
+    dir.join(format!("{service}{AUTH_FILE_SUFFIX}"))
 }
 
 /// Who may own key files, and the directories above them: whoever may
@@ -140,17 +166,12 @@ struct KeyFile {
 /// a key file of exactly the shape this library writes, holding a key with
 /// exactly this library's service-key attributes.
 fn read_key_file(service: &str) -> Result<Option<KeyFile>> {
-    use crate::secure_file::{check_location, open_checked, FileRequirements, FORBID_GROUP_OTHER_ACCESS};
+    use crate::secure_file::{check_location, open_checked};
     use std::io::Read;
 
     let path = key_file_path(&key_dir()?, service);
     let owner = key_owner()?;
-    let requirements = FileRequirements {
-        owner: Some(owner),
-        forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
-        follow_symlinks: false,
-        allow_group_read_if_root_owned: true, // root:<key-users> 0440, for a service that doesn't run as root
-    };
+    let requirements = key_dir_file_requirements()?;
     let fail = |what: String| Error::Provider(format!("TPM key file {} {what}", path.display()));
     let file = match check_location(&path, owner).and_then(|()| open_checked(&path, &requirements)) {
         Ok(file) => file,
@@ -190,24 +211,108 @@ fn read_key_file(service: &str) -> Result<Option<KeyFile>> {
     Ok(Some(KeyFile { public, private, identity }))
 }
 
-/// Writes `service`'s new key file, unless one appeared first.
+/// What every file in the key directory must satisfy: owned by
+/// [`key_owner`], readable by nobody else except the group of a root-owned
+/// file (`root:<group> 0440`), and not a symlink.
+fn key_dir_file_requirements() -> Result<crate::secure_file::FileRequirements> {
+    Ok(crate::secure_file::FileRequirements {
+        owner: Some(key_owner()?),
+        forbidden_mode_bits: crate::secure_file::FORBID_GROUP_OTHER_ACCESS,
+        follow_symlinks: false,
+        allow_group_read_if_root_owned: true, // root:<group> 0440, for a service that doesn't run as root
+    })
+}
+
+/// Reads `service`'s authValue file: exactly [`AUTH_VALUE_LEN`] bytes, held
+/// to the same rules as its key file. `Ok(None)` only when there is none.
+///
+/// Its last byte is never zero: the TPM drops trailing zero bytes from an
+/// authValue before using it, and refusing them here keeps both ends
+/// agreeing without relying on every layer in between doing the same.
+fn read_auth_file(service: &str) -> Result<Option<Auth>> {
+    use crate::secure_file::{check_location, open_checked, SecretBuffer};
+
+    let path = auth_file_path(&key_dir()?, service);
+    let owner = key_owner()?;
+    let requirements = key_dir_file_requirements()?;
+    let fail = |what: String| Error::Provider(format!("TPM authValue file {} {what}", path.display()));
+    let mut file = match check_location(&path, owner).and_then(|()| open_checked(&path, &requirements)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(fail(format!("is present but can't be trusted: {e}"))),
+    };
+    let mut raw = SecretBuffer::read_from(&mut file, AUTH_VALUE_LEN).map_err(|e| fail(format!("could not be read: {e}")))?;
+    let checked = match raw.as_slice() {
+        bytes if bytes.len() != AUTH_VALUE_LEN => Err(fail(format!("is {} bytes, not {AUTH_VALUE_LEN}", bytes.len()))),
+        [.., 0] => Err(fail("ends in a zero byte, which the TPM would drop; it is not one this library wrote".to_string())),
+        bytes => Auth::try_from(bytes.to_vec()).map_err(|e| fail(format!("was rejected: {e}"))), // `Auth` wipes itself on drop
+    };
+    raw.wipe();
+    checked.map(Some)
+}
+
+/// A fresh authValue: [`AUTH_VALUE_LEN`] random bytes, the last non-zero
+/// (see [`read_auth_file`]).
+fn generate_auth_value() -> Result<zeroize::Zeroizing<[u8; AUTH_VALUE_LEN]>> {
+    let mut value = zeroize::Zeroizing::new([0u8; AUTH_VALUE_LEN]);
+    loop {
+        getrandom::fill(&mut value[..]).map_err(|_| Error::Crypto("the OS random number generator failed"))?;
+        if value[AUTH_VALUE_LEN - 1] != 0 {
+            return Ok(value);
+        }
+    }
+}
+
+/// `service`'s authValue, creating its file first if it has none. Two
+/// processes provisioning at once both end up with the one on disk (see
+/// [`write_new_file`]), so they create their keys with the same value.
+fn provision_auth_file(service: &str) -> Result<Auth> {
+    if let Some(auth) = read_auth_file(service)? {
+        return Ok(auth);
+    }
+    write_new_file(service, AUTH_FILE_SUFFIX, "TPM authValue", &generate_auth_value()?[..])?;
+    read_auth_file(service)?.ok_or_else(|| Error::Provider("the TPM authValue file vanished right after it was written".into()))
+}
+
+/// `service`'s authValue, for a key file that exists. A key file whose
+/// authValue file is missing can't be used, and is an error rather than
+/// "not provisioned".
+fn required_auth_file(service: &str) -> Result<Auth> {
+    read_auth_file(service)?.ok_or_else(|| {
+        let path = key_dir().map(|dir| auth_file_path(&dir, service).display().to_string()).unwrap_or_default();
+        Error::Provider(format!(
+            "this service's TPM key file has no authValue file ({path}), so its key can't be used. Restore the file \
+             from a backup, or retire the service and provision it again"
+        ))
+    })
+}
+
+/// Writes `service`'s key file.
+fn write_key_file(service: &str, blob: &KeyBlob) -> Result<()> {
+    let pem = tpm_key_file::encode(blob).map_err(|e| Error::Provider(format!("could not encode the TPM key file: {e}")))?;
+    write_new_file(service, KEY_FILE_SUFFIX, "TPM key", pem.as_bytes())
+}
+
+/// Writes `<service><suffix>` into the key directory, unless it appeared
+/// first. `what` names the file in messages.
 ///
 /// The key directory must already exist, set up by an administrator: its
-/// group decides who may read the keys. A key file written by root takes
-/// the directory's group, mode `0440`, so with the directory
-/// `root:<key-users>` every service in that group can use the keys; one
-/// written by another user (the developer model) is `0400`, since a
-/// group-readable key file its own user owns is refused (see
-/// [`read_key_file`]).
+/// group decides who may read the files. A file written by root takes the
+/// directory's group, mode `0440`, so with the directory `root:<key-users>`
+/// every service in that group can read it -- until an administrator gives
+/// a service's authValue file that service's own group, which keeps every
+/// other service from using its key. One written by another user (the
+/// developer model) is `0400`, since a group-readable file its own user
+/// owns is refused (see [`read_key_file`]).
 ///
 /// The file is written to a hidden temporary name, synced, then
 /// hard-linked to its real name, which fails if that name exists: two
 /// processes provisioning the same service at once can't overwrite each
-/// other's key, and a crash never leaves a partial key file under the real
-/// name. The loser's key is discarded unused and everyone uses the
+/// other's file, and a crash never leaves a partial file under the real
+/// name. The loser's contents are discarded unused and everyone uses the
 /// winner's -- so the caller re-reads the file rather than trusting
-/// `blob`.
-fn write_key_file(service: &str, blob: &KeyBlob) -> Result<()> {
+/// `contents`.
+fn write_new_file(service: &str, suffix: &str, what: &str, contents: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let configured = key_dir()?;
@@ -227,13 +332,12 @@ fn write_key_file(service: &str, blob: &KeyBlob) -> Result<()> {
     let dir_gid = std::fs::metadata(&dir)
         .map_err(|e| Error::Provider(format!("TPM key directory {}: {e}", dir.display())))?
         .gid();
-    let pem = tpm_key_file::encode(blob).map_err(|e| Error::Provider(format!("could not encode the TPM key file: {e}")))?;
 
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).map_err(|_| Error::Crypto("the OS random number generator failed"))?;
-    let temp = dir.join(format!(".{service}{KEY_FILE_SUFFIX}.{:016x}", u64::from_ne_bytes(nonce)));
-    let target = key_file_path(&dir, service);
-    let fail = |what: &str, e: std::io::Error| Error::Provider(format!("could not {what} TPM key file {}: {e}", target.display()));
+    let temp = dir.join(format!(".{service}{suffix}.{:016x}", u64::from_ne_bytes(nonce)));
+    let target = dir.join(format!("{service}{suffix}"));
+    let fail = |doing: &str, e: std::io::Error| Error::Provider(format!("could not {doing} {what} file {}: {e}", target.display()));
 
     // SAFETY: geteuid has no preconditions.
     let as_root = unsafe { libc::geteuid() } == 0;
@@ -248,7 +352,7 @@ fn write_key_file(service: &str, blob: &KeyBlob) -> Result<()> {
             std::os::unix::fs::fchown(&file, None, Some(dir_gid))?;
             file.set_permissions(std::fs::Permissions::from_mode(0o440))?;
         }
-        file.write_all(pem.as_bytes())?;
+        file.write_all(contents)?;
         file.sync_all()
     })();
     if let Err(e) = written {
@@ -260,7 +364,7 @@ fn write_key_file(service: &str, blob: &KeyBlob) -> Result<()> {
     match linked {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            log::info!("hkdfguard: another process provisioned the TPM key for this service first; using its key");
+            log::info!("hkdfguard: another process provisioned the {what} file for this service first; using its file");
         }
         Err(e) => return Err(fail("create", e)),
     }
@@ -871,11 +975,12 @@ fn srk_template() -> Result<Public> {
 /// A service key's template: an HMAC-SHA-256 keyed-hash object, usable
 /// only for HMAC (`sign`, not `decrypt` or `restricted`), generated by the
 /// TPM (`sensitiveDataOrigin`) and fixed to this TPM and this parent, so
-/// never duplicable or exportable. No auth policy and an empty password:
-/// reading the key file is the access control (see the module doc).
-/// `noDA`, since an empty password can't be guessed and its use must never
-/// count toward the TPM's dictionary-attack lockout. A keyed-hash key the
-/// TPM generates is the size of its hash's digest: 256 bits.
+/// never duplicable or exportable. No auth policy; its authValue is given
+/// to `TPM2_Create` and is not part of the public area, so the template
+/// and the key's Name don't depend on it. `noDA`, since a 256-bit random
+/// authValue can't be guessed and a wrong one must never count toward the
+/// TPM's dictionary-attack lockout. A keyed-hash key the TPM generates is
+/// the size of its hash's digest: 256 bits.
 fn service_key_template() -> Result<Public> {
     hmac_key_template(true)
 }
@@ -888,7 +993,7 @@ fn hmac_key_template(generated: bool) -> Result<Public> {
         .with_fixed_tpm(true) // key can never be moved to a different TPM
         .with_fixed_parent(true) // key can never be re-parented/duplicated
         .with_sensitive_data_origin(generated) // the key is generated by the TPM itself
-        .with_user_with_auth(true) // standard "USER role" authorization (the empty password) is sufficient to use the key
+        .with_user_with_auth(true) // USER role: the authValue (none for the self-test key) authorizes use
         .with_no_da(true)
         .with_sign_encrypt(true) // required: TPM2_HMAC needs a signing key
         .with_decrypt(false) // and nothing else: not usable to derive or unseal
@@ -913,39 +1018,48 @@ fn hmac_key_template(generated: bool) -> Result<Public> {
 /// with a self-consistent Name, without consulting any pin. Returns the
 /// still-loaded handle; the caller flushes it. Every failure path flushes
 /// before returning.
+///
+/// Everything is checked against `TPM2_CreatePrimary`'s own response, not
+/// a later `TPM2_ReadPublic`: ESAPI keeps the public area that response
+/// carried, and that cached copy is what `TPM2_StartAuthSession` encrypts
+/// a session's salt to. A check made on a second response would let an
+/// interposer answer `TPM2_CreatePrimary` with its own key and pass
+/// `TPM2_ReadPublic` through untouched, so the pin would match while every
+/// salt went to the interposer. The Name is ESAPI's too, which it has
+/// already compared with that public area.
 fn create_srk_unpinned(ctx: &mut Context) -> Result<(KeyHandle, Public, Name)> {
     let template = srk_template()?;
-    let handle = ctx
+    let created = ctx
         .execute_with_nullauth_session(|ctx| ctx.create_primary(Hierarchy::Owner, template.clone(), None, None, None, None))
         .map_err(|e| {
             note_owner_auth_failure(&e);
             Error::Provider(format!("TPM2_CreatePrimary (storage root key) failed: {e}"))
-        })?
-        .key_handle;
-    let (public, name, _qualified_name) = match ctx.read_public(handle) {
-        Ok(v) => v,
+        })?;
+    let handle = created.key_handle;
+    let public = created.out_public;
+    let checked = ctx
+        .tr_get_name(handle.into())
+        .map_err(|e| Error::Provider(format!("could not read the storage root key's Name: {e}")))
+        .and_then(|name| {
+            verify_matches_template(&template, &public)?;
+            let expected = computed_name(&public)?;
+            if name.value() == expected.as_slice() {
+                Ok(name)
+            } else {
+                Err(Error::Provider(format!(
+                    "storage root key Name mismatch: TPM reported {} for a public area whose Name is {}",
+                    hex(name.value()),
+                    hex(&expected)
+                )))
+            }
+        });
+    match checked {
+        Ok(name) => Ok((handle, public, name)),
         Err(e) => {
             let _ = ctx.flush_context(handle.into());
-            return Err(Error::Provider(format!("TPM2_ReadPublic (storage root key) failed: {e}")));
+            Err(e)
         }
-    };
-    let checked = verify_matches_template(&template, &public).and_then(|()| {
-        let expected = computed_name(&public)?;
-        if name.value() == expected.as_slice() {
-            Ok(())
-        } else {
-            Err(Error::Provider(format!(
-                "storage root key Name mismatch: TPM reported {} for a public area whose Name is {}",
-                hex(name.value()),
-                hex(&expected)
-            )))
-        }
-    });
-    if let Err(e) = checked {
-        let _ = ctx.flush_context(handle.into());
-        return Err(e);
     }
-    Ok((handle, public, name))
 }
 
 /// [`create_srk_unpinned`], plus the policy pin
@@ -971,14 +1085,38 @@ fn create_srk(ctx: &mut Context) -> Result<KeyHandle> {
     }
 }
 
-/// Creates a new service key under the SRK. Returns it as a key file's
-/// contents; nothing stays loaded.
-fn create_service_key(ctx: &mut Context) -> Result<KeyBlob> {
+/// Logged once: a key was provisioned under an unpinned SRK.
+static UNPINNED_SALT_KEY_WARNED: OnceLock<()> = OnceLock::new();
+
+/// Creates a new service key under the SRK, with `auth` as its authValue.
+/// Returns it as a key file's contents; nothing stays loaded.
+///
+/// `TPM2_Create` sends `auth` to the TPM, so it always runs in a salted,
+/// encrypting session, whatever `tpm.session_encryption` says: this is the
+/// one time the authValue crosses the bus, and it never does in cleartext.
+/// The salt is the session's only secret here, so this command is as safe
+/// as the SRK it is salted to -- see `tpm.pinned_session_salt_key_name`.
+fn create_service_key(ctx: &mut Context, auth: &Auth) -> Result<KeyBlob> {
+    if crate::policy::pinned_session_salt_key_name()?.is_none() {
+        UNPINNED_SALT_KEY_WARNED.get_or_init(|| {
+            log::warn!(
+                "hkdfguard: provisioning a TPM key under an unpinned storage root key; on a discrete TPM, someone \
+                 able to rewrite bus traffic now could learn the key's authValue. Set \
+                 tpm.pinned_session_salt_key_name to rule that out"
+            );
+        });
+    }
     let template = service_key_template()?;
     let srk = create_srk(ctx)?;
-    let created = ctx.execute_with_nullauth_session(|ctx| ctx.create(srk, template.clone(), None, None, None, None));
+    let created = start_encrypted_session(ctx, srk).and_then(|session| {
+        let created = ctx
+            .execute_with_session(Some(session), |ctx| ctx.create(srk, template.clone(), Some(auth.clone()), None, None, None))
+            .map_err(|e| Error::Provider(format!("TPM2_Create (service key) failed: {e}")));
+        let _ = ctx.flush_context(SessionHandle::from(session).into());
+        created
+    });
     let _ = ctx.flush_context(srk.into());
-    let created = created.map_err(|e| Error::Provider(format!("TPM2_Create (service key) failed: {e}")))?;
+    let created = created?;
     verify_matches_template(&template, &created.out_public)?;
     Ok(KeyBlob {
         public: created
@@ -989,10 +1127,18 @@ fn create_service_key(ctx: &mut Context) -> Result<KeyBlob> {
     })
 }
 
-/// Loads a key file's key under `srk` and verifies the Name the TPM
-/// reports for it (see [`verify_name`]). Returns the loaded handle; the
-/// caller flushes it.
-fn load_service_key(ctx: &mut Context, srk: KeyHandle, service: &str, public: &Public, private: &Private) -> Result<KeyHandle> {
+/// Loads a key file's key under `srk`, verifies the Name the TPM reports
+/// for it (see [`verify_name`]), and gives ESAPI its authValue, so every
+/// session that uses the key is keyed by it. Returns the loaded handle;
+/// the caller flushes it.
+fn load_service_key(
+    ctx: &mut Context,
+    srk: KeyHandle,
+    service: &str,
+    public: &Public,
+    private: &Private,
+    auth: &Auth,
+) -> Result<KeyHandle> {
     let handle = ctx
         .execute_with_nullauth_session(|ctx| ctx.load(srk, private.clone(), public.clone()))
         .map_err(|e| {
@@ -1004,7 +1150,11 @@ fn load_service_key(ctx: &mut Context, srk: KeyHandle, service: &str, public: &P
     let checked = ctx
         .tr_get_name(handle.into())
         .map_err(|e| Error::Provider(format!("could not read the loaded key's Name: {e}")))
-        .and_then(|name| verify_name(service, public, &name));
+        .and_then(|name| verify_name(service, public, &name))
+        .and_then(|()| {
+            ctx.tr_set_auth(handle.into(), auth.clone())
+                .map_err(|e| Error::Provider(format!("could not set the TPM key's authValue: {e}")))
+        });
     if let Err(e) = checked {
         let _ = ctx.flush_context(handle.into());
         return Err(e);
@@ -1016,156 +1166,54 @@ fn load_service_key(ctx: &mut Context, srk: KeyHandle, service: &str, public: &P
 // Session parameter encryption.
 // ---------------------------------------------------------------------
 //
-// A discrete TPM sits on an LPC or SPI bus that an interposer can read
-// byte-for-byte. `TPM2_HMAC`'s response is one payload's wrapping key (or
-// the KEK fingerprint, which is public); a captured response opens that
-// payload (the salt in each payload's KDF input keeps it from opening any
-// other), and an interposer that stays on the bus captures every
-// subsequent one. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has
-// no external bus, so this is pure overhead there -- hence the `auto`
-// policy mode, which skips it only for known-internal manufacturers.
-// That decision rests on `TPM_PT_MANUFACTURER`, read over the very bus in
-// question, so an active interposer can forge it: `auto` defeats passive
-// sniffing only. Once the SRK is pinned, `auto` stops asking and always
-// encrypts (see `session_encryption_enabled`).
+// A discrete TPM sits on an LPC or SPI bus that an interposer can read and
+// rewrite. `TPM2_HMAC`'s response is one payload's wrapping key (or the
+// KEK fingerprint, which is public). Read, it opens that payload; replaced
+// while a DEK is wrapped, it seals the payload under a key the interposer
+// chose. A firmware or virtual TPM has no such bus, but nothing read over
+// the bus can prove that, so every TPM is treated alike.
 //
-// The mechanism is the TPM 2.0 specification's own (Part 1 §19.6): an
-// HMAC session started with `tpmKey` set to a TPM-resident decrypt key --
-// here the SRK, already loaded to be the key file's parent -- so the
-// session salt is encrypted to that key (one-pass ECDH) and the session
-// key derived from it is never on the bus in cleartext; with
-// `TPMA_SESSION.encrypt` set, the first response parameter -- here
-// `outHMAC` -- is AES-128-CFB encrypted under a key derived from the
-// session key. The cryptography lives in tpm2-tss's ESAPI layer, which
-// tss-esapi wraps; this module only configures the session.
+// What protects the response is the service key's authValue: 32 random
+// bytes in the service's `.tpmauth` file, set on the key when it was
+// created and never sent again. ESAPI and the TPM both key a session's
+// parameter encryption with `sessionKey || authValue` and its response
+// HMAC with the same value (TPM 2.0 Part 1 §19.6 and §21; tpm2-tss's
+// `iesys_compute_session_value`), for the entity the session authorizes --
+// here the service key. So an interposer who doesn't hold the authValue
+// can neither read `outHMAC` nor forge it. That is a symmetric secret: a
+// quantum computer gains nothing against it, and no public key has to be
+// trusted for it to hold.
 //
-// Three things are load-bearing. An *unsalted* session's key derives
-// from the two nonces, both visible on the bus, so the interposer computes
-// it too -- salting is the entire defense, not an option. The SRK is
-// *restricted*: the TPM uses its private half only for its children and
-// inside `TPM2_StartAuthSession`, so nobody -- not even a process that can
-// send the TPM commands and recreate the SRK from its public template --
-// can run ECDH with it to recover a session's salt. And the SRK's public
-// half is itself learned over the bus at `TPM2_ReadPublic`, so an
-// interposer can substitute its own and man-in-the-middle the session;
-// that is what `tpm.pinned_session_salt_key_name` defeats, and why
-// `required` mode refuses to run without a pin.
+// The session is also salted, to the SRK, as a second layer: the salt
+// enters `sessionKey`, so someone who has read the `.tpmauth` file but
+// can't man-in-the-middle the SRK still sees nothing. The salt is the
+// specification's one-pass ECDH, and the one classical step left. It
+// stands alone only at `TPM2_Create`, which sends a new key's authValue
+// and so can't be protected by it; `tpm.pinned_session_salt_key_name`
+// closes that against an interposer active at provisioning, and the ECDH
+// is the residual against one who records provisioning and later breaks
+// P-256.
 //
-// The session salt's one-pass ECDH is the TPM specification's, and the
-// one place a quantum computer would matter here: someone who records the
-// bus today and can later break P-256 recovers the session keys, and with
-// them the wrapping keys that crossed the bus. Only the TCG can change
-// that mechanism. On a firmware or virtual TPM there is no bus to record.
+// The session is never bound: binding to the service key would drop its
+// authValue from the response HMAC key (tpm2-tss: "bound to the object").
 //
-// Nothing secret crosses the bus outside the session: `TPM2_Load` sends
-// the key file's private area, which is encrypted under the SRK, and the
-// key has no password to send.
+// The SRK is *restricted*: the TPM uses its private half only for its
+// children and inside `TPM2_StartAuthSession`, so nobody can run ECDH with
+// it to recover a session's salt.
 
-/// `TPM_PT_MANUFACTURER` identifiers of TPMs that live inside the SoC or
-/// a hypervisor and so have no external bus to probe. Anything not listed
-/// is treated as discrete and encrypted: `auto` only ever *skips*
-/// encryption for a TPM positively known to be internal.
-///
-/// The property is four ASCII bytes packed big-endian; vendors shorter
-/// than four characters pad with a space *or* a NUL depending on the
-/// implementation (libtpms/swtpm reports `"IBM\0"`), so comparison is on
-/// the identifier with trailing padding stripped.
-const NO_EXTERNAL_BUS_MANUFACTURERS: &[&[u8]] = &[
-    b"INTC", // Intel PTT (fTPM inside the CSME)
-    b"AMD",  // AMD fTPM (inside the PSP)
-    b"QCOM", // Qualcomm fTPM
-    b"MSFT", // Hyper-V vTPM
-    b"IBM",  // IBM software TPM, i.e. swtpm / libtpms
-    b"GOOG", // Google Cloud vTPM
-    b"VMW",  // VMware vTPM
-];
-
-/// The manufacturer identifier with trailing space/NUL padding removed.
-fn manufacturer_id_bytes(id: u32) -> Vec<u8> {
-    let bytes = id.to_be_bytes();
-    let end = bytes
-        .iter()
-        .rposition(|b| *b != b' ' && *b != 0)
-        .map_or(0, |i| i + 1);
-    bytes[..end].to_vec()
-}
-
-fn manufacturer_has_no_external_bus(id: u32) -> bool {
-    let trimmed = manufacturer_id_bytes(id);
-    NO_EXTERNAL_BUS_MANUFACTURERS.contains(&trimmed.as_slice())
-}
-
-/// Once-per-process `auto`-mode verdict: does this TPM lack an external
-/// bus? A fact about the hardware, so cached like the conformance
-/// verdict. Only consulted under `auto`; `required`/`off` are policy and
-/// are re-read on every call like everything else.
-static TPM_NO_EXTERNAL_BUS: OnceLock<bool> = OnceLock::new();
-
-/// Logged once: `auto` chose to encrypt but the SRK isn't pinned.
-static UNPINNED_SALT_KEY_WARNED: OnceLock<()> = OnceLock::new();
-
-/// Whether `TPM2_HMAC` should run inside an encrypted session on this
-/// call, per `tpm.session_encryption`.
-fn session_encryption_enabled(ctx: &mut Context) -> Result<bool> {
-    use crate::policy::SessionEncryption;
-    match crate::policy::tpm_session_encryption() {
-        SessionEncryption::Required => Ok(true),
-        SessionEncryption::Off => Ok(false),
-        SessionEncryption::Auto => {
-            // A pinned SRK is the operator's statement that this TPM may
-            // have a bus worth defending, and it is what makes the
-            // encryption hold against an active interposer. Don't let a
-            // manufacturer string read over that same bus -- which such an
-            // interposer can rewrite to "INTC" -- switch it back off.
-            if crate::policy::pinned_session_salt_key_name()?.is_some() {
-                return Ok(true);
-            }
-            if let Some(internal) = TPM_NO_EXTERNAL_BUS.get() {
-                return Ok(!internal);
-            }
-            let internal = match ctx.get_tpm_property(PropertyTag::Manufacturer) {
-                Ok(Some(id)) if manufacturer_has_no_external_bus(id) => {
-                    log::info!(
-                        "hkdfguard: TPM manufacturer {:?} has no external bus; session encryption skipped (tpm.session_encryption = \"auto\")",
-                        String::from_utf8_lossy(&id.to_be_bytes())
-                    );
-                    true
-                }
-                Ok(Some(id)) => {
-                    log::info!(
-                        "hkdfguard: TPM manufacturer {:?} treated as discrete; HMAC runs in a salted, parameter-encrypted session",
-                        String::from_utf8_lossy(&id.to_be_bytes())
-                    );
-                    false
-                }
-                Ok(None) => {
-                    log::warn!("hkdfguard: TPM did not report a manufacturer; assuming discrete and encrypting sessions");
-                    false
-                }
-                Err(e) => {
-                    return Err(Error::Provider(format!("TPM2_GetCapability(manufacturer) failed: {e}")));
-                }
-            };
-            Ok(!*TPM_NO_EXTERNAL_BUS.get_or_init(|| internal))
-        }
-    }
+/// Whether `TPM2_HMAC` runs in an encrypting session, per
+/// `tpm.session_encryption`.
+fn session_encryption_enabled() -> bool {
+    crate::policy::tpm_session_encryption() == crate::policy::SessionEncryption::On
 }
 
 /// Starts a salted HMAC session, salted to `srk`, with response and
 /// command parameter encryption (AES-128-CFB). The caller flushes it.
 fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSession> {
-    if crate::policy::pinned_session_salt_key_name()?.is_none() {
-        UNPINNED_SALT_KEY_WARNED.get_or_init(|| {
-            log::warn!(
-                "hkdfguard: encrypting TPM sessions with an unpinned storage root key; this defeats passive bus sniffing \
-                 but not an active interposer -- set tpm.pinned_session_salt_key_name to close that"
-            );
-        });
-    }
     let session = ctx
         .start_auth_session(
             Some(srk), // salted: the session key depends on a secret only this TPM can unwrap
-            None,
+            None,      // never bound: see the section comment
             None,
             SessionType::Hmac,
             SymmetricDefinition::AES_128_CFB,
@@ -1175,7 +1223,7 @@ fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSess
         .ok_or_else(|| Error::Provider("TPM2_StartAuthSession returned no session".into()))?;
 
     let (attributes, mask) = SessionAttributesBuilder::new()
-        .with_decrypt(true) // encrypt the command's first parameter (buffer, the PRF input -- public, but harmless)
+        .with_decrypt(true) // encrypt the command's first parameter (TPM2_HMAC's buffer; TPM2_Create's inSensitive, which holds the authValue)
         .with_encrypt(true) // encrypt the response's first parameter (outHMAC, i.e. the wrapping key)
         .with_continue_session(true)
         .build();
@@ -1206,9 +1254,26 @@ fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSess
     }
 }
 
-/// One `TPM2_HMAC` of `input` with `key`: in `session` when given (see
-/// [`start_encrypted_session`]), else a plain HMAC authorization session.
-/// One-shot, never a sequence (see the module doc).
+/// Starts an unsalted HMAC session with no parameter encryption, for
+/// `tpm.session_encryption = "off"`. Its responses are still authenticated
+/// by the key's authValue. The caller flushes it.
+fn start_plain_session(ctx: &mut Context) -> Result<AuthSession> {
+    let session = ctx
+        .start_auth_session(None, None, None, SessionType::Hmac, SymmetricDefinition::AES_128_CFB, HashingAlgorithm::Sha256)
+        .map_err(|e| Error::Provider(format!("TPM2_StartAuthSession failed: {e}")))?
+        .ok_or_else(|| Error::Provider("TPM2_StartAuthSession returned no session".into()))?;
+    let (attributes, mask) = SessionAttributesBuilder::new().with_continue_session(true).build();
+    if let Err(e) = ctx.tr_sess_set_attributes(session, attributes, mask) {
+        let _ = ctx.flush_context(SessionHandle::from(session).into());
+        return Err(Error::Provider(format!("failed to set TPM session attributes: {e}")));
+    }
+    Ok(session)
+}
+
+/// One `TPM2_HMAC` of `input` with `key`, authorized by `session`, or --
+/// for the self-test's known-answer key, which has no authValue -- by a
+/// throwaway null-auth session. One-shot, never a sequence (see the module
+/// doc).
 fn tpm_hmac(ctx: &mut Context, session: Option<AuthSession>, key: KeyHandle, input: &[u8]) -> Result<PrfOutput> {
     let buffer = MaxBuffer::try_from(input.to_vec())
         .map_err(|e| Error::Provider(format!("a {}-byte PRF input does not fit one TPM2_HMAC: {e}", input.len())))?;
@@ -1228,30 +1293,31 @@ fn tpm_hmac(ctx: &mut Context, session: Option<AuthSession>, key: KeyHandle, inp
 /// The PRF on the TPM: re-derives the SRK, loads the key file's key under
 /// it -- verifying its Name, and any policy-pinned Name, *before* it is
 /// used, so a key that isn't the one policy expects never computes
-/// anything -- runs one `TPM2_HMAC` per input, and flushes everything on
-/// every path, so no transient object or session slot (TPMs have very few)
-/// can leak. Under session encryption all the inputs share one session.
-fn tpm_prf(ctx: &mut Context, service: &str, public: &Public, private: &Private, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
+/// anything -- runs one `TPM2_HMAC` per input in one session keyed by the
+/// key's authValue, and flushes everything on every path, so no transient
+/// object or session slot (TPMs have very few) can leak.
+fn tpm_prf(
+    ctx: &mut Context,
+    service: &str,
+    public: &Public,
+    private: &Private,
+    auth: &Auth,
+    inputs: &[&[u8]],
+) -> Result<Vec<PrfOutput>> {
     let srk = create_srk(ctx)?;
-    let key = match load_service_key(ctx, srk, service, public, private) {
+    let key = match load_service_key(ctx, srk, service, public, private, auth) {
         Ok(key) => key,
         Err(e) => {
             let _ = ctx.flush_context(srk.into());
             return Err(e);
         }
     };
-    let outputs = match session_encryption_enabled(ctx) {
-        Err(e) => Err(e),
-        Ok(true) => match start_encrypted_session(ctx, srk) {
-            Ok(session) => {
-                let outputs = inputs.iter().map(|input| tpm_hmac(ctx, Some(session), key, input)).collect();
-                let _ = ctx.flush_context(SessionHandle::from(session).into());
-                outputs
-            }
-            Err(e) => Err(e),
-        },
-        Ok(false) => inputs.iter().map(|input| tpm_hmac(ctx, None, key, input)).collect(),
-    };
+    let session = if session_encryption_enabled() { start_encrypted_session(ctx, srk) } else { start_plain_session(ctx) };
+    let outputs = session.and_then(|session| {
+        let outputs = inputs.iter().map(|input| tpm_hmac(ctx, Some(session), key, input)).collect();
+        let _ = ctx.flush_context(SessionHandle::from(session).into());
+        outputs
+    });
     let _ = ctx.flush_context(key.into());
     let _ = ctx.flush_context(srk.into());
     outputs
@@ -1261,15 +1327,17 @@ fn tpm_prf(ctx: &mut Context, service: &str, public: &Public, private: &Private,
 // Handles.
 // ---------------------------------------------------------------------
 
-// Handle type returned from `load_kek`. Holds the key file as it was read
-// once in `load_kek`, so every PRF call within one wrap/unwrap uses the
-// same key even if the file is replaced in between; the key is loaded into
-// the TPM only inside `prf`, and flushed before it returns.
+// Handle type returned from `load_kek`. Holds the key file and its
+// authValue as they were read once in `load_kek`, so every PRF call within
+// one wrap/unwrap uses the same key even if the files are replaced in
+// between; the key is loaded into the TPM only inside `prf`, and flushed
+// before it returns.
 struct Tpm2Handle {
     key_id: Vec<u8>,                      // diagnostic-only tag embedded in the wrapped payload
     service: String,                      // the service name, for its policy pin
     public: Public,                       // the key file's public area
     private: Private,                     // the key file's private area, encrypted under the SRK
+    auth: Auth,                           // the key's authValue (wiped on drop)
     context: Arc<Mutex<Option<Context>>>, // shared handle back to the TPM connection
 }
 
@@ -1279,7 +1347,7 @@ impl KekHandle for Tpm2Handle {
     }
 
     fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
-        with_context(&self.context, |ctx| tpm_prf(ctx, &self.service, &self.public, &self.private, inputs))
+        with_context(&self.context, |ctx| tpm_prf(ctx, &self.service, &self.public, &self.private, &self.auth, inputs))
     }
 }
 
@@ -1292,16 +1360,20 @@ impl KekProvider for Tpm2Provider {
         self.refused.is_some() || self.connected()
     }
 
-    // A service has a KEK here when it has a usable key file -- and, under
-    // `tpm.require_pinned_names`, a pinned Name. Side-effect free: nothing
-    // is sent to the TPM.
+    // A service has a KEK here when it has a usable key file and authValue
+    // file -- and, under `tpm.require_pinned_names`, a pinned Name. Side-
+    // effect free: nothing is sent to the TPM. A key file without its
+    // authValue file is an error, not "no KEK".
     fn kek_exists(&self, service: &str) -> Result<bool> {
         self.check_not_refused()?;
         if !self.connected() {
             return Ok(false);
         }
         match read_key_file(service)? {
-            Some(file) => pin_allows(service, &file.public),
+            Some(file) => {
+                required_auth_file(service)?;
+                pin_allows(service, &file.public)
+            }
             None => Ok(false),
         }
     }
@@ -1311,17 +1383,22 @@ impl KekProvider for Tpm2Provider {
         if !self.connected() {
             return Err(Error::Provider("TPM context not available".into()));
         }
-        let file = match read_key_file(service)? {
-            Some(file) => file,
+        let (file, auth) = match read_key_file(service)? {
+            Some(file) => (file, required_auth_file(service)?),
             None if !create_if_missing => return Err(Error::KeyNotProvisioned("no TPM key file for this service")),
             None => {
-                let blob = with_context(&self.context, create_service_key)?;
+                // The authValue file first: a concurrent provisioner then
+                // finds it and creates its key with the same value, so
+                // whichever key file wins below matches it.
+                let auth = provision_auth_file(service)?;
+                let blob = with_context(&self.context, |ctx| create_service_key(ctx, &auth))?;
                 write_key_file(service, &blob)?;
                 // Re-read rather than trusting `blob`: a concurrent
                 // provisioning may have won, and the file on disk is the
                 // key every later call uses.
-                read_key_file(service)?
-                    .ok_or_else(|| Error::Provider("the TPM key file vanished right after it was written".into()))?
+                let file = read_key_file(service)?
+                    .ok_or_else(|| Error::Provider("the TPM key file vanished right after it was written".into()))?;
+                (file, auth)
             }
         };
         if !pin_allows(service, &file.public)? {
@@ -1337,31 +1414,24 @@ impl KekProvider for Tpm2Provider {
         }
         if create_if_missing {
             // Provisioning reports the KEK as ready, so prove the key file
-            // loads on *this* TPM first.
-            with_context(&self.context, |ctx| {
-                let srk = create_srk(ctx)?;
-                let key = load_service_key(ctx, srk, service, &file.public, &file.private);
-                if let Ok(key) = &key {
-                    let _ = ctx.flush_context((*key).into());
-                }
-                let _ = ctx.flush_context(srk.into());
-                key.map(|_| ())
-            })?;
+            // loads on *this* TPM and its authValue authorizes it first.
+            with_context(&self.context, |ctx| tpm_prf(ctx, service, &file.public, &file.private, &auth, &[b"provisioned"]))?;
         }
         Ok(Box::new(Tpm2Handle {
             key_id: service_fingerprint(service),
             service: service.to_string(),
             public: file.public,
             private: file.private,
+            auth,
             context: Arc::clone(&self.context), // clone the Arc (cheap: just bumps a refcount), not the underlying context
         }))
     }
 
     // Deletes the key file, once its key is confirmed (on the TPM) to have
-    // `expected_fingerprint` and the file is confirmed to be the one read.
-    // The TPM keeps no copy, so every DEK wrapped under it is then
-    // unrecoverable -- unless a copy of the key file survives (a backup),
-    // which still loads on this TPM.
+    // `expected_fingerprint` and the file is confirmed to be the one read,
+    // then its authValue file. The TPM keeps no copy, so every DEK wrapped
+    // under it is then unrecoverable -- unless copies of both files survive
+    // (a backup), which still load on this TPM.
     fn retire_kek(&self, service: &str, expected_fingerprint: &[u8; crate::payload::FINGERPRINT_LEN]) -> Result<()> {
         self.check_not_refused()?;
         if !self.connected() {
@@ -1375,6 +1445,7 @@ impl KekProvider for Tpm2Provider {
             service: service.to_string(),
             public: file.public,
             private: file.private,
+            auth: required_auth_file(service)?,
             context: Arc::clone(&self.context),
         };
         if crate::crypto::kek_fingerprint(&handle)? != *expected_fingerprint {
@@ -1387,6 +1458,13 @@ impl KekProvider for Tpm2Provider {
         }
         std::fs::remove_file(&path)
             .map_err(|e| Error::Provider(format!("could not delete TPM key file {}: {e}", path.display())))?;
+        // The key file is gone, so the key is retired: an authValue file
+        // left behind by a failure here is harmless, and provisioning the
+        // service again reuses it.
+        let auth_path = auth_file_path(&dir, service);
+        if let Err(e) = std::fs::remove_file(&auth_path) {
+            log::warn!("hkdfguard: retired the TPM key, but could not delete its authValue file {}: {e}", auth_path.display());
+        }
         sync_dir(&dir).map_err(|e| Error::Provider(format!("could not persist deleting TPM key file {}: {e}", path.display())))
     }
 }
@@ -1909,27 +1987,75 @@ mod tests {
         }
     }
 
-    #[test]
-    fn manufacturer_classification_skips_only_known_internal_tpms() {
-        let id = |s: &[u8; 4]| u32::from_be_bytes(*s);
-        // Known fTPM / vTPM vendors: no bus, skip -- whether the short
-        // identifier is padded with spaces or with NULs.
-        for m in [b"INTC", b"AMD ", b"AMD\0", b"IBM ", b"IBM\0", b"MSFT", b"VMW\0"] {
-            assert!(manufacturer_has_no_external_bus(id(m)), "{:?}", String::from_utf8_lossy(m));
-        }
-        // Discrete vendors: encrypt.
-        for m in [b"IFX ", b"IFX\0", b"STM ", b"NTC ", b"ATML"] {
-            assert!(!manufacturer_has_no_external_bus(id(m)), "{:?}", String::from_utf8_lossy(m));
-        }
-        // Unknown: encrypt -- auto only ever skips for a positive match.
-        assert!(!manufacturer_has_no_external_bus(id(b"ZZZZ")));
-        assert!(!manufacturer_has_no_external_bus(0)); // all-NUL trims to empty, which matches nothing
+    // ---- authValue files (no TPM needed) ----
 
-        // Padding is stripped, and only padding.
-        assert_eq!(manufacturer_id_bytes(id(b"IBM\0")), b"IBM");
-        assert_eq!(manufacturer_id_bytes(id(b"IBM ")), b"IBM");
-        assert_eq!(manufacturer_id_bytes(id(b"INTC")), b"INTC");
-        assert_eq!(manufacturer_id_bytes(0), b"");
+    #[test]
+    #[serial]
+    fn provisioning_an_auth_file_writes_32_private_bytes_and_reuses_them() {
+        with_key_dir(|dir| {
+            assert!(read_auth_file(SERVICE).unwrap().is_none(), "no file: none provisioned");
+            let first = provision_auth_file(SERVICE).unwrap();
+            let path = dir.join("com.company.orders.tpmauth");
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.len(), AUTH_VALUE_LEN);
+            assert_ne!(bytes[AUTH_VALUE_LEN - 1], 0, "the TPM would drop a trailing zero");
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o400);
+            assert_eq!(first.value(), bytes.as_slice());
+
+            // Provisioning again -- or a concurrent provisioner that lost
+            // the race -- uses the value on disk, never a new one.
+            assert_eq!(provision_auth_file(SERVICE).unwrap().value(), bytes.as_slice());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_ne!(provision_auth_file("com.company.billing").unwrap().value(), bytes.as_slice(), "one value per service");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_auth_file_this_library_would_not_write_is_refused() {
+        with_key_dir(|dir| {
+            let path = dir.join("com.company.orders.tpmauth");
+            let put = |bytes: &[u8], mode: u32| {
+                let _ = std::fs::remove_file(&path);
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            };
+            let refused = |why: &str| match read_auth_file(SERVICE) {
+                Err(Error::Provider(msg)) => assert!(msg.contains(why), "expected {why:?}, got {msg}"),
+                other => panic!("expected a refusal ({why}), got {:?}", other.map(|a| a.map(|_| ()))),
+            };
+            put(&[7u8; 31], 0o400);
+            refused("is 31 bytes");
+            put(&[7u8; 33], 0o400);
+            refused("could not be read");
+            let mut trailing_zero = [7u8; AUTH_VALUE_LEN];
+            trailing_zero[AUTH_VALUE_LEN - 1] = 0;
+            put(&trailing_zero, 0o400);
+            refused("zero byte");
+            put(&[7u8; AUTH_VALUE_LEN], 0o440); // group-readable, but owned by this user rather than root
+            refused("can't be trusted");
+            put(&[7u8; AUTH_VALUE_LEN], 0o400);
+            assert!(read_auth_file(SERVICE).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_key_file_without_its_auth_file_is_an_error_not_unprovisioned() {
+        with_key_dir(|_| {
+            write_key_file(SERVICE, &fake_blob(&fake_service_public())).unwrap();
+            match required_auth_file(SERVICE) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("no authValue file") && msg.contains(".tpmauth"), "{msg}"),
+                other => panic!("expected an error, got {:?}", other.map(|_| ())),
+            }
+        });
+    }
+
+    #[test]
+    fn generated_auth_values_never_end_in_zero_and_differ() {
+        let values: Vec<_> = (0..256).map(|_| generate_auth_value().unwrap()).collect();
+        assert!(values.iter().all(|v| v[AUTH_VALUE_LEN - 1] != 0));
+        assert_ne!(*values[0], *values[1]);
     }
 
     // ---------------------------------------------------------------
@@ -2064,6 +2190,10 @@ mod tests {
             let path = dir.join("spliced.tpmkey");
             std::fs::write(&path, tpm_key_file::encode(&spliced).unwrap()).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            // The private half's own authValue, so only the TPM's check is left to catch it.
+            let auth = dir.join("spliced.tpmauth");
+            std::fs::copy(dir.join("orders.tpmauth"), &auth).unwrap();
+            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o400)).unwrap();
 
             let handle = tpm.load_kek("spliced", false).expect("the file checks can't see the splice");
             match handle.prf(&[b"input"]) {
@@ -2094,9 +2224,10 @@ mod tests {
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
             let file = read_key_file(SERVICE).unwrap().unwrap();
+            let auth = read_auth_file(SERVICE).unwrap().unwrap();
             let name = with_tpm_context(|ctx| {
                 let srk = create_srk(ctx)?;
-                let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private)?;
+                let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private, &auth)?;
                 let read = ctx.read_public(key).map_err(|e| Error::Provider(e.to_string()));
                 let _ = ctx.flush_context(key.into());
                 let _ = ctx.flush_context(srk.into());
@@ -2174,11 +2305,16 @@ mod tests {
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
             let file = read_key_file(SERVICE).unwrap().unwrap();
+            let auth = read_auth_file(SERVICE).unwrap().unwrap();
             let input = vec![0x42; crate::crypto::MAX_PRF_INPUT_LEN];
             let (plain, encrypted) = with_tpm_context(|ctx| {
                 let srk = create_srk(ctx)?;
-                let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private)?;
-                let plain = tpm_hmac(ctx, None, key, &input);
+                let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private, &auth)?;
+                let plain = start_plain_session(ctx).and_then(|session| {
+                    let mac = tpm_hmac(ctx, Some(session), key, &input);
+                    let _ = ctx.flush_context(SessionHandle::from(session).into());
+                    mac
+                });
                 let encrypted = start_encrypted_session(ctx, srk).and_then(|session| {
                     let mac = tpm_hmac(ctx, Some(session), key, &input);
                     let _ = ctx.flush_context(SessionHandle::from(session).into());
@@ -2228,10 +2364,11 @@ mod tests {
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
             let file = read_key_file(SERVICE).unwrap().unwrap();
+            let auth = read_auth_file(SERVICE).unwrap().unwrap();
             let (refused, accepted) = with_tpm_context(|ctx| {
                 let srk = create_srk(ctx)?;
                 let refused = tpm_hmac(ctx, None, srk, b"input").is_err();
-                let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private)?;
+                let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private, &auth)?;
                 let accepted = tpm_hmac(ctx, None, key, b"input").is_ok();
                 let _ = ctx.flush_context(key.into());
                 let _ = ctx.flush_context(srk.into());
@@ -2253,7 +2390,7 @@ mod tests {
         with_key_dir(|_| {
             provider().load_kek(SERVICE, true).unwrap();
             let policy_for = |name_hex: &str| {
-                format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{name_hex}\"\n")
+                format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"on\"\npinned_session_salt_key_name = \"{name_hex}\"\n")
             };
             with_policy(&policy_for(&hex(&real)), || prf_output(SERVICE, false, b"input"))
                 .expect("a correctly pinned SRK must work");
@@ -2270,45 +2407,90 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
-    fn auto_mode_skips_encryption_on_an_internal_tpm_unless_pinned_and_required_forces_it() {
-        // swtpm and firmware TPMs report a known no-bus manufacturer, so
-        // `auto` (the default, no policy file) skips encryption; `required`
-        // still encrypts. Both paths must still produce a working HMAC.
-        let (auto, reported) = with_tpm_context(|ctx| {
-            let reported = ctx
-                .get_tpm_property(PropertyTag::Manufacturer)
-                .map_err(|e| Error::Provider(e.to_string()))?;
-            Ok((session_encryption_enabled(ctx)?, reported))
-        })
-        .unwrap();
-        // Report what the TPM actually said, so a classification miss
-        // explains itself instead of just failing.
-        assert!(
-            !auto,
-            "auto must skip encryption on an internal TPM; TPM_PT_MANUFACTURER was {:?} (raw {reported:?})",
-            reported.map(|id| String::from_utf8_lossy(&id.to_be_bytes()).into_owned())
-        );
-
-        let real = hex(&srk_name());
-        // `auto` with a pinned SRK encrypts too, even on a TPM whose
-        // manufacturer it would otherwise skip: the manufacturer is read
-        // over the bus, so an interposer could have written it.
-        let pinned_auto = with_policy(
-            &format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"auto\"\npinned_session_salt_key_name = \"{real}\"\n"),
-            || with_tpm_context(session_encryption_enabled),
-        )
-        .unwrap();
-        assert!(pinned_auto, "auto with a pinned SRK must encrypt, whatever the manufacturer");
-
-        let required = format!(
-            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{real}\"\n"
-        );
-        with_policy(&required, || {
-            assert!(with_tpm_context(session_encryption_enabled).unwrap(), "required must encrypt regardless of manufacturer");
-            // And the full production path -- load_kek + prf -- works under it.
-            with_key_dir(|_| {
-                assert_ne!(prf_output(SERVICE, true, b"input").unwrap(), [0u8; 32], "HMAC through the encrypted session must succeed");
+    fn session_encryption_on_and_off_give_the_same_prf() {
+        // The full production path -- load_kek + prf -- under both modes.
+        // On is the default: no policy setting needed.
+        with_key_dir(|_| {
+            assert!(session_encryption_enabled(), "encryption is on by default");
+            let on = prf_output(SERVICE, true, b"input").unwrap();
+            let off = with_policy("[tpm]\nsession_encryption = \"off\"\n", || {
+                assert!(!session_encryption_enabled());
+                prf_output(SERVICE, false, b"input").unwrap()
             });
+            assert_eq!(on, off, "parameter encryption must not change the HMAC");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn the_key_is_unusable_without_its_auth_value_and_a_wrong_one_costs_no_lockout() {
+        // What makes the authValue the bus's protection: the TPM refuses
+        // TPM2_HMAC with the key unless the session proves it. The key is
+        // noDA, so a wrong value is TPM_RC_BAD_AUTH and never counts
+        // toward lockout -- this test can run as often as it likes.
+        with_key_dir(|dir| {
+            provider().load_kek(SERVICE, true).unwrap();
+            let file = read_key_file(SERVICE).unwrap().unwrap();
+            let mut wrong = read_auth_file(SERVICE).unwrap().unwrap().value().to_vec();
+            wrong[0] ^= 0x01;
+            for (what, auth) in [("empty", Auth::default()), ("wrong", Auth::try_from(wrong).unwrap())] {
+                for encrypted in [true, false] {
+                    let result = with_tpm_context(|ctx| {
+                        let srk = create_srk(ctx)?;
+                        let key = load_service_key(ctx, srk, SERVICE, &file.public, &file.private, &auth)?;
+                        let session = if encrypted { start_encrypted_session(ctx, srk) } else { start_plain_session(ctx) };
+                        let mac = session.and_then(|session| {
+                            let mac = tpm_hmac(ctx, Some(session), key, b"input");
+                            let _ = ctx.flush_context(SessionHandle::from(session).into());
+                            mac
+                        });
+                        let _ = ctx.flush_context(key.into());
+                        let _ = ctx.flush_context(srk.into());
+                        mac
+                    });
+                    match result {
+                        Err(Error::Provider(msg)) => assert!(msg.contains("TPM2_HMAC failed"), "{what}, encrypted {encrypted}: {msg}"),
+                        Ok(_) => panic!("the TPM must refuse the key with an {what} authValue (encrypted {encrypted})"),
+                        Err(other) => panic!("{what}, encrypted {encrypted}: unexpected {other:?}"),
+                    }
+                }
+            }
+            // The right value still works afterwards: nothing was locked out.
+            prf_output(SERVICE, false, b"input").unwrap();
+
+            // The provider itself: its authValue file replaced, the key is refused.
+            let path = dir.join("com.company.orders.tpmauth");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&path, [0x5au8; AUTH_VALUE_LEN]).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert!(prf_output(SERVICE, false, b"input").is_err(), "a replaced authValue file must not authorize the key");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn provisioning_and_retiring_cover_the_auth_file() {
+        with_key_dir(|dir| {
+            let tpm = provider();
+            let key_path = dir.join("com.company.orders.tpmkey");
+            let auth_path = dir.join("com.company.orders.tpmauth");
+            let right = fingerprint(&*tpm.load_kek(SERVICE, true).unwrap());
+            assert!(key_path.exists() && auth_path.exists(), "provisioning writes both files");
+
+            // A key file whose authValue file is gone: an error, never "no KEK".
+            let saved = std::fs::read(&auth_path).unwrap();
+            std::fs::remove_file(&auth_path).unwrap();
+            assert!(matches!(tpm.kek_exists(SERVICE), Err(Error::Provider(_))));
+            assert!(matches!(tpm.load_kek(SERVICE, false), Err(Error::Provider(_))));
+            assert!(matches!(tpm.load_kek(SERVICE, true), Err(Error::Provider(_))), "provisioning never replaces a lost authValue");
+            std::fs::write(&auth_path, &saved).unwrap();
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert_eq!(fingerprint(&*tpm.load_kek(SERVICE, false).unwrap()), right, "restored from backup, it works again");
+
+            tpm.retire_kek(SERVICE, &right).unwrap();
+            assert!(!key_path.exists() && !auth_path.exists(), "retiring deletes both");
         });
     }
 

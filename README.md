@@ -403,17 +403,20 @@ storage root key (SRK), the TCG's standard ECC P-256 storage key. The
 result is saved as a **key file**, `/var/lib/hkdfguard/tpm/<service>.tpmkey`,
 in the TPM 2.0 key file format (`-----BEGIN TSS2 PRIVATE KEY-----`, parent
 `0x40000001`) that the OpenSSL tpm2 provider and tpm2-tss-engine also use.
-Every wrap and unwrap re-creates the SRK from its template, loads the key
-file under it with `TPM2_Load`, runs one one-shot `TPM2_HMAC` per input,
-and flushes both, so nothing stays on the TPM and no persistent handle is
+The key has a random 32-byte authValue, kept beside it in
+`<service>.tpmauth`. Every wrap and unwrap re-creates the SRK from its
+template, loads the key file under it with `TPM2_Load`, runs one one-shot
+`TPM2_HMAC` per input in a session keyed by the authValue, and flushes
+everything, so nothing stays on the TPM and no persistent handle is
 needed. The provider never uses the `TPM2_HMAC_Start`/`TPM2_SequenceUpdate`
 sequence commands: on an Intel PTT firmware TPM that sequence put the TPM
 into failure mode until the next reboot. When the provider connects, its
 self-test checks that the SRK re-derives identically and runs a
 known-answer `TPM2_HMAC` test, so a TPM whose HMAC disagrees with
 HMAC-SHA-256 is refused before it wraps anything. A key file holding an ECC key
-(from the pre-release ECDH format) is refused with a message saying to
-delete it and provision again.
+(from the pre-release ECDH format), or an HMAC key with an empty password
+(from before authValues), is refused with a message saying to delete it
+and provision again.
 
 What the TPM guarantees:
 
@@ -428,11 +431,13 @@ What the TPM guarantees:
   this TPM and never duplicated out: no key file can hold an HMAC key
   anyone knows.
 
-What it does not: the key has no password, so **anyone who can read a key
-file and open the TPM can use that KEK.** Read access to the key file is
-the access control, as the PIN file is for PKCS#11. The packages create
-the directory as `root:hkdfguard 0750`, so the members of `hkdfguard` may
-use TPM keys; without the packages, create it as root:
+What it does not: **anyone who can read a key file and its authValue file,
+and open the TPM, can use that KEK.** Read access to the two files is the
+access control, as the PIN file is for PKCS#11. The packages create the
+directory as `root:hkdfguard 0750`, so the members of `hkdfguard` may use
+TPM keys; give a service's `.tpmauth` file that service's own group to
+keep the others from using its key. Without the packages, create the
+directory as root:
 
 ```sh
 install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
@@ -506,59 +511,42 @@ it; pair the allowlist with `mode = "require"`, `provider = "tpm2"` (or
 
 **2. Session parameter encryption (bus protection).** On a *discrete*
 TPM — a separate chip on the LPC/SPI bus — an interposer can read
-`TPM2_HMAC`'s response, the payload's wrapping key, in cleartext. Each
-response opens one payload (the salt in the KDF context keeps a captured
-`K_wrap` from opening any other), but an interposer that stays on
-the bus captures every subsequent one. The provider can run that command inside
-a salted HMAC session with parameter encryption (TPM 2.0 Part 1 §19.6;
-the cryptography is tpm2-tss's ESAPI, not this crate's), so the wrapping
-key crosses the bus AES-128-CFB encrypted. Nothing else secret crosses the
-bus: `TPM2_Load` sends the key file's private half, which is encrypted
-under the SRK, and the key has no password to send.
+`TPM2_HMAC`'s response, the payload's wrapping key, or replace it while a
+DEK is wrapped, sealing the payload under a key they chose. The service
+key's authValue is what stops both. ESAPI and the TPM key a session's
+parameter encryption, and its response HMAC, with the session key followed
+by the authValue of the entity the session authorizes (TPM 2.0 Part 1
+§19.6 and §21; tpm2-tss's `iesys_compute_session_value`). Every
+`TPM2_HMAC` runs in such a session for the service key, so without the
+`.tpmauth` file nobody can read `outHMAC` off the bus or forge one. It is a
+symmetric secret: no public key has to be trusted for it to hold, and a
+quantum computer gains nothing against it. Nothing read over the bus can
+prove a TPM has no bus, so every TPM is treated alike.
 
 ```toml
 [tpm]
-session_encryption = "auto"           # "auto" (default) | "required" | "off"
-pinned_session_salt_key_name = "000b<64 hex chars>"
+session_encryption = "on"             # "on" (default) | "off" (test harnesses only)
+pinned_session_salt_key_name = "000b<64 hex chars>"   # pin before provisioning on a discrete TPM
 ```
 
-`auto` reads `TPM_PT_MANUFACTURER` and skips encryption only for TPMs
-positively known to have no external bus (Intel PTT, AMD fTPM, Qualcomm,
-Hyper-V/VMware/Google vTPMs, swtpm) — there is nothing to sniff inside an
-SoC or a hypervisor, and the residual fTPM threats sit inside the TPM's
-own trust boundary where transport encryption can't help. Unknown
-vendors are encrypted. `required` always encrypts and **refuses to load
-without a pinned salt-key Name**: an unsalted session's key is derivable
-from bus-visible nonces, and even a salted one can be man-in-the-middled
-if the attacker substitutes their own salt key at `TPM2_ReadPublic`, so
-the pin is what makes `required` mean something. The salt key is the SRK
-itself, already loaded as the key file's parent; its Name stays the same
-until the TPM is cleared, so it is pinnable, and with a pin set every key
-file is loaded only under the pinned SRK. It is a *restricted* storage
-key, so the TPM uses it only for its children and to unwrap session
-salts: someone who can send the TPM commands and recreate it still can't
-run ECDH with it to recover a session's salt.
+The session is also salted to the SRK, as a second layer: someone who has
+read a `.tpmauth` file but can't man-in-the-middle the SRK still sees
+nothing. The salt is one-pass ECDH, the specification's mechanism, and it
+stands alone at one moment: `provision`, whose `TPM2_Create` sends the new
+key's authValue and so can't be protected by it. `TPM2_Create` therefore
+always runs in a salted, encrypting session, whatever `session_encryption`
+says, and `pinned_session_salt_key_name` makes it refuse an SRK whose Name
+isn't the pinned one. The pin is checked against what `TPM2_CreatePrimary`
+returned, because that is the public area ESAPI encrypts the salt to. The
+SRK is a *restricted* storage key, so the TPM uses it only for its children
+and to unwrap session salts: someone who can send the TPM commands and
+recreate it still can't run ECDH with it.
 
-The session salt is encrypted to the SRK with one-pass ECDH, the TPM
-specification's mechanism, and this is the one quantum-relevant point in
-the design: someone who records a discrete TPM's bus today and can later
-break P-256 could recover those sessions' keys, and with them the
-wrapping keys that crossed the bus. Firmware and virtual TPMs have no bus
-to record.
-
-> **`auto` only defeats a passive listener.** The manufacturer it
-> decides from is read over the same bus it is protecting. On a discrete
-> TPM, an interposer that can *rewrite* traffic can answer `INTC`, and
-> `auto` then sends `K_wrap` in the clear. Without a pin, `auto` also accepts
-> whatever salt key the bus delivers (and logs that once). So:
->
-> - **Discrete TPM, or one you can't vouch for:** use `required` with a
->   pinned salt-key Name.
-> - **Any `auto` policy with `pinned_session_salt_key_name` set always
->   encrypts**, whatever manufacturer the TPM reports — pinning is taken
->   as the statement that the bus is worth defending.
-> - **Firmware TPM or vTPM you know is one:** `auto` without a pin is fine;
->   there is no bus to defend.
+What's left that is classical: someone who records a discrete TPM's bus
+at provisioning, and later breaks P-256, recovers that key's authValue,
+and with it the wrapping keys in every session they also recorded.
+Re-provisioning gives a key a new authValue. Firmware and virtual TPMs
+have no bus to record.
 
 **3. Protect the hierarchy the keys live under.** Every key file is loaded
 under the SRK, which is re-created on demand from the Owner hierarchy's
@@ -720,14 +708,14 @@ scripts/native-tpm-preflight.sh   # read-only: device access, tpm2-tools, libtss
 scripts/native-tpm-test.sh        # the full matrix, on the real TPM
 ```
 
-The preflight identifies the TPM from `TPM2_PT_MANUFACTURER` and tells you
-what `session_encryption = "auto"` will decide on it (skip for an
-fTPM/vTPM, encrypt for a discrete chip). The full run then does everything
+The preflight identifies the TPM from `TPM2_PT_MANUFACTURER`, and says
+whether it is a discrete chip whose storage root key should be pinned
+before provisioning. The full run then does everything
 `docker/entrypoint-test.sh` does, against the real device: the
 conformance suite (key files, the storage root key's determinism, the
 Name formula, `TPM2_HMAC` against software HMAC-SHA-256, encrypted-session correctness),
-a C ABI round trip with the KEK on the TPM under both
-`auto` and a fully pinned `required` policy, and the CLI-to-C-consumer
+a C ABI round trip with the KEK on the TPM with session encryption off
+and with both Names pinned, and the CLI-to-C-consumer
 cross-process check. It learns the Names to pin from the TPM itself via
 two operator-helper tests (run them directly to get values for your own
 policy):
@@ -1343,10 +1331,10 @@ setup_min_delay_ms = 1000           # floor on create_kek/kek_exists latency; 0 
 fail_if_requirement_unmet = true    # accepted for schema parity; the library always fails closed regardless
 
 [tpm]
-key_dir = "/var/lib/hkdfguard/tpm"  # absolute path; one <service>.tpmkey per service, created by provision
+key_dir = "/var/lib/hkdfguard/tpm"  # absolute path; a <service>.tpmkey and <service>.tpmauth per service, created by provision
 require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
-session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
-pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
+session_encryption = "on"           # on | off (test harnesses only)  (see "Session parameter encryption")
+pinned_session_salt_key_name = "000b<64 hex>"   # the storage root key's Name; pin before provisioning on a discrete TPM
 tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> | mssim:<conf> | swtpm:<conf>
                                     # mssim/swtpm are for testing only: no resource manager, so another client of
                                     # the same simulator can swap a key handle between its Name check and its use
@@ -1390,7 +1378,7 @@ Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
 fail closed with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`) -- and resolves
 each hardening knob to its strictest setting
-(`session_encryption = "required"`, the pinned-names allowlist on) rather than
+(`session_encryption = "on"`, the pinned-names allowlist on) rather than
 its default.
 
 ## Design decisions worth knowing
@@ -1435,7 +1423,7 @@ its default.
   every call and dropped after it; there are no standing TPM or PKCS#11
   sessions, no memoized provider selection, and the policy file is re-read
   from disk each time. The only per-process state is a handful of facts
-  about the *hardware* (the TPM conformance verdict and its manufacturer)
+  about the *hardware* (the TPM conformance verdict)
   that cannot change underneath a
   running process, and the PKCS#11 module's library handle: `C_Initialize`
   and `C_Finalize` act on the whole process, and finalizing while another

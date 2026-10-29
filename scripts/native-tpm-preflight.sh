@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Read-only environment check for testing hkdfguard's TPM2 provider on a
 # native Linux machine with a real TPM (Intel PTT, AMD fTPM, or a discrete
-# part). Reports what it finds, says what `tpm.session_encryption = "auto"`
-# will decide on this hardware, and exits non-zero if a hard requirement
-# is missing. Changes nothing.
+# part). Reports what it finds, says whether this TPM is a discrete chip
+# whose storage root key should be pinned before provisioning, and exits
+# non-zero if a hard requirement is missing. Changes nothing.
 #
 # Usage: scripts/native-tpm-preflight.sh
 #
@@ -86,20 +86,19 @@ if [ -n "$TCTI" ] && command -v tpm2_getcap >/dev/null 2>&1 && [ "$FAILED" -eq 0
         ok "TPM manufacturer: ${MANUFACTURER:-unknown}${vendor:+ ($vendor)}${fw:+, firmware $fw}"
         case "${MANUFACTURER}" in
             INTC|AMD|QCOM)
-                ok "firmware TPM (inside the SoC): no external bus to probe -> 'tpm.session_encryption = \"auto\"' will SKIP parameter encryption here"
+                ok "firmware TPM (inside the SoC): no external bus to probe. Sessions are encrypted anyway; pinning the storage root key is optional here"
                 ;;
             MSFT|IBM|GOOG|VMW)
-                ok "virtual/software TPM: no external bus -> 'auto' will SKIP parameter encryption"
+                ok "virtual/software TPM: no external bus. Sessions are encrypted anyway; pinning the storage root key is optional here"
                 ;;
             IFX|STM|NTC|ATML|NSM|NSG|SMSC)
-                ok "discrete TPM chip: 'auto' will ENCRYPT TPM2_HMAC sessions (salted HMAC, AES-128-CFB). Pin the salt key Name for full protection -- see README"
-                warn "one conformance test assumes an fTPM and will be skipped by native-tpm-test.sh on this hardware"
+                ok "discrete TPM chip: TPM2_HMAC sessions are encrypted under each key's authValue. Pin the storage root key's Name (tpm.pinned_session_salt_key_name) BEFORE provisioning -- see README"
                 ;;
             "")
-                warn "could not read the manufacturer; 'auto' treats unknown as discrete and encrypts"
+                warn "could not read the manufacturer; treat it as discrete and pin the storage root key before provisioning"
                 ;;
             *)
-                warn "unrecognized manufacturer '$MANUFACTURER'; 'auto' treats unknown as discrete and encrypts"
+                warn "unrecognized manufacturer '$MANUFACTURER'; treat it as discrete and pin the storage root key before provisioning"
                 ;;
         esac
     else

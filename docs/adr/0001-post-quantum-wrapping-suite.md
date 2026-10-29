@@ -66,7 +66,7 @@ Three further forces shaped the choice:
 
    | Provider | KEK | PRF |
    |---|---|---|
-   | TPM 2.0 | Keyed-hash object, `HMAC_SHA_256`, TPM-generated, `fixedTPM`, `fixedParent`, sign-only, `noDA`; the same key file format and storage root key as before | One-shot `TPM2_HMAC` per input, in a salted encrypted session when `tpm.session_encryption` calls for one |
+   | TPM 2.0 | Keyed-hash object, `HMAC_SHA_256`, TPM-generated, `fixedTPM`, `fixedParent`, sign-only, `noDA`; the same key file format and storage root key as before. ADR-0002 adds an authValue | One-shot `TPM2_HMAC` per input, in a salted encrypted session; ADR-0002 keys it by the authValue |
    | PKCS#11 | 32-byte `CKK_GENERIC_SECRET`, generated on the token, sensitive, non-extractable, sign-only; imported keys refused via `CKA_ALWAYS_SENSITIVE` / `CKA_NEVER_EXTRACTABLE` | Single-part `C_Sign`, `CKM_SHA256_HMAC` |
    | External secret | Exactly 32 raw bytes in the mounted file | Software HMAC |
    | Ephemeral | 32 random bytes in locked memory | Software HMAC |
@@ -179,8 +179,9 @@ uses only that.
 **Still classical:** on a discrete TPM, session encryption salts its
 sessions by ECDH to the storage root key, as the TPM specification
 defines. Someone recording that bus today who can later break P-256 could
-recover the wrapping keys that crossed it. Only the TCG can change that;
-firmware and virtual TPMs have no bus.
+recover the wrapping keys that crossed it. Firmware and virtual TPMs have
+no bus. *Superseded by [ADR-0002](0002-tpm-sessions-keyed-by-authvalue.md),
+which narrows this to the provisioning command.*
 
 ## Follow-up
 

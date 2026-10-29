@@ -49,7 +49,9 @@ back to defaults in that case.
 | `TOML parse error` | Invalid TOML. Most often a top-level key (`preferred_order`) below a `[section]`, or an unquoted service name in `[tpm.pinned_names]` | Move `preferred_order` above the first section; quote service names: `"com.company.orders" = ...` |
 | `unknown field` | A misspelled or misplaced setting | Check it against the [policy reference](configuration.md#policy-reference) |
 | `selection.mode "require" needs a selection.provider` (or similar) | `provider` and `level` don't match the mode | `require` takes `provider`, `require-level` takes `level`, `prefer` takes neither |
-| `tpm.session_encryption "required" needs tpm.pinned_session_salt_key_name` | `required` without its pin | Add the salt-key Name ([configuration.md](configuration.md#tpm-20), step 4), or use `auto` |
+| `unknown variant` ... `session_encryption` | `"auto"` or `"required"`, from before authValues | Use `"on"` (the default) or remove the line |
+| `holds a key with an empty password (emptyAuth)` | A TPM key file from before authValues | Delete it and run `hkdfguard provision` again; re-wrap the DEKs |
+| `TPM key file has no authValue file` | The `<service>.tpmauth` beside the key file is missing | Restore it from the backup taken with the key file, or retire and re-provision |
 
 ## No provider is available (-3)
 

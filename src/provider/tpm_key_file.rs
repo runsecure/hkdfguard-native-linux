@@ -6,16 +6,21 @@
 //! ```text
 //! TPMKey ::= SEQUENCE {
 //!     type        OBJECT IDENTIFIER,     -- id-loadablekey, 2.23.133.10.1.3
-//!     emptyAuth   [0] EXPLICIT BOOLEAN,  -- TRUE: the key has no password
+//!                                        -- (emptyAuth absent: the key has a password)
 //!     parent      INTEGER,               -- 0x40000001: the Owner hierarchy's storage primary
 //!     pubkey      OCTET STRING,          -- TPM2B_PUBLIC
 //!     privkey     OCTET STRING           -- TPM2B_PRIVATE, encrypted by the parent
 //! }
 //! ```
 //!
-//! The format's other optional fields (policies, an imported secret, a
-//! description, an RSA parent) describe keys this crate never makes, so a
-//! file carrying any of them is refused rather than half-understood. DER
+//! Every service key has an authValue, kept in its own file beside the
+//! key file (see `tpm2.rs`), so `emptyAuth` -- which the format includes
+//! only to say a key has *no* password -- is never written. A file that
+//! carries it, TRUE or FALSE, is refused: TRUE is a key from before
+//! authValues, and FALSE is not how DER spells the default. The format's
+//! other optional fields (policies, an imported secret, a description, an
+//! RSA parent) describe keys this crate never makes, so a file carrying
+//! any of them is refused rather than half-understood. DER
 //! is parsed strictly: minimal lengths, no trailing bytes, and the two
 //! TPM2B size prefixes must match their contents. Nothing here talks to a
 //! TPM; `tpm2.rs` unmarshals the two structures and loads them.
@@ -41,7 +46,7 @@ const TAG_SEQUENCE: u8 = 0x30;
 const TAG_INTEGER: u8 = 0x02;
 const TAG_OCTET_STRING: u8 = 0x04;
 const TAG_BOOLEAN: u8 = 0x01;
-const TAG_EMPTY_AUTH: u8 = 0xa0; // [0] EXPLICIT, constructed
+const TAG_EMPTY_AUTH: u8 = 0xa0; // [0] EXPLICIT, constructed: recognised only to refuse it
 
 /// The two TPM structures a key file carries, each without its TPM2B size
 /// prefix: the marshalled `TPMT_PUBLIC`, and the `TPM2B_PRIVATE` buffer's
@@ -56,7 +61,6 @@ pub(crate) struct KeyBlob {
 pub(crate) fn encode(blob: &KeyBlob) -> Result<String, String> {
     let mut body = Vec::new();
     body.extend_from_slice(LOADABLE_KEY_OID);
-    body.extend_from_slice(&[TAG_EMPTY_AUTH, 0x03, TAG_BOOLEAN, 0x01, 0xff]);
     body.extend_from_slice(&[TAG_INTEGER, 0x04]);
     body.extend_from_slice(&PARENT_OWNER_HIERARCHY.to_be_bytes()); // high bit clear: no leading zero needed
     der_push(&mut body, TAG_OCTET_STRING, &tpm2b(&blob.public)?);
@@ -115,12 +119,15 @@ fn decode_der(der: &[u8]) -> Result<KeyBlob, String> {
     if oid != LOADABLE_KEY_OID {
         return Err("is not a loadable TPM key (type is not id-loadablekey)".to_string());
     }
-    if seq.peek() != Some(TAG_EMPTY_AUTH) {
-        return Err("does not mark the key as having an empty password (emptyAuth), as every key this library makes does".to_string());
-    }
-    let empty_auth = Reader { buf: seq.take(TAG_EMPTY_AUTH, "emptyAuth")? }.take(TAG_BOOLEAN, "emptyAuth")?;
-    if empty_auth != [0xff] {
-        return Err("does not mark the key as having an empty password (emptyAuth), as every key this library makes does".to_string());
+    if seq.peek() == Some(TAG_EMPTY_AUTH) {
+        let empty_auth = Reader { buf: seq.take(TAG_EMPTY_AUTH, "emptyAuth")? }.take(TAG_BOOLEAN, "emptyAuth")?;
+        return Err(if empty_auth == [0xff] {
+            "holds a key with an empty password (emptyAuth), from before hkdfguard gave every TPM key an authValue; \
+             delete the file and provision the service again"
+                .to_string()
+        } else {
+            "has an emptyAuth field, which this library never writes".to_string()
+        });
     }
     let parent = seq.take(TAG_INTEGER, "parent")?;
     if parent != PARENT_OWNER_HIERARCHY.to_be_bytes() {
@@ -240,9 +247,8 @@ mod tests {
         let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
         let der = STANDARD.decode(body).unwrap();
         let expected: Vec<u8> = [
-            &[0x30, 0x20][..],                                 // SEQUENCE, 32 bytes
-            &[0x06, 0x06, 0x67, 0x81, 0x05, 0x0a, 0x01, 0x03], // id-loadablekey
-            &[0xa0, 0x03, 0x01, 0x01, 0xff],                   // [0] emptyAuth TRUE
+            &[0x30, 0x1b][..],                                 // SEQUENCE, 27 bytes
+            &[0x06, 0x06, 0x67, 0x81, 0x05, 0x0a, 0x01, 0x03], // id-loadablekey; no emptyAuth: the key has a password
             &[0x02, 0x04, 0x40, 0x00, 0x00, 0x01],             // parent 0x40000001
             &[0x04, 0x05, 0x00, 0x03, 0xaa, 0xaa, 0xaa],       // pubkey: TPM2B of 3 bytes
             &[0x04, 0x04, 0x00, 0x02, 0xbb, 0xbb],             // privkey: TPM2B of 2 bytes
@@ -270,21 +276,26 @@ mod tests {
             pem_of(&der)
         };
         let cases = [
-            (with(9, 0x04), "id-loadablekey"),  // another key type (importable)
-            (with(14, 0x00), "empty password"), // emptyAuth FALSE
-            (with(20, 0x02), "parent"),         // parent 0x40000002
-            (with(24, 0x02), "TPM2B size"),     // pubkey's size prefix says 2, holds 3
+            (with(9, 0x04), "id-loadablekey"), // another key type (importable)
+            (with(15, 0x02), "parent"),        // parent 0x40000002
+            (with(19, 0x02), "TPM2B size"),    // pubkey's size prefix says 2, holds 3
         ];
         for (pem, expect) in cases {
             let err = decode(pem.as_bytes()).unwrap_err();
             assert!(err.contains(expect), "expected {expect:?}, got {err:?}");
         }
 
-        // No emptyAuth at all (a key with a password).
-        let mut no_auth = good[..10].to_vec();
-        no_auth.extend_from_slice(&good[15..]);
-        no_auth[1] -= 5;
-        assert!(decode(pem_of(&no_auth).as_bytes()).unwrap_err().contains("empty password"));
+        // An emptyAuth field, as a key file from before authValues has.
+        let with_empty_auth = |value: u8| {
+            let mut der = good[..10].to_vec();
+            der.extend_from_slice(&[0xa0, 0x03, 0x01, 0x01, value]);
+            der.extend_from_slice(&good[10..]);
+            der[1] += 5;
+            pem_of(&der)
+        };
+        let err = decode(with_empty_auth(0xff).as_bytes()).unwrap_err();
+        assert!(err.contains("empty password") && err.contains("provision the service again"), "{err}");
+        assert!(decode(with_empty_auth(0x00).as_bytes()).unwrap_err().contains("never writes"));
 
         // An extra trailing field inside the SEQUENCE (e.g. a description).
         let mut extra = good.clone();

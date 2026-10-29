@@ -90,8 +90,9 @@ call, so there is nothing to restart.
 Each service's KEK is a 256-bit HMAC-SHA-256 key the TPM generates and
 never exports. It is stored as a **key file**, `/var/lib/hkdfguard/tpm/<service>.tpmkey`, whose
 private half is encrypted by the TPM: the file is useless on any other
-TPM. Each operation loads the key file into the TPM, uses it, and flushes
-it, so nothing stays on the TPM.
+TPM. The key has a random 32-byte password, its **authValue**, kept beside
+it in `<service>.tpmauth`. Each operation loads the key file into the TPM,
+uses it, and flushes it, so nothing stays on the TPM.
 
 **1. Give the service access to the TPM.** The library opens
 `/dev/tpmrm0` (the kernel's resource manager). On most distributions it
@@ -102,12 +103,12 @@ ls -l /dev/tpmrm0                      # crw-rw---- tss tss ...
 sudo usermod -aG tss <service-user>
 ```
 
-**2. The key directory.** The key has no password: anyone who can read a
-key file *and* open the TPM can use that KEK. So reading the key file is
-the access control, and the key directory's group decides who may. The
-packages create `/var/lib/hkdfguard/tpm` as `root:hkdfguard 0750`, so add
-each service that uses TPM keys to `hkdfguard`. Without the packages,
-create it as root:
+**2. The key directory.** Anyone who can read a key file *and* its
+authValue file, and open the TPM, can use that KEK. So reading the two
+files is the access control, and the key directory's group decides who
+may. The packages create `/var/lib/hkdfguard/tpm` as `root:hkdfguard 0750`,
+so add each service that uses TPM keys to `hkdfguard`. Without the
+packages, create it as root:
 
 ```sh
 sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
@@ -116,18 +117,19 @@ sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 On a `.deb` system, record a different owner or mode with
 `dpkg-statoverride` or an upgrade puts `root:hkdfguard 0750` back.
 
-`hkdfguard provision` then creates each key file there, owned by root,
-with the directory's group, mode `0440`. The library refuses a key file,
-or a directory above it, that anyone else could write to, so never put
-the directory under `/tmp`. `tpm.key_dir` moves it.
+`hkdfguard provision` then creates both files there, owned by root, with
+the directory's group, mode `0440`. The library refuses either file, or a
+directory above it, that anyone else could write to, so never put the
+directory under `/tmp`. `tpm.key_dir` moves it.
 
 #### Back up the key files
 
-**A lost key file is a lost KEK:** every DEK wrapped under it becomes
-unrecoverable. Copy each key file after `provision`, to wherever you keep
-other root-of-trust material. A copy is useless on any other TPM, so
-backups are low-risk; on this TPM, though, a copy can still be used, so
-give backups the same access control as the directory.
+**A lost key file or authValue file is a lost KEK:** every DEK wrapped
+under it becomes unrecoverable. Copy both files after `provision`, to
+wherever you keep other root-of-trust material. A copy of the key file is
+useless on any other TPM, but the authValue file is a secret; on this TPM
+the pair can still be used, so give backups the same access control as
+the directory.
 
 A backup protects against losing the *file*, not the *TPM*. A motherboard
 or TPM replacement, or a TPM clear (which a firmware reset can trigger),
@@ -164,22 +166,23 @@ sudo hkdfguard provision -sn com.company.orders
 Add the line as printed, then run `provision` again; it reports "already
 provisioned".
 
-**4. Encrypt the TPM bus traffic where it matters.** On a *discrete* TPM
-(a separate chip), the wrapping key each wrap and unwrap computes (the
-output of `TPM2_HMAC`) crosses the motherboard bus. `session_encryption` controls whether it is encrypted:
+**4. The TPM bus traffic is encrypted; pin the storage root key for
+provisioning.** On a *discrete* TPM (a separate chip), the wrapping key
+each wrap and unwrap computes (the output of `TPM2_HMAC`) crosses the
+motherboard bus. It is always encrypted, and its response authenticated,
+under keys derived from the service key's authValue. Nobody without the
+authValue file can read a wrapping key off the bus or replace one. That
+needs no trusted public key, and a quantum computer doesn't help against
+it. `session_encryption = "off"` turns the encryption off, for test
+harnesses only.
 
-| Value | Behaviour | Use for |
-|---|---|---|
-| `"auto"` (default) | Encrypts unless the TPM reports a manufacturer known to have no external bus (Intel PTT, AMD fTPM, virtual TPMs) | Firmware and virtual TPMs |
-| `"required"` | Always encrypts, and refuses to run without `pinned_session_salt_key_name` | Discrete TPMs, or a TPM you can't vouch for |
-| `"off"` | Never encrypts | Not recommended |
-
-`auto` relies on the manufacturer the TPM reports over that same bus, so
-against an attacker who can rewrite bus traffic only `required` holds. The
-Name it needs is that of the TPM's storage root key, which every key file
-is loaded under and which salts the session. It is learned from the TPM,
-and stays the same until the TPM is cleared. From a source checkout on the
-host, as a user in the `tss` group:
+The one moment the authValue itself crosses the bus is `provision`, inside
+a session salted to the TPM's storage root key. Pinning that key's Name
+with `pinned_session_salt_key_name` stops an attacker who can rewrite bus
+traffic at provisioning time from substituting their own. Pin it on any
+host with a discrete TPM, before provisioning. The Name stays the same
+until the TPM is cleared. From a source checkout on the host, as a user
+in the `tss` group:
 
 ```sh
 cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning \
@@ -432,8 +435,7 @@ minimum_protection = "hardware"
 tcti = "device:/dev/tpmrm0"
 key_dir = "/var/lib/hkdfguard/tpm"
 require_pinned_names = true          # only the services below have a key
-session_encryption = "required"
-pinned_session_salt_key_name = "000b<64 hex chars>"
+pinned_session_salt_key_name = "000b<64 hex chars>"  # the storage root key provisioning is salted to
 
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"
@@ -595,6 +597,7 @@ permissions so that only the service's own account can do both.
 | `/etc/hkdfguard/policy.toml` | `root:root 0644` | Readable by services; changeable only by root |
 | `/var/lib/hkdfguard/tpm/` | `root:<key-users> 0750` | Only root may add or replace a key; its group is the group of each key file in it |
 | `/var/lib/hkdfguard/tpm/<service>.tpmkey` | `root:<key-users> 0440` (`provision` sets it) | Readable by the services allowed to use TPM keys |
+| `/var/lib/hkdfguard/tpm/<service>.tpmauth` | `root:<key-users> 0440` (`provision` sets it); better `root:<service-group> 0440` | The key's authValue: only that service should read it |
 | `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | As above |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
 | External secret `<dir>/<service>` | root or the service's user, `0400`; or `root:<group> 0440` | Only that service (or the pod's `fsGroup`) |
@@ -619,10 +622,11 @@ sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 ```
 
 As provisioned, every member of `hkdfguard` can use every service's TPM
-key: each key file takes the directory's group. To give each service its
-own, change a key file's group to that service's own group after
-`provision` (`sudo chgrp orders /var/lib/hkdfguard/tpm/com.company.orders.tpmkey`);
-the services still need the directory's group to reach it. Without that,
+key: both files take the directory's group. To give each service its own,
+change its authValue file's group to that service's own group after
+`provision` (`sudo chgrp orders /var/lib/hkdfguard/tpm/com.company.orders.tpmauth`);
+the services still need the directory's group to reach it. Without its
+authValue, another service's key file is useless to them. Without that,
 what stops one service from recovering
 another's DEK is that it can't read the other's wrapped key files. Wrapped
 files are meant to be storable openly (in backups, for example), so treat
@@ -668,8 +672,8 @@ tcti = "device:/dev/tpmrm0"
 key_dir = "/var/lib/hkdfguard/tpm"                    # one <service>.tpmkey per service
 owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"     # default: unset (empty owner password)
 require_pinned_names = false
-session_encryption = "auto"                           # auto | required | off
-pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; required by "required"
+session_encryption = "on"                             # on | off (off: test harnesses only)
+pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; pin it before provisioning on a discrete TPM
 
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"
@@ -694,6 +698,6 @@ Notes:
   `mode = "require-level"`. Any other combination is rejected.
 - All paths must be absolute.
 - Settings are checked whenever the policy is read, whichever provider ends
-  up being used. For example, `session_encryption = "required"` without
-  `pinned_session_salt_key_name` makes every call fail, even on a host
-  that never uses its TPM.
+  up being used. For example, a `session_encryption` value other than
+  `on` or `off` makes every call fail, even on a host that never uses its
+  TPM.
