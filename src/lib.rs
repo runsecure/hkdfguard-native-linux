@@ -29,7 +29,53 @@ pub use error::status; // re-export the status-code constants as part of this cr
 pub mod admin {
     use super::*;
 
+    pub use secure_file::{DirProblem, Owner, PrincipalTrust};
     pub use security_model::{DEPLOYERS_GROUP, OVER_BROAD_GROUPS};
+
+    /// The first of `dir` and its ancestors, up to `/`, that `trust`
+    /// refuses, and why: the library's own per-directory rule (owner, write
+    /// bits, sticky directories never trusted, read-only mounts exempt), so
+    /// the CLI judges folders exactly as the library will. `dir` must be
+    /// canonical.
+    pub fn first_untrusted_dir(dir: &std::path::Path, trust: &dyn PrincipalTrust) -> Option<(std::path::PathBuf, DirProblem)> {
+        secure_file::first_untrusted_dir(dir, trust)
+    }
+
+    /// Whose folders a key file the CLI writes may sit under. Production:
+    /// exactly whom the library trusts with key files (root and deployers,
+    /// and group write only through a deployer group), since that doesn't
+    /// depend on who reads the file. Developer: any owner, no group write --
+    /// the library's owner rule there is "root or the reading process's own
+    /// user", which the CLI, often running as root for an application's
+    /// account, can't know, so only modes are judged.
+    pub fn key_file_writer_trust() -> Result<Box<dyn PrincipalTrust>, AdminError> {
+        let _policy = policy::snapshot_for_call();
+        let trust = security_model::Trust::current()?;
+        Ok(match trust.model() {
+            security_model::SecurityModel::Production => Box::new(trust),
+            security_model::SecurityModel::Developer => Box::new(ModeOnly),
+        })
+    }
+
+    /// Any owner; group write never. See [`key_file_writer_trust`].
+    struct ModeOnly;
+
+    impl PrincipalTrust for ModeOnly {
+        fn trusts_owner(&self, _uid: u32) -> bool {
+            true
+        }
+        fn trusts_group_writer(&self, _gid: u32) -> bool {
+            false
+        }
+    }
+
+    /// Confirms `file` is the file `spelled` names now: by its path in
+    /// `/proc/self/fd` where `/proc` is mounted, and always by device and
+    /// inode -- the check the library makes after every open of a file it
+    /// reads. `spelled` must be canonical.
+    pub fn verify_opened(file: &std::fs::File, spelled: &std::path::Path) -> std::io::Result<()> {
+        secure_file::verify_opened(file, spelled, spelled, std::path::Path::new("/proc"))
+    }
 
     /// Why an administrative operation failed: the status code it maps to
     /// (as the C functions would return it), and a sentence for the

@@ -1486,8 +1486,11 @@ its default.
   owner password, external-secret KEKs, and key files opened
   with `hkdfguard_open_file` must each sit in a directory that, with every
   directory above it up to `/`, is owned by root (or, where the file may
-  be, the calling user) and not writable by group or others -- with no
-  exception for sticky directories, so nothing under `/tmp`, `/var/tmp` or
+  be, the calling user) and not writable by group or others. For the
+  policy, PIN, TPM and `hkdfguard_open_file` paths that holds for every
+  directory the path is looked up in -- symlinks followed the way the
+  kernel follows them, and the directory each link lives in checked like
+  the rest. All of it applies with no exception for sticky directories, so nothing under `/tmp`, `/var/tmp` or
   `/dev/shm` is accepted, however private the directory beneath. The one
   exception is a read-only mount: a Kubernetes Secret or ConfigMap volume
   is `1777` but nobody can write to it. The refusal names the directory

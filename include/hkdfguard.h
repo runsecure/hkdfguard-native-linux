@@ -460,9 +460,9 @@ int hkdfguard_key_file_principal_trusted(
  *           only). HKDFGUARD_ERR_FILE_UNTRUSTED otherwise: a
  *           wrapped DEK is ciphertext, but someone who can replace the file
  *           and can wrap under the service's KEK could plant a DEK they
- *           know. The same goes for the directories that decide what `path`
- *           names -- the one holding the opened file and the one `path`
- *           names it in (where a symlink lives), each up to `/`: owned by
+ *           know. The same goes for every directory that decides what
+ *           `path` names -- each one it passes through, and each one a
+ *           symlink along the way lives in, each up to `/`: owned by
  *           someone trusted, and not writable by anyone else
  *           -- sticky or not, at any level: a key file anywhere under
  *           /tmp, /var/tmp, /dev/shm or any other sticky, world-writable

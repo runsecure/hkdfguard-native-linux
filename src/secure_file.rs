@@ -169,26 +169,146 @@ pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
 /// for a key file under the production model). Writable by others never
 /// passes, sticky or not -- the read-only-mount exception aside.
 pub fn check_dir_chain_trusting(dir: &Path, trust: &dyn PrincipalTrust) -> io::Result<()> {
-    for d in dir.ancestors() {
-        let fail = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display()));
-        let meta = std::fs::metadata(d).map_err(|e| fail(e.to_string()))?;
-        if !meta.is_dir() {
-            return Err(fail("not a directory".to_string()));
-        }
-        if !trust.trusts_owner(meta.uid()) {
-            return Err(fail(format!("owned by uid {}, which is not an allowed owner", meta.uid())));
-        }
-
-        let mode = meta.mode();
-        if untrusted_write_bits(&meta, trust) != 0 && !on_read_only_mount(d) {
-            let sticky = if mode & STICKY != 0 { "; sticky, like /tmp, which is not enough" } else { "" };
-            return Err(fail(format!(
-                "writable by group or others (mode {:o}{sticky}), so entries could be created or replaced in it",
-                mode & 0o7777
-            )));
+    match first_untrusted_dir(dir, trust) {
+        None => Ok(()),
+        Some((d, problem)) => {
+            let what = match problem {
+                DirProblem::Unexaminable(e) => e,
+                DirProblem::NotADirectory => "not a directory".to_string(),
+                DirProblem::Owner(uid) => format!("owned by uid {uid}, which is not an allowed owner"),
+                DirProblem::Writable { mode } => {
+                    let sticky = if mode & STICKY != 0 { "; sticky, like /tmp, which is not enough" } else { "" };
+                    format!("writable by group or others (mode {mode:o}{sticky}), so entries could be created or replaced in it")
+                }
+            };
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display())))
         }
     }
+}
+
+/// Why a directory isn't one `trust` accepts, as [`judge_dir`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirProblem {
+    /// It couldn't be examined (it vanished, or can't be searched).
+    Unexaminable(String),
+    /// It isn't a directory.
+    NotADirectory,
+    /// Its owner, this uid, isn't one `trust` accepts.
+    Owner(u32),
+    /// Someone `trust` doesn't accept can write to it: these are its
+    /// permission bits (`0o7777`), sticky bit included. Never reported for
+    /// a read-only mount, which nobody can write to.
+    Writable { mode: u32 },
+}
+
+/// Whether one directory is trustworthy under `trust`: a directory, owned
+/// by someone `trust` accepts, and writable by nobody else -- through its
+/// group only if `trust` accepts that group, by others never, sticky or
+/// not, unless it is on a read-only mount. The one rule every directory
+/// check in this crate, and the CLI's, applies.
+pub fn judge_dir(dir: &Path, trust: &dyn PrincipalTrust) -> Result<(), DirProblem> {
+    let meta = std::fs::metadata(dir).map_err(|e| DirProblem::Unexaminable(e.to_string()))?;
+    if !meta.is_dir() {
+        return Err(DirProblem::NotADirectory);
+    }
+    if !trust.trusts_owner(meta.uid()) {
+        return Err(DirProblem::Owner(meta.uid()));
+    }
+    if untrusted_write_bits(&meta, trust) != 0 && !on_read_only_mount(dir) {
+        return Err(DirProblem::Writable { mode: meta.mode() & 0o7777 });
+    }
     Ok(())
+}
+
+/// The first of `dir` and its ancestors, up to `/`, that [`judge_dir`]
+/// refuses, and why; `None` if every one passes. `dir` must be canonical.
+pub fn first_untrusted_dir(dir: &Path, trust: &dyn PrincipalTrust) -> Option<(std::path::PathBuf, DirProblem)> {
+    dir.ancestors().find_map(|d| judge_dir(d, trust).err().map(|problem| (d.to_path_buf(), problem)))
+}
+
+/// Most symbolic links [`resolve_trusted`] follows in one path: Linux's
+/// own limit (`MAXSYMLINKS`), past which `open(2)` fails with `ELOOP`.
+const MAX_SYMLINKS: usize = 40;
+
+/// Resolves `path` the way the kernel does -- one component at a time,
+/// following each symbolic link where it is met, applying `..` to the
+/// directory actually reached -- and checks every directory a lookup
+/// happens in, with all of its ancestors ([`check_dir_chain_trusting`]).
+///
+/// Those are exactly the directories that decide what `path` names: the
+/// ones it passes through, *and* the ones any symbolic link along the way
+/// lives in. Whoever can write to any of them can rename an entry, or
+/// retarget a link, so that `path` names a file of their choosing. Checking
+/// only where `path` is named and where it ends up misses a link in the
+/// middle: `/home/app/conf/keys/k`, with `keys -> /etc/keys`, names a file
+/// in a trusted directory, but the account owning `/home/app/conf` can
+/// point `keys` anywhere.
+///
+/// Returns `Ok(Some(real))`, `real` the canonical path of what `path`
+/// names, once it resolves completely; `Ok(None)` when some component
+/// doesn't exist -- after checking the directory the missing name was
+/// looked up in, so whoever could create it there is trusted too. A
+/// directory refused is `PermissionDenied` with no `raw_os_error`, as
+/// every trust refusal here is; anything the OS refuses carries its error
+/// (`EACCES`, `ENOTDIR`, `ELOOP` past [`MAX_SYMLINKS`] links).
+pub fn resolve_trusted(path: &Path, trust: &dyn PrincipalTrust) -> io::Result<Option<std::path::PathBuf>> {
+    use std::collections::{HashSet, VecDeque};
+    use std::ffi::OsString;
+    use std::path::{Component, PathBuf};
+
+    // Components still to resolve; `..` kept as a name, `.` and `/` dropped.
+    let components = |p: &Path| -> VecDeque<OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
+            })
+            .collect()
+    };
+    let mut current = if path.is_absolute() { PathBuf::from("/") } else { std::fs::canonicalize(".")? };
+    let mut pending = components(path);
+    let mut checked: HashSet<PathBuf> = HashSet::new();
+    let mut links = 0;
+
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            current.pop(); // physical: the parent of the directory actually reached; `/` stays `/`
+            continue;
+        }
+        // A lookup is about to happen in `current`.
+        if checked.insert(current.clone()) {
+            check_dir_chain_trusting(&current, trust)?;
+        }
+        let candidate = current.join(&name);
+        let meta = match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if meta.file_type().is_symlink() {
+            links += 1;
+            if links > MAX_SYMLINKS {
+                return Err(io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            let target = std::fs::read_link(&candidate)?;
+            if target.is_absolute() {
+                current = PathBuf::from("/");
+            }
+            let mut rest = components(&target);
+            rest.extend(pending);
+            pending = rest;
+        } else if pending.is_empty() {
+            return Ok(Some(candidate));
+        } else if meta.is_dir() {
+            current = candidate;
+        } else {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+    }
+    // The path ended in `..` or named `/`: a directory, which the caller's
+    // open refuses as not a regular file.
+    Ok(Some(current))
 }
 
 // The write bits `meta` grants to someone `trust` doesn't accept: others'
@@ -227,12 +347,13 @@ pub fn check_metadata_trusting(meta: &Metadata, trust: &dyn PrincipalTrust) -> i
 }
 
 /// Confirms the descriptor `open` returned is the file that was resolved
-/// and checked: on Linux, by reading its path back from
+/// and checked, two ways: on Linux, by reading its path back from
 /// `<proc>/self/fd/<n>` and checking it is `within` (pass the resolved file
-/// itself to require exactly that file); where that isn't possible (`/proc`
-/// not mounted or masked, as in some minimal containers and sandboxes, or a
-/// non-Linux build), by comparing the descriptor's device and inode with
-/// the resolved path's -- just as conclusive, so neither case is weaker.
+/// itself to require exactly that file), where `/proc` is mounted; and, in
+/// every case, by comparing the descriptor's device and inode with what
+/// `target_real` names now. Without `/proc` (masked, as in some minimal
+/// containers and sandboxes, or a non-Linux build) the second alone is
+/// just as conclusive. The CLI's own opens use the same check.
 /// Every failure is `PermissionDenied` -- never `NotFound`, which callers
 /// reserve for "the file isn't there".
 pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: &Path) -> io::Result<()> {
@@ -249,7 +370,6 @@ pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: 
                     within.display()
                 )));
             }
-            return Ok(());
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -279,32 +399,22 @@ fn on_read_only_mount(path: &Path) -> bool {
 }
 
 /// Checks that nobody `owner` doesn't cover can delete, rename, or replace
-/// `path` or make it resolve elsewhere: the directory `path` is named in
-/// (or, while that doesn't exist, its nearest existing ancestor), and the
-/// directory of whatever `path` currently resolves to, must each pass
-/// [`check_dir_chain`].
+/// `path` or make it resolve elsewhere: every directory that decides what
+/// it names -- the ones it passes through and the ones any symbolic link
+/// on the way lives in -- must pass [`check_dir_chain`] (see
+/// [`resolve_trusted`]). That holds whether or not `path` exists: when it
+/// doesn't, up to the directory its missing component would be created in.
 ///
 /// Checking where a file *would* be, not just where it is, matters for
 /// files whose absence is meaningful: a missing policy means "no policy",
 /// so if an untrusted user could delete it, they could switch policy off.
+/// Every failure is `PermissionDenied`; a component the OS won't let this
+/// process look up is reported with its error.
 pub fn check_location(path: &Path, owner: Owner) -> io::Result<()> {
-    let denied = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, what);
-
-    let named_in = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let existing = named_in
-        .ancestors()
-        .find(|d| !d.as_os_str().is_empty() && d.exists())
-        .unwrap_or(Path::new("."));
-    let existing = std::fs::canonicalize(existing).map_err(|e| denied(format!("{}: {e}", existing.display())))?;
-    check_dir_chain(&existing, owner)?;
-
-    match std::fs::canonicalize(path) {
-        Ok(target) => match target.parent() {
-            Some(target_dir) if target_dir != existing => check_dir_chain(target_dir, owner),
-            _ => Ok(()),
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()), // absent, or a dangling link: the open reports it
-        Err(e) => Err(denied(format!("{}: {e}", path.display()))),
+    match resolve_trusted(path, &owner) {
+        Ok(_) => Ok(()), // present, or absent: the open reports which
+        Err(e) if e.raw_os_error().is_none() => Err(e),
+        Err(e) => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{}: {e}", path.display()))),
     }
 }
 
@@ -539,6 +649,64 @@ mod tests {
         }
         chmod(&outer, 0o700);
         check_dir_chain(&inner, Owner::RootOrCurrentUser).unwrap();
+    }
+
+    #[test]
+    fn resolve_trusted_follows_paths_as_the_kernel_does() {
+        let dir = private_tempdir();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let me = Owner::RootOrCurrentUser;
+        std::fs::create_dir(base.join("real")).unwrap();
+        std::fs::write(base.join("real/file"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", base.join("rel")).unwrap(); // relative target
+        std::os::unix::fs::symlink(base.join("real/file"), base.join("abs")).unwrap(); // absolute target
+
+        assert_eq!(resolve_trusted(&base.join("real/./file"), &me).unwrap(), Some(base.join("real/file")));
+        assert_eq!(resolve_trusted(&base.join("rel/file"), &me).unwrap(), Some(base.join("real/file")));
+        assert_eq!(resolve_trusted(&base.join("abs"), &me).unwrap(), Some(base.join("real/file")));
+        assert_eq!(resolve_trusted(&base.join("rel/../real/file"), &me).unwrap(), Some(base.join("real/file")));
+
+        // Missing: `None`, at any depth, never an error.
+        assert_eq!(resolve_trusted(&base.join("real/absent"), &me).unwrap(), None);
+        assert_eq!(resolve_trusted(&base.join("absent/deeper/file"), &me).unwrap(), None);
+        // A file used as a directory, and a loop: the OS's own errors.
+        assert_eq!(resolve_trusted(&base.join("real/file/x"), &me).unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+        std::os::unix::fs::symlink(base.join("loop"), base.join("loop")).unwrap();
+        assert_eq!(resolve_trusted(&base.join("loop"), &me).unwrap_err().raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn resolve_trusted_checks_where_a_missing_name_would_be_created() {
+        // Absent, in a directory others can write: someone could create it
+        // there, so that is refused like a present file would be.
+        let dir = private_tempdir();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = resolve_trusted(&open.join("absent"), &Owner::RootOrCurrentUser).unwrap_err();
+        assert!(err.raw_os_error().is_none() && err.to_string().contains("writable by group or others"), "{err}");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn check_location_covers_the_directory_a_symlink_in_the_middle_lives_in() {
+        // The policy file, the PIN file and the TPM key files go through
+        // check_location: a link above them, in a directory others can
+        // write, is refused, though both ends of the path are trusted.
+        let trusted = private_tempdir();
+        let untrusted = private_tempdir();
+        std::fs::write(trusted.path().join("policy.toml"), b"").unwrap();
+        let link = untrusted.path().join("conf");
+        std::os::unix::fs::symlink(trusted.path(), &link).unwrap();
+        check_location(&link.join("policy.toml"), Owner::RootOrCurrentUser).unwrap();
+        check_location(&link.join("absent.toml"), Owner::RootOrCurrentUser).unwrap();
+        std::fs::set_permissions(untrusted.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        for name in ["policy.toml", "absent.toml"] {
+            let err = check_location(&link.join(name), Owner::RootOrCurrentUser).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{name}: {err}");
+        }
+        std::fs::set_permissions(untrusted.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

@@ -35,14 +35,13 @@
 //!   itself) could plant a DEK they know, and `unwrap` would accept it as
 //!   genuine. The CLI writes key files `0600` for the same reason.
 //!   Symlinks are followed, and the checks apply to the file they resolve
-//!   to. The same holds for the directories that decide what the path
-//!   names -- the opened file's own and the one the path names it in, each
-//!   up to `/`: owned by someone trusted, and not writable by anyone else
-//!   -- **sticky or not, at any level** (see
-//!   [`secure_file::check_dir_chain_trusting`], the rule every file this
-//!   crate reads is held to). Otherwise someone else could
-//!   rename a file of their choosing over the key, or retarget a symlink to
-//!   one. So a key file anywhere under `/tmp`,
+//!   to. The same holds for every directory that decides what the path
+//!   names -- each one it passes through, and each one a symlink along the
+//!   way lives in, every one up to `/`: owned by someone trusted, and not
+//!   writable by anyone else -- **sticky or not, at any level** (see
+//!   [`secure_file::resolve_trusted`], the rule every file this crate reads
+//!   is held to). Otherwise someone else could rename a file of their
+//!   choosing over the key, or retarget a symlink to one. So a key file anywhere under `/tmp`,
 //!   `/var/tmp`, `/dev/shm` or any other sticky, world-writable directory
 //!   is refused, however private the directories beneath it: a key file
 //!   belongs in a directory only its owner (or root) can write to, all the
@@ -126,10 +125,10 @@ impl KeyFileError {
 /// The same sequence the external-secret provider uses for its secret
 /// files (`open_secret_within_mount`):
 ///
-/// 1. `path` is resolved once, symlinks and all, to the real file.
-/// 2. The directories that decide what `path` names are checked (see the
-///    module docs): the resolved file's, and the one `path` names it in,
-///    where a symlink lives if `path` is one -- each up to `/`.
+/// 1-2. `path` is resolved once, symlinks and all, to the real file, and
+///    every directory a lookup happens in on the way is checked, each up to
+///    `/` (see [`secure_file::resolve_trusted`]) -- including the ones the
+///    symlinks it follows live in.
 /// 3. The *resolved* path is opened read-only with `O_NOFOLLOW`, so a
 ///    symlink swapped in after step 1 fails the open instead of being
 ///    followed, and with `O_NONBLOCK` so a FIFO can't hang the call.
@@ -162,8 +161,13 @@ fn read_with_proc_root(path: &Path, trust: &dyn PrincipalTrust, proc_root: &Path
         follow_symlinks: false,
         allow_group_read_if_root_owned: false, // group read isn't forbidden here anyway: the file is ciphertext
     };
-    let target_real = std::fs::canonicalize(path).map_err(open_error)?;
-    check_location(path, &target_real, trust)?;
+    let target_real = match secure_file::resolve_trusted(path, trust) {
+        Ok(Some(real)) => real,
+        Ok(None) => return Err(KeyFileError::NotFound),
+        // A trust refusal carries no OS error; anything the OS refused does.
+        Err(e) if e.raw_os_error().is_none() => return Err(KeyFileError::Untrusted),
+        Err(e) => return Err(open_error(e)),
+    };
     let untrusted = |e: io::Error| match e.raw_os_error() {
         Some(libc::ELOOP) => KeyFileError::Untrusted, // became a symlink after it was resolved
         // No OS error behind it: a check on the opened descriptor refused
@@ -191,43 +195,6 @@ fn read_with_proc_root(path: &Path, trust: &dyn PrincipalTrust, proc_root: &Path
     })?;
     check(contents.as_slice())?;
     Ok(contents)
-}
-
-// The directories that decide what `path` names must be as trustworthy as
-// the file: owned by someone `trust` accepts, and not writable by anyone
-// else, sticky or not (`secure_file::check_dir_chain_trusting`). Otherwise someone
-// else could rename a file of their choosing over the key, or retarget a
-// symlink to one, and the file checks alone would pass on whatever they put
-// there. Sticky (`/tmp`-style) directories are not trusted anywhere in the
-// chain: a key file has no business in a directory every local user can
-// create entries in, and refusing it there outright leaves nothing resting
-// on the owner checks of everything beneath.
-//
-// Two directories are checked, each up to `/`: the resolved file's own --
-// where the file actually read sits, which `read` confirms after the open --
-// and the one `path` names it in, which holds the symlink if `path` is one.
-// Directories that intermediate symlinks *within* the path live in are not
-// walked; someone able to retarget one could at most redirect `path` to a
-// different file that itself passes every check here (owned by someone
-// trusted, in trusted directories) -- never to one they wrote.
-fn check_location(path: &Path, target_real: &Path, trust: &dyn PrincipalTrust) -> Result<(), KeyFileError> {
-    let check = |dir: &Path| {
-        secure_file::check_dir_chain_trusting(dir, trust)
-            .map_err(|_| KeyFileError::Untrusted)
-    };
-    // Only `/` has no parent, and `/` is a directory, not a key file.
-    let target_dir = target_real.parent().ok_or(KeyFileError::Io)?;
-    check(target_dir)?;
-
-    let named_in = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let named_in = std::fs::canonicalize(named_in).map_err(|e| match e.kind() {
-        io::ErrorKind::PermissionDenied => KeyFileError::AccessDenied, // the OS refused to resolve it
-        _ => KeyFileError::Untrusted, // can't confirm what names the file, so it isn't trusted
-    })?;
-    if named_in != target_dir {
-        check(&named_in)?;
-    }
-    Ok(())
 }
 
 fn open_error(e: io::Error) -> KeyFileError {
@@ -936,6 +903,52 @@ mod tests {
         chmod(shared.path(), 0o777);
         assert_eq!(read_with_proc_root(&elsewhere, no_proc).err(), Some(KeyFileError::Untrusted), "directory checks");
         chmod(shared.path(), 0o700);
+    }
+
+    #[test]
+    fn a_symlink_living_in_an_untrusted_directory_is_refused_even_into_a_trusted_one() {
+        // The finding: `<untrusted>/link/wrapped.key`, with `link` pointing
+        // into a trusted directory. Where the path is named and where it
+        // ends up are both trusted, but whoever can write `<untrusted>` can
+        // point `link` at any other key file they like.
+        let trusted = secure_file::private_tempdir();
+        let untrusted = secure_file::private_tempdir();
+        let bytes = valid();
+        write(trusted.path(), "wrapped.key", &bytes);
+        let link = untrusted.path().join("link");
+        std::os::unix::fs::symlink(trusted.path(), &link).unwrap();
+        let through_link = link.join("wrapped.key");
+        assert_eq!(read(&through_link).unwrap().as_slice(), &bytes[..], "fine while the link's directory is private");
+
+        chmod(untrusted.path(), 0o777);
+        assert_eq!(read(&through_link).err(), Some(KeyFileError::Untrusted));
+        chmod(untrusted.path(), 0o700);
+
+        // And a link further along a chain of them: `<trusted>/hop` ->
+        // `<untrusted>/link/wrapped.key`.
+        let hop = trusted.path().join("hop.key");
+        std::os::unix::fs::symlink(&through_link, &hop).unwrap();
+        chmod(untrusted.path(), 0o777);
+        assert_eq!(read(&hop).err(), Some(KeyFileError::Untrusted), "every link on the way counts");
+        chmod(untrusted.path(), 0o700);
+        assert!(read(&hop).is_ok());
+    }
+
+    #[test]
+    fn dotdot_after_a_symlink_is_resolved_where_the_link_leads() {
+        // `<a>/link/../wrapped.key` names `wrapped.key` beside where `link`
+        // points, as the kernel resolves it -- not `<a>/wrapped.key`.
+        let a = secure_file::private_tempdir();
+        let b = secure_file::private_tempdir();
+        let inner = b.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::os::unix::fs::symlink(&inner, a.path().join("link")).unwrap();
+        let in_b = valid();
+        write(b.path(), "wrapped.key", &in_b);
+        assert_eq!(read(&a.path().join("link/../wrapped.key")).unwrap().as_slice(), &in_b[..]);
+        chmod(b.path(), 0o777);
+        assert_eq!(read(&a.path().join("link/../wrapped.key")).err(), Some(KeyFileError::Untrusted), "and checked there");
+        chmod(b.path(), 0o700);
     }
 
     #[test]
