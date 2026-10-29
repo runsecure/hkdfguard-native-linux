@@ -402,6 +402,10 @@ fn pin_allows(service: &str, public: &Public) -> Result<bool> {
 /// manager.
 const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
 
+/// The device node [`DEFAULT_TCTI`] opens. Its presence is what tells "no
+/// TPM here" apart from "a TPM this process can't open".
+const DEFAULT_DEVICE: &str = "/dev/tpmrm0";
+
 /// Whether the policy names a TCTI, rather than leaving [`DEFAULT_TCTI`] --
 /// i.e. whether someone pointed this process at a particular TPM on purpose.
 fn tcti_is_explicit() -> bool {
@@ -563,8 +567,9 @@ fn note_owner_auth_failure(e: &tss_esapi::Error) {
 // ---------------------------------------------------------------------
 
 // Holds the shared, lazily-usable connection to the TPM. `None` means no
-// TPM was reachable at construction time (this provider is then simply
-// unavailable).
+// TPM was reachable at construction time: then either there is no TPM
+// (the provider is simply unavailable), or `unreachable` says why the one
+// there couldn't be opened.
 pub struct Tpm2Provider {
     // A TPM ESYS context is not safe to drive concurrently; serialize
     // access to the (typically low-throughput, one DEK-wrap-at-a-time) TPM
@@ -575,20 +580,58 @@ pub struct Tpm2Provider {
     // Set when a TPM is there but can't be trusted or used (see
     // `crate::provider::Backend::Refused`); every call then fails with it.
     refused: Option<String>,
+    // Set when the default device exists but this process couldn't open
+    // it: the TPM is there, but whether it is this service's provider
+    // depends on the service (see `unreachable_for`).
+    unreachable: Option<String>,
 }
 
 impl Tpm2Provider {
     pub fn new() -> Self {
         // try to connect once, at construction time
-        let (context, refused) = match open_context() {
-            Backend::Ready(ctx) => (Some(ctx), None),
-            Backend::Absent => (None, None),
+        let (context, refused, unreachable) = match open_context() {
+            Backend::Ready(ctx) => (Some(ctx), None, None),
+            Backend::Absent => (None, None, unreachable_default_device(Path::new(DEFAULT_DEVICE))),
             Backend::Refused(reason) => {
                 crate::provider::log_once(log::Level::Error, format!("hkdfguard: TPM refused: {reason}"));
-                (None, Some(reason))
+                (None, Some(reason), None)
             }
         };
-        Tpm2Provider { context: Arc::new(Mutex::new(context)), refused }
+        Tpm2Provider { context: Arc::new(Mutex::new(context)), refused, unreachable }
+    }
+
+    /// For a provider whose TPM device exists but couldn't be opened: the
+    /// error a call for `service` must fail with -- because the service has
+    /// a TPM key file, so the TPM is its provider and the chain must not
+    /// move past it -- or `None` when it has none and the TPM was never
+    /// its provider. `None` too for a provider that connected or found no
+    /// device at all.
+    fn unreachable_for(&self, service: &str) -> Result<Option<Error>> {
+        let Some(reason) = &self.unreachable else {
+            return Ok(None);
+        };
+        let path = key_file_path(&key_dir()?, service);
+        let present = match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            // ENOTDIR (a path component is a file) names nothing either.
+            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => false,
+            // A process that may not even look in the key directory was
+            // never given TPM keys, and can't be told apart from one that
+            // has lost the access: neither can use the TPM here.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                log::debug!("hkdfguard: TPM key directory not readable by this process ({e}); treating the TPM as not this service's");
+                false
+            }
+            Err(e) => return Err(Error::Provider(format!("could not check for TPM key file {}: {e}", path.display()))),
+        };
+        Ok(present.then(|| {
+            Error::Provider(format!(
+                "this service has a TPM key file ({}), but {reason}. Refusing rather than using a weaker provider: \
+                 restore this process's access to the TPM",
+                path.display()
+            ))
+        }))
     }
 
     fn connected(&self) -> bool {
@@ -601,6 +644,20 @@ impl Tpm2Provider {
             None => Ok(()),
         }
     }
+}
+
+/// Why the default TPM device, if it exists, couldn't be opened: `None`
+/// when there is no such device (no TPM on this host). Its open already
+/// failed; this only words the reason, without the device error itself,
+/// which tss-esapi reports as an unspecific TCTI failure.
+fn unreachable_default_device(device: &Path) -> Option<String> {
+    device.exists().then(|| {
+        format!(
+            "this process could not open the TPM at {} (is it in the device's group, usually tss? is the \
+             tpm2-tss device TCTI installed?)",
+            device.display()
+        )
+    })
 }
 
 impl Default for Tpm2Provider {
@@ -643,9 +700,11 @@ fn open_context() -> Backend<Context> {
     let mut ctx = match Context::new(tcti) {
         Ok(ctx) => ctx,
         // The default device failing to open is the normal state of a host
-        // with no TPM, or one this service isn't meant to use (not in the
-        // `tss` group). A TCTI someone configured on purpose is different:
-        // its TPM is meant to be used, so failing to reach it is an outage.
+        // with no TPM, or of a service that isn't meant to use it (not in
+        // the `tss` group). Which it is gets decided per service, from the
+        // key directory: see `Tpm2Provider::unreachable_for`. A TCTI
+        // someone configured on purpose is different: its TPM is meant to
+        // be used, so failing to reach it is an outage for every service.
         Err(e) if tcti_is_explicit() => return Backend::Refused(format!("could not open the configured TCTI: {e}")),
         Err(e) => {
             log::debug!("hkdfguard: no usable TPM at {DEFAULT_TCTI} ({e})");
@@ -1357,15 +1416,21 @@ impl KekProvider for Tpm2Provider {
     }
 
     fn probe(&self) -> bool {
-        self.refused.is_some() || self.connected()
+        // A TPM this process can't open is still present: whether it is
+        // this service's provider is answered per service, below.
+        self.refused.is_some() || self.connected() || self.unreachable.is_some()
     }
 
     // A service has a KEK here when it has a usable key file and authValue
     // file -- and, under `tpm.require_pinned_names`, a pinned Name. Side-
     // effect free: nothing is sent to the TPM. A key file without its
-    // authValue file is an error, not "no KEK".
+    // authValue file is an error, not "no KEK"; so is a key file this
+    // process can't use because it can't open the TPM.
     fn kek_exists(&self, service: &str) -> Result<bool> {
         self.check_not_refused()?;
+        if let Some(e) = self.unreachable_for(service)? {
+            return Err(e);
+        }
         if !self.connected() {
             return Ok(false);
         }
@@ -1380,6 +1445,14 @@ impl KekProvider for Tpm2Provider {
 
     fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
         self.check_not_refused()?;
+        if let Some(e) = self.unreachable_for(service)? {
+            return Err(e);
+        }
+        if self.unreachable.is_some() {
+            // No key file: the TPM isn't this service's provider, and a key
+            // can't be created on a TPM this process can't open.
+            return Err(Error::KeyNotProvisioned("this process can't open the TPM, and the service has no TPM key file"));
+        }
         if !self.connected() {
             return Err(Error::Provider("TPM context not available".into()));
         }
@@ -1434,6 +1507,9 @@ impl KekProvider for Tpm2Provider {
     // (a backup), which still load on this TPM.
     fn retire_kek(&self, service: &str, expected_fingerprint: &[u8; crate::payload::FINGERPRINT_LEN]) -> Result<()> {
         self.check_not_refused()?;
+        if let Some(e) = self.unreachable_for(service)? {
+            return Err(e);
+        }
         if !self.connected() {
             return Err(Error::Provider("TPM context not available".into()));
         }
@@ -2047,6 +2123,73 @@ mod tests {
             match required_auth_file(SERVICE) {
                 Err(Error::Provider(msg)) => assert!(msg.contains("no authValue file") && msg.contains(".tpmauth"), "{msg}"),
                 other => panic!("expected an error, got {:?}", other.map(|_| ())),
+            }
+        });
+    }
+
+    // ---- a TPM device that exists but can't be opened (no TPM needed) ----
+
+    // A provider in the state `new()` leaves it in when `/dev/tpmrm0`
+    // exists but this process couldn't open it.
+    fn unreachable_provider() -> Tpm2Provider {
+        let device = crate::secure_file::private_tempdir();
+        Tpm2Provider {
+            context: Arc::new(Mutex::new(None)),
+            refused: None,
+            unreachable: unreachable_default_device(device.path()),
+        }
+    }
+
+    #[test]
+    fn only_a_device_that_exists_counts_as_unreachable() {
+        let device = crate::secure_file::private_tempdir();
+        let reason = unreachable_default_device(device.path()).expect("the device exists");
+        assert!(reason.contains("could not open the TPM") && reason.contains("tss"), "{reason}");
+        assert_eq!(unreachable_default_device(&device.path().join("no-such-tpm")), None, "no device: no TPM here");
+        assert_eq!(DEFAULT_TCTI.strip_prefix("device:"), Some(DEFAULT_DEVICE));
+    }
+
+    #[test]
+    #[serial]
+    fn an_unopenable_tpm_steps_aside_for_a_service_without_a_key_file() {
+        with_key_dir(|_| {
+            let tpm = unreachable_provider();
+            assert!(tpm.probe(), "the TPM is there, so the chain asks it");
+            assert!(!tpm.kek_exists(SERVICE).unwrap());
+            for create in [false, true] {
+                match tpm.load_kek(SERVICE, create) {
+                    Err(Error::KeyNotProvisioned(msg)) => assert!(msg.contains("can't open the TPM"), "{msg}"),
+                    other => panic!("create {create}: expected the chain to move on, got {:?}", other.map(|_| ())),
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_unopenable_tpm_stops_the_chain_for_a_service_with_a_key_file() {
+        with_key_dir(|dir| {
+            write_key_file(SERVICE, &fake_blob(&fake_service_public())).unwrap();
+            let tpm = unreachable_provider();
+            let refused = |result: Result<()>| match result {
+                Err(Error::Provider(msg)) => {
+                    assert!(msg.contains("has a TPM key file") && msg.contains("com.company.orders.tpmkey"), "{msg}")
+                }
+                other => panic!("expected the TPM to refuse, got {other:?}"),
+            };
+            refused(tpm.kek_exists(SERVICE).map(|_| ()));
+            refused(tpm.load_kek(SERVICE, false).map(|_| ()));
+            refused(tpm.load_kek(SERVICE, true).map(|_| ()));
+            refused(tpm.retire_kek(SERVICE, &[0; crate::payload::FINGERPRINT_LEN]));
+
+            // A process not allowed to look in the key directory was never
+            // given TPM keys: it moves on, as with no key file.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let blind = std::fs::read_dir(dir).is_err(); // false as root, which sees through the mode
+            let exists = tpm.kek_exists(SERVICE);
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if blind {
+                assert!(!exists.unwrap(), "an unreadable key directory is not this service's TPM");
             }
         });
     }

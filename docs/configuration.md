@@ -237,9 +237,10 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   `/tmp`). Nothing on that path can then be swapped for another library.
 - **The PIN file** holds the token's user PIN (one trailing newline is
   ignored). It must be root-owned, mode `0400`, or `0440` with the service's
-  group, in directories only root can change, up to `/`. If the PIN file doesn't exist, PKCS#11 counts as absent and the
-  next provider is tried. Once it exists, any problem fails the call
-  instead.
+  group, in directories only root can change, up to `/`. Setting
+  `module` is what turns PKCS#11 on, so with it set, a missing PIN file
+  fails the call like any other problem: it is never a reason to try the
+  next provider.
 - **Choose the token** by `token_label` and/or `token_serial`. Exactly one
   token must match. With neither set, exactly one initialized token must be
   present.

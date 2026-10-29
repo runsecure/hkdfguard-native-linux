@@ -51,6 +51,8 @@ back to defaults in that case.
 | `selection.mode "require" needs a selection.provider` (or similar) | `provider` and `level` don't match the mode | `require` takes `provider`, `require-level` takes `level`, `prefer` takes neither |
 | `unknown variant` ... `session_encryption` | `"auto"` or `"required"`, from before authValues | Use `"on"` (the default) or remove the line |
 | `holds a key with an empty password (emptyAuth)` | A TPM key file from before authValues | Delete it and run `hkdfguard provision` again; re-wrap the DEKs |
+| `pkcs11.module is set, but its PIN file ... does not exist` | PKCS#11 is configured, but the PIN file is missing, misnamed, or was removed during a rotation | Create the PIN file (root-owned, `0400`, or `root:<service-group> 0440`); or remove `pkcs11.module` to stop using PKCS#11 |
+| `this service has a TPM key file (...), but this process could not open the TPM` | The service's KEK is on the TPM, but this process can't open `/dev/tpmrm0`: usually it lost `tss` membership, or the tpm2-tss device TCTI isn't installed | Restore the access (`usermod -aG tss <user>`, then restart the service); new KEKs are not created on a weaker provider meanwhile |
 | `TPM key file has no authValue file` | The `<service>.tpmauth` beside the key file is missing | Restore it from the backup taken with the key file, or retire and re-provision |
 
 ## No provider is available (-3)

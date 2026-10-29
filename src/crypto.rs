@@ -289,6 +289,13 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     if payload.ciphertext.len() != DEK_LEN + TAG_LEN {
         return Err(Error::Malformed("wrapped ciphertext has unexpected length")); // malformed/tampered length; bail out before touching any crypto
     }
+    if payload.key_id.len() > MAX_KEY_ID_LEN {
+        // No wrap records a longer one (see `wrap`), and it would make the
+        // PRF input longer than MAX_PRF_INPUT_LEN, the most a provider is
+        // promised -- and more than one TPM2_HMAC takes. Refused before any
+        // provider is reached.
+        return Err(Error::Malformed("wrapped payload's key_id is longer than any wrap records"));
+    }
 
     let provider = provider::get_by_type(payload.provider_type)?; // must use the exact provider that originally wrapped this DEK
     let handle = provider.load_kek(service, false)?; // load (never create) that provider's KEK for this service
@@ -434,6 +441,32 @@ mod tests {
             wrapped.truncate(wrapped.len() - 5); // chop bytes out of the ciphertext/tag region
             let err = unwrap("com.company.orders", &wrapped).unwrap_err();
             assert!(matches!(err, Error::Malformed(_))); // must be rejected by the explicit length check, not panic in `split_at`
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_over_long_key_id_is_refused_before_any_provider_is_reached() {
+        with_isolated_ephemeral_provider(|| {
+            crate::provider::create_kek("com.company.orders").unwrap();
+            let genuine = wrap("com.company.orders", &[0x33u8; DEK_LEN]).unwrap();
+            let longest = Payload { key_id: vec![0x41; MAX_KEY_ID_LEN], ..Payload::from_bytes(&genuine).unwrap() };
+            let too_long = Payload { key_id: vec![0x41; MAX_KEY_ID_LEN + 1], ..Payload::from_bytes(&genuine).unwrap() };
+            let huge = Payload { key_id: vec![0x41; 60_000], ..Payload::from_bytes(&genuine).unwrap() };
+
+            // At the bound it reaches the provider, and fails only because
+            // the key_id is bound into the wrapping key.
+            assert!(matches!(unwrap("com.company.orders", &longest.to_bytes()), Err(Error::AuthFailed)));
+            // One past it, and far past it: refused as malformed, never sent
+            // to the provider as an over-long PRF input.
+            for payload in [too_long, huge] {
+                let err = unwrap("com.company.orders", &payload.to_bytes()).unwrap_err();
+                assert!(matches!(err, Error::Malformed(msg) if msg.contains("key_id")), "{err:?}");
+            }
+            // And with no KEK at all for the service, the length check still
+            // answers first: nothing was looked up.
+            let orphan = Payload { key_id: vec![0x41; 60_000], ..Payload::from_bytes(&genuine).unwrap() };
+            assert!(matches!(unwrap("com.company.never-created", &orphan.to_bytes()), Err(Error::Malformed(_))));
         });
     }
 

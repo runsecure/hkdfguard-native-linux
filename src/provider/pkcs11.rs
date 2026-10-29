@@ -383,12 +383,12 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
 }
 
 // Loads the PIN, loads the module, initializes the library, picks a slot,
-// opens a read-only session, and logs in. `Absent` when PKCS#11 isn't
-// configured on this host -- no `pkcs11.module` in policy, or no PIN file.
-// Once it is configured,
-// every later failure is `Refused`: the HSM is meant to be used, so a
-// module that won't load, a missing token, or a wrong PIN is an outage to
-// surface, not a reason to wrap under a weaker provider.
+// opens a read-only session, and logs in. `Absent` only when PKCS#11 isn't
+// configured on this host: no `pkcs11.module` in policy. Once it is, every
+// later failure is `Refused` -- a missing PIN file included: the HSM is
+// meant to be used, so a PIN file not yet provisioned, misnamed, or gone
+// mid-rotation, a module that won't load, a missing token, or a wrong PIN
+// is an outage to surface, not a reason to wrap under a weaker provider.
 fn open_session() -> Backend<OpenSession> {
     if std::env::var_os("HKDFGUARD_PKCS11_PIN").is_some() {
         crate::provider::log_once(
@@ -412,10 +412,11 @@ fn open_session() -> Backend<OpenSession> {
     let pin = match read_pin_file(&pin_path) {
         Ok(pin) => pin,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Its directory is root-controlled (see `read_pin_file`), so
-            // nobody else can make it absent.
-            log::debug!("hkdfguard: no PKCS#11 PIN file at {}; PKCS#11 provider not used", pin_path.display());
-            return Backend::Absent;
+            return Backend::Refused(format!(
+                "pkcs11.module is set, but its PIN file {} does not exist. Create it (root-owned, mode 0400, or \
+                 root:<service-group> 0440), or remove pkcs11.module from the policy to stop using PKCS#11",
+                pin_path.display()
+            ));
         }
         Err(e) => return Backend::Refused(format!("PIN file {}: {e}", pin_path.display())),
     };
@@ -1046,6 +1047,38 @@ mod tests {
     fn missing_pin_file_is_not_found() {
         let err = read_pin_file(Path::new("/nonexistent-hkdfguard-pin-file")).err().unwrap();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_configured_module_with_no_pin_file_is_refused_not_skipped() {
+        // `pkcs11.module` is the opt-in. With it set, a PIN file that isn't
+        // there must stop the chain, not hand new KEKs to the next provider.
+        // Checked before the module is loaded, so no token is needed.
+        use crate::provider::{KekProvider, ProviderType};
+        let dir = crate::secure_file::private_tempdir();
+        let missing = dir.path().join("pkcs11.pin");
+        let _policy = crate::policy::test_support::TestPolicy::write(&format!(
+            "security_model = \"developer\"\npreferred_order = [\"pkcs11\", \"ephemeral\"]\n\
+             [pkcs11]\nmodule = \"/usr/lib/hkdfguard-test-no-such-module.so\"\npin_file = \"{}\"\n",
+            missing.display()
+        ));
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "a configured HSM with no PIN file is present, and refused");
+        match provider.load_kek("com.company.orders", true) {
+            Err(Error::Provider(msg)) => assert!(msg.contains("does not exist") && msg.contains("pkcs11.pin"), "{msg}"),
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+
+        // And the chain stops there: no KEK is created on Ephemeral.
+        match crate::provider::create_kek("com.company.orders") {
+            Err(Error::Provider(msg)) => assert!(msg.starts_with("PKCS11:") && msg.contains("PIN file"), "{msg}"),
+            Err(other) => panic!("expected the PKCS#11 refusal, got {other:?}"),
+            Ok((provider, _)) => {
+                assert_ne!(provider.provider_type(), ProviderType::Ephemeral, "must not fall through to Ephemeral");
+                panic!("expected the PKCS#11 refusal, got a KEK on {:?}", provider.provider_type());
+            }
+        }
     }
 
     fn tok(label: &str, serial: &str) -> (String, String) {
