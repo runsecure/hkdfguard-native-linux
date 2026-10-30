@@ -62,3 +62,17 @@ path = "fuzz_targets/cli_args.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tpm_key_file"
+path = "fuzz_targets/tpm_key_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_walk"
+path = "fuzz_targets/path_walk.rs"
+test = false
+doc = false
+bench = false

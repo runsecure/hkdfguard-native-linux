@@ -1,5 +1,5 @@
-//! hkdfguard-native-linux: `ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM` DEK
-//! wrapping backed by a priority-ordered chain of KEK providers (TPM2,
+//! hkdfguard-native-linux: `HMAC-SHA-256 KDF (SP 800-108) -> AES-256-GCM`
+//! DEK wrapping backed by a priority-ordered chain of KEK providers (TPM2,
 //! PKCS#11, external secret, ephemeral).
 //!
 //! This crate's only public interface is the stable C ABI below. No
@@ -9,7 +9,7 @@
 //! and [`hkdfguard_generate_and_wrap_dek`].
 
 mod audit; // the audit trail: syslog (authpriv) records, the Windows build's Event Log events
-mod crypto; // ECDH -> HKDF -> AES-GCM protocol
+mod crypto; // KEK PRF -> AES-GCM protocol
 mod error; // internal error type + public status codes
 mod key_file; // reading and checking a wrapped-DEK key file (hkdfguard_open_file)
 mod payload; // wrapped-payload wire format
@@ -23,13 +23,65 @@ mod test_tmp; // where tests make temp dirs: a private root, not the sticky /tmp
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
 /// Administration for the `hkdfguard` CLI: operations deliberately kept
-/// out of the C ABI, so no application linking the library can call them.
-/// Rust-only and not a stable interface.
+/// out of the C ABI, so no C, Python or .NET application linking the
+/// shared library can call them. Rust-only and not a stable interface.
+///
+/// Not a security boundary for Rust code: a Rust program that depends on
+/// this crate can call these as the CLI does. What protects them is what
+/// they check themselves -- `retire_kek` refuses anyone but root under the
+/// production security model, and deletes nothing without the KEK's exact
+/// fingerprint -- not who can reach them.
 #[doc(hidden)]
 pub mod admin {
     use super::*;
 
+    pub use secure_file::{DirProblem, Owner, PrincipalTrust};
     pub use security_model::{DEPLOYERS_GROUP, OVER_BROAD_GROUPS};
+
+    /// The first of `dir` and its ancestors, up to `/`, that `trust`
+    /// refuses, and why: the library's own per-directory rule (owner, write
+    /// bits, sticky directories never trusted, read-only mounts exempt), so
+    /// the CLI judges folders exactly as the library will. `dir` must be
+    /// canonical.
+    pub fn first_untrusted_dir(dir: &std::path::Path, trust: &dyn PrincipalTrust) -> Option<(std::path::PathBuf, DirProblem)> {
+        secure_file::first_untrusted_dir(dir, trust)
+    }
+
+    /// Whose folders a key file the CLI writes may sit under. Production:
+    /// exactly whom the library trusts with key files (root and deployers,
+    /// and group write only through a deployer group), since that doesn't
+    /// depend on who reads the file. Developer: any owner, no group write --
+    /// the library's owner rule there is "root or the reading process's own
+    /// user", which the CLI, often running as root for an application's
+    /// account, can't know, so only modes are judged.
+    pub fn key_file_writer_trust() -> Result<Box<dyn PrincipalTrust>, AdminError> {
+        let _policy = policy::snapshot_for_call();
+        let trust = security_model::Trust::current()?;
+        Ok(match trust.model() {
+            security_model::SecurityModel::Production => Box::new(trust),
+            security_model::SecurityModel::Developer => Box::new(ModeOnly),
+        })
+    }
+
+    /// Any owner; group write never. See [`key_file_writer_trust`].
+    struct ModeOnly;
+
+    impl PrincipalTrust for ModeOnly {
+        fn trusts_owner(&self, _uid: u32) -> bool {
+            true
+        }
+        fn trusts_group_writer(&self, _gid: u32) -> bool {
+            false
+        }
+    }
+
+    /// Confirms `file` is the file `spelled` names now: by its path in
+    /// `/proc/self/fd` where `/proc` is mounted, and always by device and
+    /// inode -- the check the library makes after every open of a file it
+    /// reads. `spelled` must be canonical.
+    pub fn verify_opened(file: &std::fs::File, spelled: &std::path::Path) -> std::io::Result<()> {
+        secure_file::verify_opened(file, spelled, spelled, std::path::Path::new("/proc"))
+    }
 
     /// Why an administrative operation failed: the status code it maps to
     /// (as the C functions would return it), and a sentence for the
@@ -83,7 +135,7 @@ pub mod admin {
                 return Err(error::Error::AccessDenied("under the production security model only root retires a KEK"));
             }
             let (provider, handle) = provider::select_existing(&service)?;
-            if crypto::kek_fingerprint(&handle.public_key()?) != *expected_fingerprint {
+            if crypto::kek_fingerprint(&*handle)? != *expected_fingerprint {
                 return Err(error::Error::KekFingerprintMismatch);
             }
             drop(handle);
@@ -394,9 +446,10 @@ pub extern "C" fn hkdfguard_kek_exists(service: *const c_char, exists: *mut c_in
 }
 
 /// Writes the 32-byte fingerprint of the KEK `service` currently resolves to:
-/// SHA-256 of its public key, SEC1-uncompressed (`0x04 || X || Y`) -- the
+/// a fixed HMAC output under the KEK (see `docs/why-hmac-prf.md`) -- the
 /// same value every payload wrapped under it carries, and that
-/// [`hkdfguard_unwrap_dek`] checks. Public-key material, not a secret. Lets
+/// [`hkdfguard_unwrap_dek`] checks. Public, not a secret: it reveals
+/// nothing about the KEK. Lets
 /// an operator record which KEK a service uses after provisioning, and
 /// confirm it before retiring it. Never creates a KEK.
 ///
@@ -556,20 +609,47 @@ pub(crate) fn harden_process_impl(flags: c_uint) -> c_int {
     // non-dumpable flag below is what stops same-user debuggers, and it is
     // applied (or this fails) either way.
 
-    let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    // SAFETY: setrlimit reads a valid, fully initialized rlimit.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
-        log::error!(
-            "hkdfguard: could not disable core dumps (setrlimit RLIMIT_CORE): {}",
-            std::io::Error::last_os_error()
-        );
-        return status::PROCESS_HARDENING_FAILED;
+    // Under Miri, which can't make these system calls, the same steps run
+    // with nothing to change.
+    if cfg!(miri) {
+        return harden_steps(None, &|| 0);
     }
 
     #[cfg(target_os = "linux")]
-    {
+    let dumpable = (
+        // SAFETY: PR_GET_DUMPABLE takes no further arguments and returns the flag.
+        || unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) },
         // SAFETY: PR_SET_DUMPABLE takes one integer argument; the rest are ignored.
-        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong, 0, 0, 0) } != 0 {
+        |value: libc::c_ulong| unsafe { libc::prctl(libc::PR_SET_DUMPABLE, value, 0, 0, 0) },
+    );
+    let no_core = || {
+        let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: setrlimit reads a valid, fully initialized rlimit.
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }
+    };
+    #[cfg(target_os = "linux")]
+    let dumpable_calls: Option<DumpableCalls> = Some((&dumpable.0, &dumpable.1));
+    #[cfg(not(target_os = "linux"))]
+    let dumpable_calls: Option<DumpableCalls> = None;
+    harden_steps(dumpable_calls, &no_core)
+}
+
+/// The dumpable flag's getter and setter (Linux's `prctl`), for
+/// [`harden_steps`].
+type DumpableCalls<'a> = (&'a dyn Fn() -> c_int, &'a dyn Fn(libc::c_ulong) -> c_int);
+
+/// `harden_process_impl`'s steps, with the system calls passed in so the
+/// order, and the undo, can be tested.
+///
+/// The reversible step first. Lowering RLIMIT_CORE's hard limit can never
+/// be undone by an unprivileged process, so it comes last: if it fails, the
+/// dumpable flag is put back, and a failed call leaves the process exactly
+/// as it found it.
+fn harden_steps(dumpable: Option<DumpableCalls>, no_core: &dyn Fn() -> c_int) -> c_int {
+    let mut was_dumpable = 0;
+    if let Some((get, set)) = dumpable {
+        was_dumpable = get();
+        if set(0) != 0 {
             log::error!(
                 "hkdfguard: could not mark the process non-dumpable (prctl PR_SET_DUMPABLE): {}",
                 std::io::Error::last_os_error()
@@ -577,7 +657,18 @@ pub(crate) fn harden_process_impl(flags: c_uint) -> c_int {
             return status::PROCESS_HARDENING_FAILED;
         }
     }
-
+    if no_core() != 0 {
+        log::error!(
+            "hkdfguard: could not disable core dumps (setrlimit RLIMIT_CORE): {}",
+            std::io::Error::last_os_error()
+        );
+        if let Some((_, set)) = dumpable {
+            if was_dumpable > 0 {
+                set(was_dumpable as libc::c_ulong); // restores the flag this call cleared
+            }
+        }
+        return status::PROCESS_HARDENING_FAILED;
+    }
     status::OK
 }
 
@@ -690,8 +781,9 @@ fn create_kek_impl(service: *const c_char) -> c_int {
     gated_setup(|| {
         // Asked first, so the audit trail records a KEK being *created*
         // (1000/1001), not every idempotent re-run. If the question itself
-        // fails, the create below reports the real error.
-        let existed = provider::kek_exists(&service_str).unwrap_or(false);
+        // fails, the create below reports the real error -- and if the
+        // create succeeds anyway, the record says it may have found one.
+        let existed = provider::kek_exists(&service_str).ok();
         // Under the production model only root creates a persistent KEK;
         // anyone else gets the existing one, or KEK_ACCESS_DENIED.
         let created = security_model::current().and_then(|model| {
@@ -703,8 +795,13 @@ fn create_kek_impl(service: *const c_char) -> c_int {
         });
         match created {
             Ok((provider, _handle)) => {
-                if !existed {
-                    audit::kek_created(&service_str, provider.provider_type(), provider::preferred_type());
+                let creation = match existed {
+                    Some(true) => None,
+                    Some(false) => Some(audit::Creation::Created),
+                    None => Some(audit::Creation::Unconfirmed),
+                };
+                if let Some(creation) = creation {
+                    audit::kek_created(&service_str, provider.provider_type(), provider::preferred_type(), creation);
                 }
                 status::OK
             }
@@ -775,7 +872,7 @@ fn kek_fingerprint_impl(service: *const c_char, out: *mut u8, out_len: *mut c_in
     let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     let fingerprint = gated_setup(|| {
         let (_provider, handle) = provider::select_existing(&service_str)?;
-        Ok(crypto::kek_fingerprint(&handle.public_key()?))
+        crypto::kek_fingerprint(&*handle)
     });
     match fingerprint {
         Ok(fingerprint) => {
@@ -848,7 +945,7 @@ fn wrap_impl(
     dek_array.copy_from_slice(dek_slice);
 
     let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
-    let result = crypto::wrap(&service_str, &dek_array); // do the actual ECDH -> HKDF -> AES-GCM work
+    let result = crypto::wrap(&service_str, &dek_array); // do the actual KEK PRF -> AES-GCM work
     dek_array.zeroize(); // our local copy of the plaintext DEK is no longer needed; scrub it now
 
     let wrapped = match result {
@@ -1242,10 +1339,12 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
         Err(e) => {
             log::error!("hkdfguard: hkdfguard_open_file refused key file {}: {}", path.display(), e.describe());
             let code = e.status_code();
-            // The one open_file failure that is audited: a possible key
-            // exposure an administrator needs to hear about (event 2006).
+            // Audited: a possible key exposure (event 2006), and a file
+            // that could have been replaced or isn't a payload (2003).
             if code == status::FILE_PLAINTEXT_KEY {
                 audit::plaintext_key_file(&path);
+            } else {
+                audit::key_file_refused(&path, code);
             }
             return fail(code);
         }
@@ -1265,8 +1364,53 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
 
 #[cfg(test)]
 mod ffi_tests {
+    #[test]
+    fn hardening_clears_the_dumpable_flag_first_and_restores_it_if_core_dumps_cant_be_disabled() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let get = || {
+            calls.borrow_mut().push("get".to_string());
+            1
+        };
+        let set = |v: libc::c_ulong| {
+            calls.borrow_mut().push(format!("set {v}"));
+            0
+        };
+        let fail_core = || {
+            calls.borrow_mut().push("no_core".to_string());
+            -1
+        };
+        assert_eq!(super::harden_steps(Some((&get, &set)), &fail_core), super::status::PROCESS_HARDENING_FAILED);
+        assert_eq!(*calls.borrow(), ["get", "set 0", "no_core", "set 1"], "reversible first, and undone on failure");
+
+        calls.borrow_mut().clear();
+        let ok_core = || {
+            calls.borrow_mut().push("no_core".to_string());
+            0
+        };
+        assert_eq!(super::harden_steps(Some((&get, &set)), &ok_core), super::status::OK);
+        assert_eq!(*calls.borrow(), ["get", "set 0", "no_core"]);
+
+        // Already non-dumpable: nothing to restore.
+        calls.borrow_mut().clear();
+        let get0 = || {
+            calls.borrow_mut().push("get".to_string());
+            0
+        };
+        assert_eq!(super::harden_steps(Some((&get0, &set)), &fail_core), super::status::PROCESS_HARDENING_FAILED);
+        assert_eq!(*calls.borrow(), ["get", "set 0", "no_core"]);
+
+        // The flag can't be cleared: core dumps are never touched.
+        calls.borrow_mut().clear();
+        let set_fails = |v: libc::c_ulong| {
+            calls.borrow_mut().push(format!("set {v}"));
+            -1
+        };
+        assert_eq!(super::harden_steps(Some((&get, &set_fails)), &ok_core), super::status::PROCESS_HARDENING_FAILED);
+        assert_eq!(*calls.borrow(), ["get", "set 0"], "the irreversible step is not taken");
+    }
+
     use super::*; // bring the exported functions + `status` into scope
-    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
     use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
     // Disables the external-secret provider so tests deterministically
@@ -1404,6 +1548,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "asserts wall-clock speed, which Miri's interpreter can't reproduce")]
     fn kek_fingerprint_pays_the_setup_floor_but_argument_errors_do_not() {
         with_isolated_ephemeral_provider(|| {
             with_setup_delay(Some(Duration::from_millis(50)), || {
@@ -1471,6 +1616,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "asserts wall-clock speed, which Miri's interpreter can't reproduce")]
     fn invalid_arguments_are_rejected_before_the_floor() {
         // Validation failures never reach a provider, so they shouldn't
         // pay for one: an obviously-bad call returns immediately.
@@ -1514,6 +1660,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "asserts wall-clock speed, which Miri's interpreter can't reproduce")]
     fn setup_floor_is_taken_from_the_policy_file() {
         // With the test override cleared, the floor comes from the same
         // policy file that names the providers -- exactly as in production.
@@ -2358,8 +2505,7 @@ mod ffi_tests {
         let secret_path = ext_dir.path().join(service_str);
         let service = CString::new(service_str).unwrap();
 
-        let key_a = p256::SecretKey::generate();
-        std::fs::write(&secret_path, key_a.to_bytes()).unwrap();
+        std::fs::write(&secret_path, provider::random_kek_for_tests()).unwrap();
         // Owner-only, as the provider requires of a KEK file. The rotation
         // rewrite below preserves this mode, so it's set once.
         std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
@@ -2376,8 +2522,7 @@ mod ffi_tests {
         // Simulate an out-of-band KEK rotation: the deployment platform
         // rewrites the mounted secret file with a brand new, unrelated
         // key under the exact same service name.
-        let key_b = p256::SecretKey::generate();
-        std::fs::write(&secret_path, key_b.to_bytes()).unwrap();
+        std::fs::write(&secret_path, provider::random_kek_for_tests()).unwrap();
 
         let mut out = [0xAAu8; 32]; // recognizable non-zero pattern
         let mut out_len: c_int = out.len() as c_int;
@@ -2536,7 +2681,7 @@ mod ffi_tests {
         let mut long = valid.clone();
         long.push(0);
         let mut bad_version = valid.clone();
-        bad_version[0] = 2;
+        bad_version[0] = 2; // a version this library does not know
         let b64_dek = {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode([9u8; 32]) + "\n"
@@ -2609,6 +2754,36 @@ mod ffi_tests {
         assert_eq!((rc, out_len), (status::FILE_UNTRUSTED, crypto::MAX_WRAPPED_LEN as c_int), "writable directory");
         assert!(out.iter().all(|&b| b == 0));
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Each refusal left an integrity record (2003) naming the file.
+        let records = audit::captured_containing(&format!("path={}", audit_quote_for_tests(&file)));
+        assert!(
+            records.iter().filter(|r| r.contains("event=2003") && r.contains("result=FILE_UNTRUSTED(-39)")).count() >= 3,
+            "{records:#?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn open_file_audits_a_malformed_key_file_but_not_a_missing_one() {
+        let _policy = developer_policy();
+        let mut bytes = sample_wrapped_bytes();
+        bytes[0] = 0x7f; // not a version any wrap writes
+        let (dir, path) = key_file_with(&bytes);
+        assert_eq!(open_file(&path, crypto::MAX_WRAPPED_LEN).0, status::FILE_MALFORMED);
+        let file = dir.path().join("wrapped.key");
+        let records = audit::captured_containing(&format!("path={}", audit_quote_for_tests(&file)));
+        assert!(records.iter().any(|r| r.contains("event=2003") && r.contains("result=FILE_MALFORMED(-38)")), "{records:#?}");
+
+        let missing = dir.path().join("missing.key");
+        let c_missing = CString::new(missing.to_str().unwrap()).unwrap();
+        assert_eq!(open_file(&c_missing, crypto::MAX_WRAPPED_LEN).0, status::FILE_NOT_FOUND);
+        assert!(audit::captured_containing(&format!("path={}", audit_quote_for_tests(&missing))).is_empty());
+    }
+
+    // A path as the audit trail quotes it (plain ASCII paths only).
+    fn audit_quote_for_tests(path: &std::path::Path) -> String {
+        format!("\"{}\"", path.display())
     }
 
     #[test]
@@ -2837,6 +3012,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "needs the passwd database, which Miri can't reach")]
     fn security_model_reports_production_by_default_and_developer_when_set() {
         let _none = policy::test_support::TestPolicy::absent();
         // Production trusts root and deployers, and with no deployer_groups
@@ -2984,5 +3160,33 @@ pub mod fuzz_support {
     /// `Payload::from_bytes`: the parsed key-id and ciphertext lengths.
     pub fn payload_from_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
         crate::payload::Payload::from_bytes(bytes).ok().map(|p| (p.key_id.len(), p.ciphertext.len()))
+    }
+
+    /// The TPM key file decoder (`tpm_key_file::decode`): the public and
+    /// private areas it carries, or why it was refused.
+    pub fn tpm_key_file_decode(text: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        crate::provider::tpm_key_file::decode(text).map(|blob| (blob.public, blob.private))
+    }
+
+    /// The TPM key file encoder (`tpm_key_file::encode`).
+    pub fn tpm_key_file_encode(public: &[u8], private: &[u8]) -> Result<String, String> {
+        crate::provider::tpm_key_file::encode(&crate::provider::tpm_key_file::KeyBlob {
+            public: public.to_vec(),
+            private: private.to_vec(),
+        })
+    }
+
+    /// The `.tpmauth` content rule (`tpm_key_file::check_auth_value`).
+    pub fn tpm_auth_value_check(bytes: &[u8]) -> Result<(), String> {
+        crate::provider::tpm_key_file::check_auth_value(bytes)
+    }
+
+    pub const TPM_AUTH_VALUE_LEN: usize = crate::provider::tpm_key_file::AUTH_VALUE_LEN;
+
+    /// `secure_file::resolve_trusted` under the developer-model rule for
+    /// configuration (root or this user, nothing group- or other-writable).
+    /// `Err` carries `raw_os_error` for an OS refusal and none for a trust one.
+    pub fn resolve_trusted(path: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+        crate::secure_file::resolve_trusted(path, &crate::secure_file::Owner::RootOrCurrentUser)
     }
 }

@@ -3,7 +3,7 @@
 # on the cluster kubectl points at, which must share the local Docker
 # engine's images (Docker Desktop's built-in Kubernetes does; see below).
 # Each scenario is a Job whose pod mounts a Secret
-# holding a P-256 KEK (SEC1 DER, made and fingerprinted on this machine
+# holding a KEK (32 random bytes, made and fingerprinted on this machine
 # with the OpenSSL commands docs/configuration.md gives) and a ConfigMap
 # holding the policy at /etc/hkdfguard, and runs docker/k8s/pod-test.sh:
 # provision, wrap a DEK, and unwrap it in a separate process through the

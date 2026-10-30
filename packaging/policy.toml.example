@@ -94,14 +94,16 @@ mode = "prefer"
 # are for test harnesses only.
 #tcti = "device:/dev/tpmrm0"
 
-# Directory of TPM key files, one <service>.tpmkey per service, created by
-# `hkdfguard provision`. Whoever can read a key file and open the TPM can
-# use that KEK, so the directory's group is the services that use TPM keys;
-# each key file takes that group, mode 0440. The packages create the
-# default directory as root:hkdfguard 0750; a key_dir of your own needs
+# Directory of TPM key files: a <service>.tpmkey and its authValue,
+# <service>.tpmauth, per service, created by `hkdfguard provision`. Whoever
+# can read both files and open the TPM can use that KEK, so the directory's
+# group is the services that use TPM keys; both files take that group, mode
+# 0440. Give each .tpmauth file its own service's group to keep the others
+# out. The packages create the default directory as root:hkdfguard 0750; a
+# key_dir of your own needs
 #   install -d -m 0750 -o root -g <key-users> <dir>
-# Back the key files up: a lost key file is a lost KEK. A copy is useless
-# on any other TPM.
+# Back both files up: losing either loses the KEK. A key file is useless on
+# any other TPM; the .tpmauth file is a secret.
 #key_dir = "/var/lib/hkdfguard/tpm"
 
 # File holding the Owner hierarchy's password, if you set one. Unset: an
@@ -113,12 +115,12 @@ mode = "prefer"
 # creates the key file and prints the exact entry to add.
 #require_pinned_names = false
 
-# Encrypt the ECDH shared secret on the TPM bus: "auto" | "required" | "off".
-# "auto" skips encryption only for TPMs known to have no external bus
-# (firmware TPMs). "required" needs pinned_session_salt_key_name: the Name
-# of the TPM's storage root key, which every key file is loaded under and
-# which salts the session.
-#session_encryption = "auto"
+# Encrypt each wrapping key (TPM2_HMAC's output) on the TPM bus, keyed by
+# the service key's authValue: "on" (default) | "off" (test harnesses only).
+#session_encryption = "on"
+# The Name of the TPM's storage root key, which every key file is loaded
+# under and provisioning's session is salted to. Pin it before provisioning
+# on a discrete TPM.
 #pinned_session_salt_key_name = "000b<64 hex chars>"
 
 [tpm.pinned_names]

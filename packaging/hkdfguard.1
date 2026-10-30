@@ -123,9 +123,10 @@ included, unless on a read-only mount.
 .BR \-\-force ", " \-f
 Replace an existing
 .IR \-\-key\-file\-path .
-The new payload is produced first; only then is the old file overwritten
-in place and removed, so a failed wrap never destroys it. The overwrite
-cannot guarantee erasure on copy-on-write filesystems or flash storage.
+The new payload is written to a temporary file in the same folder first,
+then renamed over the old file in one step, so a failed wrap or write
+never touches it. The replaced file is then overwritten; that cannot
+guarantee erasure on copy-on-write filesystems or flash storage.
 .TP
 .BR \-\-fingerprint ", " \-fp " \fIhex\fR"
 The KEK's fingerprint as

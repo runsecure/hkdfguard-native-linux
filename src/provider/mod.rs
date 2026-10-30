@@ -1,11 +1,11 @@
 //! Provider abstraction, the priority-ordered selection chain, and the
 //! optional provider allow-list policy.
 //!
-//! Every provider implements the identical ECDH -> HKDF-SHA512 -> AES-256-GCM
+//! Every provider implements the identical keyed-PRF -> AES-256-GCM
 //! protocol (see `crypto.rs`); the only thing that differs between providers
-//! is *where the persistent P-256 KEK private key lives* and *who performs
-//! the ECDH operation*. PKCS#11/TPM2 providers never hand the private scalar
-//! back to this crate -- `ecdh()` returns only the derived shared secret.
+//! is *where the persistent HMAC-SHA-256 KEK lives* and *who computes the
+//! HMAC*. PKCS#11/TPM2 providers never hand the key back to this crate --
+//! `prf()` returns only HMAC outputs.
 //!
 //! There is deliberately no software-backed (locally-generated,
 //! filesystem-encrypted-at-rest) provider: a deployment without TPM2 or
@@ -39,34 +39,55 @@ pub mod pkcs11;
 pub mod tpm2;
 // The TPM provider's key file format. Pure Rust, so its tests run in every
 // build, not only those with the tpm2 feature.
-#[cfg(any(feature = "tpm2", test))]
+// Also in the fuzz harnesses' build (`hkdfguard_test_paths`), which fuzzes
+// it through `crate::fuzz_support` without linking tpm2-tss.
+#[cfg(any(feature = "tpm2", test, hkdfguard_test_paths))]
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
-mod tpm_key_file;
+pub(crate) mod tpm_key_file;
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::policy::PolicyEvaluator; // brings `.allowed_providers()` into scope on `crate::policy::Policy`
-use p256::PublicKey; // the P-256 point type `ecdh` takes: the payload's salt-derived point
 use std::sync::{Arc, OnceLock}; // `Arc` for shared provider ownership, `OnceLock` for the one-time warning flag
 use zeroize::Zeroizing; // wrapper that scrubs its contents from memory when dropped
 
-/// 32-byte X9.63 ECDH shared secret (the raw shared point's X-coordinate),
-/// zeroized on drop. Never logged, never returned across the FFI boundary.
-pub type SharedSecret = Zeroizing<[u8; 32]>; // alias so every provider returns the same self-zeroizing type
+/// Length of a KEK held in software (the external-secret and ephemeral
+/// providers), and of every key a provider generates: 256 bits, the
+/// HMAC-SHA-256 output size.
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11", feature = "external-secret", feature = "ephemeral")), allow(dead_code))]
+pub const KEK_LEN: usize = 32;
 
-/// ECDH with a private key this process holds in software (the
-/// external-secret and ephemeral providers). `to_nonzero_scalar` returns a
-/// `Copy` type with no zeroing `Drop`, so the scalar is kept in one local,
-/// passed by reference, and wiped here; the result is written straight into
-/// the zeroizing output rather than through an unwiped stack array.
-#[cfg(any(feature = "external-secret", feature = "ephemeral"))]
-pub(crate) fn software_ecdh(secret_key: &p256::SecretKey, point: &PublicKey) -> SharedSecret {
-    use zeroize::Zeroize as _;
-    let mut scalar = secret_key.to_nonzero_scalar();
-    let shared = p256::ecdh::diffie_hellman(&scalar, point.as_affine()); // zeroized on drop
-    scalar.zeroize();
-    let mut out = SharedSecret::new([0u8; 32]);
-    out.copy_from_slice(shared.raw_secret_bytes().as_slice());
-    out
+/// One HMAC-SHA-256 output under a KEK, zeroized on drop. Never logged,
+/// never returned across the FFI boundary.
+pub type PrfOutput = Zeroizing<[u8; 32]>;
+
+/// A fresh random key of the size providers use, as an operator would
+/// provision an external secret.
+#[cfg(test)]
+pub(crate) fn random_kek_for_tests() -> [u8; KEK_LEN] {
+    let mut key = [0u8; KEK_LEN];
+    getrandom::fill(&mut key).unwrap();
+    key
+}
+
+/// HMAC-SHA-256 with a key this process holds in software (the
+/// external-secret and ephemeral providers). The HMAC pad blocks `hmac`
+/// derives from the key are beyond this crate's reach (`hmac` 0.13 has no
+/// zeroize support); the SHA-256 states keyed with them are wiped on drop
+/// by `sha2`'s `zeroize` feature.
+// Also the TPM provider's: its self-test checks TPM2_HMAC against it.
+#[cfg(any(feature = "external-secret", feature = "ephemeral", feature = "tpm2", test))]
+pub(crate) fn software_prf(key: &[u8; KEK_LEN], inputs: &[&[u8]]) -> Vec<PrfOutput> {
+    use hmac::{Hmac, KeyInit, Mac};
+    inputs
+        .iter()
+        .map(|input| {
+            let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
+            mac.update(input);
+            let mut out = PrfOutput::new([0u8; 32]);
+            out.copy_from_slice(&mac.finalize().into_bytes());
+            out
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] // cheap to copy/compare/hash; needed for logging, matching, and use as a map-ish key
@@ -128,10 +149,9 @@ pub(crate) enum Backend<T> {
     Refused(String),
 }
 
-/// A handle to a loaded persistent service KEK. The private key material
-/// never leaves the provider that produced this handle -- only
-/// [`KekHandle::ecdh`]'s *output* (a shared secret) crosses back into
-/// `crypto.rs`.
+/// A handle to a loaded persistent service KEK. The key never leaves the
+/// provider that produced this handle -- only [`KekHandle::prf`]'s
+/// *outputs* cross back into `crypto.rs`.
 pub trait KekHandle {
     /// Provider-specific opaque identifier for this KEK, recorded (not
     /// secret) in the wrapped payload for diagnostics and provider
@@ -139,15 +159,13 @@ pub trait KekHandle {
     /// `service` string is always the logical identity.
     fn key_id(&self) -> &[u8]; // borrowed, non-secret bytes to embed in the payload
 
-    /// Perform ECDH between this KEK's persistent private key and the given
-    /// point (the payload's salt-derived `H_salt`), returning the raw shared secret.
-    fn ecdh(&self, point: &PublicKey) -> Result<SharedSecret>; // never exposes the private key itself
-
-    /// This KEK's own public key -- never secret (it's the public half of
-    /// the persistent keypair), used only by `crypto::wrap`/`crypto::unwrap`
-    /// to compute/verify the payload's embedded fingerprint (see
-    /// `crypto::kek_fingerprint`) before any ECDH is attempted.
-    fn public_key(&self) -> Result<PublicKey>;
+    /// HMAC-SHA-256 under this KEK of each of `inputs`, in order, in one
+    /// session with the device: a wrap or unwrap needs two outputs (the
+    /// KEK fingerprint and the wrapping key, see `crypto.rs`), and on a
+    /// TPM each session costs a key load. Each input is one SP 800-108
+    /// block, at most [`crate::crypto::MAX_PRF_INPUT_LEN`] bytes. Never
+    /// exposes the key itself.
+    fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>>;
 }
 
 // `Send + Sync` because providers are shared across calls via `Arc` and
@@ -175,7 +193,7 @@ pub trait KekProvider: Send + Sync {
 
     /// Permanently deletes this provider's KEK for `service` -- only if the
     /// key it would delete has exactly `expected_fingerprint` (see
-    /// `crypto::kek_fingerprint`), checked on the very objects deleted.
+    /// `crypto::kek_fingerprint`), computed with the very object deleted.
     /// [`Error::KekNotFound`] if it holds none, and
     /// [`Error::KekFingerprintMismatch`] if it holds a different one.
     ///
@@ -329,7 +347,8 @@ pub(crate) fn log_once(level: log::Level, message: String) {
 }
 
 /// Test-only: forget which warnings were logged, so a test can see its own.
-#[cfg(test)]
+/// Gated like its one caller.
+#[cfg(all(test, feature = "external-secret", feature = "ephemeral"))]
 fn reset_warn_once() {
     WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
@@ -534,7 +553,6 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
 #[cfg(test)]
 mod tests {
     use super::*; // bring `ProviderType` etc. into scope
-    use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
     use serial_test::serial;
 
     // Points HKDFGUARD_POLICY_FILE somewhere guaranteed not to exist, so
@@ -565,6 +583,7 @@ mod tests {
     // reachable TPM or PKCS#11 token that provider legitimately serves
     // the key. Asserting either one specifically would make the test
     // track hardware presence instead of the invariant.
+    #[cfg(feature = "ephemeral")] // as its callers are
     fn assert_never_ephemeral(result: Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)>) {
         match result {
             Ok((provider, _handle)) => assert_ne!(
@@ -633,8 +652,6 @@ mod tests {
     fn create_kek_prefers_external_secret_when_provisioned() {
         #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
         {
-            use p256::SecretKey;
-
             let _policy = crate::policy::allow_ephemeral_policy_for_tests(); // the billing fall-through below needs Ephemeral opted in
 
             let ext_dir = crate::secure_file::private_tempdir();
@@ -642,9 +659,9 @@ mod tests {
 
             // Write an external secret for "com.company.orders", owner-only
             // as the provider requires of a KEK file.
-            let secret_key = SecretKey::generate();
+            let secret_key = random_kek_for_tests();
             let secret_path = ext_dir.path().join("com.company.orders");
-            std::fs::write(&secret_path, secret_key.to_bytes()).unwrap();
+            std::fs::write(&secret_path, secret_key).unwrap();
             std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
 
             let (provider, handle) = create_kek("com.company.orders").unwrap();
@@ -699,8 +716,6 @@ mod tests {
     fn create_kek_constructs_a_fresh_provider_on_every_call() {
         #[cfg(feature = "external-secret")]
         {
-            use p256::SecretKey;
-
             // This test is about external-secret specifically (that a
             // fresh instance of it is constructed per call), so pin the
             // chain to it -- otherwise a reachable TPM or PKCS#11 token
@@ -712,11 +727,11 @@ mod tests {
 
             // external-secret never creates a key itself, so both
             // services need to be pre-provisioned.
-            let key_a = SecretKey::generate();
-            let key_b = SecretKey::generate();
+            let key_a = random_kek_for_tests();
+            let key_b = random_kek_for_tests();
             for (name, key) in [("com.company.a", &key_a), ("com.company.b", &key_b)] {
                 let path = ext_dir.path().join(name);
-                std::fs::write(&path, key.to_bytes()).unwrap();
+                std::fs::write(&path, key).unwrap();
                 std::fs::set_permissions(&path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap(); // owner-only, as the provider requires
             }
 
@@ -821,9 +836,9 @@ mod tests {
             // Pre-provision the external secret so it's actually usable
             // once the chain reaches it (this provider never creates one
             // itself).
-            let secret_key = p256::SecretKey::generate();
+            let secret_key = random_kek_for_tests();
             let secret_path = ext_dir.path().join("com.company.orders");
-            std::fs::write(&secret_path, secret_key.to_bytes()).unwrap();
+            std::fs::write(&secret_path, secret_key).unwrap();
             std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap(); // owner-only, as the provider requires
 
             // PKCS#11 (no PIN configured) is unreachable; policy must
@@ -890,8 +905,11 @@ mod tests {
 
     // ---- each provider failure is logged exactly once ----
 
+    // The log capture below is used only by the external-secret tests.
+    #[cfg(feature = "external-secret")]
     struct CapturingLogger(std::sync::Mutex<Vec<String>>);
 
+    #[cfg(feature = "external-secret")]
     impl log::Log for CapturingLogger {
         fn enabled(&self, metadata: &log::Metadata) -> bool {
             metadata.level() <= log::Level::Warn
@@ -904,10 +922,12 @@ mod tests {
         fn flush(&self) {}
     }
 
+    #[cfg(feature = "external-secret")]
     static CAPTURED: CapturingLogger = CapturingLogger(std::sync::Mutex::new(Vec::new()));
 
     // Runs `f` and returns every warn/error line it logged that contains
     // `marker`. `#[serial]` callers keep other tests' lines out.
+    #[cfg(feature = "external-secret")]
     fn logged_lines_containing(marker: &str, f: impl FnOnce()) -> Vec<String> {
         if log::set_logger(&CAPTURED).is_ok() {
             log::set_max_level(log::LevelFilter::Warn);
@@ -921,11 +941,12 @@ mod tests {
     // a hard provider failure ("permissions too broad"), not a soft decline.
     // Both halves must stay bound for the test's duration: the mount
     // directory, and the policy layer pointing the provider at it.
+    #[cfg(feature = "external-secret")]
     fn mount_with_untrusted_secret(service: &str) -> (tempfile::TempDir, crate::policy::test_support::TestPolicy) {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join(service);
-        std::fs::write(&path, p256::SecretKey::generate().to_bytes()).unwrap();
+        std::fs::write(&path, random_kek_for_tests()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let mount = crate::policy::test_support::secret_mount(dir.path());
         (dir, mount)

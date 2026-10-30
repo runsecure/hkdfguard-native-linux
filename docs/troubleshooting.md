@@ -49,7 +49,11 @@ back to defaults in that case.
 | `TOML parse error` | Invalid TOML. Most often a top-level key (`preferred_order`) below a `[section]`, or an unquoted service name in `[tpm.pinned_names]` | Move `preferred_order` above the first section; quote service names: `"com.company.orders" = ...` |
 | `unknown field` | A misspelled or misplaced setting | Check it against the [policy reference](configuration.md#policy-reference) |
 | `selection.mode "require" needs a selection.provider` (or similar) | `provider` and `level` don't match the mode | `require` takes `provider`, `require-level` takes `level`, `prefer` takes neither |
-| `tpm.session_encryption "required" needs tpm.pinned_session_salt_key_name` | `required` without its pin | Add the salt-key Name ([configuration.md](configuration.md#tpm-20), step 4), or use `auto` |
+| `unknown variant` ... `session_encryption` | `"auto"` or `"required"`, from before authValues | Use `"on"` (the default) or remove the line |
+| `holds a key with an empty password (emptyAuth)` | A TPM key file from before authValues | Delete it and run `hkdfguard provision` again; re-wrap the DEKs |
+| `pkcs11.module is set, but its PIN file ... does not exist` | PKCS#11 is configured, but the PIN file is missing, misnamed, or was removed during a rotation | Create the PIN file (root-owned, `0400`, or `root:<service-group> 0440`); or remove `pkcs11.module` to stop using PKCS#11 |
+| `this service has a TPM key file (...), but this process could not open the TPM` | The service's KEK is on the TPM, but this process can't open `/dev/tpmrm0`: usually it lost `tss` membership, or the tpm2-tss device TCTI isn't installed | Restore the access (`usermod -aG tss <user>`, then restart the service); new KEKs are not created on a weaker provider meanwhile |
+| `TPM key file has no authValue file` | The `<service>.tpmauth` beside the key file is missing | Restore it from the backup taken with the key file, or retire and re-provision |
 
 ## No provider is available (-3)
 
@@ -93,6 +97,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 |---|---|
 | `TPM key file ... is present but can't be trusted` | Make it `root:<group> 0440` or `root:root 0400`, a regular file (not a symlink), in directories only root can change up to `/` (never under `/tmp`) |
 | `TPM key file ... is not a key this library creates`, or holds an unreadable part | The file isn't one `provision` wrote, or is damaged. Restore it from your backup. |
+| `TPM key file ... holds an ECC key, from the ECDH format hkdfguard used before its first release` | The key file was made by a pre-release build. Delete it and run `provision` again; anything wrapped under it was in the old payload format, which this version refuses anyway, so deliver those DEKs again and wrap them anew. |
 | `TPM key directory ... does not exist` | `provision` needs it: create it as the message says, with the group of the services that use TPM keys. |
 | `TPM2_Load of this service's key file failed` | The key file was made by another TPM, or this TPM was cleared since (a firmware reset can do it). The key is gone for good; see [Fingerprint mismatch](#fingerprint-mismatch--16). |
 | `TSS2_LOG enables debug/trace logging in tpm2-tss ...` | Unset `TSS2_LOG`, or lower it to `info` or below: at debug levels tpm2-tss logs secrets |
@@ -119,7 +124,8 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `owned by uid ..., which is not an allowed owner` | The key file must be owned by root or by the service's user |
 | `resolves to ..., outside the secret mount` | A symlink points out of the mount. Deliver the file inside it. |
 | `directory ...: writable by group or others (mode ...)` | The mount, or a directory above it or above the resolved file, can be changed by others -- a sticky one (`/tmp`) included. Mount the secrets read-only (as Kubernetes does), or somewhere only root or the service can write, up to `/`. |
-| `external secret is not a valid P-256 key (expected 32 raw bytes, PKCS#8 DER or SEC1 DER; PEM must be converted to DER)` | The file isn't one of the accepted forms. Most often it's PEM (text starting `-----BEGIN`): convert it with `openssl pkey -in key.pem -outform DER -out key.der`. Or the key is for another curve: only P-256 is accepted. |
+| `external secret is N bytes; it must be exactly 32 raw random bytes ...` | The file must hold exactly 32 raw bytes. Most often it's base64 or hex text (decode it to raw bytes where it is mounted), has a trailing newline (`echo` adds one), or is an old P-256 key in PEM or DER, which is no longer accepted. Generate a new key with `head -c 32 /dev/urandom` or `openssl rand -out <file> 32` and pin its new fingerprint. |
+| `external secret is all zero bytes` | The file was filled from `/dev/zero` or truncated and extended. Provision 32 random bytes. |
 | `the external secret for this service has fingerprint ..., which is not the one pinned in policy` | The mounted key isn't the one `external_secret.pinned_keys` names. Either something else wrote the mount (check every container that mounts the volume read-write), or the key was rotated without adding its fingerprint first. Pin the new fingerprint only once you've confirmed where the key came from. |
 | `external_secret.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[external_secret.pinned_keys]`. Compare the printed fingerprint with the one you computed when generating the key, then add the line. |
 | A configured `external_secret.dir` is missing | The mount isn't there yet (a volume not attached, a sidecar not ready). Fix the mount; the library won't use another provider in the meantime. |
@@ -146,7 +152,7 @@ KEK** than the one the service resolves to now. Something changed the key:
   again. (A TPM cleared by a firmware reset or `tpm2_clear`, or replaced,
   fails earlier: its key files no longer load at all.)
 - **External secret:** the key file was replaced or rotated.
-- **PKCS#11:** the key pair was deleted and generated again, or a
+- **PKCS#11:** the HMAC secret key was deleted and generated again, or a
   different token is now selected.
 - **Any provider:** the payload came from another host. A payload only
   ever opens on the host whose KEK wrapped it.
@@ -177,7 +183,10 @@ HKDFGuard can't tell these apart, by design.
 wrapped DEK at all: most often a **truncated** or **extended** copy (compare
 its size with what `wrap` reported, at most 276 bytes), or the wrong file.
 `HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED` means the payload's version byte isn't
-one this library knows: a payload from a newer HKDFGuard, or not a payload.
+one this library knows (it accepts version 1 only): a payload from a newer
+HKDFGuard, or not a payload. A payload from a pre-release build (the ECDH
+format, which also carried version 1) fails instead with
+`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`, and is never decrypted.
 Read key files with `hkdfguard_open_file`, which reports these problems
 before unwrap is called.
 
