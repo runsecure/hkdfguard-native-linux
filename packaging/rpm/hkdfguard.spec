@@ -21,7 +21,7 @@
 %global linked_licenses Apache-2.0 AND BSD-3-Clause AND ISC AND MIT AND (Apache-2.0 OR MIT) AND (MIT OR Unlicense)
 
 Name:           hkdfguard
-Version:        0.9.0
+Version:        0.9.1
 Release:        1%{?dist}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK (CLI)
 License:        MPL-2.0 AND %{linked_licenses}
@@ -46,8 +46,9 @@ Requires:       %{libpkg}%{?_isa} = %{version}-%{release}
 HKDFGuard wraps 32-byte Data Encryption Keys (DEKs) under a persistent,
 per-service Key Encryption Key (KEK) held by the strongest provider the
 host offers: a TPM 2.0, a PKCS#11 token, or an administrator-provisioned
-secret file. Wrapping is ECDH (P-256) against a per-payload point,
-HKDF-SHA512 and AES-256-GCM.}
+secret file. Each DEK is wrapped with AES-256-GCM under a per-payload
+key derived from the KEK with HMAC-SHA-256 (NIST SP 800-108); there is
+no public-key step, so the scheme is safe against quantum computers.}
 
 %description %{common_description}
 
@@ -177,5 +178,13 @@ exit 0
 %{_libdir}/libhkdfguard.a
 
 %changelog
+* Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
+- Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys
+  carry a per-service authValue (<service>.tpmauth) that keys session
+  encryption; tpm.session_encryption is now "on" or "off"; a configured
+  provider that is failing no longer hands KEKs to a weaker one; wrap
+  --force replaces a key file atomically. TPM key files from 0.9.0 must be
+  provisioned again.
+
 * Fri Oct 02 2026 runsecure <torin@torinblair.com> - 0.9.0-1
 - Initial packaging.

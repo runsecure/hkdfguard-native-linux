@@ -176,10 +176,11 @@ how the docs tell operators to deliver and pin keys.
 - Bash. On Windows, Git Bash works; the scripts convert paths for
   `kubectl.exe` and OpenSSL.
 
-**What a scenario does.** Each one is a Job. The script generates a P-256
-key (SEC1 DER) and computes its fingerprint, then delivers the key: as a
-Secret volume, or by storing it in a Vault dev server for a Vault Agent
-native sidecar to render into a shared `emptyDir`. It also creates the
+**What a scenario does.** Each one is a Job. The script generates a KEK
+(32 random bytes, `openssl rand`) and computes its fingerprint, then
+delivers the key: as a Secret volume, or by storing it base64-encoded in a
+Vault dev server for a Vault Agent native sidecar to render, as the raw 32
+bytes, into a shared `emptyDir`. It also creates the
 scenario's `policy.toml` as a ConfigMap, mounted read-only over
 `/etc/hkdfguard`, which is how a deployment would ship it. In the pod,
 [`k8s/pod-test.sh`](k8s/pod-test.sh) prints the policy and the mount's
@@ -298,7 +299,7 @@ as they would outside Docker.
 `src/provider/tpm2.rs`'s `mod tests` includes a `#[ignore]`d conformance
 suite that empirically validates the assumptions the TPM2 provider's
 whole persistence model depends on (deterministic `TPM2_CreatePrimary`,
-distinct keys per service, ECDH repeatability, ...) -- see that module's
+distinct keys per service, `TPM2_HMAC` matching software HMAC-SHA-256, ...) -- see that module's
 doc comments. `docker/run-tests.sh` already runs it against a swtpm
 instance that lives and dies with that one container. For a setup where
 swtpm keeps running (or gets restarted) independently of the test runner

@@ -22,7 +22,6 @@ use std::fs;
 use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
 // A private temp root, not the sticky /tmp (see src/test_tmp.rs).
 #[path = "../src/test_tmp.rs"]
@@ -243,9 +242,10 @@ fn tpm_untrustworthy_key_file_fails_the_call() {
     // An external-secret mount holding a KEK for the service.
     let mount = tempdir();
     let service_name = "com.securitytest.tpm.fallthrough";
-    let key = p256::SecretKey::generate();
+    let mut key = [0u8; 32]; // a KEK, as an operator provisions one: 32 random bytes
+    getrandom::fill(&mut key).unwrap();
     let key_path = mount.path().join(service_name);
-    fs::write(&key_path, key.to_bytes()).unwrap();
+    fs::write(&key_path, key).unwrap();
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
     let service = CString::new(service_name).unwrap();
     let dek = [0x55u8; 32];

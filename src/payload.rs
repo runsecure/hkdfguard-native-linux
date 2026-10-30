@@ -16,13 +16,13 @@
 //!                                   4 is unassigned and rejected -- see `ProviderType`)
 //! 2       2     key_id_len (u16)
 //! 4       N     key_id             (provider-specific opaque identifier)
-//! 4+N     32    salt               (per-payload random salt: hashed to the ECDH point, and HKDF's salt)
+//! 4+N     32    salt               (per-payload random salt, in the wrapping key's KDF context)
 //! 36+N    12    nonce              (AES-256-GCM 96-bit nonce)
 //! 48+N    4     ciphertext_len (u32)
 //! 52+N    M     ciphertext         (AES-256-GCM ciphertext, includes 16-byte tag)
-//! 52+N+M  32    fingerprint        (SHA-256 of the persistent KEK's public key --
+//! 52+N+M  32    fingerprint        (a fixed PRF output of the persistent KEK --
 //!                                   see `crypto::kek_fingerprint` -- checked by
-//!                                   `unwrap` before any ECDH/AES-GCM is attempted)
+//!                                   `unwrap` before AES-GCM is attempted)
 //! ```
 //!
 //! The service name is intentionally NOT part of this payload -- per spec it
@@ -32,20 +32,20 @@
 //! The leading version byte exists so the layout can evolve without a
 //! future parser ever misreading an old blob as a new one; `from_bytes`
 //! rejects any value other than [`VERSION`] outright. Note the `salt`
-//! field is deliberately a random salt and *not* an ephemeral ECDH public
-//! key: it is hashed to the payload's ECDH point and also salts HKDF --
-//! see [`crate::crypto`] for why the protocol derives the wrapping key
-//! from a hashed point rather than an ephemeral key.
+//! field is a random salt, not a public key: it enters the KDF that
+//! derives this payload's wrapping key from the KEK -- see
+//! [`crate::crypto`].
 //!
-//! Every field here except the ciphertext is authenticated, both as the
-//! AEAD's associated data and as part of the HKDF `info` -- see
-//! [`Payload::authenticated_bytes`].
+//! Every field here except the ciphertext is authenticated as the AEAD's
+//! associated data ([`Payload::authenticated_bytes`]), and every field
+//! before the ciphertext is also bound into the wrapping key's derivation
+//! ([`Payload::header_bytes`]).
 
 use crate::error::{Error, Result}; // this module's own error type + `Result<T, Error>` alias
 use crate::provider::ProviderType; // the provider tag stored in the payload (1, 2, 3 or 5)
 
 pub const VERSION: u8 = 1; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes
-pub const SALT_LEN: usize = 32; // per-payload HKDF salt; 32 bytes matches SHA-256's output size, HKDF's natural salt width
+pub const SALT_LEN: usize = 32; // per-payload random salt; 256 bits, so two payloads never share a wrapping key
 pub const NONCE_LEN: usize = 12; // AES-GCM's standard 96-bit nonce size
 pub const FINGERPRINT_LEN: usize = 32; // SHA-256 digest size
 
@@ -55,10 +55,10 @@ pub const FINGERPRINT_LEN: usize = 32; // SHA-256 digest size
 pub struct Payload {
     pub provider_type: ProviderType, // which provider produced (and must later reload) the KEK
     pub key_id: Vec<u8>,             // provider-specific opaque tag, variable length
-    pub salt: [u8; SALT_LEN],        // per-payload random salt; selects the ECDH point and salts HKDF, so each payload's wrapping key is unique
+    pub salt: [u8; SALT_LEN],        // per-payload random salt, in the wrapping key's KDF context, so each payload's wrapping key is unique
     pub nonce: [u8; NONCE_LEN],      // the AES-GCM nonce used for this one encryption
     pub ciphertext: Vec<u8>,         // AES-GCM ciphertext, tag included at the end
-    pub fingerprint: [u8; FINGERPRINT_LEN], // SHA-256 of the persistent KEK's public key at wrap time
+    pub fingerprint: [u8; FINGERPRINT_LEN], // the persistent KEK's fingerprint (a fixed PRF output) at wrap time
 }
 
 impl Payload {
@@ -82,7 +82,7 @@ impl Payload {
         out.push(self.provider_type as u8); // byte 1: provider tag (enum cast to its u8 discriminant)
         out.extend_from_slice(&(self.key_id.len() as u16).to_le_bytes()); // bytes 2..4: key_id length, little-endian u16
         out.extend_from_slice(&self.key_id); // the key_id bytes themselves
-        out.extend_from_slice(&self.salt); // fixed 32-byte per-payload HKDF salt
+        out.extend_from_slice(&self.salt); // fixed 32-byte per-payload salt
         out.extend_from_slice(&self.nonce); // fixed 12-byte AES-GCM nonce
         out.extend_from_slice(&(self.ciphertext.len() as u32).to_le_bytes()); // ciphertext length, little-endian u32
     }
@@ -96,15 +96,23 @@ impl Payload {
         out // return the fully assembled buffer
     }
 
+    /// Every field before the ciphertext, in wire order: the part of the
+    /// payload the wrapping key is bound to (see `crate::crypto`). The
+    /// fingerprint is not in it: the provider computes the fingerprint and
+    /// the wrapping key in the same call.
+    pub fn header_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.prefix_len());
+        self.write_prefix(&mut out);
+        out
+    }
+
     /// Every byte of this payload except the ciphertext itself: the
     /// header fields in wire order, followed by the trailing fingerprint.
     ///
-    /// Used both as the AEAD's associated data and as part of the HKDF
-    /// `info`, so every non-ciphertext byte is authenticated *and* bound
-    /// into key derivation. The ciphertext is excluded because the AEAD
-    /// already authenticates it directly; its declared *length* is
-    /// included, since that is a header field a tamperer could otherwise
-    /// shift.
+    /// The AEAD's associated data, so every non-ciphertext byte is
+    /// authenticated. The ciphertext is excluded because the AEAD already
+    /// authenticates it directly; its declared *length* is included, since
+    /// that is a header field a tamperer could otherwise shift.
     pub fn authenticated_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.prefix_len() + FINGERPRINT_LEN);
         self.write_prefix(&mut out);
@@ -130,7 +138,7 @@ impl Payload {
         let key_id_len = u16::from_le_bytes(cursor.take(2)?.try_into().unwrap()) as usize; // read the 2-byte length prefix, then widen to usize for indexing
         let key_id = cursor.take(key_id_len)?.to_vec(); // read exactly that many bytes and copy them into an owned Vec
 
-        let salt: [u8; SALT_LEN] = cursor.take(SALT_LEN)?.try_into().unwrap(); // read the fixed 32-byte HKDF salt into a fixed-size array
+        let salt: [u8; SALT_LEN] = cursor.take(SALT_LEN)?.try_into().unwrap(); // read the fixed 32-byte salt into a fixed-size array
 
         let nonce: [u8; NONCE_LEN] = cursor.take(NONCE_LEN)?.try_into().unwrap(); // read the fixed 12-byte nonce into a fixed-size array
 

@@ -465,6 +465,7 @@ OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision 
 FP=$(fingerprint_in "$OUT")
 KEY_FILE=/var/lib/hkdfguard/tpm/$RETIRE_SERVICE.tpmkey
 [ -f "$KEY_FILE" ] || { echo "FAIL: provision on TPM2 wrote no key file at $KEY_FILE" >&2; exit 1; }
+[ -f "${KEY_FILE%.tpmkey}.tpmauth" ] || { echo "FAIL: provision on TPM2 wrote no authValue file beside $KEY_FILE" >&2; exit 1; }
 if as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$WRONG" >/dev/null 2>&1; then
     echo "FAIL: TPM2 retire with the wrong fingerprint succeeded" >&2; exit 1
 fi
@@ -473,6 +474,7 @@ OUT=$(as_ci $CLI retire -sn $RETIRE_SERVICE -fp "$FP" 2>&1) || { echo "FAIL: TPM
 grep -q "retired KEK for service \"$RETIRE_SERVICE\" (fingerprint $FP, provider TPM2)" <<<"$OUT" \
     || { echo "FAIL: unexpected TPM2 retire output: $OUT" >&2; exit 1; }
 [ ! -e "$KEY_FILE" ] || { echo "FAIL: TPM2 retire left the key file behind" >&2; exit 1; }
+[ ! -e "${KEY_FILE%.tpmkey}.tpmauth" ] || { echo "FAIL: TPM2 retire left the authValue file behind" >&2; exit 1; }
 echo "TPM2: wrong fingerprint refused, nothing deleted; right one deleted the key file."
 rm -rf "$RETIRE_DIR"
 

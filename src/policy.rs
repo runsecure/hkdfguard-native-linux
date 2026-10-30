@@ -233,9 +233,9 @@ struct ExternalSecretPolicy {
     /// only place looked at; when unset, the provider searches the
     /// conventional secret mounts.
     dir: Option<String>,
-    /// Expected KEK fingerprint, per service, as hex: SHA-256 of the
-    /// key's uncompressed SEC1 public point, the value `provision` prints
-    /// and every payload carries. One string, or a list of them while a
+    /// Expected KEK fingerprint, per service, as hex: the fixed HMAC
+    /// output `crypto::kek_fingerprint` defines, the value `provision`
+    /// prints and every payload carries. One string, or a list of them while a
     /// rotation is in progress. When a service has an entry here, a
     /// mounted key with any other fingerprint is refused -- see
     /// [`pinned_external_keys`] for why the mount checks alone don't catch
@@ -342,17 +342,19 @@ struct TpmPolicy {
     /// wrap/unwrap decline), whatever key file it has. Default `false`.
     #[serde(default)]
     require_pinned_names: bool,
-    /// Whether `TPM2_ECDH_ZGen` runs inside a salted, parameter-encrypted
-    /// HMAC session, so the shared secret does not cross the TPM bus in
-    /// cleartext. See [`SessionEncryption`].
+    /// Whether `TPM2_HMAC` and `TPM2_Create` run with parameter encryption,
+    /// so a payload's wrapping key, and a new key's authValue, don't cross
+    /// the TPM bus in cleartext. See [`SessionEncryption`].
     #[serde(default)]
     session_encryption: SessionEncryption,
-    /// Expected TPM Name of the key that salts encrypted sessions, as
-    /// lowercase hex. Without it, a bus-resident attacker can substitute
-    /// their own salt key at `TPM2_ReadPublic` and decrypt the session
-    /// (a full man-in-the-middle), so `session_encryption = "required"`
-    /// refuses to load without one. Under `auto` it is optional and its
-    /// absence is logged once: passive sniffing is still defeated.
+    /// Expected TPM Name of the storage root key, as lowercase hex: the
+    /// key every key file is loaded under and every session is salted to.
+    /// Checked against what `TPM2_CreatePrimary` returned, on every call.
+    /// It matters most when a service is provisioned: `TPM2_Create` sends
+    /// the new key's authValue in a session whose only secret is the salt,
+    /// so an interposer who substituted the storage root key there would
+    /// learn it. After provisioning the authValue protects every session
+    /// on its own (see `crate::provider::tpm2`).
     pinned_session_salt_key_name: Option<String>,
     /// Which TPM to talk to, as a tpm2-tss TCTI string:
     /// `device:/dev/tpmrm0` (the default when unset), `tabrmd:...`,
@@ -364,8 +366,7 @@ struct TpmPolicy {
     /// to a simulator directly, with no resource manager in between, so
     /// object handles are shared by every client of that simulator: another
     /// client could flush and replace the key between the provider's
-    /// `TPM2_ReadPublic` (where its Name is checked) and its
-    /// `TPM2_ECDH_ZGen`. `device:/dev/tpmrm0` and `tabrmd` give each
+    /// `TPM2_ReadPublic` (where its Name is checked) and its `TPM2_HMAC`. `device:/dev/tpmrm0` and `tabrmd` give each
     /// connection its own handles, which closes that window.
     tcti: Option<String>,
     /// Absolute path of the directory holding the TPM key files, one
@@ -399,28 +400,22 @@ fn validate_tcti(tcti: &str) -> Result<()> {
 
 /// Policy for TPM session parameter encryption (`tpm.session_encryption`).
 ///
-/// The threat this addresses is an interposer on a *discrete* TPM's LPC or
-/// SPI bus reading `TPM2_ECDH_ZGen`'s response -- the shared secret -- in
-/// cleartext. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has no
-/// external bus, so encryption there is pure overhead with no security
-/// return; the residual fTPM threats are inside the TPM's own trust
-/// boundary, where transport encryption cannot help.
+/// The threat is an interposer on a *discrete* TPM's LPC or SPI bus: one
+/// reading `TPM2_HMAC`'s response, a payload's wrapping key, or replacing
+/// it with a key of their own while a DEK is wrapped. Every service key
+/// has a secret authValue, and the sessions that use the key derive their
+/// encryption and response-HMAC keys from it, so encryption needs no
+/// trusted public key and no guess about whether the TPM has a bus. It is
+/// on unless a test harness turns it off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionEncryption {
-    /// Always encrypt, and refuse the TPM unless the salt key's Name is
-    /// pinned. For fleets with discrete TPMs, or when the manufacturer
-    /// string can't be trusted.
-    Required,
-    /// Encrypt unless the TPM reports a manufacturer known to have no
-    /// external bus (fTPM/vTPM vendors). Unknown vendors are encrypted --
-    /// the decision only ever *skips* encryption for a known-internal TPM.
-    /// The manufacturer is read over the bus being protected, so an active
-    /// interposer can forge it: this defeats passive sniffing only. With
-    /// `pinned_session_salt_key_name` set, `auto` always encrypts.
+    /// Encrypt every `TPM2_HMAC` and `TPM2_Create`: the default.
     #[default]
-    Auto,
-    /// Never encrypt. For test harnesses; not for production.
+    On,
+    /// Send `TPM2_HMAC`'s input and output in cleartext. Responses are
+    /// still authenticated by the key's authValue. For test harnesses;
+    /// not for production.
     Off,
 }
 
@@ -720,18 +715,6 @@ impl Policy {
             .as_deref()
             .map(|hex| parse_tpm_name("tpm.pinned_session_salt_key_name", hex))
             .transpose()?;
-        // `required` without a pin is a false sense of security: the
-        // session would be encrypted, but to a salt key an interposer can
-        // substitute. Refuse the policy rather than honor half of it.
-        if raw.tpm.session_encryption == SessionEncryption::Required
-            && pinned_session_salt_key_name.is_none()
-        {
-            return Err(Error::Policy(
-                "hkdfguard policy: tpm.session_encryption \"required\" needs tpm.pinned_session_salt_key_name; \
-                 without a pinned salt key the encrypted session can be man-in-the-middled on the bus"
-                    .to_string(),
-            ));
-        }
 
         if let Some(tcti) = &raw.tpm.tcti {
             validate_tcti(tcti)?;
@@ -1172,15 +1155,14 @@ pub(crate) fn require_tpm_pinned_names() -> bool {
     }
 }
 
-/// TPM session parameter-encryption mode. No policy file → `Auto`. A
-/// policy file that exists but is invalid → `Required` (fail closed: a
-/// broken policy must never be what turns bus protection off).
+/// TPM session parameter-encryption mode. `On` unless a valid policy
+/// file sets `off`: a broken policy must never be what turns bus
+/// protection off.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn tpm_session_encryption() -> SessionEncryption {
     match load() {
         Some(Ok(policy)) => policy.tpm_session_encryption(),
-        Some(Err(_)) => SessionEncryption::Required,
-        None => SessionEncryption::Auto,
+        Some(Err(_)) | None => SessionEncryption::On,
     }
 }
 
@@ -1279,7 +1261,7 @@ pub(crate) fn pkcs11_settings() -> Result<Pkcs11Settings> {
     }
 }
 
-/// The pinned session-salt-key Name, if policy sets one. `Err` on a
+/// The pinned storage-root-key Name (`tpm.pinned_session_salt_key_name`), if policy sets one. `Err` on a
 /// policy file that exists but can't be trusted -- pinning fails closed.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
@@ -2177,39 +2159,35 @@ mod tests {
     // ---- tpm.session_encryption / tpm.pinned_session_salt_key_name ----
 
     #[test]
-    fn session_encryption_defaults_to_auto_with_no_pin() {
+    fn session_encryption_defaults_to_on_with_no_pin() {
         let policy = Policy::from_toml_str("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
-        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Auto);
+        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::On);
         assert_eq!(policy.pinned_session_salt_key_name(), None);
     }
 
     #[test]
     fn session_encryption_modes_parse() {
-        for (text, expected) in [
-            ("auto", SessionEncryption::Auto),
-            ("off", SessionEncryption::Off),
-        ] {
+        for (text, expected) in [("on", SessionEncryption::On), ("off", SessionEncryption::Off)] {
             let doc = format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"{text}\"\n");
             assert_eq!(Policy::from_toml_str(&doc).unwrap().tpm_session_encryption(), expected, "{text}");
         }
-        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"sometimes\"\n";
-        assert!(Policy::from_toml_str(doc).is_err(), "unknown mode must be rejected");
+        // "auto" and "required" were the pre-authValue modes; neither means
+        // anything now, so a policy still naming one is refused, not guessed at.
+        for removed in ["sometimes", "auto", "required"] {
+            let doc = format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"{removed}\"\n");
+            assert!(Policy::from_toml_str(&doc).is_err(), "{removed} must be rejected");
+        }
     }
 
     #[test]
-    fn required_session_encryption_needs_a_pinned_salt_key() {
-        let without_pin = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\n";
-        assert!(
-            Policy::from_toml_str(without_pin).is_err(),
-            "required without a pinned salt key is a MITM-able session and must be refused"
-        );
-
-        let with_pin = format!(
-            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{A_NAME}\"\n"
-        );
-        let policy = Policy::from_toml_str(&with_pin).unwrap();
-        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Required);
-        assert_eq!(policy.pinned_session_salt_key_name().unwrap().len(), SHA256_TPM_NAME_LEN);
+    fn a_pinned_salt_key_needs_no_particular_mode() {
+        for mode in ["on", "off"] {
+            let doc = format!(
+                "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"{mode}\"\npinned_session_salt_key_name = \"{A_NAME}\"\n"
+            );
+            let policy = Policy::from_toml_str(&doc).unwrap();
+            assert_eq!(policy.pinned_session_salt_key_name().unwrap().len(), SHA256_TPM_NAME_LEN);
+        }
     }
 
     #[test]
@@ -2225,18 +2203,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn session_encryption_helpers_fail_closed() {
-        // No policy: auto, nothing pinned.
+        // No policy: on, nothing pinned.
         let _no_policy = TestPolicy::absent();
         let mode = tpm_session_encryption();
         let pin = pinned_session_salt_key_name();
-        assert_eq!(mode, SessionEncryption::Auto);
+        assert_eq!(mode, SessionEncryption::On);
         assert_eq!(pin.unwrap(), None);
 
-        // Broken policy: required (never "off"), and pinning errors.
+        // Broken policy: on (never "off"), and pinning errors.
         let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n[tpm]\nsession_encryption = \"off\"\n");
         let mode = tpm_session_encryption();
         let pin = pinned_session_salt_key_name();
-        assert_eq!(mode, SessionEncryption::Required, "a broken policy must not turn bus protection off");
+        assert_eq!(mode, SessionEncryption::On, "a broken policy must not turn bus protection off");
         assert!(pin.is_err());
     }
 
@@ -2439,7 +2417,7 @@ mod tests {
         assert_eq!(policy.setup_min_delay(), Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
         assert!(!policy.require_tpm_pinned_names());
         assert!(policy.pinned_tpm_name("com.company.orders").is_none());
-        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Auto);
+        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::On);
         assert!(policy.pinned_session_salt_key_name().is_none());
         assert!(policy.tpm_tcti().is_none());
         assert!(policy.tpm_key_dir().is_none());

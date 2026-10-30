@@ -26,7 +26,6 @@
 //! anything that ships). Without it, the tests that need one are ignored.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use p256::SecretKey;
 use serial_test::serial;
 use std::ffi::CString;
 use std::fs;
@@ -48,7 +47,6 @@ fn tempdir() -> std::io::Result<tempfile::TempDir> {
     Ok(test_tmp::private_tempdir())
 }
 use hkdfguard::{hkdfguard_open_file, hkdfguard_unwrap_dek, status};
-use p256::elliptic_curve::Generate as _; // `SecretKey::generate()`, from the OS CSPRNG
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
 // through the inherited environment, by every CLI process it spawns --
@@ -87,9 +85,10 @@ fn external_secret_policy(mount: &Path) -> String {
 // would otherwise serve the service and this would test the wrong thing.
 fn with_provisioned_external_secret<F: FnOnce()>(service: &str, f: F) {
     let dir = tempdir().unwrap();
-    let secret_key = SecretKey::generate();
+    let mut secret_key = [0u8; 32]; // a KEK, as an operator provisions one: 32 random bytes
+    getrandom::fill(&mut secret_key).unwrap();
     let secret_path = dir.path().join(service);
-    fs::write(&secret_path, secret_key.to_bytes()).unwrap();
+    fs::write(&secret_path, secret_key).unwrap();
     fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap(); // owner-only, as the provider requires of a KEK file
     with_policy(&external_secret_policy(dir.path()), f);
 }
@@ -250,8 +249,10 @@ fn cli_wrap_writes_where_the_path_was_checked_not_where_a_link_before_dotdot_lea
         let base = fs::canonicalize(dir.path()).unwrap();
         let keys = base.join("keys");
         let elsewhere = base.join("elsewhere");
-        fs::create_dir_all(elsewhere.join("deep")).unwrap();
-        fs::create_dir(&keys).unwrap();
+        // 0700 whatever the umask: a 002 umask would leave these group-writable, and refused.
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).recursive(true).create(elsewhere.join("deep")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&keys).unwrap();
         std::os::unix::fs::symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
 
         let output = run_wrap_stdin(&keys.join("link/../wrapped.key"), "com.example.dotdot", &[7u8; 32], &[]);

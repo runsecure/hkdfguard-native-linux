@@ -2,9 +2,10 @@
 # made the way docs/configuration.md tells operators to make them, and the
 # per-scenario policy that pins them.
 #
-# Keys are SEC1 DER from OpenSSL, and their fingerprints are computed with
-# the documented OpenSSL pipeline -- on this machine, before the key is
-# delivered -- so the tests exercise exactly the commands the docs give.
+# Keys are 32 random bytes from OpenSSL, and their fingerprints are
+# computed with the documented OpenSSL command -- on this machine, before
+# the key is delivered -- so the tests exercise exactly the commands the
+# docs give.
 
 if ! command -v openssl >/dev/null 2>&1; then
     echo "these tests need openssl on this machine, to generate and fingerprint KEKs" >&2
@@ -16,14 +17,16 @@ fi
 # (MSYS_NO_PATHCONV), so convert explicitly; elsewhere, the path as given.
 openssl_path() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 
-# new_key <file>: a fresh P-256 KEK, SEC1 DER, readable only by this user.
+# new_key <file>: a fresh KEK, 32 random bytes, readable only by this user.
 new_key() {
-    ( umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER -out "$(openssl_path "$1")" )
+    ( umask 077; openssl rand -out "$(openssl_path "$1")" 32 )
 }
 
-# fingerprint <file>: the KEK's fingerprint, as policy pins it.
+# fingerprint <file>: the KEK's fingerprint, as policy pins it: HMAC-SHA-256
+# under the key of the fixed SP 800-108 fingerprint block.
 fingerprint() {
-    openssl pkey -inform DER -in "$(openssl_path "$1")" -pubout -outform DER | tail -c 65 | sha256sum | cut -d' ' -f1
+    printf '\0\0\0\001hkdfguard-kek-fingerprint-v1\0\0\0\001\0' |
+        openssl dgst -sha256 -mac HMAC -macopt "hexkey:$(od -An -v -tx1 "$1" | tr -d ' \n')" | awk '{print $NF}'
 }
 
 # write_policy <file> <dir or -> <pin> [<key file>...]

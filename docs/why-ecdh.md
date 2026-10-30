@@ -1,5 +1,12 @@
 # Why HKDFGuard wraps keys with ECDH against a hashed point
 
+> **Superseded.** This describes a pre-release design that was never
+> released. HKDFGuard now uses a device-held HMAC key and
+> the SP 800-108 KDF, which is safe against quantum computers and uses
+> only NIST-approved functions: see [why-hmac-prf.md](why-hmac-prf.md) and
+> [ADR-0001](adr/0001-post-quantum-wrapping-suite.md). Kept as the record
+> of what was considered.
+
 HKDFGuard derives each payload's wrapping key from an ECDH between the
 service's KEK and a point hashed from the payload's own random salt. The
 purpose of that choice is one property: **only something that can use the

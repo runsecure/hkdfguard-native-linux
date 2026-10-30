@@ -1,9 +1,9 @@
 [package]
 name = "hkdfguard"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 license = "MPL-2.0"
-description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, ephemeral)."
+description = "Linux implementation of HKDFGuard: HMAC-SHA-256 KDF (SP 800-108) -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, ephemeral)."
 repository = "https://github.com/runsecure/hkdfguard-native-linux"
 
 [lib]
@@ -14,13 +14,12 @@ name = "hkdfguard"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-# group-digest: RFC 9380 hash-to-curve (P256_XMD:SHA-256_SSWU_RO_) for the
-# per-payload ECDH point; pulls in only the small RustCrypto hash2curve crate.
-p256 ={ version = "0.14", features = ["ecdh", "pkcs8", "getrandom", "group-digest"] }
-elliptic-curve = { version = "0.14", features = ["pkcs8"] }
-hkdf = "0.13"
+# HMAC-SHA-256: the KEK PRF for keys held in software (external secret,
+# ephemeral), and the reference the TPM's known-answer self-test checks
+# TPM2_HMAC against.
+hmac = "0.13"
 # zeroize: the hasher wipes its state and buffered input when dropped --
-# HKDF-SHA512 keys SHA-512 states with the ECDH shared secret.
+# HMAC-SHA-256 keys SHA-256 states with a software-held KEK.
 sha2 = { version = "0.11", features = ["zeroize"] }
 # zeroize: the cipher wipes its expanded AES round keys and GHASH key when
 # dropped, so the per-payload wrapping key doesn't outlive its own wipe.

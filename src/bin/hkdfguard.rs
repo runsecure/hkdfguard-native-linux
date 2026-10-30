@@ -8,10 +8,13 @@
 //!   the library's setup-call latency floor) and meant to run once, at
 //!   deployment time.
 //! - `retire` -- permanently delete a service's KEK, given the fingerprint
-//!   `provision` printed for it. PKCS#11 only (see `admin::retire_kek`); it
-//!   goes through the library's Rust-only admin API, the one deliberate
-//!   exception to the C-ABI-only rule below, so that no application
-//!   linking the library can delete a KEK.
+//!   `provision` printed for it. TPM2 and PKCS#11 only (see
+//!   `admin::retire_kek`); it goes through the library's Rust-only admin
+//!   API, the one deliberate exception to the C-ABI-only rule below, so
+//!   that no application linking the shared library through its C ABI can
+//!   delete a KEK. A Rust program depending on the crate could call it
+//!   too; what stops it is the API's own checks (root only under the
+//!   production model, and the exact fingerprint), not reachability.
 //! - `wrap` -- wrap a caller-supplied Data Encryption Key (DEK) under the
 //!   service's KEK and write the wrapped payload to a file. It never
 //!   creates a KEK: if none is provisioned, it fails and says to run
@@ -31,7 +34,7 @@
 //!   `deployer_groups`). Only their key files are trusted by
 //!   `hkdfguard_open_file`, so `wrap` refuses anyone else before reading
 //!   the DEK, and checks the key file's folders against the library's own
-//!   rule (`hkdfguard_key_file_principal_trusted`).
+//!   rule (`admin::first_untrusted_dir`, under `admin::key_file_writer_trust`).
 //! - **Application** -- unwraps, through the library; it cannot persist a
 //!   key file its own service would accept.
 //!
@@ -106,16 +109,25 @@
 //! answer for each folder's owner and group decides, as it will when the
 //! key file is read.
 //!
-//! When `--force` replaces an existing file at `--key-file-path`, the wrap
-//! is completed in memory *first*, and only then is the old file securely
-//! overwritten in place and removed (see [`secure_delete`]); a file with
-//! more than one hard link is refused. A wrap that
-//! fails -- no KEK provisioned, provider unavailable, bad DEK input --
-//! therefore never destroys the key file that was already there. The
-//! secure overwrite is a best-effort measure against a plain read of the
-//! disk: it cannot guarantee erasure on copy-on-write or log-structured
-//! filesystems (e.g. btrfs, ZFS), or on flash storage doing wear-leveling
-//! remaps, where the original blocks may still exist elsewhere.
+//! A key file is never written in place. The wrap is completed in memory
+//! first; the payload is then written to a hidden temporary file in the
+//! key file's folder, synced, and only then given its real name -- by a
+//! hard link that fails if the name is taken, or, with `--force`, by a
+//! `rename(2)` over the existing file, which replaces it in one step (see
+//! [`stage_key_file`] and [`publish_key_file`]). So any failure -- no KEK
+//! provisioned, provider unavailable, bad DEK input, a full disk, a folder
+//! that refuses the write -- leaves the key file that was already there
+//! exactly as it was, and never a partial one.
+//!
+//! The file `--force` replaced is then securely overwritten through a
+//! descriptor opened, and checked, before the rename (see
+//! [`open_for_shredding`]); a file with more than one hard link is refused
+//! up front, and one that turns out to still have a name afterwards is
+//! left alone. The overwrite is a best-effort measure against a plain read
+//! of the disk: it cannot guarantee erasure on copy-on-write or
+//! log-structured filesystems (e.g. btrfs, ZFS), or on flash storage doing
+//! wear-leveling remaps, where the original blocks may still exist
+//! elsewhere.
 
 use base64ct::{Base64, Encoding as _};
 use std::ffi::CString;
@@ -130,7 +142,7 @@ use zeroize::Zeroize;
 use hkdfguard::admin::{DEPLOYERS_GROUP, OVER_BROAD_GROUPS};
 use hkdfguard::{
     admin, harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
-    hkdfguard_kek_fingerprint, hkdfguard_key_file_principal_trusted, hkdfguard_security_model, hkdfguard_wrap_dek,
+    hkdfguard_kek_fingerprint, hkdfguard_security_model, hkdfguard_wrap_dek,
     status,
 };
 
@@ -153,8 +165,8 @@ const KEY_FILE_GROUP_MODE: u32 = 0o640;
 // hkdfguard_security_model's value for the production model.
 const SECURITY_MODEL_PRODUCTION: c_int = 0;
 
-// Number of (all-zero pass, random pass) rounds `secure_delete` runs before
-// removing the file -- 2 passes per round, so this yields 8 total
+// Number of (all-zero pass, random pass) rounds `shred_replaced` runs on
+// the file `--force` replaced -- 2 passes per round, so this yields 8 total
 // overwrites as specified.
 const SECURE_DELETE_ROUNDS: usize = 4;
 
@@ -226,7 +238,7 @@ enum Command {
     },
 }
 
-// A KEK fingerprint: SHA-256 of its public key.
+// A KEK fingerprint: a fixed HMAC output of the KEK (see crypto.rs).
 const FINGERPRINT_LEN: usize = 32;
 
 enum ParseOutcome {
@@ -667,8 +679,11 @@ fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [
             // that is a BufReader whose 8 KiB heap buffer would receive the
             // DEK first and keep it, unwiped and unlocked, for the life of
             // the process. ManuallyDrop: the File must not close stdin.
-            // SAFETY: descriptor 0 stays open for the process's lifetime,
-            // and nothing else in this program reads it.
+            // SAFETY: descriptor 0 is open -- Rust's runtime reopens
+            // /dev/null on any standard descriptor that is closed when the
+            // process starts, so it can't be a file this program opened --
+            // and stays open for the process's lifetime; nothing else in
+            // this program reads it, and ManuallyDrop never closes it.
             let mut fd0 = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDIN_FILENO) });
             read_bounded(&mut *fd0, "the DEK on stdin", &mut scratch.text)?
         }
@@ -831,6 +846,8 @@ fn lookup_group_from(spec: &str, initial_buf: usize) -> Result<Option<(libc::gid
 
     let mut size = initial_buf.max(1);
     loop {
+        // SAFETY: an all-zero `group` (null pointers, zero ids) is a valid
+        // out-parameter; getgr*_r fills it.
         let mut grp: libc::group = unsafe { std::mem::zeroed() };
         let mut result: *mut libc::group = std::ptr::null_mut();
         let mut buf = vec![0u8; size];
@@ -955,8 +972,7 @@ fn require_real_folder(path: &Path) -> Result<PathBuf, String> {
 // about to write, asked before anything is touched: under the production
 // model, the library trusts only key files owned by root or a deployer, so
 // anyone else is refused here -- nothing would ever open what they wrote.
-// Returns whether the production model is in force.
-fn require_may_persist_key_files() -> Result<bool, String> {
+fn require_may_persist_key_files() -> Result<(), String> {
     let (mut model, mut may_write): (c_int, c_int) = (0, 0);
     let rc = hkdfguard_security_model(&mut model, &mut may_write);
     if rc != status::OK {
@@ -972,88 +988,54 @@ fn require_may_persist_key_files() -> Result<bool, String> {
              policy lists in deployer_groups. Run wrap as root, or as a deployer. Nothing was written"
         ));
     }
-    Ok(production)
+    Ok(())
 }
-
-// The library's answer to whether `principal` ("uid:<n>" or "gid:<n>") may
-// own, or write through its group, a key file or a folder above one.
-fn principal_trusted(principal: &str) -> Result<bool, String> {
-    let c_principal = CString::new(principal).map_err(|_| "a principal must not contain a NUL byte".to_string())?;
-    let mut trusted: c_int = 0;
-    let rc = hkdfguard_key_file_principal_trusted(c_principal.as_ptr(), &mut trusted);
-    if rc != status::OK {
-        return Err(format!("hkdfguard_key_file_principal_trusted({principal}) failed: {}", describe_status(rc)));
-    }
-    Ok(trusted == 1)
-}
-
-// Who the library trusts with key files, as `require_unshared_folder`
-// asks: `None` under the developer model, where that depends on who reads
-// the file, so only modes are checked; under production, the library's
-// own answer for a uid or gid (see `principal_trusted`).
-type PrincipalCheck<'a> = Option<&'a dyn Fn(&str) -> Result<bool, String>>;
 
 // `wrap` only: the key file's folder, and every folder above it up to `/`,
-// must not be writable by group or others -- sticky (`/tmp`, `/var/tmp`,
-// `/dev/shm`) included. The library refuses to read a key file under any
-// such folder (HKDFGUARD_ERR_FILE_UNTRUSTED), so writing one there would
-// only hand the application a file it can never open; better to say so
-// before the DEK is read or a provider is touched. `spelled` is what
-// `require_real_folder` returned, so its folder is the real one and every
-// ancestor is too.
+// must be ones the library would trust -- `trust`, from
+// `admin::key_file_writer_trust`. The library refuses to read a key file
+// under any other folder (HKDFGUARD_ERR_FILE_UNTRUSTED), so writing one
+// there would only hand the application a file it can never open; better
+// to say so before the DEK is read or a provider is touched. `spelled` is
+// what `require_real_folder` returned, so its folder is the real one and
+// every ancestor is too, and no link in it needs following.
 //
-// Developer model (`principals` is None): mode only, not ownership. `wrap`
-// often runs as root into a folder owned by the application's account,
-// which the library -- running as that account -- accepts, while the
-// library's ownership rule (root or the reading process's own user)
-// depends on who reads the file, which this tool cannot know.
-//
-// Production model: the rule doesn't depend on the reader, so it is
-// checked exactly: each folder's owner must be one the library trusts
-// (root or a deployer), and a folder writable through its group passes if
-// that group is a deployer group (a `root:hkdfguard-deployers 2775` folder
-// the deployers share). As in the library, a folder on a read-only mount is
-// not writable whatever its mode bits say (nothing can be written there
-// anyway, so the create below fails on its own).
-fn require_unshared_folder(path: &Path, spelled: &Path, principals: PrincipalCheck) -> Result<(), String> {
+// The judgment is the library's own (`admin::first_untrusted_dir`): no
+// folder writable by others, sticky (`/tmp`, `/var/tmp`, `/dev/shm`) or
+// not; under the production model, each folder owned by root or a
+// deployer, and writable through its group only if that is a deployer
+// group (a `root:hkdfguard-deployers 2775` folder the deployers share).
+// Under the developer model only modes are judged, not owners: `wrap` often
+// runs as root into a folder owned by the application's account, which the
+// library -- running as that account -- accepts. A folder on a read-only
+// mount is not writable whatever its mode bits say.
+fn require_unshared_folder(path: &Path, spelled: &Path, trust: &dyn admin::PrincipalTrust) -> Result<(), String> {
     let folder = spelled.parent().ok_or_else(|| format!("{} has no parent folder", path.display()))?;
-    for dir in folder.ancestors() {
-        let meta = fs::metadata(dir).map_err(|e| format!("failed to check folder {}: {e}", dir.display()))?;
-        let which = if dir == folder { "the key file's folder" } else { "a folder above the key file" };
-        if let Some(trusted) = principals {
-            if !trusted(&format!("uid:{}", meta.uid()))? {
-                return Err(format!(
-                    "{which}, {}, is owned by uid {}, whom the library does not trust with key files under the \
-                     production security model (root, or a member of {DEPLOYERS_GROUP} or of a policy \
-                     deployer_groups group); it would refuse to read a key file at {} \
-                     (HKDFGUARD_ERR_FILE_UNTRUSTED)",
-                    dir.display(),
-                    meta.uid(),
-                    path.display()
-                ));
-            }
-        }
-        let mode = meta.mode() & 0o7777;
-        if mode & 0o022 == 0 || on_read_only_mount(dir) {
-            continue;
-        }
-        if mode & 0o002 == 0 {
-            if let Some(trusted) = principals {
-                if trusted(&format!("gid:{}", meta.gid()))? {
-                    continue; // writable only through a deployer group
-                }
-            }
-        }
-        let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
-        return Err(format!(
-            "{which}, {}, is writable by group or others (mode {mode:o}){sticky}; the library would refuse to \
-             read a key file at {} (HKDFGUARD_ERR_FILE_UNTRUSTED), because someone else could replace it. \
-             Write the key file into a folder that only its owner (or root) can write to, all the way up to /",
+    let Some((dir, problem)) = admin::first_untrusted_dir(folder, trust) else {
+        return Ok(());
+    };
+    let which = if dir == folder { "the key file's folder" } else { "a folder above the key file" };
+    Err(match problem {
+        admin::DirProblem::Owner(uid) => format!(
+            "{which}, {}, is owned by uid {uid}, whom the library does not trust with key files under the \
+             production security model (root, or a member of {DEPLOYERS_GROUP} or of a policy deployer_groups \
+             group); it would refuse to read a key file at {} (HKDFGUARD_ERR_FILE_UNTRUSTED)",
             dir.display(),
             path.display()
-        ));
-    }
-    Ok(())
+        ),
+        admin::DirProblem::Writable { mode } => {
+            let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
+            format!(
+                "{which}, {}, is writable by group or others (mode {mode:o}){sticky}; the library would refuse to \
+                 read a key file at {} (HKDFGUARD_ERR_FILE_UNTRUSTED), because someone else could replace it. \
+                 Write the key file into a folder that only its owner (or root) can write to, all the way up to /",
+                dir.display(),
+                path.display()
+            )
+        }
+        admin::DirProblem::NotADirectory => format!("failed to check folder {}: not a directory", dir.display()),
+        admin::DirProblem::Unexaminable(e) => format!("failed to check folder {}: {e}", dir.display()),
+    })
 }
 
 // --dek-file only: the DEK file's folder, and every folder above it up to
@@ -1063,70 +1045,41 @@ fn require_unshared_folder(path: &Path, spelled: &Path, principals: PrincipalChe
 // someone else could put a DEK of their choosing at the path, and the
 // application would end up encrypting under a key they know. As in the
 // library, a folder on a read-only mount is exempt: a Kubernetes Secret
-// volume is `1777` but nobody can write to it. `spelled` is what
+// volume is `1777` but nobody can write to it. The judgment is the
+// library's (`admin::first_untrusted_dir`). `spelled` is what
 // `require_real_folder` returned, so its folder is the real one.
 fn require_private_dek_folder(path: &str, spelled: &Path) -> Result<(), String> {
     let folder = spelled.parent().ok_or_else(|| format!("--dek-file {path} has no parent folder"))?;
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    for dir in folder.ancestors() {
-        let meta = fs::metadata(dir).map_err(|e| format!("failed to check --dek-file {path}'s folder {}: {e}", dir.display()))?;
-        if meta.uid() != 0 && meta.uid() != euid {
-            return Err(format!(
-                "--dek-file {path}: folder {} is owned by uid {}, which is neither root nor this process's user, \
-                 so someone else could replace the DEK file",
-                dir.display(),
-                meta.uid()
-            ));
-        }
-        let mode = meta.mode() & 0o7777;
-        if mode & 0o022 == 0 || on_read_only_mount(dir) {
-            continue;
-        }
-        let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
-        return Err(format!(
-            "--dek-file {path}: folder {} is writable by group or others (mode {mode:o}){sticky}, so someone else \
-             could replace the DEK file. Keep it in a folder only its owner (or root) can write to, all the way up to /",
-            dir.display()
-        ));
-    }
-    Ok(())
-}
-
-fn on_read_only_mount(dir: &Path) -> bool {
-    let Ok(c_path) = CString::new(dir.as_os_str().as_encoded_bytes()) else {
-        return false;
+    let Some((dir, problem)) = admin::first_untrusted_dir(folder, &admin::Owner::RootOrCurrentUser) else {
+        return Ok(());
     };
-    // SAFETY: c_path is a valid NUL-terminated string; `st` is a properly
-    // sized out-parameter that statvfs fully initializes on success.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
-        return false;
-    }
-    st.f_flag & libc::ST_RDONLY != 0
+    Err(match problem {
+        admin::DirProblem::Owner(uid) => format!(
+            "--dek-file {path}: folder {} is owned by uid {uid}, which is neither root nor this process's user, \
+             so someone else could replace the DEK file",
+            dir.display()
+        ),
+        admin::DirProblem::Writable { mode } => {
+            let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
+            format!(
+                "--dek-file {path}: folder {} is writable by group or others (mode {mode:o}){sticky}, so someone else \
+                 could replace the DEK file. Keep it in a folder only its owner (or root) can write to, all the way up to /",
+                dir.display()
+            )
+        }
+        admin::DirProblem::NotADirectory => format!("failed to check --dek-file {path}'s folder {}: not a directory", dir.display()),
+        admin::DirProblem::Unexaminable(e) => format!("failed to check --dek-file {path}'s folder {}: {e}", dir.display()),
+    })
 }
 
 // After an open: `file` must be the file at `spelled` (see
 // `require_real_folder`) -- nothing was swapped between the folder check
-// and the open. Judged from the descriptor: where the kernel says it is
-// (/proc/self/fd), and its device and inode against what the spelled path
-// names now. Without /proc only the second applies.
+// and the open. The library's own post-open check (`admin::verify_opened`):
+// where the kernel says the descriptor is (/proc/self/fd), and its device
+// and inode against what the spelled path names now.
 fn require_opened_at(file: &File, path: &Path, spelled: &Path) -> Result<(), String> {
-    if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
-        if actual != spelled {
-            return Err(format!(
-                "{} was opened at {} instead; refusing to use it (a folder in its path changed)",
-                path.display(),
-                actual.display()
-            ));
-        }
-    }
-    let opened = file.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
-    let named = fs::symlink_metadata(spelled).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
-    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
-        return Err(format!("{} was moved or replaced while it was being opened; refusing to use it", path.display()));
-    }
-    Ok(())
+    admin::verify_opened(file, spelled)
+        .map_err(|e| format!("{} changed while it was being opened; refusing to use it ({e})", path.display()))
 }
 
 // Largest existing file `--force` will overwrite. A wrapped key is a few
@@ -1135,10 +1088,9 @@ fn require_opened_at(file: &File, path: &Path, spelled: &Path) -> Result<(), Str
 // times over.
 const MAX_REPLACEABLE_KEY_FILE_LEN: u64 = 64 * 1024;
 
-// Overwrites `path`'s existing content in place for `SECURE_DELETE_ROUNDS`
-// rounds -- each round first an all-zero-bit pass, then a pass of fresh
-// random bits, fsync'd after every pass -- before unlinking it. Called only
-// when `--force` is about to replace a file that already exists.
+// Opens the file `--force` is about to replace, for `shred_replaced` to
+// overwrite once the new key file has taken its name. Called before the
+// rename, so everything refused here leaves both files as they were.
 //
 // Only ever a regular file, and only the one at `path` itself: a symlink
 // there is refused rather than followed (following it would overwrite
@@ -1152,14 +1104,13 @@ const MAX_REPLACEABLE_KEY_FILE_LEN: u64 = 64 * 1024;
 // spells (`require_opened_at`), so nothing swapped in between gets
 // overwritten either.
 //
-// If the file can't be opened for writing (EACCES/EPERM -- this tool
-// doesn't own it), the overwrite passes are skipped entirely and this falls
-// back to a plain `remove_file`: destroying
-// the old bytes first is worth attempting, but not worth failing the whole
-// command over when this process isn't even allowed to write to the file
-// it's about to replace -- matches this project's macOS/Windows tools.
-fn secure_delete(path: &Path) -> Result<(), String> {
-    let refuse = |why: &str| format!("{} {why}; refusing to overwrite it", path.display());
+// `Ok(None)` if the file can't be opened for writing (EACCES/EPERM -- this
+// tool doesn't own it): it is still replaced, but not overwritten first.
+// Destroying the old bytes is worth attempting, but not worth failing the
+// whole command over when this process isn't even allowed to write to the
+// file it's replacing -- matches this project's macOS/Windows tools.
+fn open_for_shredding(path: &Path) -> Result<Option<(File, usize)>, String> {
+    let refuse = |why: &str| format!("{} {why}; refusing to replace it", path.display());
     let check = |meta: &fs::Metadata| -> Result<usize, String> {
         if !meta.file_type().is_file() {
             return Err(refuse("is not a regular file (a symlink, directory, FIFO, or device)"));
@@ -1177,27 +1128,22 @@ fn secure_delete(path: &Path) -> Result<(), String> {
         Ok(meta.len() as usize)
     };
 
-    // Every stat, open and remove below goes through `spelled`, the path
+    // Every stat and open below goes through `spelled`, the path
     // require_real_folder checked -- never `path` as given, which the kernel
     // could resolve into another folder (see require_real_folder).
     let spelled = require_real_folder(path)?;
     let examined = fs::symlink_metadata(&spelled).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
     check(&examined)?;
 
-    let mut file = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(&spelled)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Checked above: a regular file with one name, in a real folder.
-            return fs::remove_file(&spelled).map_err(|e| {
-                format!("failed to remove {} after permission-denied secure delete: {e}", path.display())
-            });
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None), // checked above: a regular file with one name
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refuse("changed to a symlink")),
-        Err(e) => return Err(format!("failed to open {} for secure delete: {e}", path.display())),
+        Err(e) => return Err(format!("failed to open {} to replace it: {e}", path.display())),
     };
     let opened = file.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
     if (opened.dev(), opened.ino()) != (examined.dev(), examined.ino()) {
@@ -1205,7 +1151,28 @@ fn secure_delete(path: &Path) -> Result<(), String> {
     }
     require_opened_at(&file, path, &spelled)?;
     let len = check(&opened)?;
+    Ok(Some((file, len)))
+}
 
+// Overwrites the file `--force` just replaced for `SECURE_DELETE_ROUNDS`
+// rounds -- each round first an all-zero-bit pass, then a pass of fresh
+// random bits, fsync'd after every pass -- through the descriptor
+// `open_for_shredding` returned. The rename has already removed its only
+// name, so the kernel frees it when the descriptor closes.
+//
+// Only while it has no name left: if it still has one -- someone moved it
+// aside between the check and the rename, so the rename replaced something
+// else -- overwriting it would destroy a file that still exists. It is
+// left alone then, and so is whatever the rename replaced.
+fn shred_replaced(mut file: File, len: usize, path: &Path) -> Result<(), String> {
+    let links = file.metadata().map_err(|e| format!("failed to stat the replaced {}: {e}", path.display()))?.nlink();
+    if links != 0 {
+        return Err(format!(
+            "the file replaced at {} was moved while it was being replaced and still has {links} name(s); it was \
+             left as it is, not overwritten",
+            path.display()
+        ));
+    }
     let mut buf = vec![0u8; len];
     for _ in 0..SECURE_DELETE_ROUNDS {
         buf.iter_mut().for_each(|b| *b = 0); // pass: overwrite with bit 0 throughout
@@ -1214,13 +1181,11 @@ fn secure_delete(path: &Path) -> Result<(), String> {
         getrandom::fill(&mut buf).map_err(|e| format!("random overwrite of {} failed: {e}", path.display()))?; // pass: overwrite with a fresh random bit pattern
         overwrite_pass(&mut file, path, &buf)?;
     }
-
-    drop(file);
-    fs::remove_file(&spelled).map_err(|e| format!("failed to remove {} after secure delete: {e}", path.display()))
+    Ok(())
 }
 
 // Rewinds to the start of `file` and writes `buf` (the same length as the
-// file, per `secure_delete`), fsync'ing before returning so this pass is
+// file, per `shred_replaced`), fsync'ing before returning so this pass is
 // durable on disk before the next one begins.
 fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String> {
     file.seek(SeekFrom::Start(0))
@@ -1354,12 +1319,12 @@ fn run_wrap(
     let path = checked.as_path();
     // Someone the library would trust with a key file: under the
     // production model, root or a deployer, or nothing is written.
-    let production = require_may_persist_key_files()?;
+    require_may_persist_key_files()?;
     // And not in a folder (or under one) that someone untrusted can write
     // to, sticky /tmp included: the library would refuse to read the key
     // file there, so refuse to write it (see require_unshared_folder).
-    let check: &dyn Fn(&str) -> Result<bool, String> = &principal_trusted;
-    require_unshared_folder(Path::new(&key_file_path), path, production.then_some(check))?;
+    let trust = admin::key_file_writer_trust().map_err(|e| e.message)?;
+    require_unshared_folder(Path::new(&key_file_path), path, &*trust)?;
 
     // Fast, friendly pre-check: fail before reading the DEK or touching
     // the provider if the output path obviously already exists and --force
@@ -1413,64 +1378,15 @@ fn run_wrap(
         }
     }
 
-    // Only now, with a complete wrapped payload in hand, replace the old
-    // file. Re-evaluated here rather than trusting the pre-check above, in
-    // case the file appeared in the meantime.
-    if path_is_taken(path) {
-        if !force {
-            return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
-        }
-        secure_delete(path)?;
-    }
-
-    // `create_new` makes "does this file already exist" and "create it"
-    // one indivisible kernel operation (the actual correctness guarantee
-    // against the exists-then-create race), and `.mode(KEY_FILE_MODE)`
-    // sets the permissions at the moment of creation so there's no window
-    // where the file briefly exists with broader (umask-derived)
-    // permissions before being locked down after the fact. By the time
-    // this runs, `path` is always either brand new or was just deleted by
-    // `secure_delete` above, so `set_permissions` below is defense-in-depth
-    // against the umask, not strictly required.
-    let spelled = require_real_folder(path)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(KEY_FILE_MODE)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("{key_file_path} already exists; pass --force|-f to overwrite")
-            } else {
-                format!("failed to open {key_file_path}: {e}")
-            }
-        })?;
-    // The file just created must be at the spelled path. If a folder was
-    // swapped for a link after the check above, nothing is written: the
-    // (still empty) file is removed from wherever it actually landed.
-    if let Err(e) = require_opened_at(&file, path, &spelled) {
-        if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
-            remove_created_file(&actual, &file);
-        }
-        return Err(e);
-    }
-    // --group: the file goes to that group on the open descriptor before a
-    // byte is written, so it never holds the payload under any other group.
-    // It is still 0600 here; the mode widens to 0640 only below, after the
-    // group is right. A non-root caller can only give groups it belongs to:
-    // the kernel's rule, reported plainly, and the empty file removed.
-    if let Some((gid, name)) = &group {
-        // SAFETY: a valid open descriptor; uid -1 leaves the owner as it is.
-        if unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, *gid) } != 0 {
-            let e = std::io::Error::last_os_error();
-            remove_created_file(path, &file);
-            return Err(format!(
-                "could not give {key_file_path} to group \"{name}\": {e} (only root, or a member of the group, can)"
-            ));
-        }
-    }
+    // Only now, with a complete wrapped payload in hand, write it: in full
+    // to a temporary file beside the key file first, then under its real
+    // name. Until that last step the folder holds exactly what it held
+    // before, whatever fails.
     let mode = if group.is_some() { KEY_FILE_GROUP_MODE } else { KEY_FILE_MODE };
-    finish_key_file(&mut file, path, &key_file_path, &wrapped, mode)?;
+    let staged = stage_key_file(path, &key_file_path, &wrapped, group.as_ref(), mode)?;
+    if let Some(warning) = publish_key_file(staged, path, &key_file_path, force)? {
+        eprintln!("{PROGRAM_NAME}: warning: {warning}");
+    }
 
     let access = match &group {
         Some((_, name)) => format!("owner read/write + {name} read-only"),
@@ -1492,7 +1408,7 @@ fn run_wrap(
     Ok(())
 }
 
-// Removes the key file this run created -- but only if `path` still names
+// Removes the file this run created -- but only if `path` still names
 // that very file: the same device and inode as the open descriptor. Linux
 // can't unlink through a descriptor, so this is the nearest thing to it; a
 // file someone renamed into place after the fact is left alone. Best
@@ -1506,25 +1422,149 @@ fn remove_created_file(path: &Path, file: &File) {
     }
 }
 
-// Writes the payload into the key file just created, gives it its final
-// mode, and flushes the file and then its folder to storage, so a reported
-// success survives a crash. On any failure the file is removed (see
-// remove_created_file): a failed wrap never leaves an empty or truncated key
-// file behind, for the next `wrap` to call "already exists" or a service to
-// read as malformed. `shown` is the path as the operator spelled it, for
+// A key file written in full under a temporary name, waiting for
+// `publish_key_file` to give it its real one.
+struct StagedKeyFile {
+    file: File,
+    temp: PathBuf,
+}
+
+// Writes `wrapped` to a new hidden file in `path`'s folder, named after it
+// plus a random suffix, with its final group and mode, and flushes it to
+// storage. On any failure the temporary file is removed again, so nothing
+// is left behind. `shown` is the path as the operator spelled it, for
 // messages.
-fn finish_key_file(file: &mut File, path: &Path, shown: &str, wrapped: &[u8], mode: u32) -> Result<(), String> {
+//
+// `create_new` with `O_NOFOLLOW` and `.mode(KEY_FILE_MODE)` create the file
+// atomically, never through anything already there, and with no window in
+// which it has broader (umask-derived) permissions. With --group, the file
+// goes to that group on the open descriptor before a byte is written, so
+// it never holds the payload under any other group; the mode widens to
+// 0640 only after the group is right. A non-root caller can only give
+// groups it belongs to: the kernel's rule, reported plainly.
+fn stage_key_file(
+    path: &Path,
+    shown: &str,
+    wrapped: &[u8],
+    group: Option<&(libc::gid_t, String)>,
+    mode: u32,
+) -> Result<StagedKeyFile, String> {
+    let spelled = require_real_folder(path)?;
+    let name = spelled.file_name().ok_or_else(|| format!("{shown} names no file"))?.to_string_lossy().into_owned();
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|e| format!("the OS random number generator failed: {e}"))?;
+    let temp = spelled.with_file_name(format!(".{name}.hkdfguard-{}", hex(&suffix)));
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(KEY_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
+        .map_err(|e| format!("failed to create a temporary file beside {shown}: {e}"))?;
+    // The file just created must be in the spelled folder. If a folder was
+    // swapped for a link after the check above, nothing is written: the
+    // (still empty) file is removed from wherever it actually landed.
+    if let Err(e) = require_opened_at(&file, &temp, &temp) {
+        if let Ok(actual) = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+            remove_created_file(&actual, &file);
+        }
+        return Err(e);
+    }
     let result = (|| {
+        if let Some((gid, group_name)) = group {
+            // SAFETY: a valid open descriptor; uid -1 leaves the owner as it is.
+            if unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, *gid) } != 0 {
+                let e = std::io::Error::last_os_error();
+                return Err(format!(
+                    "could not give {shown} to group \"{group_name}\": {e} (only root, or a member of the group, can)"
+                ));
+            }
+        }
         file.write_all(wrapped).map_err(|e| format!("failed to write {shown}: {e}"))?;
         file.set_permissions(fs::Permissions::from_mode(mode))
             .map_err(|e| format!("failed to set permissions on {shown}: {e}"))?;
-        file.sync_all().map_err(|e| format!("failed to flush {shown} to storage: {e}"))?;
-        sync_parent_folder(path).map_err(|e| format!("failed to flush the folder of {shown} to storage: {e}"))
+        file.sync_all().map_err(|e| format!("failed to flush {shown} to storage: {e}"))
     })();
-    if result.is_err() {
-        remove_created_file(path, file);
+    if let Err(e) = result {
+        remove_created_file(&temp, &file);
+        return Err(e);
     }
-    result
+    Ok(StagedKeyFile { file, temp })
+}
+
+// Gives the staged key file its real name, `path`, and flushes the folder,
+// so a reported success survives a crash. The temporary name is gone
+// afterwards, whatever happens.
+//
+// With no file at `path`, a hard link: it fails if one appeared meanwhile,
+// so a key file is never replaced without --force. With --force and a file
+// there, `rename(2)` over it: one step, so `path` names the old key file
+// or the new one at every moment, never neither. The old file is opened
+// and checked first (`open_for_shredding`); anything refused there leaves
+// both as they were. Once the rename is done the new key file is in place,
+// so a failure overwriting the old one is returned as a warning, not an
+// error.
+fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool) -> Result<Option<String>, String> {
+    let StagedKeyFile { file, temp } = staged;
+    let fail = |e: String| {
+        remove_created_file(&temp, &file);
+        Err(e)
+    };
+    let taken = || format!("{shown} already exists; pass --force|-f to overwrite");
+
+    let spelled = match require_real_folder(path) {
+        Ok(spelled) => spelled,
+        Err(e) => return fail(e),
+    };
+    let replacing = path_is_taken(&spelled);
+    if replacing && !force {
+        return fail(taken());
+    }
+    let old = if replacing {
+        match open_for_shredding(&spelled) {
+            Ok(old) => old,
+            Err(e) => return fail(e),
+        }
+    } else {
+        None
+    };
+
+    if replacing {
+        if let Err(e) = fs::rename(&temp, &spelled) {
+            return fail(format!("failed to replace {shown}: {e}"));
+        }
+    } else {
+        match fs::hard_link(&temp, &spelled) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temp);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return fail(if force {
+                    format!("{shown} was created by something else while this wrap ran; nothing was replaced, run it again")
+                } else {
+                    taken()
+                });
+            }
+            Err(e) => return fail(format!("failed to create {shown}: {e}")),
+        }
+    }
+    // The spelled path must now name the very file staged. Compared by
+    // device and inode: /proc/self/fd still shows the temporary name the
+    // descriptor was opened under, even once that name is gone.
+    let (Ok(staged_meta), Ok(named)) = (file.metadata(), fs::symlink_metadata(&spelled)) else {
+        return Err(format!("could not confirm {shown} was written: it can't be examined"));
+    };
+    if (staged_meta.dev(), staged_meta.ino()) != (named.dev(), named.ino()) {
+        return Err(format!("{shown} was replaced by something else right after it was written; check its contents"));
+    }
+    sync_parent_folder(&spelled).map_err(|e| format!("failed to flush the folder of {shown} to storage: {e}"))?;
+
+    Ok(old.and_then(|(old_file, len)| {
+        shred_replaced(old_file, len, path)
+            .err()
+            .map(|e| format!("{shown} was replaced, but the old file was not securely overwritten: {e}"))
+    }))
 }
 
 // fsync on the folder, so the key file's directory entry -- not just its
@@ -1695,7 +1735,6 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serial_test::serial;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn every_status_the_linux_library_returns_is_described() {
@@ -1756,68 +1795,141 @@ mod tests {
         }
     }
 
-    // `secure_delete`'s multi-pass overwrite content isn't observable from
-    // outside the function by the time it returns (the file is gone by
-    // then) -- what's directly testable here is its documented end state:
-    // the file no longer exists. (An inode-number check would not be a
-    // reliable stronger signal: some filesystems reuse a just-freed inode
-    // immediately for a new file.)
-    #[test]
-    fn secure_delete_removes_the_file() {
-        let file = NamedTempFile::new_in(test_tmp::root()).unwrap();
-        fs::write(file.path(), b"sensitive content to be wiped").unwrap();
-        assert!(file.path().exists());
+    // Writes `payload` to `path` exactly as `wrap` does: staged, then
+    // published.
+    fn write_key(path: &Path, payload: &[u8], force: bool) -> Result<Option<String>, String> {
+        let staged = stage_key_file(path, &path.display().to_string(), payload, None, KEY_FILE_MODE)?;
+        publish_key_file(staged, path, &path.display().to_string(), force)
+    }
 
-        secure_delete(file.path()).unwrap();
-
-        assert!(!file.path().exists());
+    // Nothing but `expected` in `dir`: no temporary file left behind.
+    fn assert_only(dir: &Path, expected: &[&str]) {
+        let mut names: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(names, expected, "unexpected files in {}", dir.display());
     }
 
     #[test]
-    fn secure_delete_handles_an_empty_file() {
-        let file = NamedTempFile::new_in(test_tmp::root()).unwrap(); // created empty
-        secure_delete(file.path()).unwrap();
-        assert!(!file.path().exists());
-    }
-
-    #[test]
-    fn secure_delete_refuses_a_symlink_and_leaves_its_target_alone() {
+    fn a_new_key_file_is_created_in_place_with_its_mode() {
         let dir = private_tempdir();
-        let victim = dir.path().join("some-other-file");
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        assert_eq!(write_key(&key, b"payload", false).unwrap(), None);
+        assert_eq!(fs::read(&key).unwrap(), b"payload");
+        assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, KEY_FILE_MODE);
+        assert_eq!(fs::metadata(&key).unwrap().nlink(), 1, "the temporary name is gone");
+        assert_only(dir.path(), &["wrapped.key"]);
+    }
+
+    #[test]
+    fn without_force_an_existing_key_file_is_never_touched() {
+        let dir = private_tempdir();
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        fs::write(&key, b"old payload").unwrap();
+        assert!(write_key(&key, b"new payload", false).unwrap_err().contains("already exists"));
+        assert_eq!(fs::read(&key).unwrap(), b"old payload");
+        assert_only(dir.path(), &["wrapped.key"]);
+    }
+
+    #[test]
+    fn force_replaces_the_key_file_in_one_step_and_shreds_the_old_one() {
+        let dir = private_tempdir();
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        let old = vec![0xA5u8; 132];
+        fs::write(&key, &old).unwrap();
+        // A descriptor on the old file, held across the replacement: what a
+        // later read of its blocks would see.
+        let mut held = File::open(&key).unwrap();
+
+        assert_eq!(write_key(&key, b"new payload", true).unwrap(), None, "no warning");
+        assert_eq!(fs::read(&key).unwrap(), b"new payload");
+        assert_only(dir.path(), &["wrapped.key"]);
+
+        assert_eq!(held.metadata().unwrap().nlink(), 0, "the old file has no name left");
+        let mut after = Vec::new();
+        held.read_to_end(&mut after).unwrap();
+        assert_eq!(after.len(), old.len());
+        assert_ne!(after, old, "the old payload was overwritten before it was released");
+    }
+
+    #[test]
+    fn force_replaces_an_empty_file_and_creates_a_missing_one() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let empty = base.join("empty.key");
+        File::create(&empty).unwrap();
+        write_key(&empty, b"payload", true).unwrap();
+        assert_eq!(fs::read(&empty).unwrap(), b"payload");
+
+        let missing = base.join("missing.key");
+        write_key(&missing, b"payload", true).unwrap();
+        assert_eq!(fs::read(&missing).unwrap(), b"payload");
+        assert_only(dir.path(), &["empty.key", "missing.key"]);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_old_key_file_exactly_as_it_was() {
+        // The case that used to destroy it: the folder refuses new entries,
+        // so the new file can't be written. Nothing is overwritten first now.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes through a 0555 folder
+        }
+        let dir = private_tempdir();
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        fs::write(&key, b"old payload").unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let result = write_key(&key, b"new payload", true);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.unwrap_err().contains("temporary file"));
+        assert_eq!(fs::read(&key).unwrap(), b"old payload", "the old key file must survive a failed write");
+        assert_only(dir.path(), &["wrapped.key"]);
+    }
+
+    #[test]
+    fn force_refuses_a_symlink_and_leaves_it_and_its_target_alone() {
+        let dir = private_tempdir();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let victim = base.join("some-other-file");
         fs::write(&victim, b"not a wrapped key").unwrap();
-        let link = dir.path().join("wrapped.key");
+        let link = base.join("wrapped.key");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
 
-        let err = secure_delete(&link).unwrap_err();
+        let err = write_key(&link, b"payload", true).unwrap_err();
         assert!(err.contains("not a regular file"), "unexpected: {err}");
         assert_eq!(fs::read(&victim).unwrap(), b"not a wrapped key", "the link's target must be untouched");
-        assert!(path_is_taken(&link), "and the link itself is left for the operator to look at");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "and the link is left for the operator");
+        assert_only(dir.path(), &["some-other-file", "wrapped.key"]);
     }
 
     #[test]
-    fn secure_delete_refuses_a_fifo_without_blocking() {
+    #[cfg_attr(miri, ignore = "makes a FIFO, which Miri can't")]
+    fn force_refuses_a_fifo_without_blocking() {
         let dir = private_tempdir();
-        let fifo = dir.path().join("wrapped.key");
+        let fifo = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
         let c = CString::new(fifo.to_str().unwrap()).unwrap();
         // SAFETY: c is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let path = fifo.clone();
-        std::thread::spawn(move || tx.send(secure_delete(&path)).unwrap());
-        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("secure_delete blocked on a FIFO");
+        std::thread::spawn(move || tx.send(write_key(&path, b"payload", true)).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the write blocked on a FIFO");
         assert!(result.unwrap_err().contains("not a regular file"));
+        assert_only(dir.path(), &["wrapped.key"]);
     }
 
     #[test]
-    fn secure_delete_refuses_a_file_far_larger_than_a_wrapped_key() {
+    fn force_refuses_a_file_far_larger_than_a_wrapped_key() {
         let dir = private_tempdir();
-        let big = dir.path().join("wrapped.key");
+        let big = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
         let f = File::create(&big).unwrap();
         f.set_len(MAX_REPLACEABLE_KEY_FILE_LEN + 1).unwrap(); // sparse: no real disk use
-        let err = secure_delete(&big).unwrap_err();
+        let err = write_key(&big, b"payload", true).unwrap_err();
         assert!(err.contains("far larger"), "unexpected: {err}");
-        assert!(big.exists());
+        assert_eq!(fs::metadata(&big).unwrap().len(), MAX_REPLACEABLE_KEY_FILE_LEN + 1);
+        assert_only(dir.path(), &["wrapped.key"]);
     }
 
     #[test]
@@ -1830,26 +1942,32 @@ mod tests {
     }
 
     #[test]
-    fn secure_delete_fails_cleanly_on_a_missing_file() {
-        let file = NamedTempFile::new_in(test_tmp::root()).unwrap();
-        let path = file.path().to_path_buf();
-        drop(file);
-        fs::remove_file(&path).ok();
-        assert!(secure_delete(&path).is_err());
-    }
-
-    #[test]
-    fn secure_delete_refuses_a_hard_linked_file_and_leaves_both_names_intact() {
+    fn force_refuses_a_hard_linked_file_and_leaves_both_names_intact() {
         let dir = private_tempdir();
         let base = fs::canonicalize(dir.path()).unwrap();
         let key = base.join("wrapped.key");
         fs::write(&key, b"payload").unwrap();
         let other = base.join("elsewhere.dat");
         fs::hard_link(&key, &other).unwrap();
-        let err = secure_delete(&key).unwrap_err();
+        let err = write_key(&key, b"new payload", true).unwrap_err();
         assert!(err.contains("2 hard links"), "{err}");
         assert_eq!(fs::read(&other).unwrap(), b"payload", "the other name's contents are untouched");
-        assert!(key.exists(), "the key file itself is left in place");
+        assert_eq!(fs::read(&key).unwrap(), b"payload", "the key file itself is left in place");
+        assert_only(dir.path(), &["elsewhere.dat", "wrapped.key"]);
+    }
+
+    #[test]
+    fn a_replaced_file_that_still_has_a_name_is_never_overwritten() {
+        // As if someone moved the old key file aside between the check and
+        // the rename: the descriptor's file is still named, so it is left
+        // alone and the caller gets a warning, not destroyed data.
+        let dir = private_tempdir();
+        let moved = fs::canonicalize(dir.path()).unwrap().join("moved-aside.key");
+        fs::write(&moved, b"still somebody's file").unwrap();
+        let file = OpenOptions::new().write(true).open(&moved).unwrap();
+        let err = shred_replaced(file, 21, &moved).unwrap_err();
+        assert!(err.contains("still has 1 name"), "{err}");
+        assert_eq!(fs::read(&moved).unwrap(), b"still somebody's file");
     }
 
     #[test]
@@ -1889,13 +2007,13 @@ mod tests {
         chmod(&outer, 0o755);
         chmod(&inner, 0o700);
         let key = inner.join("wrapped.key");
-        require_unshared_folder(&key, &key, None).expect("0700 under 0755 under a private root");
+        require_unshared_folder(&key, &key, &ModesOnly).expect("0700 under 0755 under a private root");
         chmod(&inner, 0o755);
-        require_unshared_folder(&key, &key, None).expect("0755: others may read, not write");
+        require_unshared_folder(&key, &key, &ModesOnly).expect("0755: others may read, not write");
 
         for mode in [0o775, 0o757, 0o777, 0o1777, 0o1770] {
             chmod(&inner, mode);
-            let err = require_unshared_folder(&key, &key, None).unwrap_err();
+            let err = require_unshared_folder(&key, &key, &ModesOnly).unwrap_err();
             assert!(err.contains("the key file's folder") && err.contains(&format!("mode {mode:o}")), "{err}");
             assert!(err.contains("library would refuse"), "{err}");
             assert_eq!(err.contains("sticky"), mode & 0o1000 != 0, "{err}");
@@ -1903,10 +2021,34 @@ mod tests {
         chmod(&inner, 0o700);
         for mode in [0o1777, 0o777, 0o770] {
             chmod(&outer, mode);
-            let err = require_unshared_folder(&key, &key, None).unwrap_err();
+            let err = require_unshared_folder(&key, &key, &ModesOnly).unwrap_err();
             assert!(err.contains("a folder above the key file") && err.contains(outer.to_str().unwrap()), "{err}");
         }
         chmod(&outer, 0o755);
+    }
+
+    // Test trusts: who may own a folder, and which group may write it.
+    struct ModesOnly;
+    impl admin::PrincipalTrust for ModesOnly {
+        fn trusts_owner(&self, _uid: u32) -> bool {
+            true
+        }
+        fn trusts_group_writer(&self, _gid: u32) -> bool {
+            false
+        }
+    }
+    struct Rule {
+        owners: Vec<u32>,
+        any_owner: bool,
+        group: Option<u32>,
+    }
+    impl admin::PrincipalTrust for Rule {
+        fn trusts_owner(&self, uid: u32) -> bool {
+            self.any_owner || uid == 0 || self.owners.contains(&uid)
+        }
+        fn trusts_group_writer(&self, gid: u32) -> bool {
+            self.group == Some(gid)
+        }
     }
 
     #[test]
@@ -1917,36 +2059,33 @@ mod tests {
         fs::create_dir(&keys).unwrap();
         let key = keys.join("wrapped.key");
         let meta = fs::metadata(&keys).unwrap();
-        let (me, my_group) = (format!("uid:{}", meta.uid()), format!("gid:{}", meta.gid()));
         let chmod = |mode: u32| fs::set_permissions(&keys, fs::Permissions::from_mode(mode)).unwrap();
 
         // Every folder's owner trusted, and this folder's group a deployer group.
-        let deployer = |p: &str| -> Result<bool, String> { Ok(p == "uid:0" || p == me || p == my_group) };
+        let deployer = Rule { owners: vec![meta.uid()], any_owner: false, group: Some(meta.gid()) };
         // Every owner trusted, no group.
-        let no_group = |p: &str| -> Result<bool, String> { Ok(p.starts_with("uid:")) };
+        let no_group = Rule { owners: vec![], any_owner: true, group: None };
         // Only root.
-        let root_only = |p: &str| -> Result<bool, String> { Ok(p == "uid:0") };
+        let root_only = Rule { owners: vec![], any_owner: false, group: None };
 
         chmod(0o755);
-        require_unshared_folder(&key, &key, Some(&deployer)).expect("0755, trusted owners");
+        require_unshared_folder(&key, &key, &deployer).expect("0755, trusted owners");
         if meta.uid() != 0 {
-            let err = require_unshared_folder(&key, &key, Some(&root_only)).unwrap_err();
+            let err = require_unshared_folder(&key, &key, &root_only).unwrap_err();
             assert!(err.contains(&format!("owned by uid {}", meta.uid())) && err.contains("production"), "{err}");
         }
         for mode in [0o775, 0o2775, 0o770] {
             chmod(mode);
-            require_unshared_folder(&key, &key, Some(&deployer)).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
-            let err = require_unshared_folder(&key, &key, Some(&no_group)).unwrap_err();
+            require_unshared_folder(&key, &key, &deployer).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+            let err = require_unshared_folder(&key, &key, &no_group).unwrap_err();
             assert!(err.contains("writable by group or others"), "mode {mode:o}: {err}");
         }
         for mode in [0o777, 0o1777, 0o757] {
             chmod(mode);
-            let err = require_unshared_folder(&key, &key, Some(&deployer)).unwrap_err();
+            let err = require_unshared_folder(&key, &key, &deployer).unwrap_err();
             assert!(err.contains("writable by group or others"), "mode {mode:o}: others may never write: {err}");
         }
         chmod(0o700);
-        let failing = |_: &str| -> Result<bool, String> { Err("the library said no".to_string()) };
-        assert_eq!(require_unshared_folder(&key, &key, Some(&failing)).unwrap_err(), "the library said no");
     }
 
     #[test]
@@ -1954,7 +2093,7 @@ mod tests {
         // `/` is root's, and (as a non-root test run) not this user's: the
         // library running as the application's account would accept a key
         // file there, so wrap must not refuse it for its owner.
-        require_unshared_folder(Path::new("/wrapped.key"), Path::new("/wrapped.key"), None).expect("root-owned 0755");
+        require_unshared_folder(Path::new("/wrapped.key"), Path::new("/wrapped.key"), &ModesOnly).expect("root-owned 0755");
 
         // Owned by another non-root user: only root can arrange that.
         // SAFETY: geteuid has no preconditions.
@@ -1969,7 +2108,7 @@ mod tests {
         for mode in [0o700, 0o755] {
             fs::set_permissions(&theirs, fs::Permissions::from_mode(mode)).unwrap();
             let key = theirs.join("wrapped.key");
-            require_unshared_folder(&key, &key, None).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+            require_unshared_folder(&key, &key, &ModesOnly).unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
         }
     }
 
@@ -2019,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn secure_delete_refuses_a_file_reached_through_a_symlinked_folder() {
+    fn force_refuses_a_file_reached_through_a_symlinked_folder() {
         use std::os::unix::fs::symlink;
         let dir = private_tempdir();
         let base = fs::canonicalize(dir.path()).unwrap();
@@ -2027,9 +2166,10 @@ mod tests {
         fs::create_dir(&real).unwrap();
         fs::write(real.join("victim.key"), b"not yours").unwrap();
         symlink(&real, base.join("link")).unwrap();
-        let err = secure_delete(&base.join("link/victim.key")).unwrap_err();
+        let err = write_key(&base.join("link/victim.key"), b"payload", true).unwrap_err();
         assert!(err.contains("symbolic link"), "{err}");
         assert_eq!(fs::read(real.join("victim.key")).unwrap(), b"not yours");
+        assert_only(&real, &["victim.key"]);
     }
 
     #[test]
@@ -2067,7 +2207,9 @@ mod tests {
         let dir = private_tempdir();
         let base = fs::canonicalize(dir.path()).unwrap();
         let real = base.join("real");
-        fs::create_dir(&real).unwrap();
+        // 0700 whatever the umask: a 002 umask would leave `real` group-writable, and refused.
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&real).unwrap();
         fs::write(real.join("dek.b64"), valid_b64()).unwrap();
         fs::set_permissions(real.join("dek.b64"), fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&real, base.join("link")).unwrap();
@@ -2089,8 +2231,10 @@ mod tests {
         let base = fs::canonicalize(dir.path()).unwrap();
         let keys = base.join("keys");
         let elsewhere = base.join("elsewhere");
-        fs::create_dir_all(elsewhere.join("deep")).unwrap();
-        fs::create_dir(&keys).unwrap();
+        // 0700 whatever the umask: a 002 umask would leave these group-writable, and refused.
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).recursive(true).create(elsewhere.join("deep")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&keys).unwrap();
         symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
         let checked = STANDARD.encode([0x11u8; DEK_LEN]);
         let planted = STANDARD.encode([0x22u8; DEK_LEN]);
@@ -2105,13 +2249,11 @@ mod tests {
     }
 
     #[test]
-    fn secure_delete_never_follows_a_link_before_dotdot_into_another_folder() {
+    fn force_never_follows_a_link_before_dotdot_into_another_folder() {
         // keys/link -> elsewhere/deep, so to the kernel keys/link/.. is
         // `elsewhere`, while the folder check resolves it as text to `keys`.
-        // The file in `elsewhere` is read-only, so opening it for writing
-        // fails and secure_delete takes its plain-remove fallback -- which
-        // must act on the checked path (keys/victim.key, absent) and leave
-        // elsewhere/victim.key alone.
+        // Every step must act on the checked path, keys/victim.key, and
+        // leave elsewhere/victim.key alone.
         use std::os::unix::fs::symlink;
         let dir = private_tempdir();
         let base = fs::canonicalize(dir.path()).unwrap();
@@ -2124,9 +2266,10 @@ mod tests {
         fs::write(&victim, b"someone else's file").unwrap();
         fs::set_permissions(&victim, fs::Permissions::from_mode(0o400)).unwrap();
 
-        let err = secure_delete(&keys.join("link/../victim.key")).unwrap_err();
-        assert!(err.contains("failed to stat"), "nothing at the checked path keys/victim.key: {err}");
+        write_key(&keys.join("link/../victim.key"), b"payload", true).unwrap();
+        assert_eq!(fs::read(keys.join("victim.key")).unwrap(), b"payload", "written at the checked path");
         assert_eq!(fs::read(&victim).unwrap(), b"someone else's file", "the file in the other folder is untouched");
+        assert_only(&elsewhere, &["deep", "victim.key"]);
     }
 
     #[test]
@@ -2150,28 +2293,33 @@ mod tests {
     }
 
     #[test]
-    fn finish_key_file_writes_flushes_and_sets_the_mode() {
+    fn a_staged_key_file_takes_its_final_mode_before_it_is_named() {
         let dir = private_tempdir();
-        let base = fs::canonicalize(dir.path()).unwrap();
-        let key = base.join("wrapped.key");
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(KEY_FILE_MODE).open(&key).unwrap();
-        finish_key_file(&mut file, &key, "wrapped.key", b"payload", KEY_FILE_GROUP_MODE).unwrap();
-        assert_eq!(fs::read(&key).unwrap(), b"payload");
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        let staged = stage_key_file(&key, "wrapped.key", b"payload", None, KEY_FILE_GROUP_MODE).unwrap();
+        assert!(!path_is_taken(&key), "not under its real name until published");
+        assert_eq!(fs::read(&staged.temp).unwrap(), b"payload");
+        assert_eq!(fs::metadata(&staged.temp).unwrap().permissions().mode() & 0o777, KEY_FILE_GROUP_MODE);
+        assert!(staged.temp.file_name().unwrap().to_str().unwrap().starts_with(".wrapped.key.hkdfguard-"));
+        publish_key_file(staged, &key, "wrapped.key", false).unwrap();
         assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, KEY_FILE_GROUP_MODE);
+        assert_only(dir.path(), &["wrapped.key"]);
     }
 
     #[test]
-    fn finish_key_file_removes_the_file_when_writing_fails() {
-        // A descriptor opened read-only: write_all fails, as a full disk or
-        // an I/O error would make it. No empty key file may be left behind.
+    fn a_failed_stage_leaves_no_temporary_file() {
+        // A group this user isn't in: fchown fails after the file exists, as
+        // a full disk or an I/O error would fail the write.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root may give any group
+        }
         let dir = private_tempdir();
-        let base = fs::canonicalize(dir.path()).unwrap();
-        let key = base.join("wrapped.key");
-        fs::write(&key, b"").unwrap();
-        let mut read_only = File::open(&key).unwrap();
-        let err = finish_key_file(&mut read_only, &key, "wrapped.key", b"payload", KEY_FILE_MODE).unwrap_err();
-        assert!(err.contains("failed to write wrapped.key"), "{err}");
-        assert!(!key.exists(), "the failed key file is removed");
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        let root_group = (0, "root".to_string());
+        let err = stage_key_file(&key, "wrapped.key", b"payload", Some(&root_group), KEY_FILE_GROUP_MODE).err().unwrap();
+        assert!(err.contains("could not give wrapped.key to group \"root\""), "{err}");
+        assert_only(dir.path(), &[]);
     }
 
     #[test]
@@ -2611,7 +2759,16 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return; // root holds every role: nothing to refuse
         }
-        with_policy("security_model = \"production\"\npreferred_order = [\"external-secret\"]\n[selection]\nmode = \"prefer\"\n", || {
+        // An empty mount of its own, so a provider is present -- and the
+        // refusal is the role check's, not "no provider" -- whether or not
+        // this host has a conventional external-secret mount.
+        let mount = private_tempdir();
+        let policy = format!(
+            "security_model = \"production\"\npreferred_order = [\"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
+             [external_secret]\ndir = \"{}\"\n",
+            mount.path().display()
+        );
+        with_policy(&policy, || {
             let (mut model, mut may_write) = (-1, -1);
             assert_eq!(hkdfguard_security_model(&mut model, &mut may_write), status::OK);
             assert_eq!(model, SECURITY_MODEL_PRODUCTION);

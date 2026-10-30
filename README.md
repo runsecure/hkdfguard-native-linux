@@ -8,31 +8,52 @@ only ever opened there, never on another host or by another
 implementation.
 
 ```
-ECDH (P-256, per-payload hashed point)  ->  HKDF-SHA512  ->  AES-256-GCM
+HMAC-SHA-256 KEK  ->  SP 800-108 counter-mode KDF (per payload)  ->  AES-256-GCM
 ```
 
 A wrapped payload can only be **created** and **opened** on the host that
-holds the KEK. The wrapping key is `ECDH(KEK_priv, H_salt)`, where
-`H_salt` is a P-256 point hashed from the payload's random 32-byte salt
-(RFC 9380 hash-to-curve; no one knows the discrete log of a hash output), so
-producing a valid payload requires the KEK's private key — which never
-leaves the TPM, HSM, or root-owned secret file. Because the point is
-different for every payload, so is the raw ECDH secret `Z`: capturing
-one `Z` (core dump, swap, a discrete TPM's bus) opens exactly that one
-payload, not every payload the service has ever wrapped.
+holds the KEK. Each service's KEK is a 256-bit HMAC-SHA-256 key that never
+leaves the TPM, HSM, or root-owned secret file. For each payload the
+provider computes one block of the NIST SP 800-108 counter-mode KDF, with
+HMAC-SHA-256 as the PRF:
 
-This is deliberately *not* ECIES. An ephemeral-key scheme would let
-anyone holding the KEK's public key (not a secret — on a TPM, anyone who
-can reach the device can recompute it) derive the same wrapping key and
-mint a payload that unwraps to a DEK of their choosing. See
-[docs/why-ecdh.md](docs/why-ecdh.md) for the full rationale, and note the
-consequence: a build server **cannot** pre-wrap a DEK for a host. DEKs
-are delivered to the host and wrapped there.
+```
+K_wrap  = HMAC(KEK, [1]_32 || "hkdfguard-wrap-v1" || 0x00 || Context || [256]_32)
+Context = len(service)_16le || service || header
+```
 
-Wire format version 1. Every byte of a payload except the ciphertext is
-bound into both the AEAD's associated data and the HKDF `info`, so the
-`provider_type` tag and the KEK fingerprint are authenticated rather
-than merely present.
+where `header` is every payload field before the ciphertext (version,
+provider tag, key ID, the random 32-byte salt, the nonce and the
+ciphertext length). `K_wrap` is the AES-256-GCM key directly. There is no
+public key anywhere in wrapping, so producing a valid payload requires the
+KEK itself. Because the salt is in the KDF context, every payload has its
+own wrapping key: capturing one `K_wrap` (core dump, swap, a discrete TPM's
+bus) opens exactly that one payload, not every payload the service has
+ever wrapped.
+
+There is no discrete-log or factoring step for a quantum computer to
+attack; Grover's algorithm only halves the strength of a symmetric key, and
+256-bit keys keep about 128 bits. Every function is NIST-approved
+(HMAC-SHA-256, FIPS 198-1; the KDF, SP 800-108; AES-256-GCM, SP 800-38D),
+but the library is **not** FIPS 140 validated: its software crypto is
+RustCrypto, not a validated module, and neither Intel PTT, AMD fTPM nor
+SoftHSM2 is a validated device. See [docs/why-hmac-prf.md](docs/why-hmac-prf.md)
+for the full rationale (and
+[docs/adr/0001-post-quantum-wrapping-suite.md](docs/adr/0001-post-quantum-wrapping-suite.md)
+for the decision record), and note the consequence: a build server
+**cannot** pre-wrap a DEK for a host. DEKs are delivered to the host and
+wrapped there.
+
+Wire format version 1. (Payloads from pre-release builds, which used an
+ECDH construction under the same version number, fail the KEK fingerprint
+check and are never decrypted.) The header is bound into the KDF context, and the AEAD's
+associated data is the header plus the KEK fingerprint -- every byte of a
+payload except the ciphertext -- so the `provider_type` tag and the
+fingerprint are authenticated rather than merely present. The fingerprint,
+`HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)`,
+is public, the same for every payload a KEK wraps, and reveals nothing
+about the KEK; unwrap checks it before decrypting. The provider computes
+the fingerprint and the wrapping key in one call.
 
 Treat a wrapped payload as opaque bytes: size buffers with
 `HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
@@ -45,7 +66,7 @@ For installing, configuring and using HKDFGuard on a host:
 - [Configuration](docs/configuration.md): `/etc/hkdfguard/policy.toml`, setting up each provider, example policies, permissions
 - [Usage](docs/usage.md): the deployment workflow, the CLI, the C API, linking, the application's account
 - [Troubleshooting](docs/troubleshooting.md): finding out why a call fails, and what each error means
-- [Why ECDH](docs/why-ecdh.md): why keys are wrapped with ECDH against a hashed point, and the forgery attack that rules out ECIES
+- [Why an HMAC PRF](docs/why-hmac-prf.md): why keys are wrapped with a per-payload key from an HMAC-SHA-256 KDF, and why the design is post-quantum
 
 The rest of this README covers the design and building from source.
 
@@ -190,8 +211,8 @@ caller isn't steered into creating a key somewhere weaker.
 
 | Provider | Absent (the walk moves on) | Present but failing (the call fails) |
 |---|---|---|
-| TPM2 | default device can't be opened (no TPM, or not in `tss`) | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a service's key file present but untrusted or unreadable (a missing one is "not provisioned" for that service: the walk moves on); a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
-| PKCS#11 | no module configured; no PIN file | untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
+| TPM2 | no TPM device; or the default device exists but this process can't open it (not in `tss`) and the service has no TPM key file | the default device can't be opened but the service *has* a key file (lost `tss` membership, a missing TCTI plugin); leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a service's key file present but untrusted or unreadable (a missing one is "not provisioned" for that service: the walk moves on); a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
+| PKCS#11 | no module configured; under the developer security model, a configured module whose PIN file doesn't exist | a configured module whose PIN file doesn't exist (production model); untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
 | External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
 | (any) | -- | policy present but unusable |
 
@@ -291,7 +312,7 @@ same IDs, meanings and severities (1004 aside), so one set of alerts covers both
 
 | ID | Severity | When |
 |---|---|---|
-| 1000 | info | A KEK was created (not merely found). |
+| 1000 | info | A KEK was created (not merely found). If whether one already existed couldn't be checked first, the record carries `existed_before=unknown` and says it may have been found instead. |
 | 1001 | warning | A KEK was created on a provider other than the policy's first choice, which was unavailable or declined. |
 | 1002 | info | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | info | A DEK was unwrapped. |
@@ -299,7 +320,7 @@ same IDs, meanings and severities (1004 aside), so one set of alerts covers both
 | 1005 | warning | A key file was read under the developer security model, which trusts files the calling account owns. Logged once per process; names the file. |
 | 2000 | warning | `KEK_ACCESS_DENIED`: under the production security model, a non-root caller tried to create a KEK that doesn't exist, or to retire one. |
 | 2002 | error | `KEK_INVALID`. |
-| 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. Or `hkdfguard_open_file` refused a key file someone else could have replaced (`FILE_UNTRUSTED`), or one that isn't a well-formed payload (`FILE_MALFORMED`, `FILE_TOO_SHORT`, `FILE_TOO_LONG`); names the file. |
 | 2004 | error | `POLICY_INVALID`: every call fails closed until the policy is fixed. |
 | 2005 | error | `PROVIDER_UNAVAILABLE`, `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`. |
 | 2006 | error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
@@ -321,7 +342,7 @@ wrap that made it. That also makes a substituted older payload visible (see
 "Design decisions worth knowing"). To hash a key file for comparison, run
 `sha256sum <file>`.
 
-The records never contain DEKs, KEKs, shared secrets, derived keys or
+The records never contain DEKs, KEKs, wrapping keys or other derived keys, or
 plaintext. Caller mistakes (`INVALID_ARGUMENT`, `BUFFER_TOO_SMALL`,
 `INVALID_SERVICE_NAME`) and `KEK_NOT_FOUND` aren't recorded. Delivery is
 best effort: non-blocking, and a missing `/dev/log` (as in a minimal
@@ -374,19 +395,32 @@ environment-variable override.
 
 ### The TPM key and its key file
 
-Each service's KEK on the TPM is an ordinary TPM key: an ECC P-256
-decryption key that `TPM2_Create` generates under the Owner hierarchy's
+Each service's KEK on the TPM is an ordinary TPM key: a keyedHash
+object with the HMAC-SHA-256 scheme (attributes `fixedTPM`, `fixedParent`,
+`sensitiveDataOrigin`, `userWithAuth`, `noDA` and `sign`; not `decrypt`,
+not `restricted`) that `TPM2_Create` generates under the Owner hierarchy's
 storage root key (SRK), the TCG's standard ECC P-256 storage key. The
 result is saved as a **key file**, `/var/lib/hkdfguard/tpm/<service>.tpmkey`,
 in the TPM 2.0 key file format (`-----BEGIN TSS2 PRIVATE KEY-----`, parent
 `0x40000001`) that the OpenSSL tpm2 provider and tpm2-tss-engine also use.
-Every wrap and unwrap re-creates the SRK from its template, loads the key
-file under it with `TPM2_Load`, runs `TPM2_ECDH_ZGen`, and flushes both, so
-nothing stays on the TPM and no persistent handle is needed.
+The key has a random 32-byte authValue, kept beside it in
+`<service>.tpmauth`. Every wrap and unwrap re-creates the SRK from its
+template, loads the key file under it with `TPM2_Load`, runs one one-shot
+`TPM2_HMAC` per input in a session keyed by the authValue, and flushes
+everything, so nothing stays on the TPM and no persistent handle is
+needed. The provider never uses the `TPM2_HMAC_Start`/`TPM2_SequenceUpdate`
+sequence commands: on an Intel PTT firmware TPM that sequence put the TPM
+into failure mode until the next reboot. When the provider connects, its
+self-test checks that the SRK re-derives identically and runs a
+known-answer `TPM2_HMAC` test, so a TPM whose HMAC disagrees with
+HMAC-SHA-256 is refused before it wraps anything. A key file holding an ECC key
+(from the pre-release ECDH format), or an HMAC key with an empty password
+(from before authValues), is refused with a message saying to delete it
+and provision again.
 
 What the TPM guarantees:
 
-- **The private key never leaves the TPM.** The key file's private half is
+- **The HMAC key never leaves the TPM.** The key file's private half is
   encrypted and integrity-protected under the SRK, whose seed the TPM
   generated and never exports. The file is useless on any other TPM, and
   `TPM2_Load` refuses a file whose halves don't belong together.
@@ -394,14 +428,16 @@ What the TPM guarantees:
   `fixedTPM`, `fixedParent` or `sensitiveDataOrigin`, or differs in any
   other attribute or parameter from the keys it creates. The TPM refuses to
   import an object with `fixedTPM` set, so such a key was generated inside
-  this TPM and never duplicated out: no key file can hold a private key
+  this TPM and never duplicated out: no key file can hold an HMAC key
   anyone knows.
 
-What it does not: the key has no password, so **anyone who can read a key
-file and open the TPM can use that KEK.** Read access to the key file is
-the access control, as the PIN file is for PKCS#11. The packages create
-the directory as `root:hkdfguard 0750`, so the members of `hkdfguard` may
-use TPM keys; without the packages, create it as root:
+What it does not: **anyone who can read a key file and its authValue file,
+and open the TPM, can use that KEK.** Read access to the two files is the
+access control, as the PIN file is for PKCS#11. The packages create the
+directory as `root:hkdfguard 0750`, so the members of `hkdfguard` may use
+TPM keys; give a service's `.tpmauth` file that service's own group to
+keep the others from using its key. Without the packages, create the
+directory as root:
 
 ```sh
 install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
@@ -475,52 +511,42 @@ it; pair the allowlist with `mode = "require"`, `provider = "tpm2"` (or
 
 **2. Session parameter encryption (bus protection).** On a *discrete*
 TPM — a separate chip on the LPC/SPI bus — an interposer can read
-`TPM2_ECDH_ZGen`'s response, the shared secret, in cleartext. Each
-response opens one payload (the per-payload hashed point keeps a
-captured `Z` from opening any other), but an interposer that stays on
-the bus captures every subsequent one. The provider can run that command inside
-a salted HMAC session with parameter encryption (TPM 2.0 Part 1 §19.6;
-the cryptography is tpm2-tss's ESAPI, not this crate's), so the secret
-crosses the bus AES-128-CFB encrypted. Nothing else secret crosses the
-bus: `TPM2_Load` sends the key file's private half, which is encrypted
-under the SRK, and the key has no password to send.
+`TPM2_HMAC`'s response, the payload's wrapping key, or replace it while a
+DEK is wrapped, sealing the payload under a key they chose. The service
+key's authValue is what stops both. ESAPI and the TPM key a session's
+parameter encryption, and its response HMAC, with the session key followed
+by the authValue of the entity the session authorizes (TPM 2.0 Part 1
+§19.6 and §21; tpm2-tss's `iesys_compute_session_value`). Every
+`TPM2_HMAC` runs in such a session for the service key, so without the
+`.tpmauth` file nobody can read `outHMAC` off the bus or forge one. It is a
+symmetric secret: no public key has to be trusted for it to hold, and a
+quantum computer gains nothing against it. Nothing read over the bus can
+prove a TPM has no bus, so every TPM is treated alike.
 
 ```toml
 [tpm]
-session_encryption = "auto"           # "auto" (default) | "required" | "off"
-pinned_session_salt_key_name = "000b<64 hex chars>"
+session_encryption = "on"             # "on" (default) | "off" (test harnesses only)
+pinned_session_salt_key_name = "000b<64 hex chars>"   # pin before provisioning on a discrete TPM
 ```
 
-`auto` reads `TPM_PT_MANUFACTURER` and skips encryption only for TPMs
-positively known to have no external bus (Intel PTT, AMD fTPM, Qualcomm,
-Hyper-V/VMware/Google vTPMs, swtpm) — there is nothing to sniff inside an
-SoC or a hypervisor, and the residual fTPM threats sit inside the TPM's
-own trust boundary where transport encryption can't help. Unknown
-vendors are encrypted. `required` always encrypts and **refuses to load
-without a pinned salt-key Name**: an unsalted session's key is derivable
-from bus-visible nonces, and even a salted one can be man-in-the-middled
-if the attacker substitutes their own salt key at `TPM2_ReadPublic`, so
-the pin is what makes `required` mean something. The salt key is the SRK
-itself, already loaded as the key file's parent; its Name stays the same
-until the TPM is cleared, so it is pinnable, and with a pin set every key
-file is loaded only under the pinned SRK. It is a *restricted* storage
-key, so the TPM uses it only for its children and to unwrap session
-salts: someone who can send the TPM commands and recreate it still can't
-run ECDH with it to recover a session's salt.
+The session is also salted to the SRK, as a second layer: someone who has
+read a `.tpmauth` file but can't man-in-the-middle the SRK still sees
+nothing. The salt is one-pass ECDH, the specification's mechanism, and it
+stands alone at one moment: `provision`, whose `TPM2_Create` sends the new
+key's authValue and so can't be protected by it. `TPM2_Create` therefore
+always runs in a salted, encrypting session, whatever `session_encryption`
+says, and `pinned_session_salt_key_name` makes it refuse an SRK whose Name
+isn't the pinned one. The pin is checked against what `TPM2_CreatePrimary`
+returned, because that is the public area ESAPI encrypts the salt to. The
+SRK is a *restricted* storage key, so the TPM uses it only for its children
+and to unwrap session salts: someone who can send the TPM commands and
+recreate it still can't run ECDH with it.
 
-> **`auto` only defeats a passive listener.** The manufacturer it
-> decides from is read over the same bus it is protecting. On a discrete
-> TPM, an interposer that can *rewrite* traffic can answer `INTC`, and
-> `auto` then sends `Z` in the clear. Without a pin, `auto` also accepts
-> whatever salt key the bus delivers (and logs that once). So:
->
-> - **Discrete TPM, or one you can't vouch for:** use `required` with a
->   pinned salt-key Name.
-> - **Any `auto` policy with `pinned_session_salt_key_name` set always
->   encrypts**, whatever manufacturer the TPM reports — pinning is taken
->   as the statement that the bus is worth defending.
-> - **Firmware TPM or vTPM you know is one:** `auto` without a pin is fine;
->   there is no bus to defend.
+What's left that is classical: someone who records a discrete TPM's bus
+at provisioning, and later breaks P-256, recovers that key's authValue,
+and with it the wrapping keys in every session they also recorded.
+Re-provisioning gives a key a new authValue. Firmware and virtual TPMs
+have no bus to record.
 
 **3. Protect the hierarchy the keys live under.** Every key file is loaded
 under the SRK, which is re-created on demand from the Owner hierarchy's
@@ -588,9 +614,9 @@ SRK and service keys are `noDA`, so their use is never refused for it, and
 Owner-hierarchy authorization failures are not counted towards it.
 
 Callers never see which provider is active. Every provider implements the
-identical `ECDH -> HKDF-SHA512 -> AES-256-GCM` protocol
+identical `HMAC-SHA-256 (SP 800-108 block) -> AES-256-GCM` protocol
 ([`src/crypto.rs`](src/crypto.rs)); the only difference is where the
-persistent P-256 KEK's private key lives and who performs the ECDH.
+persistent HMAC-SHA-256 KEK lives and who computes the HMAC.
 
 ### Build & verification matrix
 
@@ -603,8 +629,8 @@ same image, they need glibc 2.39 or newer: Ubuntu 24.04+, Debian 13, RHEL
 | Feature | Builds on macOS (this repo's dev env) | Builds & links natively on Linux | Hardware/module test |
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
-| `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.12.1 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against hashed per-payload points accepted |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite -- key files created, reloaded across connections and refused when spliced, the storage root key's determinism, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points agreeing with the key file's public key, retiring, pins, and salted/parameter-encrypted sessions producing the same `Z` as plain ones -- plus the reboot-persistence check, passes against `swtpm` (`docker/run-tests.sh`) and, via `scripts/native-tpm-test.sh`, against a real firmware TPM, **Intel PTT**, on Ubuntu 24.04 (tpm2-tss 4.0.1). The earlier derived-key design also passed against **AMD fTPM** and **Hyper-V's vTPM** (`MSFT`); the key-file design has not been run there yet |
+| `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.12.1 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKey` (`CKM_GENERIC_SECRET_KEY_GEN`) + `C_Sign` with `CKM_SHA256_HMAC` executed for real, the token's output matching software HMAC-SHA-256, the same key reused for a service, and imported or weakly protected keys refused |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite -- key files created, reloaded across connections and refused when spliced, the storage root key's determinism, the client-side Name formula matching the TPM's own, `TPM2_HMAC` matching software HMAC-SHA-256 for every input length, retiring, pins, and salted/parameter-encrypted sessions producing the same HMAC output as plain ones -- plus the reboot-persistence check, passes against `swtpm` (`docker/run-tests.sh`) and, via `scripts/native-tpm-test.sh`, against a real firmware TPM, **Intel PTT**, on Ubuntu 24.04 (tpm2-tss 4.0.1). The earlier derived-key design also passed against **AMD fTPM** and **Hyper-V's vTPM** (`MSFT`); the key-file design has not been run there yet |
 
 The TPM provider's key-file design has been verified against `swtpm` and
 a real firmware TPM, Intel PTT; its earlier derived-key design was also
@@ -634,7 +660,7 @@ wrapped before a guest reboot unwrapped after it.
 > **Dictionary-attack lockout on Hyper-V vTPMs.** A new Hyper-V vTPM
 > allows only **3** failed authorizations, forgives one every **1000 s**,
 > and has no lockout password. One test guest came up already in lockout,
-> before any hkdfguard code had run, and every `TPM2_ECDH_ZGen`, so every
+> before any hkdfguard code had run, and every service-key operation, so every
 > wrap and unwrap, failed until it was cleared with
 > `tpm2_dictionarylockout --clear-lockout`. The most likely cause is
 > Hyper-V's **Reset**, used several times on that guest during
@@ -682,14 +708,14 @@ scripts/native-tpm-preflight.sh   # read-only: device access, tpm2-tools, libtss
 scripts/native-tpm-test.sh        # the full matrix, on the real TPM
 ```
 
-The preflight identifies the TPM from `TPM2_PT_MANUFACTURER` and tells you
-what `session_encryption = "auto"` will decide on it (skip for an
-fTPM/vTPM, encrypt for a discrete chip). The full run then does everything
+The preflight identifies the TPM from `TPM2_PT_MANUFACTURER`, and says
+whether it is a discrete chip whose storage root key should be pinned
+before provisioning. The full run then does everything
 `docker/entrypoint-test.sh` does, against the real device: the
 conformance suite (key files, the storage root key's determinism, the
-Name formula, ECDH against hashed points, encrypted-session correctness),
-a C ABI round trip with the KEK on the TPM under both
-`auto` and a fully pinned `required` policy, and the CLI-to-C-consumer
+Name formula, `TPM2_HMAC` against software HMAC-SHA-256, encrypted-session correctness),
+a C ABI round trip with the KEK on the TPM with session encryption off
+and with both Names pinned, and the CLI-to-C-consumer
 cross-process check. It learns the Names to pin from the TPM itself via
 two operator-helper tests (run them directly to get values for your own
 policy):
@@ -776,7 +802,7 @@ target.
 
 One `debian/` directory serves both Debian-family targets. Built on
 Ubuntu, `packaging/build-deb.sh` adds the customary backport changelog
-entry, so the Ubuntu packages are versioned `0.9.0-1~ubuntu24.04.1` for
+entry, so the Ubuntu packages are versioned `0.9.1-1~ubuntu24.04.1` for
 release `noble`. One spec serves all three RPM targets. On SUSE it follows
 SUSE's naming policy and runs `ldconfig` from scriptlets:
 
@@ -869,7 +895,7 @@ taken out of one -- with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify hkdfguard_0.9.0-1_amd64.deb \
+gh attestation verify hkdfguard_0.9.1-1_amd64.deb \
     --repo runsecure/hkdfguard-native-linux \
     --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
 ```
@@ -885,11 +911,11 @@ workflow and tag:
 
 ```sh
 cosign verify-blob-attestation --new-bundle-format \
-    --bundle hkdfguard-0.9.0.sigstore.json \
+    --bundle hkdfguard-0.9.1.sigstore.json \
     --type https://slsa.dev/provenance/v1 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0 \
-    hkdfguard_0.9.0-1_amd64.deb
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.1 \
+    hkdfguard_0.9.1-1_amd64.deb
 ```
 
 [docs/installation.md](docs/installation.md#download-and-verify) has a
@@ -931,7 +957,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-tctildr0t64 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.0 / /
+COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.1 / /
 ```
 
 - **Debian-family images only**, with glibc 2.39 or newer: Ubuntu 24.04+
@@ -961,12 +987,12 @@ Sigstore, and signs each with cosign (keyless, as the release workflow;
 the job fails unless the signature then verifies). To verify one:
 
 ```sh
-gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
+gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.1 \
     --repo runsecure/hkdfguard-native-linux
 # or the cosign signature, with cosign 3.0+:
-cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.0 \
+cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.1 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.0
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.1
 ```
 
 In a build, verify the image's digest and copy from that digest, not the
@@ -998,9 +1024,15 @@ packaging/build-overlay.sh    # hkdfguard-overlay:local and :local-dev for this 
 
 ## External-secret file requirements
 
-For the external-secret provider the mounted file *is* the KEK private
-key, so it is held to the same standard as the PKCS#11 PIN and the TPM
-owner password. `<mount>/<service>` must:
+For the external-secret provider the mounted file *is* the KEK, so it is
+held to the same standard as the PKCS#11 PIN and the TPM owner password.
+`<mount>/<service>` must:
+
+- hold **exactly 32 raw random bytes**, used directly as the HMAC-SHA-256
+  key: not base64 or hex text, no trailing newline, not PEM or DER. Any
+  other length is refused with an error saying so, and so is an all-zero
+  file. Generate one with `head -c 32 /dev/urandom > <file>` or
+  `openssl rand -out <file> 32`;
 
 - be **owned by root or by the process's user**, with **no group or other
   access** — `0400` or `0600`. A root-owned file may also be readable by
@@ -1081,10 +1113,10 @@ hkdfguard wrap \
 `provision` is idempotent and never changes an existing KEK, but it
 always verifies one: it loads the KEK through the provider (on a TPM,
 loading its key file into the TPM and checking it against any pinned
-Name; on PKCS#11, finding the key pair on the token) and reports "already
+Name; on PKCS#11, finding the HMAC key on the token) and reports "already
 provisioned ... verified". So a KEK that is missing or wrong on the
 provider fails at deployment, not at the first wrap. On a TPM it creates
-the service's key file; on PKCS#11, its key pair; for `external-secret`
+the service's key file; on PKCS#11, its HMAC secret key; for `external-secret`
 the mounted file *is* the provisioning.
 
 `provision` prints the KEK's fingerprint, and `wrap` prints the
@@ -1105,16 +1137,25 @@ readable by any process running as the same user (`/proc/<pid>/cmdline`,
 `/proc/<pid>/environ`). `printf` is a shell builtin, so the DEK never
 reaches any argv.
 
-`wrap --force` completes the wrap in memory *before* it securely
-overwrites and replaces the existing key file, so a wrap that fails — no
-KEK, provider unavailable, bad input — never destroys the key file that
-was already there. It only ever overwrites a regular file at that exact
-path: a symlink there is refused rather than followed (following it would
-overwrite whatever it points to), as are a directory, FIFO, or device, any
-file far larger than a wrapped key, and a file with more than one hard link
-(overwriting it would also destroy the file at its other name). The overwrite is best-effort: on
-copy-on-write or log-structured filesystems (btrfs, ZFS) and on flash
-storage, old blocks can survive it.
+`wrap` never writes a key file in place. It completes the wrap in memory,
+writes the payload to a hidden temporary file in the same folder, syncs
+it, and only then gives it the key file's name. With `--force` that last
+step is a `rename(2)` over the existing file, so the path holds the old
+key file or the new one at every moment. Whatever fails before then (no
+KEK, provider unavailable, bad input, a full disk, a folder that refuses
+the write) leaves the existing key file exactly as it was, and no
+temporary file behind.
+
+The replaced file is then securely overwritten through a descriptor
+opened before the rename. `--force` only ever replaces a regular file at
+that exact path: a symlink there is refused rather than followed, as are a
+directory, FIFO, or device, any file far larger than a wrapped key, and a
+file with more than one hard link (overwriting it would also destroy the
+file at its other name). A replaced file that still turns out to have a
+name, because something moved it during the wrap, is left alone, with a
+warning. The overwrite is best-effort: on copy-on-write or
+log-structured filesystems (btrfs, ZFS) and on flash storage, old blocks
+can survive it.
 
 The key file's folder must be a real folder at the path spelled: a
 `--key-file-path` that goes through a symbolic link anywhere above the file
@@ -1192,7 +1233,7 @@ hkdfguard retire -sn com.company.orders -fp 3f1c...e09a   # all 64 hex character
 The fingerprint is checked twice: against the KEK the service resolves to
 (the one every wrap uses), and again on the exact token objects about to be
 deleted. A wrong fingerprint, a missing KEK, or a token holding anything
-other than the one key pair `provision` made (a duplicate, or a pair
+other than the one secret key `provision` made (a duplicate, or a key
 without hkdfguard's protections) deletes nothing. On success it writes audit
 event 1004, naming the fingerprint. Running `provision` afterwards creates
 a new, different KEK.
@@ -1205,7 +1246,7 @@ What can be retired depends on the provider:
 
 | Provider | `retire` |
 |---|---|
-| PKCS#11 | Deletes the service's key pair from the token. |
+| PKCS#11 | Deletes the service's HMAC secret key from the token. |
 | TPM | Deletes the service's key file. The TPM keeps no copy, so the KEK is gone -- unless a copy of the key file survives (a backup), which still loads on this TPM: destroy those too. |
 | External secret | Refused: the KEK is the mounted secret. Remove it where it is managed (the Kubernetes Secret, Vault entry, systemd credential). |
 | Ephemeral | Refused: an ephemeral KEK ends with its process. |
@@ -1225,7 +1266,7 @@ The only environment variable the library acts on:
 
 | Env var | Purpose |
 |---|---|
-| `TSS2_LOG` | tpm2-tss's own log level. If it sets `debug` or `trace` for any module, the TPM provider **refuses to run**: at those levels tpm2-tss logs raw TPM commands and responses (including ECDH shared secrets), session keys, and plaintext parameters, and `TSS2_LOGFILE` can send that to any path. `info` and below are fine. |
+| `TSS2_LOG` | tpm2-tss's own log level. If it sets `debug` or `trace` for any module, the TPM provider **refuses to run**: at those levels tpm2-tss logs raw TPM commands and responses (including `TPM2_HMAC` outputs, i.e. wrapping keys), session keys, and plaintext parameters, and `TSS2_LOGFILE` can send that to any path. `info` and below are fine. |
 
 ### Testing against scratch configuration
 
@@ -1299,10 +1340,10 @@ setup_min_delay_ms = 1000           # floor on create_kek/kek_exists latency; 0 
 fail_if_requirement_unmet = true    # accepted for schema parity; the library always fails closed regardless
 
 [tpm]
-key_dir = "/var/lib/hkdfguard/tpm"  # absolute path; one <service>.tpmkey per service, created by provision
+key_dir = "/var/lib/hkdfguard/tpm"  # absolute path; a <service>.tpmkey and <service>.tpmauth per service, created by provision
 require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
-session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
-pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
+session_encryption = "on"           # on | off (test harnesses only)  (see "Session parameter encryption")
+pinned_session_salt_key_name = "000b<64 hex>"   # the storage root key's Name; pin before provisioning on a discrete TPM
 tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> | mssim:<conf> | swtpm:<conf>
                                     # mssim/swtpm are for testing only: no resource manager, so another client of
                                     # the same simulator can swap a key handle between its Name check and its use
@@ -1346,7 +1387,7 @@ Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
 fail closed with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`) -- and resolves
 each hardening knob to its strictest setting
-(`session_encryption = "required"`, the pinned-names allowlist on) rather than
+(`session_encryption = "on"`, the pinned-names allowlist on) rather than
 its default.
 
 ## Design decisions worth knowing
@@ -1357,10 +1398,12 @@ its default.
   and order is pinned explicitly rather than left to a serialization
   library's derive output, which could silently change across a
   dependency bump. 
-- **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
+- **Pure-Rust crypto (`hmac`/`sha2`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
-  static linking (`libhkdfguard.a`), and RustCrypto's P-256/HKDF-SHA512/
+  static linking (`libhkdfguard.a`), and RustCrypto's HMAC-SHA-256 and
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
+  They are not a FIPS 140 validated module, so the library uses only
+  NIST-approved functions but is not itself FIPS validated.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.
 - **TPM2 KEKs are key files, not persistent handles or derived
@@ -1389,7 +1432,7 @@ its default.
   every call and dropped after it; there are no standing TPM or PKCS#11
   sessions, no memoized provider selection, and the policy file is re-read
   from disk each time. The only per-process state is a handful of facts
-  about the *hardware* (the TPM conformance verdict and its manufacturer)
+  about the *hardware* (the TPM conformance verdict)
   that cannot change underneath a
   running process, and the PKCS#11 module's library handle: `C_Initialize`
   and `C_Finalize` act on the whole process, and finalizing while another
@@ -1419,15 +1462,14 @@ its default.
   stack-allocated `[u8; 32]` instead of the more convenient
   `Aead::{encrypt,decrypt}`, which internally allocates a heap `Vec<u8>`
   for exactly this data.
-- **Private key material never leaves the TPM or the PKCS#11 token.**
-  `Pkcs11Handle` holds no key bytes at all -- only object handles for the
-  key pair and the open session. `Tpm2Handle` holds the service's key file
-  as read once per wrap/unwrap -- its public half, and its private half
+- **Key material never leaves the TPM or the PKCS#11 token.**
+  `Pkcs11Handle` holds no key bytes at all -- only the object handle for
+  the HMAC key and the open session. `Tpm2Handle` holds the service's key
+  file as read once per wrap/unwrap -- its public half, and its private half
   encrypted under the storage root key, which only this TPM can use -- so
-  `public_key` and `ecdh` use the same key even if the file is replaced in
-  between. `ecdh()` asks
-  the device/token to compute the shared point and only the
-  (non-reversible) result crosses back.
+  the fingerprint and the wrapping key come from the same key even if the
+  file is replaced in between. `prf()` asks the device/token to compute
+  HMAC-SHA-256 and only the (non-reversible) outputs cross back.
 - **Every secret file is checked on its opened descriptor, never by path.**
   The policy file, the PKCS#11 PIN, TPM key files and the owner password,
   an external-secret KEK, and the CLI's `--dek-file` all go through the same
@@ -1444,8 +1486,11 @@ its default.
   owner password, external-secret KEKs, and key files opened
   with `hkdfguard_open_file` must each sit in a directory that, with every
   directory above it up to `/`, is owned by root (or, where the file may
-  be, the calling user) and not writable by group or others -- with no
-  exception for sticky directories, so nothing under `/tmp`, `/var/tmp` or
+  be, the calling user) and not writable by group or others. For the
+  policy, PIN, TPM and `hkdfguard_open_file` paths that holds for every
+  directory the path is looked up in -- symlinks followed the way the
+  kernel follows them, and the directory each link lives in checked like
+  the rest. All of it applies with no exception for sticky directories, so nothing under `/tmp`, `/var/tmp` or
   `/dev/shm` is accepted, however private the directory beneath. The one
   exception is a read-only mount: a Kubernetes Secret or ConfigMap volume
   is `1777` but nobody can write to it. The refusal names the directory
@@ -1458,14 +1503,14 @@ its default.
   becomes a path -- plus a containment check that any symlink it follows
   resolves inside the mount directory.
 - **Every other point a secret transits a heap buffer is explicitly
-  zeroized**, not left to an incidental `Drop`: the ECDH shared secret and
-  derived AES key (`Zeroizing<[u8; 32]>` throughout), the HKDF
-  pseudorandom key between extract and expand, the raw bytes read from a
-  PKCS#11 token attribute, and the external-secret provider's mounted
-  secret-file bytes. What stays out of reach is stack residue inside the
-  RustCrypto crates themselves: the HMAC pad blocks `hmac` 0.13 builds
-  from the HKDF key (it has no zeroize support) and compression-function
-  temporaries. Each is specific to one payload, like the shared secret.
+  zeroized**, not left to an incidental `Drop`: every HMAC output,
+  including the wrapping key (`Zeroizing<[u8; 32]>` throughout), the AES
+  key schedule built from it (aes-gcm's `zeroize` feature), the SHA-256
+  states keyed with a software KEK (sha2's `zeroize` feature), and the
+  external-secret and ephemeral providers' copies of their KEKs. What stays
+  out of reach is stack residue inside the RustCrypto crates themselves:
+  the HMAC pad blocks `hmac` 0.13 derives from a software-held KEK (it has
+  no zeroize support) and compression-function temporaries.
 - **On any `hkdfguard_unwrap_dek` failure, the caller's entire declared
   output buffer is zeroed** before returning -- no partial or stale key
   material is ever left behind.
@@ -1474,15 +1519,16 @@ its default.
   machine ID, MAC address, container ID, or any other host fingerprint.
   The one necessary exception is the Ephemeral provider, whose whole
   design requires keeping generated keys in a heap-resident map for the
-  life of the process; those keys still zeroize on drop
-  (`elliptic_curve::SecretKey` implements `ZeroizeOnDrop`), but by
-  definition can't be stack-only across calls.
+  life of the process; each call's copy still zeroizes on drop
+  (`Zeroizing<[u8; 32]>`), and the keys themselves sit in locked,
+  dump-excluded pages, but by definition can't be stack-only across calls.
 - **Logging** comes in two kinds. The audit trail (see "Audit trail") is
   syslog `authpriv` records, written whatever the host does. Diagnostics go
   through the `log` crate: provider selection, provider initialization,
   migration events and error reasons, seen only by a host that installs a
-  logger (the CLI logs to stderr). Neither ever carries DEKs, KEKs, shared
-  secrets, HKDF output, plaintext or ciphertext. Both name the service.
+  logger (the CLI logs to stderr). Neither ever carries DEKs, KEKs,
+  wrapping keys or other HMAC outputs (bar the public fingerprint),
+  plaintext or ciphertext. Both name the service.
 
 ## Layout
 
@@ -1497,7 +1543,7 @@ src/
   security_model.rs         production/developer: who creates KEKs, whose key files are trusted
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format (version 1)
-  crypto.rs                 ECDH(H_salt) -> HKDF-SHA512 -> AES-256-GCM protocol; salt-to-point hashing
+  crypto.rs                 HMAC-SHA-256 SP 800-108 block -> AES-256-GCM protocol; KEK fingerprint
   policy.rs                 /etc/hkdfguard/policy.toml parsing and evaluation
   secure_file.rs            Descriptor-checked secret-file reads, self-wiping buffer
   provider/
