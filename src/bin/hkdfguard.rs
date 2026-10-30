@@ -1904,6 +1904,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "makes a FIFO, which Miri can't")]
     fn force_refuses_a_fifo_without_blocking() {
         let dir = private_tempdir();
         let fifo = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");

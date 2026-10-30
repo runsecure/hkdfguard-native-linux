@@ -404,6 +404,11 @@ pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: 
 
 fn on_read_only_mount(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
+    // Miri, which runs the tests to check `unsafe` code, can't call
+    // statvfs: under it nothing is a read-only mount, as no test directory is.
+    if cfg!(miri) {
+        return false;
+    }
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
@@ -942,6 +947,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "makes a FIFO, which Miri can't")]
     fn a_fifo_is_refused_without_blocking_the_open() {
         let dir = private_tempdir();
         let fifo = dir.path().join("policy.toml");

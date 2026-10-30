@@ -983,6 +983,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "makes a FIFO, which Miri can't")]
     fn fifo_is_refused_without_blocking() {
         let dir = secure_file::private_tempdir();
         let fifo = dir.path().join("wrapped.key");
@@ -999,6 +1000,7 @@ mod tests {
     // ---- read(): the production security model ----
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs the passwd database, which Miri can't reach")]
     fn production_refuses_this_user_s_own_key_file_unless_it_is_a_deployer() {
         let (uid, name, _) = Trust::this_user_for_tests();
         if uid == 0 {
@@ -1020,6 +1022,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "needs the passwd database, which Miri can't reach")]
     fn production_lets_a_deployer_group_write_the_folder_and_nobody_else() {
         let (uid, name, _) = Trust::this_user_for_tests();
         let base = secure_file::private_tempdir();

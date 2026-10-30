@@ -1660,6 +1660,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "asserts wall-clock speed, which Miri's interpreter can't reproduce")]
     fn setup_floor_is_taken_from_the_policy_file() {
         // With the test override cleared, the floor comes from the same
         // policy file that names the providers -- exactly as in production.
@@ -3011,6 +3012,7 @@ mod ffi_tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "needs the passwd database, which Miri can't reach")]
     fn security_model_reports_production_by_default_and_developer_when_set() {
         let _none = policy::test_support::TestPolicy::absent();
         // Production trusts root and deployers, and with no deployer_groups

@@ -556,6 +556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens a Unix datagram socket, which Miri can't")]
     fn send_to_delivers_one_datagram_and_never_blocks_or_fails() {
         // Not `private_tempdir`: nothing here goes through the library's
         // trust checks, and a socket path must fit in sun_path (108 bytes),
