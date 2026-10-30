@@ -14,15 +14,13 @@
 //! 0       1     version            (currently 1)
 //! 1       1     provider_type      (1=TPM2 2=PKCS11 3=EXTERNAL_SECRET 5=EPHEMERAL;
 //!                                   4 is unassigned and rejected -- see `ProviderType`)
-//! 2       1     key_type           (what the ciphertext holds, and so its exact
-//!                                   length -- see `KeyType`)
-//! 3       2     key_id_len (u16)
-//! 5       N     key_id             (provider-specific opaque identifier)
-//! 5+N     32    salt               (per-payload random salt, in the wrapping key's KDF context)
-//! 37+N    12    nonce              (AES-256-GCM 96-bit nonce)
-//! 49+N    4     ciphertext_len (u32)
-//! 53+N    M     ciphertext         (AES-256-GCM ciphertext, includes 16-byte tag)
-//! 53+N+M  32    fingerprint        (a fixed PRF output of the persistent KEK --
+//! 2       2     key_id_len (u16)
+//! 4       N     key_id             (provider-specific opaque identifier)
+//! 4+N     32    salt               (per-payload random salt, in the wrapping key's KDF context)
+//! 36+N    12    nonce              (AES-256-GCM 96-bit nonce)
+//! 48+N    4     ciphertext_len (u32)
+//! 52+N    M     ciphertext         (AES-256-GCM ciphertext, includes 16-byte tag)
+//! 52+N+M  32    fingerprint        (a fixed PRF output of the persistent KEK --
 //!                                   see `crypto::kek_fingerprint` -- checked by
 //!                                   `unwrap` before AES-GCM is attempted)
 //! ```
@@ -51,56 +49,11 @@ pub const SALT_LEN: usize = 32; // per-payload random salt; 256 bits, so two pay
 pub const NONCE_LEN: usize = 12; // AES-GCM's standard 96-bit nonce size
 pub const FINGERPRINT_LEN: usize = 32; // SHA-256 digest size
 
-/// What a payload's ciphertext holds. Each type has exactly one length,
-/// so the tag and `ciphertext_len` must agree (checked by `crypto::unwrap`
-/// and `key_file::check`, before any provider is reached), and since the
-/// tag is a header field it is bound into the wrapping key and
-/// authenticated like the rest: a payload can't be relabelled as another
-/// type. 0 is never assigned, so a zeroed header is never a valid one.
-/// The numbers are shared by every platform's build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum KeyType {
-    Symmetric256 = 1,  // 32 bytes: the standard DEK, e.g. an AES-256 key
-    Symmetric512 = 2,  // 64 bytes, e.g. an AES-256-SIV or XTS key pair, or an HMAC-SHA-512 key
-    Symmetric768 = 3,  // 96 bytes
-    Symmetric1024 = 4, // 128 bytes
-}
-
-impl KeyType {
-    /// Every type, shortest first.
-    pub const ALL: [KeyType; 4] = [KeyType::Symmetric256, KeyType::Symmetric512, KeyType::Symmetric768, KeyType::Symmetric1024];
-    /// The shortest key any type holds.
-    pub const MIN_LEN: usize = KeyType::Symmetric256.key_len();
-    /// The longest key any type holds.
-    pub const MAX_LEN: usize = KeyType::Symmetric1024.key_len();
-
-    /// The exact length, in bytes, of a key of this type.
-    pub const fn key_len(self) -> usize {
-        match self {
-            KeyType::Symmetric256 => 32,
-            KeyType::Symmetric512 => 64,
-            KeyType::Symmetric768 => 96,
-            KeyType::Symmetric1024 => 128,
-        }
-    }
-
-    /// The type whose keys are exactly `len` bytes, if any.
-    pub fn from_len(len: usize) -> Option<Self> {
-        KeyType::ALL.into_iter().find(|t| t.key_len() == len)
-    }
-
-    pub fn from_u8(value: u8) -> Option<Self> {
-        KeyType::ALL.into_iter().find(|t| *t as u8 == value)
-    }
-}
-
 // Plain Rust struct mirroring the wire layout above; `to_bytes`/`from_bytes`
 // are the only places that translate between this and raw bytes.
 #[derive(Debug)]
 pub struct Payload {
     pub provider_type: ProviderType, // which provider produced (and must later reload) the KEK
-    pub key_type: KeyType,           // what the ciphertext holds; fixes its length
     pub key_id: Vec<u8>,             // provider-specific opaque tag, variable length
     pub salt: [u8; SALT_LEN],        // per-payload random salt, in the wrapping key's KDF context, so each payload's wrapping key is unique
     pub nonce: [u8; NONCE_LEN],      // the AES-GCM nonce used for this one encryption
@@ -112,7 +65,7 @@ impl Payload {
     // Length of everything this payload serializes to except the
     // ciphertext bytes and the trailing fingerprint.
     fn prefix_len(&self) -> usize {
-        1 + 1 + 1 + 2 + self.key_id.len() + SALT_LEN + NONCE_LEN + 4
+        1 + 1 + 2 + self.key_id.len() + SALT_LEN + NONCE_LEN + 4
     }
 
     // Writes every field except the ciphertext bytes and the trailing
@@ -127,8 +80,7 @@ impl Payload {
     fn write_prefix(&self, out: &mut Vec<u8>) {
         out.push(VERSION); // byte 0: format version
         out.push(self.provider_type as u8); // byte 1: provider tag (enum cast to its u8 discriminant)
-        out.push(self.key_type as u8); // byte 2: key type, which fixes the ciphertext length
-        out.extend_from_slice(&(self.key_id.len() as u16).to_le_bytes()); // bytes 3..5: key_id length, little-endian u16
+        out.extend_from_slice(&(self.key_id.len() as u16).to_le_bytes()); // bytes 2..4: key_id length, little-endian u16
         out.extend_from_slice(&self.key_id); // the key_id bytes themselves
         out.extend_from_slice(&self.salt); // fixed 32-byte per-payload salt
         out.extend_from_slice(&self.nonce); // fixed 12-byte AES-GCM nonce
@@ -183,9 +135,6 @@ impl Payload {
         let provider_type = ProviderType::from_u8(provider_byte) // convert the raw byte into the enum
             .ok_or(Error::Malformed("unknown provider type in wrapped payload"))?; // reject any value but 1, 2, 3 and 5
 
-        let key_type = KeyType::from_u8(cursor.take(1)?[0]) // the key-type tag
-            .ok_or(Error::Malformed("unknown key type in wrapped payload"))?; // reject any value but 1 through 4
-
         let key_id_len = u16::from_le_bytes(cursor.take(2)?.try_into().unwrap()) as usize; // read the 2-byte length prefix, then widen to usize for indexing
         let key_id = cursor.take(key_id_len)?.to_vec(); // read exactly that many bytes and copy them into an owned Vec
 
@@ -207,7 +156,6 @@ impl Payload {
 
         Ok(Payload {
             provider_type,
-            key_type,
             key_id,
             salt,
             nonce,
@@ -250,7 +198,6 @@ mod tests {
         // Build an arbitrary payload...
         let payload = Payload {
             provider_type: ProviderType::ExternalSecret,
-            key_type: KeyType::Symmetric256,
             key_id: vec![1, 2, 3, 4],
             salt: [7u8; SALT_LEN],
             nonce: [9u8; NONCE_LEN],
@@ -261,7 +208,6 @@ mod tests {
         let parsed = Payload::from_bytes(&bytes).unwrap(); // ...and parse it back.
         // Every field should survive the round trip unchanged.
         assert_eq!(parsed.provider_type, payload.provider_type);
-        assert_eq!(parsed.key_type, payload.key_type);
         assert_eq!(parsed.key_id, payload.key_id);
         assert_eq!(parsed.salt, payload.salt);
         assert_eq!(parsed.nonce, payload.nonce);
@@ -273,7 +219,6 @@ mod tests {
     fn round_trips_empty_key_id_and_empty_ciphertext() {
         let payload = Payload {
             provider_type: ProviderType::Ephemeral,
-            key_type: KeyType::Symmetric256,
             key_id: vec![],
             salt: [0x04; SALT_LEN],
             nonce: [0x55; NONCE_LEN],
@@ -290,60 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_every_key_type() {
-        for kt in KeyType::ALL {
-            let payload = Payload {
-                provider_type: ProviderType::Ephemeral,
-                key_type: kt,
-                key_id: vec![0x12, 0x34],
-                salt: [0x42; SALT_LEN],
-                nonce: [0x24; NONCE_LEN],
-                ciphertext: vec![0x99; kt.key_len() + 16],
-                fingerprint: [0xEE; FINGERPRINT_LEN],
-            };
-            let bytes = payload.to_bytes();
-            assert_eq!(bytes[2], kt as u8, "byte 2 is the key type");
-            let parsed = Payload::from_bytes(&bytes).unwrap();
-            assert_eq!(parsed.key_type, kt);
-            assert_eq!(parsed.ciphertext.len(), kt.key_len() + 16);
-        }
-    }
-
-    #[test]
-    fn key_types_are_the_four_symmetric_lengths() {
-        // The numbers are wire values shared with the other platforms'
-        // builds: pinned here so a reordering can't renumber them.
-        let table: Vec<(u8, usize)> = KeyType::ALL.iter().map(|t| (*t as u8, t.key_len())).collect();
-        assert_eq!(table, [(1, 32), (2, 64), (3, 96), (4, 128)]);
-        assert_eq!((KeyType::MIN_LEN, KeyType::MAX_LEN), (32, 128));
-        for len in 0..=256 {
-            assert_eq!(KeyType::from_len(len).map(KeyType::key_len), [32, 64, 96, 128].contains(&len).then_some(len), "length {len}");
-        }
-        for value in 0..=u8::MAX {
-            assert_eq!(KeyType::from_u8(value).is_some(), (1..=4).contains(&value), "key type {value}");
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_key_type() {
-        let payload = Payload {
-            provider_type: ProviderType::ExternalSecret,
-            key_type: KeyType::Symmetric256,
-            key_id: vec![1, 2],
-            salt: [1u8; SALT_LEN],
-            nonce: [2u8; NONCE_LEN],
-            ciphertext: vec![3u8; 48],
-            fingerprint: [0xEE; FINGERPRINT_LEN],
-        };
-        let mut bytes = payload.to_bytes();
-        for value in [0u8, 5, 0x1a, 0xFF] {
-            bytes[2] = value;
-            let err = Payload::from_bytes(&bytes).unwrap_err();
-            assert!(matches!(err, Error::Malformed("unknown key type in wrapped payload")), "key type {value}");
-        }
-    }
-
-    #[test]
     fn round_trips_all_provider_types() {
         for pt in [
             ProviderType::Tpm2,
@@ -353,7 +244,6 @@ mod tests {
         ] {
             let payload = Payload {
                 provider_type: pt,
-                key_type: KeyType::Symmetric256,
                 key_id: vec![0x12, 0x34],
                 salt: [0x42; SALT_LEN],
                 nonce: [0x24; NONCE_LEN],
@@ -370,7 +260,6 @@ mod tests {
     fn rejects_unsupported_version() {
         let payload = Payload {
             provider_type: ProviderType::ExternalSecret,
-            key_type: KeyType::Symmetric256,
             key_id: vec![1, 2],
             salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
@@ -398,7 +287,6 @@ mod tests {
     fn rejects_unknown_provider_type() {
         let payload = Payload {
             provider_type: ProviderType::ExternalSecret,
-            key_type: KeyType::Symmetric256,
             key_id: vec![1, 2],
             salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
@@ -423,7 +311,6 @@ mod tests {
     fn rejects_truncated_payload() {
         let payload = Payload {
             provider_type: ProviderType::Ephemeral,
-            key_type: KeyType::Symmetric256,
             key_id: vec![1, 2, 3],
             salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
@@ -445,7 +332,6 @@ mod tests {
     fn rejects_trailing_bytes() {
         let payload = Payload {
             provider_type: ProviderType::Ephemeral,
-            key_type: KeyType::Symmetric256,
             key_id: vec![],
             salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
@@ -462,7 +348,6 @@ mod tests {
     fn rejects_invalid_declared_lengths() {
         let payload = Payload {
             provider_type: ProviderType::ExternalSecret,
-            key_type: KeyType::Symmetric256,
             key_id: vec![1, 2, 3, 4],
             salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
@@ -470,14 +355,14 @@ mod tests {
             fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let mut bytes = payload.to_bytes();
-        // Modify key_id_len (bytes 3..5) to claim a huge length
+        // Modify key_id_len (bytes 2..4) to claim a huge length
+        bytes[2] = 0xFF;
         bytes[3] = 0xFF;
-        bytes[4] = 0xFF;
         assert!(Payload::from_bytes(&bytes).is_err());
 
         // Restore and modify ciphertext_len (last 4 bytes before ciphertext)
         let mut bytes2 = payload.to_bytes();
-        let ct_len_offset = 1 + 1 + 1 + 2 + 4 + SALT_LEN + NONCE_LEN;
+        let ct_len_offset = 1 + 1 + 2 + 4 + SALT_LEN + NONCE_LEN;
         bytes2[ct_len_offset] = 0xFF;
         bytes2[ct_len_offset + 1] = 0xFF;
         bytes2[ct_len_offset + 2] = 0xFF;

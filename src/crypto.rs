@@ -500,7 +500,6 @@ mod tests {
     fn sample_payload() -> Payload {
         Payload {
             provider_type: crate::provider::ProviderType::Ephemeral,
-            key_type: crate::payload::KeyType::Symmetric256,
             key_id: b"key-id".to_vec(),
             salt: [0x11u8; SALT_LEN],
             nonce: [0x22u8; NONCE_LEN],
@@ -973,7 +972,6 @@ mod known_answer {
     fn compute() -> Steps {
         let mut payload = Payload {
             provider_type: crate::provider::ProviderType::ExternalSecret,
-            key_type: crate::payload::KeyType::Symmetric256,
             key_id: format!("external:{SERVICE}").into_bytes(),
             salt: [0x11; SALT_LEN],
             nonce: [0x22; NONCE_LEN],

@@ -2629,7 +2629,6 @@ mod ffi_tests {
     fn sample_wrapped_bytes() -> Vec<u8> {
         payload::Payload {
             provider_type: provider::ProviderType::Ephemeral,
-            key_type: crate::payload::KeyType::Symmetric256,
             key_id: b"ephemeral:com.company.orders".to_vec(),
             salt: [1; payload::SALT_LEN],
             nonce: [2; payload::NONCE_LEN],
