@@ -405,6 +405,9 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
 // meant to be used, so a PIN file not yet provisioned, misnamed, or gone
 // mid-rotation, a module that won't load, a missing token, or a wrong PIN
 // is an outage to surface, not a reason to wrap under a weaker provider.
+// The one exception is a missing PIN file under the developer model, where
+// the PIN file is the switch (the -dev overlay's "SoftHSM2, else
+// ephemeral"): there it is `Absent`, with a warning.
 fn open_session() -> Backend<OpenSession> {
     if std::env::var_os("HKDFGUARD_PKCS11_PIN").is_some() {
         crate::provider::log_once(
@@ -428,6 +431,16 @@ fn open_session() -> Backend<OpenSession> {
     let pin = match read_pin_file(&pin_path) {
         Ok(pin) => pin,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if matches!(crate::security_model::current(), Ok(crate::security_model::SecurityModel::Developer)) {
+                crate::provider::log_once(
+                    log::Level::Warn,
+                    format!(
+                        "hkdfguard: developer security model: pkcs11.module is set but its PIN file {} does not exist; PKCS#11 provider not used",
+                        pin_path.display()
+                    ),
+                );
+                return Backend::Absent;
+            }
             return Backend::Refused(format!(
                 "pkcs11.module is set, but its PIN file {} does not exist. Create it (root-owned, mode 0400, or \
                  root:<service-group> 0440), or remove pkcs11.module from the policy to stop using PKCS#11",
@@ -1075,7 +1088,7 @@ mod tests {
         let dir = crate::secure_file::private_tempdir();
         let missing = dir.path().join("pkcs11.pin");
         let _policy = crate::policy::test_support::TestPolicy::write(&format!(
-            "security_model = \"developer\"\npreferred_order = [\"pkcs11\", \"ephemeral\"]\n\
+            "security_model = \"production\"\npreferred_order = [\"pkcs11\", \"ephemeral\"]\n\
              [pkcs11]\nmodule = \"/usr/lib/hkdfguard-test-no-such-module.so\"\npin_file = \"{}\"\n",
             missing.display()
         ));
@@ -1094,6 +1107,26 @@ mod tests {
                 assert_ne!(provider.provider_type(), ProviderType::Ephemeral, "must not fall through to Ephemeral");
                 panic!("expected the PKCS#11 refusal, got a KEK on {:?}", provider.provider_type());
             }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn under_the_developer_model_a_missing_pin_file_skips_pkcs11() {
+        // The -dev overlay's policy: SoftHSM2 once its PIN file exists,
+        // ephemeral until then.
+        use crate::provider::{KekProvider, ProviderType};
+        let dir = crate::secure_file::private_tempdir();
+        let missing = dir.path().join("pkcs11.pin");
+        let _policy = crate::policy::test_support::TestPolicy::write(&format!(
+            "security_model = \"developer\"\npreferred_order = [\"pkcs11\", \"ephemeral\"]\n\
+             [pkcs11]\nmodule = \"/usr/lib/hkdfguard-test-no-such-module.so\"\npin_file = \"{}\"\n",
+            missing.display()
+        ));
+        assert!(!Pkcs11Provider::new().probe(), "no PIN file: PKCS#11 is not in use");
+        match crate::provider::create_kek("com.company.orders") {
+            Ok((provider, _)) => assert_eq!(provider.provider_type(), ProviderType::Ephemeral),
+            Err(e) => panic!("expected a KEK on Ephemeral, got {e:?}"),
         }
     }
 

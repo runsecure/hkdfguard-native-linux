@@ -405,6 +405,7 @@ mod tests {
     fn payload_with_key_id(key_id_len: usize) -> Vec<u8> {
         Payload {
             provider_type: ProviderType::ExternalSecret,
+            key_type: crate::payload::KeyType::Symmetric256,
             key_id: vec![b'k'; key_id_len],
             salt: [0x11; SALT_LEN],
             nonce: [0x22; NONCE_LEN],
