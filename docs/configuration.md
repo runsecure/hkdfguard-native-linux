@@ -253,7 +253,9 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   group, in directories only root can change, up to `/`. Setting
   `module` is what turns PKCS#11 on, so with it set, a missing PIN file
   fails the call like any other problem: it is never a reason to try the
-  next provider.
+  next provider. The one exception is the developer security model, where
+  a missing PIN file skips PKCS#11 with a warning (the `-dev` overlay's
+  "SoftHSM2, else ephemeral").
 - **Choose the token** by `token_label` and/or `token_serial`. Exactly one
   token must match. With neither set, exactly one initialized token must be
   present.

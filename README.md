@@ -212,7 +212,7 @@ caller isn't steered into creating a key somewhere weaker.
 | Provider | Absent (the walk moves on) | Present but failing (the call fails) |
 |---|---|---|
 | TPM2 | no TPM device; or the default device exists but this process can't open it (not in `tss`) and the service has no TPM key file | the default device can't be opened but the service *has* a key file (lost `tss` membership, a missing TCTI plugin); leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a service's key file present but untrusted or unreadable (a missing one is "not provisioned" for that service: the walk moves on); a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
-| PKCS#11 | no module configured | a configured module whose PIN file doesn't exist; untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
+| PKCS#11 | no module configured; under the developer security model, a configured module whose PIN file doesn't exist | a configured module whose PIN file doesn't exist (production model); untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
 | External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
 | (any) | -- | policy present but unusable |
 
