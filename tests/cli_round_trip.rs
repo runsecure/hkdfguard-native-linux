@@ -249,8 +249,10 @@ fn cli_wrap_writes_where_the_path_was_checked_not_where_a_link_before_dotdot_lea
         let base = fs::canonicalize(dir.path()).unwrap();
         let keys = base.join("keys");
         let elsewhere = base.join("elsewhere");
-        fs::create_dir_all(elsewhere.join("deep")).unwrap();
-        fs::create_dir(&keys).unwrap();
+        // 0700 whatever the umask: a 002 umask would leave these group-writable, and refused.
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).recursive(true).create(elsewhere.join("deep")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&keys).unwrap();
         std::os::unix::fs::symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
 
         let output = run_wrap_stdin(&keys.join("link/../wrapped.key"), "com.example.dotdot", &[7u8; 32], &[]);

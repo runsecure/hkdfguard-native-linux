@@ -706,7 +706,9 @@ mod tests {
         let dir = private_tempdir();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let me = Owner::RootOrCurrentUser;
-        std::fs::create_dir(base.join("real")).unwrap();
+        // 0700 whatever the umask: a 002 umask would leave `real` group-writable, and refused.
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(base.join("real")).unwrap();
         std::fs::write(base.join("real/file"), b"x").unwrap();
         std::os::unix::fs::symlink("real", base.join("rel")).unwrap(); // relative target
         std::os::unix::fs::symlink(base.join("real/file"), base.join("abs")).unwrap(); // absolute target

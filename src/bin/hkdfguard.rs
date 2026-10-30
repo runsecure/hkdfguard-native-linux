@@ -2207,7 +2207,9 @@ mod tests {
         let dir = private_tempdir();
         let base = fs::canonicalize(dir.path()).unwrap();
         let real = base.join("real");
-        fs::create_dir(&real).unwrap();
+        // 0700 whatever the umask: a 002 umask would leave `real` group-writable, and refused.
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&real).unwrap();
         fs::write(real.join("dek.b64"), valid_b64()).unwrap();
         fs::set_permissions(real.join("dek.b64"), fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&real, base.join("link")).unwrap();
@@ -2229,8 +2231,10 @@ mod tests {
         let base = fs::canonicalize(dir.path()).unwrap();
         let keys = base.join("keys");
         let elsewhere = base.join("elsewhere");
-        fs::create_dir_all(elsewhere.join("deep")).unwrap();
-        fs::create_dir(&keys).unwrap();
+        // 0700 whatever the umask: a 002 umask would leave these group-writable, and refused.
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).recursive(true).create(elsewhere.join("deep")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&keys).unwrap();
         symlink(elsewhere.join("deep"), keys.join("link")).unwrap();
         let checked = STANDARD.encode([0x11u8; DEK_LEN]);
         let planted = STANDARD.encode([0x22u8; DEK_LEN]);
