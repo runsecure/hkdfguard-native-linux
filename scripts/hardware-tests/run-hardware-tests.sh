@@ -354,6 +354,12 @@ if [ "$(id -u)" = 0 ] && [ "$ALLOW_ROOT" -ne 1 ]; then
     echo "(sudo usermod -aG tss <user>, then log in again), or pass --allow-root to run anyway." >&2
     exit 1
 fi
+if [ ! -f "$HERE/MANIFEST" ] || [ ! -x "$BIN/hkdfguard" ]; then
+    echo "$HERE is not an extracted bundle: there are no test binaries to run." >&2
+    echo "Build one with scripts/hardware-tests/make-bundle.sh, then run run-hardware-tests.sh from" >&2
+    echo "the extracted hkdfguard-hardware-tests/ folder, or use scripts/native-tpm-test.sh to build and test from source." >&2
+    exit 1
+fi
 
 main 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}

@@ -64,8 +64,14 @@ for t in "${TARGETS[@]}"; do
         $REMOTE_DIR/run-hardware-tests.sh $RUN_ARGS"
     code=$?
     mkdir -p "$logs"
-    scp -q "$t:$REMOTE_DIR/hardware-tests-*.log" "$t:$REMOTE_DIR/tpm-capabilities-*.txt" "$logs/" 2>/dev/null \
-        || echo "(could not fetch every log from $t)"
+    # Whichever of the logs this run and earlier ones left: a reboot phase
+    # writes no capabilities file.
+    files=$(ssh "$t" "cd $REMOTE_DIR 2>/dev/null && ls hardware-tests-*.log tpm-capabilities-*.txt 2>/dev/null")
+    if [ -n "$files" ]; then
+        scp -q $(printf "$t:$REMOTE_DIR/%s " $files) "$logs/" || echo "(could not fetch the logs from $t)"
+    else
+        echo "(no logs on $t to fetch)"
+    fi
     [ "$KEEP" = 1 ] || ssh "$t" "rm -rf $REMOTE_DIR" || true
     if [ "$code" -eq 0 ]; then RESULTS+=("$t: passed"); else RESULTS+=("$t: FAILED (exit $code)"); FAILED=1; fi
 done

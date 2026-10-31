@@ -30,12 +30,15 @@ and it can drive several targets over SSH.
    runs on Ubuntu 24.04+, Debian 13, RHEL 10 and their relatives. For Debian
    12, RHEL 9 or SLES 15, build on that distribution (or the oldest one you
    will test). `MANIFEST` in the bundle names the oldest glibc it needs.
+   On RHEL 9, `tpm2-tss-devel` is in CodeReady Builder, not BaseOS or
+   AppStream: enable it first with `sudo subscription-manager repos
+   --enable codeready-builder-for-rhel-9-$(uname -m)-rpms`.
 
 2. Prepare each target:
 
    - Install `tpm2-tools`. The probe needs it, and it pulls in the tpm2-tss
-     libraries the bundle links against. Install `softhsm2` too if the
-     PKCS#11 suite should run.
+     libraries the bundle links against. Install SoftHSM2 too (`softhsm2`;
+     `softhsm` on RHEL and Fedora) if the PKCS#11 suite should run.
    - Use an ordinary user in the `tss` group: `sudo usermod -aG tss <user>`,
      then log in again. Don't use root, because the tests that prove another
      user's file is refused skip as root. The runner refuses root unless

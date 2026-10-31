@@ -90,9 +90,13 @@ if command -v tpm2_getcap >/dev/null 2>&1; then
 else
     fail "tpm2-tools not found: install 'tpm2-tools' (it also pulls in the tpm2-tss libraries the bundle links against)"
 fi
+# Tested on output, not pipeline status: under pipefail, awk exiting at the
+# first match makes a long `ldconfig -p` die of SIGPIPE, so a library that
+# is there would look missing.
 for lib in libtss2-esys.so.0 libtss2-tctildr.so.0 libtss2-mu.so.0; do
-    if ldconfig -p 2>/dev/null | grep -q "$lib"; then
-        ok "$lib: $(ldconfig -p | awk -v l="$lib" '$1==l {print $NF; exit}')"
+    path=$(ldconfig -p 2>/dev/null | awk -v l="$lib" '$1==l {print $NF; exit}' || true)
+    if [ -n "$path" ]; then
+        ok "$lib: $path"
     else
         fail "$lib not found by the dynamic linker: install the tpm2-tss runtime libraries (installing tpm2-tools pulls them in)"
     fi
@@ -171,11 +175,13 @@ PERSISTENT=$(getcap handles-persistent)
 NVIDX=$(getcap handles-nv-index)
 
 # field <yaml> <key> <subkey>: `key:` then an indented `subkey: value` under it.
+# Trailing spaces are dropped: the TPM pads 4-byte strings with them
+# (STMicroelectronics reports "STM ").
 field() {
     printf '%s\n' "$1" | awk -v k="$2:" -v s="$3:" '
         $1 == k { f = 1; next }
         f && /^[^ \t]/ { exit }
-        f && $1 == s { $1 = ""; sub(/^ +/, ""); gsub(/"/, ""); print; exit }'
+        f && $1 == s { $1 = ""; gsub(/"/, ""); sub(/^ +/, ""); sub(/ +$/, ""); print; exit }'
 }
 # scalar <yaml> <key>: `key: value` on one line.
 scalar() { printf '%s\n' "$1" | awk -v k="$2:" '$1 == k { print $2; exit }'; }

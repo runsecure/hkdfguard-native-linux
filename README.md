@@ -625,16 +625,20 @@ All of the below has actually been run, in Docker on Ubuntu 24.04 (glibc
 not just reasoned about. Because the release binaries are built in that
 same image, they need glibc 2.39 or newer: Ubuntu 24.04+, Debian 13, RHEL
 10. Debian 12 is not a target -- its tpm2-tss is 3.2.1, even in backports.
+The `tpm2` feature itself does build and pass against tpm2-tss 3.2: the
+TPM row's RHEL 9.8 run (tpm2-tss 3.2.3) was a source build on that guest,
+not the release binaries.
 
 | Feature | Builds on macOS (this repo's dev env) | Builds & links natively on Linux | Hardware/module test |
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
 | `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.12.1 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKey` (`CKM_GENERIC_SECRET_KEY_GEN`) + `C_Sign` with `CKM_SHA256_HMAC` executed for real, the token's output matching software HMAC-SHA-256, the same key reused for a service, and imported or weakly protected keys refused |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite -- key files created, reloaded across connections and refused when spliced, the storage root key's determinism, the client-side Name formula matching the TPM's own, `TPM2_HMAC` matching software HMAC-SHA-256 for every input length, retiring, pins, and salted/parameter-encrypted sessions producing the same HMAC output as plain ones -- plus the reboot-persistence check, passes against `swtpm` (`docker/run-tests.sh`) and, via `scripts/native-tpm-test.sh`, against a real firmware TPM, **Intel PTT**, on Ubuntu 24.04 (tpm2-tss 4.0.1). The earlier derived-key design also passed against **AMD fTPM** and **Hyper-V's vTPM** (`MSFT`); the key-file design has not been run there yet |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 (Ubuntu 24.04) and 3.2.3 (RHEL 9.8) | The `#[ignore]`d conformance suite -- key files created, reloaded across connections and refused when spliced, the storage root key's determinism, the client-side Name formula matching the TPM's own, `TPM2_HMAC` matching software HMAC-SHA-256 for every input length, retiring, pins, and salted/parameter-encrypted sessions producing the same HMAC output as plain ones -- plus the reboot-persistence check, passes against `swtpm` (`docker/run-tests.sh`) and, via `scripts/native-tpm-test.sh`, against a real firmware TPM, **Intel PTT**, on Ubuntu 24.04 (tpm2-tss 4.0.1), and, via the hardware-test bundle (`scripts/hardware-tests/`), against **Hyper-V's vTPM** (`MSFT`, firmware 8213.275.21.18467) in a RHEL 9.8 guest (tpm2-tss 3.2.3, bundle built on the guest), the C ABI, CLI-to-C and PKCS#11 suites included. The earlier derived-key design also passed against **AMD fTPM**; the key-file design has not been run there yet |
 
-The TPM provider's key-file design has been verified against `swtpm` and
-a real firmware TPM, Intel PTT; its earlier derived-key design was also
-verified against AMD fTPM and Hyper-V's virtual TPM. It has **not** been
+The TPM provider's key-file design has been verified against `swtpm`, a
+real firmware TPM (Intel PTT) and Hyper-V's virtual TPM (in a RHEL 9.8
+guest); its earlier derived-key design was also verified against AMD fTPM,
+and against Hyper-V's vTPM in other guests. It has **not** been
 exercised against a discrete TPM chip (e.g. Infineon
 or Nuvoton), against other hypervisors' vTPMs (VMware, Google Cloud,
 AWS NitroTPM), or against a hardware HSM/YubiHSM -- the PKCS#11 provider
@@ -697,7 +701,8 @@ another private directory to use that instead.
 Docker proves the code against `swtpm`. This repo's maintainers have run
 the scripts below to completion, including reboot persistence, on real
 **Intel PTT** and **AMD fTPM** firmware TPMs, and on **Hyper-V's vTPM**
-in Ubuntu 24.04 and AlmaLinux 10 guests. A **discrete** TPM (e.g.
+in Ubuntu 24.04 and AlmaLinux 10 guests, and the hardware-test bundle
+(below) in a RHEL 9.8 guest. A **discrete** TPM (e.g.
 Infineon, Nuvoton) has not yet been tested -- the code path exists (see
 the known limitation on parameter encryption below) but is unverified
 against real discrete hardware. To prove it against the hardware you
