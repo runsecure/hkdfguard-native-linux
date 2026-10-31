@@ -6,10 +6,11 @@
 //! |                                                                        |
 //! | Verified: built and linked against real `libtss2-esys` 4.0.1 on       |
 //! | Ubuntu 24.04, with the `#[ignore]`d conformance suite passing against |
-//! | swtpm (docker/run-tests.sh) and against a real firmware TPM -- Intel  |
-//! | PTT (scripts/native-tpm-test.sh). Not yet exercised against a        |
-//! | discrete TPM chip (e.g. Infineon, Nuvoton). Re-run both after any    |
-//! | change here.                                                          |
+//! | swtpm (docker/run-tests.sh), a real firmware TPM -- Intel PTT         |
+//! | (scripts/native-tpm-test.sh) -- a discrete STMicroelectronics chip,   |
+//! | and Hyper-V's vTPM (scripts/hardware-tests/). Not yet exercised       |
+//! | against other discrete chips (e.g. Infineon, Nuvoton). Re-run both    |
+//! | after any change here.                                                |
 //! |______________________________________________________________________|
 //! ```
 //!

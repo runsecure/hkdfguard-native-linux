@@ -4,3 +4,4 @@
 # gigabytes. dist/ reaches the containers that need it as a bind mount.
 /target/
 /dist/
+/build-hardware-tests/

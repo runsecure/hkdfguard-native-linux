@@ -93,8 +93,14 @@ fn with_provisioned_external_secret<F: FnOnce()>(service: &str, f: F) {
     with_policy(&external_secret_policy(dir.path()), f);
 }
 
+// HKDFGUARD_TEST_CLI: the CLI to drive instead of the one cargo built
+// alongside this test, whose path is compiled in -- for a test executable
+// copied to another machine (scripts/hardware-tests/make-bundle.sh).
 fn cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_hkdfguard"))
+    match std::env::var_os("HKDFGUARD_TEST_CLI") {
+        Some(path) => Command::new(path),
+        None => Command::new(env!("CARGO_BIN_EXE_hkdfguard")),
+    }
 }
 
 // `hkdfguard provision --service-name <service>`
