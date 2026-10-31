@@ -250,18 +250,25 @@ fn tpm_untrustworthy_key_file_fails_the_call() {
     let service = CString::new(service_name).unwrap();
     let dek = [0x55u8; 32];
     let key_dir = tempdir();
-    let policy = format!(
-        "preferred_order = [\"tpm2\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
-         [startup_behavior]\nsetup_min_delay_ms = 0\n\
-         [tpm]\nkey_dir = \"{}\"\n\
-         [external_secret]\ndir = \"{}\"\n",
-        key_dir.path().display(),
-        mount.path().display()
-    );
+    // HKDFGUARD_TEST_TPM_TCTI: the TPM to reach when it isn't the default
+    // device (swtpm, tpm2-abrmd) -- scripts/hardware-tests sets it.
+    let reachable = std::env::var("HKDFGUARD_TEST_TPM_TCTI").ok().filter(|t| !t.is_empty());
+    let policy_with = |tcti: Option<&str>| {
+        format!(
+            "preferred_order = [\"tpm2\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
+             [startup_behavior]\nsetup_min_delay_ms = 0\n\
+             [tpm]\nkey_dir = \"{}\"\n{}\
+             [external_secret]\ndir = \"{}\"\n",
+            key_dir.path().display(),
+            tcti.map(|t| format!("tcti = \"{t}\"\n")).unwrap_or_default(),
+            mount.path().display()
+        )
+    };
+    let policy = policy_with(reachable.as_deref());
 
     // Control: a policy-named TCTI that can't be opened is Refused -> the
     // whole call fails, nothing falls through.
-    let refused = policy.replace("[tpm]\n", "[tpm]\ntcti = \"device:/dev/hkdfguard-no-such-tpm\"\n");
+    let refused = policy_with(Some("device:/dev/hkdfguard-no-such-tpm"));
     with_policy(&refused, || {
         let mut out = [0u8; 512];
         assert_eq!(wrap(&service, &dek, &mut out, 512).0, status::PROVIDER_ERROR, "an unreachable policy-named TCTI fails the call");
