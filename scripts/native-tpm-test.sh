@@ -77,6 +77,7 @@ section "preflight"
 source scripts/native-tpm-preflight.sh
 TCTI="${HKDFGUARD_TCTI:-$HKDFGUARD_PREFLIGHT_TCTI}"
 export TPM2TOOLS_TCTI="$TCTI" # for tpm2-tools only; the library takes its TCTI from policy
+export HKDFGUARD_TEST_TPM_TCTI="$TCTI" # for the integration tests that write a policy of their own
 MANUFACTURER="$HKDFGUARD_PREFLIGHT_MANUFACTURER"
 
 FEATURES="tpm2"

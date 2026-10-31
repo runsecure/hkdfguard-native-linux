@@ -739,6 +739,17 @@ scripts/native-tpm-test.sh reboot capture   # provisions a key file, wraps a DEK
 scripts/native-tpm-test.sh reboot verify    # the same storage root key must come back, and the key file unwrap it
 ```
 
+To qualify other machines -- another laptop's TPM, a Hyper-V guest's
+vTPM -- without a Rust toolchain on each, build the same matrix once as a
+bundle and run it there, by hand or over SSH. It first records the host,
+its TPM stack and the TPM's capabilities, and checks the TPM has
+everything the provider uses ([scripts/hardware-tests/README.md](scripts/hardware-tests/README.md)):
+
+```sh
+scripts/hardware-tests/make-bundle.sh --docker
+scripts/hardware-tests/run-remote.sh user@guest1 user@guest2   # logs come back to build-hardware-tests/logs/
+```
+
 ### Testing in Docker (recommended if you're not already on Linux)
 
 ```sh
@@ -1570,6 +1581,9 @@ scripts/
   native-tpm-preflight.sh    Read-only check of a real Linux TPM host
   native-tpm-test.sh         Full matrix on a real TPM; `reboot capture|verify`
   tpm-reboot-test.sh         swtpm-restart approximation of reboot persistence
+  hardware-tests/            The native matrix as a prebuilt bundle, plus a
+                              read-only TPM probe, for other machines and
+                              Hyper-V guests (run over SSH: run-remote.sh)
 docker/                      Dockerfile + entrypoint running the full matrix
                               against swtpm and SoftHSM2 (run-tests.sh)
   distros/                   Per-distribution SoftHSM2 + Ephemeral test images:
