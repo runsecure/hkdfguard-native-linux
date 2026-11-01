@@ -249,7 +249,8 @@ pub(crate) fn plaintext_key_file(path: &Path) {
             status::FILE_PLAINTEXT_KEY,
             quote(path.as_os_str().as_bytes())
         ),
-        "the file looks like an unwrapped DEK (32 raw bytes, or its base64 or hex), so it may be a plaintext key \
+        "the file looks like an unwrapped DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), \
+         or its base64 or hex), so it may be a plaintext key \
          written to disk by mistake; none of its contents were returned. Treat that key as exposed: find out how \
          the file was written, remove it, and re-mint the DEK",
     );
