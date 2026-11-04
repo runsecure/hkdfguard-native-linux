@@ -144,6 +144,10 @@ pub enum Error {
     /// A deployer group can't be used: it doesn't exist, is over-broad, or
     /// couldn't be looked up. Refines `Policy`.
     GroupInvalid(String), // carries a human-readable description, for logs only
+    /// A caller-supplied argument is out of range: a secret name or
+    /// secret length `crypto::wrap_secret` doesn't accept. The C ABI
+    /// checks these itself first; this is the Rust API's own guard.
+    InvalidArgument(&'static str),
 }
 
 impl Error {
@@ -163,6 +167,7 @@ impl Error {
             Error::KekFingerprintMismatch => status::KEK_FINGERPRINT_MISMATCH,
             Error::AccessDenied(_) => status::KEK_ACCESS_DENIED,
             Error::GroupInvalid(_) => status::LINUX_GROUP_INVALID,
+            Error::InvalidArgument(_) => status::INVALID_ARGUMENT,
         }
     }
 }
@@ -190,6 +195,7 @@ impl fmt::Display for Error {
             ),
             Error::AccessDenied(msg) => write!(f, "access denied: {msg}"),
             Error::GroupInvalid(msg) => write!(f, "policy error: {msg}"),
+            Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
         }
     }
 }

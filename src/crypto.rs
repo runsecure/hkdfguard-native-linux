@@ -104,6 +104,48 @@ const WRAP_LABEL: &[u8] = b"hkdfguard-wrap-v1";
 /// SP 800-108 label for the KEK fingerprint.
 const FINGERPRINT_LABEL: &[u8] = b"hkdfguard-kek-fingerprint-v1";
 
+/// Prefix of a secret's SP 800-108 label. A secret's label is this prefix
+/// followed by the caller's secret name -- `"hkdfguard-secret-v1/vault.password"`
+/// -- so every secret name gets its own wrapping keys, and no secret name
+/// can ever produce [`WRAP_LABEL`] or [`FINGERPRINT_LABEL`]: the label is
+/// always the library's prefix first, and a name holds no zero byte (see
+/// [`is_valid_secret_name`]), so where the label ends is never ambiguous.
+const SECRET_LABEL_PREFIX: &[u8] = b"hkdfguard-secret-v1/";
+
+/// Longest secret name, in bytes.
+pub const SECRET_NAME_MAX_LEN: usize = 64;
+
+/// Longest secret [`wrap_secret`] takes, in bytes. Mirrored as
+/// `HKDFGUARD_SECRET_MAX_LEN` in `include/hkdfguard.h`.
+pub const SECRET_MAX_LEN: usize = 256;
+
+/// What a secret is padded to before encryption: its length as a
+/// little-endian `u16`, the secret, then zeros up to [`SECRET_MAX_LEN`].
+/// Every secret payload is therefore the same size, and its ciphertext
+/// says nothing about how long the secret is.
+pub(crate) const SECRET_BLOCK_LEN: usize = 2 + SECRET_MAX_LEN;
+
+/// Longest SP 800-108 label any wrapping key uses.
+const MAX_LABEL_LEN: usize = SECRET_LABEL_PREFIX.len() + SECRET_NAME_MAX_LEN;
+const _: () = assert!(WRAP_LABEL.len() <= MAX_LABEL_LEN);
+
+/// Whether `name` may name a secret: 1..=[`SECRET_NAME_MAX_LEN`] bytes of
+/// lowercase ASCII letters, digits, `.`, `_` and `-`. Nothing else, and in
+/// particular no uppercase and no Unicode: two spellings that look alike
+/// would derive different keys, and fail to unwrap as an indistinguishable
+/// authentication failure. Refused up front instead, as a caller error.
+pub fn is_valid_secret_name(name: &str) -> bool {
+    (1..=SECRET_NAME_MAX_LEN).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A secret's SP 800-108 label (see [`SECRET_LABEL_PREFIX`]). `name` must
+/// already be valid.
+fn secret_label(name: &str) -> Vec<u8> {
+    debug_assert!(is_valid_secret_name(name));
+    [SECRET_LABEL_PREFIX, name.as_bytes()].concat()
+}
+
 /// `L`, the KDF's output length in bits: one HMAC-SHA-256 block.
 const OUTPUT_BITS: u32 = 256;
 
@@ -128,12 +170,19 @@ fn fingerprint_block() -> Vec<u8> {
 /// A payload's wrapping-key PRF input. The length prefix keeps the
 /// concatenation unambiguous, so no two distinct (service, header) pairs
 /// produce the same block. Public, so a heap `Vec` is fine.
+#[cfg(test)]
 fn wrap_block(service: &str, header: &[u8]) -> Vec<u8> {
+    labeled_wrap_block(WRAP_LABEL, service, header)
+}
+
+/// The same, under `label`: [`WRAP_LABEL`] for a DEK, a [`secret_label`]
+/// for a secret.
+fn labeled_wrap_block(label: &[u8], service: &str, header: &[u8]) -> Vec<u8> {
     let mut context = Vec::with_capacity(2 + service.len() + header.len());
     context.extend_from_slice(&(service.len() as u16).to_le_bytes()); // unambiguous framing for the variable-length service name
     context.extend_from_slice(service.as_bytes());
     context.extend_from_slice(header);
-    kdf_block(WRAP_LABEL, &context)
+    kdf_block(label, &context)
 }
 
 pub const DEK_LEN: usize = 32; // the mandated, fixed DEK size in bytes
@@ -149,10 +198,11 @@ pub const MAX_KEY_ID_LEN: usize = 16 + crate::MAX_SERVICE_LEN;
 const MAX_HEADER_LEN: usize = 1 + 1 + 2 + MAX_KEY_ID_LEN + SALT_LEN + NONCE_LEN + 4;
 
 /// Longest PRF input a provider is ever given: the wrapping-key block for
-/// the longest service name and header. Every provider must accept it; a
-/// TPM takes at most `TPM2_PT_INPUT_BUFFER` bytes per `TPM2_HMAC`, which
-/// the PC Client profile puts at 1024.
-pub const MAX_PRF_INPUT_LEN: usize = 4 + WRAP_LABEL.len() + 1 + 2 + crate::MAX_SERVICE_LEN + MAX_HEADER_LEN + 4;
+/// the longest label (a secret's, with the longest secret name), service
+/// name and header. Every provider must accept it; a TPM takes at most
+/// `TPM2_PT_INPUT_BUFFER` bytes per `TPM2_HMAC`, which the PC Client
+/// profile puts at 1024.
+pub const MAX_PRF_INPUT_LEN: usize = 4 + MAX_LABEL_LEN + 1 + 2 + crate::MAX_SERVICE_LEN + MAX_HEADER_LEN + 4;
 const _: () = assert!(MAX_PRF_INPUT_LEN <= 1024, "a PRF input must fit one TPM2_HMAC command");
 const _: () = assert!(FINGERPRINT_LABEL.len() + 9 <= MAX_PRF_INPUT_LEN);
 
@@ -170,11 +220,24 @@ pub const MIN_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN;
 /// name. Mirrored as `HKDFGUARD_WRAPPED_MAX_LEN` in `include/hkdfguard.h`.
 pub const MAX_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN + MAX_KEY_ID_LEN;
 
+/// Smallest and largest wrapped secret: as for a DEK, with the padded
+/// [`SECRET_BLOCK_LEN`]-byte block in place of the DEK. Every secret is
+/// padded to the same block, so a secret payload's size depends only on
+/// the provider's `key_id`, never on the secret. The largest is mirrored
+/// as `HKDFGUARD_SECRET_WRAPPED_MAX_LEN` in `include/hkdfguard.h`.
+pub const MIN_SECRET_WRAPPED_LEN: usize = FIXED_WRAPPED_LEN - DEK_LEN + SECRET_BLOCK_LEN;
+pub const MAX_SECRET_WRAPPED_LEN: usize = MIN_SECRET_WRAPPED_LEN + MAX_KEY_ID_LEN;
+
 /// The KEK fingerprint and a payload's wrapping key, from one PRF call to
 /// the provider (see the module doc).
-fn derive_keys(handle: &dyn KekHandle, service: &str, header: &[u8]) -> Result<([u8; FINGERPRINT_LEN], PrfOutput)> {
+fn derive_keys(
+    handle: &dyn KekHandle,
+    label: &[u8],
+    service: &str,
+    header: &[u8],
+) -> Result<([u8; FINGERPRINT_LEN], PrfOutput)> {
     let fingerprint_input = fingerprint_block();
-    let wrap_input = wrap_block(service, header);
+    let wrap_input = labeled_wrap_block(label, service, header);
     let mut outputs = handle.prf(&[&fingerprint_input, &wrap_input])?;
     let (Some(wrapping_key), Some(fingerprint), None) = (outputs.pop(), outputs.pop(), outputs.pop()) else {
         return Err(Error::Provider("the KEK returned the wrong number of PRF outputs".into()));
@@ -205,6 +268,73 @@ pub(crate) fn software_kek_fingerprint(key: &[u8; provider::KEK_LEN]) -> [u8; FI
 // exist (created via `provider::create_kek`, i.e. `hkdfguard_create_kek`);
 // this never creates one itself -- see `provider::select_existing`.
 pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
+    seal(WRAP_LABEL, service, dek)
+}
+
+// Reverses `wrap`: parses the payload, re-derives the same wrapping key,
+// and decrypts+authenticates the original DEK back out. The recovered DEK
+// lives only in the stack-allocated, self-zeroizing array returned to the
+// caller -- never in a heap buffer at any point, and never in a buffer
+// that a panic could leave un-wiped.
+pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>> {
+    open(WRAP_LABEL, service, wrapped)
+}
+
+/// Wraps `secret` (1..=[`SECRET_MAX_LEN`] bytes) for `service` under the
+/// secret name `name`, which must pass [`is_valid_secret_name`]. The same
+/// protocol as [`wrap`], with two differences: the wrapping key's label is
+/// `"hkdfguard-secret-v1/" || name` instead of `"hkdfguard-wrap-v1"`, so a
+/// secret payload never opens as a DEK, nor as a secret of another name;
+/// and the plaintext is the secret padded to [`SECRET_BLOCK_LEN`] bytes, so
+/// every secret payload is the same size. The name, like the service, is
+/// not stored in the payload: [`unwrap_secret`] must be given it again.
+pub fn wrap_secret(service: &str, name: &str, secret: &[u8]) -> Result<Vec<u8>> {
+    if !is_valid_secret_name(name) || secret.is_empty() || secret.len() > SECRET_MAX_LEN {
+        return Err(Error::InvalidArgument("secret name or length out of range"));
+    }
+    let mut block = Zeroizing::new([0u8; SECRET_BLOCK_LEN]); // stack, scrubbed on drop
+    block[..2].copy_from_slice(&(secret.len() as u16).to_le_bytes());
+    block[2..2 + secret.len()].copy_from_slice(secret);
+    seal(&secret_label(name), service, &block)
+}
+
+/// A secret recovered by [`unwrap_secret`]: its padded block, on the
+/// stack and scrubbed on drop, of which [`UnwrappedSecret::as_bytes`] is
+/// the secret.
+pub struct UnwrappedSecret {
+    block: Zeroizing<[u8; SECRET_BLOCK_LEN]>,
+}
+
+impl UnwrappedSecret {
+    /// The secret itself, without its length prefix and padding.
+    pub fn as_bytes(&self) -> &[u8] {
+        let len = u16::from_le_bytes([self.block[0], self.block[1]]) as usize; // checked by `unwrap_secret`
+        &self.block[2..2 + len]
+    }
+}
+
+/// Reverses [`wrap_secret`], given the same `service` and `name`. A
+/// payload wrapped under another name, or a DEK payload, fails: the
+/// derived wrapping key differs ([`Error::AuthFailed`]), or for a DEK
+/// payload already its ciphertext length ([`Error::Malformed`]).
+pub fn unwrap_secret(service: &str, name: &str, wrapped: &[u8]) -> Result<UnwrappedSecret> {
+    if !is_valid_secret_name(name) {
+        return Err(Error::InvalidArgument("secret name out of range"));
+    }
+    let block = open::<SECRET_BLOCK_LEN>(&secret_label(name), service, wrapped)?;
+    // Authenticated, so only a wrap under this KEK could have produced
+    // these bytes; checked anyway, so `as_bytes` can rely on them.
+    let len = u16::from_le_bytes([block[0], block[1]]) as usize;
+    if len == 0 || len > SECRET_MAX_LEN || block[2 + len..].iter().any(|&b| b != 0) {
+        return Err(Error::Malformed("wrapped secret's padding is not one wrap_secret produces"));
+    }
+    Ok(UnwrappedSecret { block })
+}
+
+// The protocol itself (see the module doc), for an `N`-byte plaintext
+// block under the SP 800-108 `label`: `WRAP_LABEL` and a DEK, or a
+// secret's label and its padded block.
+fn seal<const N: usize>(label: &[u8], service: &str, plaintext: &[u8; N]) -> Result<Vec<u8>> {
     let (provider, handle) = provider::select_existing(service)?; // walk the priority chain for an already-created KEK
     if handle.key_id().len() > MAX_KEY_ID_LEN {
         // Keeps MAX_WRAPPED_LEN (which callers size buffers from) true.
@@ -224,18 +354,18 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     // its final size, so the header covers the real declared ciphertext
     // length. The wrapping key and the AEAD's associated data both have to
     // be fixed before encryption, and the ciphertext is always exactly
-    // DEK_LEN + TAG_LEN, so there is no chicken-and-egg problem here.
+    // N + TAG_LEN, so there is no chicken-and-egg problem here.
     let mut payload = Payload {
         provider_type: provider.provider_type(), // records which provider produced this KEK, for `unwrap` to use later
         key_id: handle.key_id().to_vec(),        // provider's diagnostic tag
         salt,
         nonce: nonce_bytes,
-        ciphertext: vec![0u8; DEK_LEN + TAG_LEN], // placeholder, filled in below
+        ciphertext: vec![0u8; N + TAG_LEN], // placeholder, filled in below
         fingerprint: [0u8; FINGERPRINT_LEN],      // filled in below, from the same PRF call as the wrapping key
     };
     salt.zeroize(); // already copied into the payload; don't leave a second copy on the stack
 
-    let (fingerprint, mut wrapping_key) = derive_keys(&*handle, service, &payload.header_bytes())?; // only the KEK's holder can compute these (already stack-only: see `provider::PrfOutput`)
+    let (fingerprint, mut wrapping_key) = derive_keys(&*handle, label, service, &payload.header_bytes())?; // only the KEK's holder can compute these (already stack-only: see `provider::PrfOutput`)
     payload.fingerprint = fingerprint; // identifies *which* KEK this payload is wrapped under, for `unwrap` to check before decrypting
     // Every non-ciphertext byte of the payload, as the AEAD's associated
     // data -- see `Payload::authenticated_bytes`. This is what
@@ -250,7 +380,7 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     // ends as ciphertext, entirely within this stack frame. `Zeroizing`, so
     // the plaintext is scrubbed even if something below panics before the
     // encryption completes.
-    let mut ct_buf = Zeroizing::new(*dek);
+    let mut ct_buf = Zeroizing::new(*plaintext);
     let tag_result = cipher.encrypt_inout_detached(&Nonce::from(nonce_bytes), &authenticated, (&mut ct_buf[..]).into());
     wrapping_key.zeroize(); // the derived AES key is no longer needed either way; scrub it immediately
 
@@ -278,15 +408,14 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     Ok(payload.to_bytes()) // serialize to the final wire format
 }
 
-// Reverses `wrap`: parses the payload, re-derives the same wrapping key,
-// and decrypts+authenticates the original DEK back out. The recovered DEK
-// lives only in the stack-allocated, self-zeroizing array returned to the
+// Reverses `seal` under the same `label`. The recovered plaintext lives
+// only in the stack-allocated, self-zeroizing array returned to the
 // caller -- never in a heap buffer at any point, and never in a buffer
 // that a panic could leave un-wiped.
-pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>> {
+fn open<const N: usize>(label: &[u8], service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; N]>> {
     let payload = Payload::from_bytes(wrapped)?; // parse and structurally validate the wire format (ciphertext stays a heap Vec, but it's ciphertext, not a secret)
 
-    if payload.ciphertext.len() != DEK_LEN + TAG_LEN {
+    if payload.ciphertext.len() != N + TAG_LEN {
         return Err(Error::Malformed("wrapped ciphertext has unexpected length")); // malformed/tampered length; bail out before touching any crypto
     }
     if payload.key_id.len() > MAX_KEY_ID_LEN {
@@ -302,7 +431,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
 
     // Re-derive the same wrapping key from the same header, and the
     // current KEK's fingerprint, in one PRF call.
-    let (current_fingerprint, mut wrapping_key) = derive_keys(&*handle, service, &payload.header_bytes())?;
+    let (current_fingerprint, mut wrapping_key) = derive_keys(&*handle, label, service, &payload.header_bytes())?;
 
     // Before decrypting, check that this payload was actually wrapped
     // under the KEK `service` resolves to *right now* -- catches a
@@ -324,8 +453,8 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; DEK_LEN]>>
     // into its AES-GCM ciphertext body and trailing tag, then copy the
     // body onto the stack -- this is the *only* place the decrypted DEK
     // will ever live.
-    let (ct_part, tag_part) = payload.ciphertext.split_at(DEK_LEN);
-    let mut dek = Zeroizing::new([0u8; DEK_LEN]);
+    let (ct_part, tag_part) = payload.ciphertext.split_at(N);
+    let mut dek = Zeroizing::new([0u8; N]);
     dek.copy_from_slice(ct_part); // still ciphertext at this point
     let tag = Tag::try_from(tag_part).map_err(|_| Error::Malformed("wrapped ciphertext has unexpected length"))?;
 
@@ -482,6 +611,142 @@ mod tests {
         });
     }
 
+    // ---- secrets ----
+
+    #[test]
+    #[serial]
+    fn secrets_of_every_length_round_trip_to_payloads_of_one_size() {
+        with_isolated_ephemeral_provider(|| {
+            crate::provider::create_kek("com.company.orders").unwrap();
+            let mut sizes = std::collections::BTreeSet::new();
+            for secret in [
+                b"p".to_vec(),
+                b"correct horse battery staple".to_vec(),
+                vec![0u8; 17], // binary-safe: zeros are part of the secret, not padding
+                (0..=255u8).collect::<Vec<u8>>(), // SECRET_MAX_LEN bytes, every value
+            ] {
+                let wrapped = wrap_secret("com.company.orders", "vault.password", &secret).unwrap();
+                sizes.insert(wrapped.len());
+                let back = unwrap_secret("com.company.orders", "vault.password", &wrapped).unwrap();
+                assert_eq!(back.as_bytes(), &secret[..]);
+            }
+            assert_eq!(sizes.len(), 1, "a secret payload's size must not depend on the secret: {sizes:?}");
+            let len = *sizes.first().unwrap();
+            assert!((MIN_SECRET_WRAPPED_LEN..=MAX_SECRET_WRAPPED_LEN).contains(&len));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_secret_opens_only_under_its_own_name_and_service() {
+        with_isolated_ephemeral_provider(|| {
+            crate::provider::create_kek("com.company.orders").unwrap();
+            crate::provider::create_kek("com.company.billing").unwrap();
+            let wrapped = wrap_secret("com.company.orders", "vault.password", b"hunter2").unwrap();
+            for name in ["ssl.certificate", "vault.passwordx", "vault.passwor"] {
+                assert!(matches!(unwrap_secret("com.company.orders", name, &wrapped), Err(Error::AuthFailed)), "{name}");
+            }
+            assert!(matches!(
+                unwrap_secret("com.company.billing", "vault.password", &wrapped),
+                Err(Error::KekFingerprintMismatch | Error::AuthFailed)
+            ));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn dek_and_secret_payloads_never_open_as_each_other() {
+        with_isolated_ephemeral_provider(|| {
+            crate::provider::create_kek("com.company.orders").unwrap();
+            let dek_payload = wrap("com.company.orders", &[0x42u8; DEK_LEN]).unwrap();
+            let secret_payload = wrap_secret("com.company.orders", "vault.password", b"hunter2").unwrap();
+            // Different ciphertext lengths: refused before any key is derived.
+            assert!(matches!(unwrap_secret("com.company.orders", "vault.password", &dek_payload), Err(Error::Malformed(_))));
+            assert!(matches!(unwrap("com.company.orders", &secret_payload), Err(Error::Malformed(_))));
+            // And the label alone separates them: a DEK-sized payload sealed
+            // under a secret's label still fails as a DEK.
+            let same_shape = seal(&secret_label("vault.password"), "com.company.orders", &[0x42u8; DEK_LEN]).unwrap();
+            assert_eq!(same_shape.len(), dek_payload.len());
+            assert!(matches!(unwrap("com.company.orders", &same_shape), Err(Error::AuthFailed)));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_secret_block_with_bad_framing_is_refused_even_when_authentic() {
+        with_isolated_ephemeral_provider(|| {
+            crate::provider::create_kek("com.company.orders").unwrap();
+            let label = secret_label("vault.password");
+            let mut nonzero_padding = [0u8; SECRET_BLOCK_LEN];
+            nonzero_padding[..2].copy_from_slice(&3u16.to_le_bytes());
+            nonzero_padding[2..5].copy_from_slice(b"abc");
+            nonzero_padding[100] = 1;
+            let mut too_long = [0u8; SECRET_BLOCK_LEN];
+            too_long[..2].copy_from_slice(&((SECRET_MAX_LEN + 1) as u16).to_le_bytes());
+            let empty = [0u8; SECRET_BLOCK_LEN];
+            for block in [nonzero_padding, too_long, empty] {
+                let wrapped = seal(&label, "com.company.orders", &block).unwrap();
+                assert!(matches!(unwrap_secret("com.company.orders", "vault.password", &wrapped), Err(Error::Malformed(_))));
+            }
+        });
+    }
+
+    #[test]
+    fn secret_names_and_lengths_outside_the_rules_are_refused_before_any_provider() {
+        // No KEK and no policy: every refusal here happens first.
+        let longest = "a".repeat(SECRET_NAME_MAX_LEN);
+        assert!(is_valid_secret_name(&longest));
+        for name in [
+            "", "Vault.password", "vault password", "vault/password", "vault\0password", "vault.pässword",
+            &"a".repeat(SECRET_NAME_MAX_LEN + 1),
+        ] {
+            assert!(!is_valid_secret_name(name), "{name:?}");
+            assert!(matches!(wrap_secret("com.company.nokek", name, b"x"), Err(Error::InvalidArgument(_))), "{name:?}");
+            assert!(matches!(unwrap_secret("com.company.nokek", name, b""), Err(Error::InvalidArgument(_))), "{name:?}");
+        }
+        for name in ["vault.password", "ssl.certificate", "db_admin-2", "0"] {
+            assert!(is_valid_secret_name(name), "{name:?}");
+        }
+        for secret in [vec![], vec![1u8; SECRET_MAX_LEN + 1]] {
+            assert!(matches!(wrap_secret("com.company.nokek", "vault.password", &secret), Err(Error::InvalidArgument(_))));
+        }
+        // What a caller of the Rust API sees: the C ABI's INVALID_ARGUMENT,
+        // and a message naming the rule, never the secret.
+        let err = wrap_secret("com.company.nokek", "Vault", b"hunter2").unwrap_err();
+        assert_eq!(err.status_code(), crate::status::INVALID_ARGUMENT);
+        let msg = err.to_string();
+        assert!(msg.starts_with("invalid argument: ") && !msg.contains("hunter2"), "{msg}");
+    }
+
+    #[test]
+    fn no_secret_label_is_ever_a_dek_or_fingerprint_label() {
+        for name in ["hkdfguard-wrap-v1", "hkdfguard-kek-fingerprint-v1", "a", &"z".repeat(SECRET_NAME_MAX_LEN)] {
+            let label = secret_label(name);
+            assert!(label.starts_with(SECRET_LABEL_PREFIX));
+            assert!(!label.contains(&0));
+            assert_ne!(label, WRAP_LABEL);
+            assert_ne!(label, FINGERPRINT_LABEL);
+            let header = sample_payload().header_bytes();
+            assert_ne!(labeled_wrap_block(&label, "service.a", &header), wrap_block("service.a", &header));
+        }
+        assert_ne!(
+            labeled_wrap_block(&secret_label("vault.password"), "s", b"h"),
+            labeled_wrap_block(&secret_label("ssl.certificate"), "s", b"h")
+        );
+    }
+
+    #[test]
+    fn header_publishes_the_secret_sizes() {
+        let header = include_str!("../include/hkdfguard.h");
+        for expected in [
+            format!("#define HKDFGUARD_SECRET_WRAPPED_MAX_LEN {MAX_SECRET_WRAPPED_LEN}"),
+            format!("#define HKDFGUARD_SECRET_MAX_LEN {SECRET_MAX_LEN}"),
+            format!("#define HKDFGUARD_SECRET_NAME_MAX_LEN {SECRET_NAME_MAX_LEN}"),
+        ] {
+            assert!(header.contains(&expected), "include/hkdfguard.h must contain `{expected}`");
+        }
+    }
+
     // ---- the SP 800-108 blocks ----
 
     #[test]
@@ -562,7 +827,10 @@ mod tests {
     fn max_prf_input_len_is_the_longest_wrap_block() {
         let service = "s".repeat(crate::MAX_SERVICE_LEN);
         let payload = Payload { key_id: vec![0x4b; MAX_KEY_ID_LEN], ..sample_payload() };
-        assert_eq!(wrap_block(&service, &payload.header_bytes()).len(), MAX_PRF_INPUT_LEN);
+        let longest_name = "n".repeat(SECRET_NAME_MAX_LEN);
+        let longest = labeled_wrap_block(&secret_label(&longest_name), &service, &payload.header_bytes());
+        assert_eq!(longest.len(), MAX_PRF_INPUT_LEN);
+        assert!(wrap_block(&service, &payload.header_bytes()).len() < MAX_PRF_INPUT_LEN);
         assert!(fingerprint_block().len() < MAX_PRF_INPUT_LEN);
     }
 
@@ -587,7 +855,7 @@ mod tests {
     fn one_prf_call_yields_the_fingerprint_and_the_wrapping_key() {
         let kek = RecordingKek { key: [0x2a; 32], seen: Default::default() };
         let header = sample_payload().header_bytes();
-        let (fingerprint, wrapping_key) = derive_keys(&kek, "service.a", &header).unwrap();
+        let (fingerprint, wrapping_key) = derive_keys(&kek, WRAP_LABEL, "service.a", &header).unwrap();
 
         let calls = kek.seen.borrow().clone();
         assert_eq!(calls.len(), 1, "one device session per wrap or unwrap");
@@ -609,7 +877,7 @@ mod tests {
                 Ok(vec![PrfOutput::new([0; 32])])
             }
         }
-        assert!(derive_keys(&Short, "s", b"h").is_err());
+        assert!(derive_keys(&Short, WRAP_LABEL, "s", b"h").is_err());
     }
 
     #[test]
@@ -639,8 +907,8 @@ mod tests {
             let payload_b = Payload::from_bytes(&wrap(service, &dek_b).unwrap()).unwrap();
 
             let (_provider, handle) = crate::provider::select_existing(service).unwrap();
-            let (_, key_a) = derive_keys(&*handle, service, &payload_a.header_bytes()).unwrap();
-            let (_, key_b) = derive_keys(&*handle, service, &payload_b.header_bytes()).unwrap();
+            let (_, key_a) = derive_keys(&*handle, WRAP_LABEL, service, &payload_a.header_bytes()).unwrap();
+            let (_, key_b) = derive_keys(&*handle, WRAP_LABEL, service, &payload_b.header_bytes()).unwrap();
             assert_ne!(*key_a, *key_b, "two payloads for one service must not share a wrapping key");
 
             // Key A genuinely opens payload A (so the capture is "real")...
@@ -720,7 +988,7 @@ mod tests {
             let payload = Payload::from_bytes(&wrapped).unwrap();
 
             let (_provider, handle) = crate::provider::select_existing(service).unwrap();
-            let (_, wrapping_key) = derive_keys(&*handle, service, &payload.header_bytes()).unwrap();
+            let (_, wrapping_key) = derive_keys(&*handle, WRAP_LABEL, service, &payload.header_bytes()).unwrap();
             let correct_aad = payload.authenticated_bytes();
 
             let (ct_part, tag_part) = payload.ciphertext.split_at(DEK_LEN);

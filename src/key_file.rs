@@ -50,13 +50,54 @@
 //!   itself refusing to open the file -- e.g. `EACCES` -- is the separate
 //!   [`KeyFileError::AccessDenied`].)
 
-use crate::crypto::{DEK_LEN, MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN, TAG_LEN};
+use crate::crypto::{
+    DEK_LEN, MAX_KEY_ID_LEN, MAX_SECRET_WRAPPED_LEN, MAX_WRAPPED_LEN, MIN_SECRET_WRAPPED_LEN, MIN_WRAPPED_LEN,
+    SECRET_BLOCK_LEN, TAG_LEN,
+};
 use crate::error::status;
 use crate::payload::{Payload, NONCE_LEN, SALT_LEN, VERSION};
 use crate::provider::ProviderType;
 use crate::secure_file::{self, FileRequirements, PrincipalTrust, SecretBuffer};
 use std::io;
 use std::path::Path;
+
+/// Which kind of payload a key file holds: a wrapped DEK
+/// (`hkdfguard_open_file`) or a wrapped secret (`hkdfguard_open_secret_file`).
+/// Both are read and trusted by exactly the same rules; only the sizes
+/// differ, and only a DEK file is checked for an unwrapped key (a secret
+/// has no fixed form to recognise; one saved unwrapped is shorter than any
+/// secret payload, so it is refused as [`KeyFileError::TooShort`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Dek,
+    Secret,
+}
+
+impl Kind {
+    /// Smallest payload of this kind (an empty `key_id`).
+    pub fn min_len(self) -> usize {
+        match self {
+            Kind::Dek => MIN_WRAPPED_LEN,
+            Kind::Secret => MIN_SECRET_WRAPPED_LEN,
+        }
+    }
+
+    /// Largest payload of this kind.
+    pub fn max_len(self) -> usize {
+        match self {
+            Kind::Dek => MAX_WRAPPED_LEN,
+            Kind::Secret => MAX_SECRET_WRAPPED_LEN,
+        }
+    }
+
+    /// The one ciphertext length (tag included) a wrap of this kind produces.
+    fn ciphertext_len(self) -> usize {
+        match self {
+            Kind::Dek => DEK_LEN + TAG_LEN,
+            Kind::Secret => SECRET_BLOCK_LEN + TAG_LEN,
+        }
+    }
+}
 
 /// Why a key file was refused. Each maps to its own C status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,12 +188,23 @@ impl KeyFileError {
 /// file may have held a plaintext key, and either way the buffer is wiped
 /// when dropped.
 pub fn read(path: &Path, trust: &dyn PrincipalTrust) -> Result<SecretBuffer, KeyFileError> {
-    read_with_proc_root(path, trust, Path::new("/proc"))
+    read_with_proc_root(path, trust, Path::new("/proc"), Kind::Dek)
+}
+
+/// [`read`], for a file holding a wrapped secret: the same trust rules,
+/// with the secret payload's sizes, and no plaintext-key detection.
+pub fn read_secret(path: &Path, trust: &dyn PrincipalTrust) -> Result<SecretBuffer, KeyFileError> {
+    read_with_proc_root(path, trust, Path::new("/proc"), Kind::Secret)
 }
 
 // `read`, with where `/proc` is mounted made a parameter so tests can run
 // it as though `/proc` were missing.
-fn read_with_proc_root(path: &Path, trust: &dyn PrincipalTrust, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
+fn read_with_proc_root(
+    path: &Path,
+    trust: &dyn PrincipalTrust,
+    proc_root: &Path,
+    kind: Kind,
+) -> Result<SecretBuffer, KeyFileError> {
     // Owner and mode are judged below, against `trust`, on the opened
     // descriptor's metadata; `open_checked` only opens it safely.
     let req = FileRequirements {
@@ -180,20 +232,20 @@ fn read_with_proc_root(path: &Path, trust: &dyn PrincipalTrust, proc_root: &Path
     secure_file::check_metadata_trusting(&meta, trust).map_err(untrusted)?;
     secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::Untrusted)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
-    if size == DEK_LEN as u64 {
+    if kind == Kind::Dek && size == DEK_LEN as u64 {
         return Err(KeyFileError::PlaintextKey);
     }
-    if size > MAX_WRAPPED_LEN as u64 {
+    if size > kind.max_len() as u64 {
         return Err(KeyFileError::TooLong);
     }
     // The size can change between the fstat and the read; `check` judges
     // what was actually read, and a file that grew past the limit fails
     // the read itself.
-    let contents = SecretBuffer::read_from(&mut file, MAX_WRAPPED_LEN).map_err(|e| match e.kind() {
+    let contents = SecretBuffer::read_from(&mut file, kind.max_len()).map_err(|e| match e.kind() {
         io::ErrorKind::InvalidData => KeyFileError::TooLong,
         _ => KeyFileError::Io,
     })?;
-    check(contents.as_slice())?;
+    check_kind(contents.as_slice(), kind)?;
     Ok(contents)
 }
 
@@ -208,15 +260,21 @@ fn open_error(e: io::Error) -> KeyFileError {
 
 /// Checks that `bytes` are a complete wrapped DEK payload: see the module
 /// docs for what each refusal means.
+#[cfg(any(test, hkdfguard_test_paths))]
 pub fn check(bytes: &[u8]) -> Result<(), KeyFileError> {
-    if looks_like_plaintext_dek(bytes) {
+    check_kind(bytes, Kind::Dek)
+}
+
+/// [`check`], for a payload of either kind.
+pub fn check_kind(bytes: &[u8], kind: Kind) -> Result<(), KeyFileError> {
+    if kind == Kind::Dek && looks_like_plaintext_dek(bytes) {
         return Err(KeyFileError::PlaintextKey);
     }
     let len = bytes.len();
-    if len < MIN_WRAPPED_LEN {
+    if len < kind.min_len() {
         return Err(KeyFileError::TooShort);
     }
-    if len > MAX_WRAPPED_LEN {
+    if len > kind.max_len() {
         return Err(KeyFileError::TooLong);
     }
     // From here `len >= MIN_WRAPPED_LEN`, so the fixed header fields read
@@ -228,7 +286,7 @@ pub fn check(bytes: &[u8]) -> Result<(), KeyFileError> {
     if key_id_len > MAX_KEY_ID_LEN {
         return Err(KeyFileError::Malformed); // no wrap records a longer one, so this is not a length the file could be "short" of
     }
-    let declared = MIN_WRAPPED_LEN + key_id_len;
+    let declared = kind.min_len() + key_id_len;
     if len < declared {
         return Err(KeyFileError::TooShort);
     }
@@ -238,7 +296,7 @@ pub fn check(bytes: &[u8]) -> Result<(), KeyFileError> {
     // `len == declared`, so the ciphertext length field is in bounds.
     let ct_len_at = 4 + key_id_len + SALT_LEN + NONCE_LEN;
     let ct_len = u32::from_le_bytes(bytes[ct_len_at..ct_len_at + 4].try_into().unwrap()) as usize;
-    if ct_len != DEK_LEN + TAG_LEN {
+    if ct_len != kind.ciphertext_len() {
         return Err(KeyFileError::Malformed);
     }
     // Every field is now known to be consistent; the real parser has the
@@ -399,7 +457,7 @@ mod tests {
     }
 
     fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
-        super::read_with_proc_root(path, &Owner::RootOrCurrentUser, proc_root)
+        super::read_with_proc_root(path, &Owner::RootOrCurrentUser, proc_root, super::Kind::Dek)
     }
 
     fn payload_with_key_id(key_id_len: usize) -> Vec<u8> {

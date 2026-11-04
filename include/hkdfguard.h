@@ -41,6 +41,20 @@ extern "C" {
  * size never needs a retry. */
 #define HKDFGUARD_WRAPPED_MAX_LEN 276
 
+/* Longest secret hkdfguard_wrap_secret takes, in bytes, and the capacity
+ * hkdfguard_unwrap_secret requires of its `out` buffer. */
+#define HKDFGUARD_SECRET_MAX_LEN 256
+
+/* Longest secret name, in bytes (excluding the NUL). */
+#define HKDFGUARD_SECRET_NAME_MAX_LEN 64
+
+/* Largest wrapped payload hkdfguard_wrap_secret can produce, for any
+ * provider, service name and secret. Every secret is padded to
+ * HKDFGUARD_SECRET_MAX_LEN before encryption, so a payload's size never
+ * depends on the secret's length. A buffer of this size never needs a
+ * retry. */
+#define HKDFGUARD_SECRET_WRAPPED_MAX_LEN 502
+
 /*
  * Status codes returned by every hkdfguard_* function.
  *
@@ -375,6 +389,80 @@ int hkdfguard_generate_and_wrap_dek(
     uint8_t* out,
     int* out_len);
 
+/*
+ * Wraps a secret -- a password, such as a certificate's or a vault's -- of
+ * 1..=256 bytes under the persistent KEK identified by `service`, bound to
+ * the secret name `secret_name`.
+ *
+ * The wrapping key is derived from the KEK under the SP 800-108 label
+ * "hkdfguard-secret-v1/" followed by `secret_name`, instead of the DEK
+ * functions' "hkdfguard-wrap-v1". So the payload opens only through
+ * hkdfguard_unwrap_secret with the same `service` and the same
+ * `secret_name`: never through hkdfguard_unwrap_dek, and never as a secret
+ * of another name. The name is not stored in the payload; supply it again
+ * to unwrap.
+ *
+ * service:      see hkdfguard_wrap_dek.
+ * secret_name:  NUL-terminated, 1..=HKDFGUARD_SECRET_NAME_MAX_LEN bytes of
+ *               lowercase ASCII letters, digits, '.', '_' and '-' -- e.g.
+ *               "vault.password", "ssl.certificate". Not normalized:
+ *               anything else, uppercase included, returns
+ *               HKDFGUARD_ERR_INVALID_ARGUMENT.
+ * secret:       pointer to `secret_len` bytes to wrap. Binary-safe; a
+ *               password needs no NUL terminator.
+ * secret_len:   1..=HKDFGUARD_SECRET_MAX_LEN; anything else returns
+ *               HKDFGUARD_ERR_INVALID_ARGUMENT.
+ * out, out_len: as for hkdfguard_wrap_dek, with
+ *               HKDFGUARD_SECRET_WRAPPED_MAX_LEN as the capacity that
+ *               always fits (and the one a too-small capacity is answered
+ *               with, without reaching a provider).
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_wrap_secret(
+    const char* service,
+    const char* secret_name,
+    const uint8_t* secret,
+    int secret_len,
+    uint8_t* out,
+    int* out_len);
+
+/*
+ * Unwraps a payload produced by hkdfguard_wrap_secret for the same
+ * `service` and `secret_name`, recovering the secret.
+ *
+ * Errors are those of hkdfguard_unwrap_dek. A `secret_name` (or `service`)
+ * other than the one used to wrap returns HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED,
+ * indistinguishable from tampering; a payload from hkdfguard_wrap_dek
+ * returns HKDFGUARD_ERR_PAYLOAD_MALFORMED.
+ *
+ * service, secret_name: as for hkdfguard_wrap_secret.
+ * wrapped:       pointer to the wrapped payload bytes.
+ * wrapped_len:   length of `wrapped` in bytes.
+ * out:           buffer to receive the secret. NOT NUL-terminated: use
+ *                *out_len. May be the same buffer as `wrapped`.
+ * out_len:       in: capacity of `out`, which must be at least
+ *                     HKDFGUARD_SECRET_MAX_LEN (256) -- the secret's length
+ *                     isn't known until it is decrypted. A smaller capacity
+ *                     returns HKDFGUARD_ERR_BUFFER_TOO_SMALL with *out_len
+ *                     set to HKDFGUARD_SECRET_MAX_LEN, before any provider
+ *                     is reached.
+ *                out: on HKDFGUARD_OK, the secret's length.
+ *
+ * On ANY non-OK return, every byte of the caller's originally-declared
+ * `out` capacity is zeroed, exactly as for hkdfguard_unwrap_dek. Zero the
+ * secret yourself once you are done with it.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_unwrap_secret(
+    const char* service,
+    const char* secret_name,
+    const uint8_t* wrapped,
+    int wrapped_len,
+    uint8_t* out,
+    int* out_len);
+
 /* Values of hkdfguard_security_model's *out_model: the Windows build's. */
 #define HKDFGUARD_SECURITY_MODEL_PRODUCTION 0
 #define HKDFGUARD_SECURITY_MODEL_DEVELOPER  1
@@ -519,6 +607,28 @@ int hkdfguard_key_file_principal_trusted(
  * capacity, or a NULL `out` with a positive capacity.
  */
 int hkdfguard_open_file(
+    const char* path,
+    uint8_t* out,
+    int* out_len);
+
+/*
+ * hkdfguard_open_file, for a file holding a payload from
+ * hkdfguard_wrap_secret -- as `hkdfguard protect --key-file-path` writes.
+ * Reading it never unwraps it: pass the bytes to hkdfguard_unwrap_secret.
+ *
+ * The same ownership, permission and directory checks as
+ * hkdfguard_open_file, and the same status codes, with these differences:
+ *   - sizes: HKDFGUARD_SECRET_WRAPPED_MAX_LEN is the capacity that always
+ *     fits, and the one a too-small capacity is answered with;
+ *   - no HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: a secret has no fixed form to
+ *     recognise. A secret saved unwrapped is shorter than any secret
+ *     payload, so it is HKDFGUARD_ERR_FILE_TOO_SHORT; if that is what the
+ *     file holds, treat the secret as exposed;
+ *   - a wrapped DEK file is HKDFGUARD_ERR_FILE_TOO_SHORT or
+ *     HKDFGUARD_ERR_FILE_MALFORMED, as a secret file is for
+ *     hkdfguard_open_file.
+ */
+int hkdfguard_open_secret_file(
     const char* path,
     uint8_t* out,
     int* out_len);

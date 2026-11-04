@@ -1,5 +1,6 @@
-//! CLI tool for setting up a service's persistent KEK and wrapping DEKs
-//! under it, and retiring a KEK. Three subcommands, deliberately separate:
+//! CLI tool for setting up a service's persistent KEK, wrapping DEKs and
+//! secrets under it, and retiring a KEK. Four subcommands, deliberately
+//! separate:
 //!
 //! - `provision` -- ensure a KEK exists for a service, and print its
 //!   fingerprint. With `retire`, the only place the setup calls
@@ -21,6 +22,17 @@
 //!   `provision`. That keeps the fast, repeatable operation free of the
 //!   setup calls, and makes "the KEK is missing" a loud, specific error
 //!   instead of something quietly fixed on the fly.
+//! - `protect` -- `wrap` for a secret (a password, 1 to 256 bytes), bound
+//!   to a `--secret-name` that must be given again to unwrap it (see
+//!   `hkdfguard_wrap_secret`). Written to a key file exactly as `wrap`
+//!   writes one, for `hkdfguard_open_secret_file`, or with `--stdout`
+//!   printed as base64 for the caller to store -- in which case nothing on
+//!   disk is checked, and whoever stores it must keep it writable only by
+//!   root or a deployer: anyone who can replace a payload, and can wrap
+//!   under the service's KEK, can substitute a secret they know. The
+//!   secret is read as is (one trailing newline ignored), or as base64
+//!   with `--base64`, from `--secret-stdin` or `--secret-file`, under the
+//!   same rules as the DEK below.
 //!
 //! ## Security model
 //!
@@ -29,7 +41,7 @@
 //!
 //! - **Security admin** -- `provision` and `retire`: root only. The library
 //!   itself refuses to create a KEK, or retire one, for anyone else.
-//! - **Deployment admin** -- `wrap`: root, or a *deployer* (a direct member
+//! - **Deployment admin** -- `wrap`, and `protect --key-file-path`: root, or a *deployer* (a direct member
 //!   of `hkdfguard-deployers`, or of a group the policy lists in
 //!   `deployer_groups`). Only their key files are trusted by
 //!   `hkdfguard_open_file`, so `wrap` refuses anyone else before reading
@@ -58,6 +70,12 @@
 //!     --service-name|-sn <name> \
 //!     (--dek-stdin | --dek-file <path>) \
 //!     [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]
+//!
+//! hkdfguard protect \
+//!     --service-name|-sn <name> --secret-name|-sid <name> \
+//!     (--secret-stdin | --secret-file <path>) [--base64] \
+//!     [--fingerprint|-fp <64 hex chars>] \
+//!     (--key-file-path|-kf <path> [--group|-g <name>] [--force|-f] | --stdout)
 //! ```
 //!
 //! ## Supplying the DEK
@@ -142,7 +160,7 @@ use zeroize::Zeroize;
 use hkdfguard::admin::{DEPLOYERS_GROUP, OVER_BROAD_GROUPS};
 use hkdfguard::{
     admin, harden_flags, hkdfguard_create_kek, hkdfguard_harden_process_with_flags, hkdfguard_kek_exists,
-    hkdfguard_kek_fingerprint, hkdfguard_security_model, hkdfguard_wrap_dek,
+    hkdfguard_kek_fingerprint, hkdfguard_security_model, hkdfguard_wrap_dek, hkdfguard_wrap_secret,
     status,
 };
 
@@ -189,6 +207,20 @@ const MAX_DEK_INPUT_LEN: usize = 64;
 // Room to base64-decode any accepted input: base64 decodes 4 characters
 // to at most 3 bytes, and `decode_slice` checks against that estimate.
 const MAX_DECODED_LEN: usize = MAX_DEK_INPUT_LEN / 4 * 3;
+// `protect`'s limits, mirroring the library's (HKDFGUARD_SECRET_MAX_LEN,
+// HKDFGUARD_SECRET_NAME_MAX_LEN), so the tool can say exactly what is wrong.
+const SECRET_MAX_LEN: usize = 256;
+const SECRET_NAME_MAX_LEN: usize = 64;
+// Upper bound on `protect`'s input: a UTF-8 byte-order mark, base64 of the
+// longest secret (344 characters; the raw secret is shorter), and a CRLF.
+const MAX_SECRET_INPUT_LEN: usize = 3 + SECRET_MAX_LEN.div_ceil(3) * 4 + 2;
+const MAX_SECRET_DECODED_LEN: usize = MAX_SECRET_INPUT_LEN / 4 * 3;
+// Room for any wrapped secret (HKDFGUARD_SECRET_WRAPPED_MAX_LEN is 502):
+// every secret is padded to the same size, so no retry is ever needed.
+const INITIAL_SECRET_WRAPPED_CAPACITY: usize = 512;
+const TERMINAL_SECRET_MESSAGE: &str = "refusing to read the secret from an interactive terminal, where it would be \
+                                       echoed and kept in the scrollback; pipe it in instead, e.g. \
+                                       printf '%s' \"$SECRET\" | hkdfguard protect ... --secret-stdin";
 // Mode bits that must be clear on a --dek-file: no access at all for
 // group or others.
 const FORBID_GROUP_OTHER_ACCESS: u32 = 0o077;
@@ -206,8 +238,8 @@ const TERMINAL_DEK_MESSAGE: &str = "refusing to read the DEK from an interactive
 const UTF16_DEK_MESSAGE: &str = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text \
                                  (in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)";
 
-// Where the base64 DEK is read from. Never argv, never the environment --
-// see this file's header comment.
+// Where the base64 DEK, or `protect`'s secret, is read from. Never argv,
+// never the environment -- see this file's header comment.
 #[derive(Debug, PartialEq, Eq)]
 enum DekSource {
     Stdin,
@@ -236,6 +268,31 @@ enum Command {
         // by `provision`. Nothing is deleted unless the KEK matches it.
         fingerprint: [u8; FINGERPRINT_LEN],
     },
+    Protect {
+        service_name: String,
+        // --secret-name: bound into the wrapping key's label; needed again
+        // to unwrap.
+        secret_name: String,
+        source: DekSource,
+        // --base64: the input is base64 of the secret, not the secret itself.
+        base64: bool,
+        output: ProtectOutput,
+        expected_fingerprint: Option<[u8; FINGERPRINT_LEN]>,
+    },
+}
+
+// Where `protect` puts the wrapped secret: exactly one, always explicit.
+#[derive(Debug, PartialEq, Eq)]
+enum ProtectOutput {
+    // --key-file-path: a key file, written as `wrap` writes one, for
+    // hkdfguard_open_secret_file.
+    KeyFile {
+        key_file_path: String,
+        force: bool,
+        group: Option<String>,
+    },
+    // --stdout: base64 on stdout, for the caller to store.
+    Stdout,
 }
 
 // A KEK fingerprint: a fixed HMAC output of the KEK (see crypto.rs).
@@ -252,6 +309,9 @@ fn print_usage() {
          \x20 {PROGRAM_NAME} provision --service-name|-sn <name>\n\
          \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n\
          \x20      [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]\n\
+         \x20 {PROGRAM_NAME} protect --service-name|-sn <name> --secret-name|-sid <name>\n\
+         \x20      (--secret-stdin | --secret-file <path>) [--base64] [--fingerprint|-fp <64 hex chars>]\n\
+         \x20      (--key-file-path|-kf <path> [--group|-g <name>] [--force|-f] | --stdout)\n\
          \x20 {PROGRAM_NAME} retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>\n\
          \n\
          provision  ensures a KEK exists for the service, and prints its fingerprint: record\n\
@@ -262,13 +322,21 @@ fn print_usage() {
          \x20          members (mode 0640). Fails if the KEK has not been provisioned.\n\
          \x20          Prints the fingerprint of the KEK it wrapped under; with --fingerprint,\n\
          \x20          writes nothing unless that is the KEK given.\n\
+         protect    wraps a secret (a password, 1 to 256 bytes) under the service's existing\n\
+         \x20          KEK, bound to --secret-name (lowercase letters, digits, '.', '_', '-'),\n\
+         \x20          which must be given again to unwrap it. Writes it to --key-file-path as\n\
+         \x20          wrap does (for hkdfguard_open_secret_file), or prints it as base64 with\n\
+         \x20          --stdout: then store it where only root or a deployer can write. The\n\
+         \x20          secret is read as is (one trailing newline ignored), or as base64 with\n\
+         \x20          --base64 -- needed for a binary secret or one ending in a newline.\n\
          retire     permanently deletes the service's KEK, only if its fingerprint is the\n\
          \x20          one given; every DEK wrapped under it becomes unrecoverable. TPM2 and\n\
          \x20          PKCS#11 only.\n\
          \n\
          Under the production security model (the default), provision and retire need\n\
-         root, and wrap needs root or a member of {DEPLOYERS_GROUP} (or of a group\n\
-         the policy lists in deployer_groups): the library trusts only their key files.\n\
+         root, and wrap and protect --key-file-path need root or a member of\n\
+         {DEPLOYERS_GROUP} (or of a group the policy lists in deployer_groups): the\n\
+         library trusts only their key files.\n\
          \n\
          The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n\
          from a command-line argument or an environment variable, both of which are\n\
@@ -277,7 +345,9 @@ fn print_usage() {
          Examples:\n\
          \x20 {PROGRAM_NAME} provision -sn svc\n\
          \x20 printf '%s' \"$DEK_B64\" | {PROGRAM_NAME} wrap -kf key.bin -sn svc --dek-stdin\n\
-         \x20 {PROGRAM_NAME} wrap -kf key.bin -sn svc --dek-file \"$CREDENTIALS_DIRECTORY/dek\""
+         \x20 {PROGRAM_NAME} wrap -kf key.bin -sn svc --dek-file \"$CREDENTIALS_DIRECTORY/dek\"\n\
+         \x20 printf '%s' \"$PASS\" | {PROGRAM_NAME} protect -sn svc -sid ssl.certificate --secret-stdin -kf cert.pass\n\
+         \x20 {PROGRAM_NAME} protect -sn svc -sid vault.password --secret-file /run/secrets/vault --stdout"
     );
 }
 
@@ -332,7 +402,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     let mut args = args.skip(1); // skip argv[0]
 
     let subcommand = match args.next() {
-        None => return Err("missing subcommand: expected `provision`, `wrap` or `retire`".to_string()),
+        None => return Err("missing subcommand: expected `provision`, `wrap`, `protect` or `retire`".to_string()),
         Some(s) if s == "--help" || s == "-h" || s == "help" => return Ok(ParseOutcome::Help),
         Some(s) => s,
     };
@@ -341,7 +411,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
         "provision" => parse_provision(&mut args),
         "wrap" => parse_wrap(&mut args),
         "retire" => parse_retire(&mut args),
-        other => Err(format!("unknown subcommand {other:?}: expected `provision`, `wrap` or `retire`")),
+        "protect" => parse_protect(&mut args),
+        other => Err(format!("unknown subcommand {other:?}: expected `provision`, `wrap`, `protect` or `retire`")),
     }
 }
 
@@ -486,6 +557,84 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
     }))
 }
 
+fn parse_protect(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
+    let mut key_file_path: Option<String> = None;
+    let mut to_stdout = false;
+    let mut service_name: Option<String> = None;
+    let mut secret_name: Option<String> = None;
+    let mut source: Option<DekSource> = None;
+    let mut base64 = false;
+    let mut force = false;
+    let mut group: Option<String> = None;
+    let mut expected_fingerprint: Option<[u8; FINGERPRINT_LEN]> = None;
+
+    fn set_source(slot: &mut Option<DekSource>, source: DekSource) -> Result<(), String> {
+        if slot.is_some() {
+            return Err("give exactly one of --secret-stdin or --secret-file".to_string());
+        }
+        *slot = Some(source);
+        Ok(())
+    }
+    fn set_flag(flag: &mut bool, name: &str) -> Result<(), String> {
+        if *flag {
+            return Err(format!("give {name} at most once"));
+        }
+        *flag = true;
+        Ok(())
+    }
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(ParseOutcome::Help),
+            "--service-name" | "-sn" => set_once(&mut service_name, "--service-name", take_service_name(&arg, args)?)?,
+            "--secret-name" | "-sid" => {
+                let value = take_value(&arg, "--secret-name", args)?;
+                set_once(&mut secret_name, "--secret-name", value)?;
+            }
+            "--key-file-path" | "-kf" => {
+                let value = take_value(&arg, "--key-file-path", args)?;
+                set_once(&mut key_file_path, "--key-file-path", value)?;
+            }
+            "--stdout" => set_flag(&mut to_stdout, "--stdout")?,
+            "--secret-stdin" => set_source(&mut source, DekSource::Stdin)?,
+            "--secret-file" => {
+                let value = take_value(&arg, "--secret-file", args)?;
+                set_source(&mut source, DekSource::File(value))?;
+            }
+            "--base64" => set_flag(&mut base64, "--base64")?,
+            "--force" | "-f" => set_flag(&mut force, "--force")?,
+            "--group" | "-g" => {
+                let value = take_value(&arg, "--group", args)?;
+                set_once(&mut group, "--group", value)?;
+            }
+            "--fingerprint" | "-fp" => {
+                let value = take_value(&arg, "--fingerprint", args)?;
+                set_once(&mut expected_fingerprint, "--fingerprint", parse_fingerprint_hex(&value)?)?;
+            }
+            "--dek-stdin" | "--dek-file" => {
+                return Err(format!("{arg} is not valid for `protect`; give the secret with --secret-stdin or --secret-file"))
+            }
+            other => return Err(format!("unrecognized argument for `protect`: {other}")),
+        }
+    }
+
+    let service_name = service_name.ok_or("protect: missing required --service-name|-sn")?;
+    let secret_name = secret_name.ok_or("protect: missing required --secret-name|-sid")?;
+    let source = source.ok_or("protect: missing required --secret-stdin or --secret-file <path>")?;
+    let output = match (key_file_path, to_stdout) {
+        (Some(_), true) => return Err("protect: give exactly one of --key-file-path or --stdout".to_string()),
+        (None, false) => return Err("protect: missing required --key-file-path|-kf <path> or --stdout".to_string()),
+        (Some(key_file_path), false) => ProtectOutput::KeyFile { key_file_path, force, group },
+        (None, true) => {
+            if force || group.is_some() {
+                return Err("protect: --force and --group apply only to --key-file-path".to_string());
+            }
+            ProtectOutput::Stdout
+        }
+    };
+    Ok(ParseOutcome::Run(Command::Protect { service_name, secret_name, source, base64, output, expected_fingerprint }))
+}
+
 // Reads at most `MAX_DEK_INPUT_LEN` bytes from `src` into a single
 // pre-sized, self-zeroing buffer.
 //
@@ -499,6 +648,14 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
 // Reads into `buf` (the caller's `DekScratch`) and returns how many bytes
 // it filled.
 fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<usize, String> {
+    read_bounded_into(src, what, buf, &format!("expected base64 of a {DEK_LEN}-byte DEK"))
+}
+
+// `read_bounded`, into any buffer: at most `buf.len() - 1` bytes are
+// accepted. `expected` says what the input should have been, for the
+// too-long message.
+fn read_bounded_into(src: &mut dyn Read, what: &str, buf: &mut [u8], expected: &str) -> Result<usize, String> {
+    let limit = buf.len() - 1;
     let mut filled = 0;
     while filled < buf.len() {
         match src.read(&mut buf[filled..]) {
@@ -508,15 +665,13 @@ fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN
             Err(e) => return Err(format!("failed to read {what}: {e}")),
         }
     }
-    if filled > MAX_DEK_INPUT_LEN {
+    if filled > limit {
         // UTF-16 doubles the text, so it is over the limit long before
         // decode_dek could say why: name it here instead.
         if buf.starts_with(b"\xFF\xFE") || buf.starts_with(b"\xFE\xFF") {
             return Err(UTF16_DEK_MESSAGE.to_string());
         }
-        return Err(format!(
-            "{what} is longer than {MAX_DEK_INPUT_LEN} bytes; expected base64 of a {DEK_LEN}-byte DEK"
-        ));
+        return Err(format!("{what} is longer than {limit} bytes; {expected}"));
     }
     Ok(filled)
 }
@@ -526,6 +681,12 @@ fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN
 // ownership/permission checks made against the *opened descriptor* rather
 // than the path, so nothing can be swapped between the check and the read.
 fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<usize, String> {
+    read_private_input_file("--dek-file", "the DEK", path, buf, &format!("expected base64 of a {DEK_LEN}-byte DEK"))
+}
+
+// `read_dek_file`, for any input flag (`--dek-file`, `--secret-file`) and
+// buffer: `flag` and `what` name the flag and what it holds, for messages.
+fn read_private_input_file(flag: &str, what: &str, path: &str, buf: &mut [u8], expected: &str) -> Result<usize, String> {
     // No symbolic link in the folders above it either, as for the key file
     // (and as the Windows tool requires of its --dek-file): a redirected
     // folder could make the deployment wrap a DEK someone else planted.
@@ -535,45 +696,48 @@ fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<us
     // would follow a link before a `..` in it into another folder (see
     // require_real_folder). Messages still show the operator's spelling.
     let spelled = require_real_folder(Path::new(path))?;
-    require_private_dek_folder(path, &spelled)?;
+    require_private_input_folder(flag, what, path, &spelled)?;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
         .open(&spelled)
         .map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
-                format!("--dek-file {path} is a symlink; refusing to follow it")
+                format!("{flag} {path} is a symlink; refusing to follow it")
             } else {
-                format!("failed to open --dek-file {path}: {e}")
+                format!("failed to open {flag} {path}: {e}")
             }
         })?;
     require_opened_at(&file, Path::new(path), &spelled)?;
 
     let meta = file
         .metadata()
-        .map_err(|e| format!("failed to stat --dek-file {path}: {e}"))?;
+        .map_err(|e| format!("failed to stat {flag} {path}: {e}"))?;
     if !meta.file_type().is_file() {
         // A FIFO here would block the read indefinitely; a directory or
         // device makes no sense as a key source.
-        return Err(format!("--dek-file {path} is not a regular file"));
+        return Err(format!("{flag} {path} is not a regular file"));
     }
     // SAFETY: geteuid takes no arguments and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    if meta.uid() != 0 && meta.uid() != euid {
-        return Err(format!(
-            "--dek-file {path} is owned by uid {}, which is neither root nor this process's user",
-            meta.uid()
-        ));
-    }
+    require_trusted_input_owner(flag, path, meta.uid(), unsafe { libc::geteuid() })?;
     let offending = meta.mode() & FORBID_GROUP_OTHER_ACCESS;
     if offending != 0 {
         return Err(format!(
-            "--dek-file {path} permissions are too broad (mode {:o}; bits {offending:o} must be clear)",
+            "{flag} {path} permissions are too broad (mode {:o}; bits {offending:o} must be clear)",
             meta.mode() & 0o7777
         ));
     }
 
-    read_bounded(&mut file, "--dek-file", buf)
+    read_bounded_into(&mut file, flag, buf, expected)
+}
+
+// An input file (`--dek-file`, `--secret-file`) is trusted only when root
+// or this process's user owns it: anyone else could have chosen its bytes.
+fn require_trusted_input_owner(flag: &str, path: &str, owner: u32, euid: u32) -> Result<(), String> {
+    if owner != 0 && owner != euid {
+        return Err(format!("{flag} {path} is owned by uid {owner}, which is neither root nor this process's user"));
+    }
+    Ok(())
 }
 
 // Decodes the base64 DEK text, tolerating exactly one trailing newline
@@ -624,27 +788,29 @@ fn decode_dek<'a>(text: &[u8], out: &'a mut [u8; MAX_DECODED_LEN]) -> Result<&'a
 // This covers the CLI's own copies. The library's transient copies (on
 // its stack, while it wraps) are covered only by `lock_memory`'s
 // mlockall.
-struct DekScratch {
-    text: [u8; MAX_DEK_INPUT_LEN + 1],
-    decoded: [u8; MAX_DECODED_LEN],
+//
+// Generic over the two buffers' sizes: `DekScratch` for `wrap`,
+// `SecretScratch` for `protect`.
+struct Scratch<const TEXT: usize, const DECODED: usize> {
+    text: [u8; TEXT],
+    decoded: [u8; DECODED],
     locked: bool,
 }
 
-impl DekScratch {
+type DekScratch = Scratch<{ MAX_DEK_INPUT_LEN + 1 }, MAX_DECODED_LEN>;
+type SecretScratch = Scratch<{ MAX_SECRET_INPUT_LEN + 1 }, MAX_SECRET_DECODED_LEN>;
+
+impl<const TEXT: usize, const DECODED: usize> Scratch<TEXT, DECODED> {
     fn new() -> Box<Self> {
-        let mut scratch = Box::new(DekScratch {
-            text: [0; MAX_DEK_INPUT_LEN + 1],
-            decoded: [0; MAX_DECODED_LEN],
-            locked: false,
-        });
+        let mut scratch = Box::new(Scratch { text: [0; TEXT], decoded: [0; DECODED], locked: false });
         if !PROCESS_MEMORY_LOCKED.load(std::sync::atomic::Ordering::Relaxed) {
             // SAFETY: the range is this live, heap-pinned allocation.
-            let rc = unsafe { libc::mlock((&raw const *scratch).cast(), std::mem::size_of::<DekScratch>()) };
+            let rc = unsafe { libc::mlock((&raw const *scratch).cast(), std::mem::size_of::<Self>()) };
             if rc == 0 {
                 scratch.locked = true;
             } else {
                 eprintln!(
-                    "warning: could not lock the DEK's buffer into memory (mlock: {}); it could be written to swap",
+                    "warning: could not lock the key material's buffer into memory (mlock: {}); it could be written to swap",
                     std::io::Error::last_os_error()
                 );
             }
@@ -653,13 +819,13 @@ impl DekScratch {
     }
 }
 
-impl Drop for DekScratch {
+impl<const TEXT: usize, const DECODED: usize> Drop for Scratch<TEXT, DECODED> {
     fn drop(&mut self) {
         self.text.zeroize();
         self.decoded.zeroize();
         if self.locked {
             // SAFETY: the same range `new` locked; still allocated here.
-            unsafe { libc::munlock((&raw const *self).cast(), std::mem::size_of::<DekScratch>()) };
+            unsafe { libc::munlock((&raw const *self).cast(), std::mem::size_of::<Self>()) };
         }
     }
 }
@@ -692,6 +858,116 @@ fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [
     let dek = decode_dek(&scratch.text[..len], &mut scratch.decoded);
     scratch.text.zeroize(); // the base64 text has served its only purpose; don't wait for scope exit
     dek
+}
+
+// `protect`'s input as the secret it stands for, decoded into `out`.
+//
+// The same framing rules as `decode_dek`: a leading UTF-8 byte-order mark
+// is skipped, a UTF-16 one refused, and exactly one trailing newline
+// (optionally CRLF) ignored, so `printf '%s\n'` and editors work. Then:
+//
+// - raw (the default): the remaining bytes are the secret, exactly. A
+//   secret that really ends in a newline, starts with a byte-order mark,
+//   or is binary must be given with --base64;
+// - --base64: strict, padded, standard base64 of the secret, decoded in
+//   constant time, with one fixed message for any malformed input.
+//
+// Either way 1..=SECRET_MAX_LEN bytes; no error message ever includes any
+// of the input.
+fn decode_secret<'a>(text: &[u8], base64: bool, out: &'a mut [u8; MAX_SECRET_DECODED_LEN]) -> Result<&'a [u8], String> {
+    let text = text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(text);
+    if text.starts_with(b"\xFF\xFE") || text.starts_with(b"\xFE\xFF") {
+        return Err("the secret input is UTF-16 encoded; send it as UTF-8 (or as base64, with --base64)".to_string());
+    }
+    let trimmed = match text.strip_suffix(b"\n") {
+        Some(t) => t.strip_suffix(b"\r").unwrap_or(t),
+        None => text,
+    };
+    if trimmed.is_empty() {
+        return Err("the secret input is empty".to_string());
+    }
+    let len = if base64 {
+        Base64::decode(trimmed, out)
+            .map_err(|_| "the secret input is not valid base64 (standard alphabet, padded, at most one trailing newline)".to_string())?
+            .len()
+    } else {
+        if trimmed.len() > out.len() {
+            return Err(format!("the secret is longer than {SECRET_MAX_LEN} bytes"));
+        }
+        out[..trimmed.len()].copy_from_slice(trimmed);
+        trimmed.len()
+    };
+    if len == 0 || len > SECRET_MAX_LEN {
+        out.zeroize();
+        return Err(format!("the secret must be 1 to {SECRET_MAX_LEN} bytes, got {len}"));
+    }
+    Ok(&out[..len])
+}
+
+// Reads `protect`'s secret from wherever the caller pointed us, into
+// `scratch`, and returns it as a slice of `scratch.decoded`. The input
+// text is wiped before returning, as in `load_dek`.
+fn load_secret<'a>(source: &DekSource, base64: bool, scratch: &'a mut SecretScratch) -> Result<&'a [u8], String> {
+    let expected = format!("expected a secret of at most {SECRET_MAX_LEN} bytes (or its base64, with --base64)");
+    let len = match source {
+        DekSource::Stdin => {
+            // SAFETY: isatty takes a descriptor number and only inspects it.
+            if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+                return Err(TERMINAL_SECRET_MESSAGE.to_string());
+            }
+            // Straight from descriptor 0, never `std::io::stdin()`'s
+            // buffer -- see `load_dek`.
+            // SAFETY: as in `load_dek`: descriptor 0 is open for the
+            // process's lifetime, and ManuallyDrop never closes it.
+            let mut fd0 = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDIN_FILENO) });
+            read_bounded_into(&mut *fd0, "the secret on stdin", &mut scratch.text, &expected)?
+        }
+        DekSource::File(path) => read_private_input_file("--secret-file", "the secret", path, &mut scratch.text, &expected)?,
+    };
+    let secret = decode_secret(&scratch.text[..len], base64, &mut scratch.decoded);
+    scratch.text.zeroize();
+    secret
+}
+
+// `--secret-name`: the library's rule (1..=64 bytes of lowercase ASCII
+// letters, digits, '.', '_' and '-'), checked here too for a specific
+// message. Not normalized: the name is bound into the key exactly as
+// given, so `Vault.Password` is refused rather than quietly lowered.
+fn validate_secret_name(name: &str) -> Result<CString, String> {
+    if name.is_empty() || name.len() > SECRET_NAME_MAX_LEN {
+        return Err(format!("--secret-name must be 1 to {SECRET_NAME_MAX_LEN} bytes, got {}", name.len()));
+    }
+    if !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')) {
+        return Err(format!(
+            "--secret-name {name:?} may contain only lowercase ASCII letters, digits, '.', '_' and '-'"
+        ));
+    }
+    Ok(CString::new(name).expect("the secret-name charset excludes NUL"))
+}
+
+// Wraps `secret` under `service`'s *existing* KEK, bound to `name`.
+fn wrap_secret(service: &CString, service_display: &str, name: &CString, secret: &[u8]) -> Result<Vec<u8>, String> {
+    let mut wrapped = vec![0u8; INITIAL_SECRET_WRAPPED_CAPACITY];
+    let mut wrapped_len: c_int = wrapped.len() as c_int;
+    let rc = hkdfguard_wrap_secret(
+        service.as_ptr(),
+        name.as_ptr(),
+        secret.as_ptr(),
+        secret.len() as c_int,
+        wrapped.as_mut_ptr(),
+        &mut wrapped_len,
+    );
+    if rc == status::KEK_NOT_FOUND {
+        return Err(format!(
+            "no KEK is provisioned for service \"{service_display}\"; run \
+             `{PROGRAM_NAME} provision --service-name {service_display}` first"
+        ));
+    }
+    if rc != status::OK {
+        return Err(format!("hkdfguard_wrap_secret failed: {}", describe_status(rc)));
+    }
+    wrapped.truncate(wrapped_len as usize);
+    Ok(wrapped)
 }
 
 // Maps a library status code to a human-readable description, for a
@@ -1048,28 +1324,33 @@ fn require_unshared_folder(path: &Path, spelled: &Path, trust: &dyn admin::Princ
 // volume is `1777` but nobody can write to it. The judgment is the
 // library's (`admin::first_untrusted_dir`). `spelled` is what
 // `require_real_folder` returned, so its folder is the real one.
-fn require_private_dek_folder(path: &str, spelled: &Path) -> Result<(), String> {
-    let folder = spelled.parent().ok_or_else(|| format!("--dek-file {path} has no parent folder"))?;
-    let Some((dir, problem)) = admin::first_untrusted_dir(folder, &admin::Owner::RootOrCurrentUser) else {
-        return Ok(());
-    };
-    Err(match problem {
+fn require_private_input_folder(flag: &str, what: &str, path: &str, spelled: &Path) -> Result<(), String> {
+    let folder = spelled.parent().ok_or_else(|| format!("{flag} {path} has no parent folder"))?;
+    match admin::first_untrusted_dir(folder, &admin::Owner::RootOrCurrentUser) {
+        None => Ok(()),
+        Some((dir, problem)) => Err(describe_input_folder_problem(flag, what, path, &dir, problem)),
+    }
+}
+
+// The message for `require_private_input_folder`'s refusal of `dir`.
+fn describe_input_folder_problem(flag: &str, what: &str, path: &str, dir: &Path, problem: admin::DirProblem) -> String {
+    match problem {
         admin::DirProblem::Owner(uid) => format!(
-            "--dek-file {path}: folder {} is owned by uid {uid}, which is neither root nor this process's user, \
-             so someone else could replace the DEK file",
+            "{flag} {path}: folder {} is owned by uid {uid}, which is neither root nor this process's user, \
+             so someone else could replace {what} file",
             dir.display()
         ),
         admin::DirProblem::Writable { mode } => {
             let sticky = if mode & 0o1000 != 0 { " (sticky, like /tmp, which is not enough)" } else { "" };
             format!(
-                "--dek-file {path}: folder {} is writable by group or others (mode {mode:o}){sticky}, so someone else \
-                 could replace the DEK file. Keep it in a folder only its owner (or root) can write to, all the way up to /",
+                "{flag} {path}: folder {} is writable by group or others (mode {mode:o}){sticky}, so someone else \
+                 could replace {what} file. Keep it in a folder only its owner (or root) can write to, all the way up to /",
                 dir.display()
             )
         }
-        admin::DirProblem::NotADirectory => format!("failed to check --dek-file {path}'s folder {}: not a directory", dir.display()),
-        admin::DirProblem::Unexaminable(e) => format!("failed to check --dek-file {path}'s folder {}: {e}", dir.display()),
-    })
+        admin::DirProblem::NotADirectory => format!("failed to check {flag} {path}'s folder {}: not a directory", dir.display()),
+        admin::DirProblem::Unexaminable(e) => format!("failed to check {flag} {path}'s folder {}: {e}", dir.display()),
+    }
 }
 
 // After an open: `file` must be the file at `spelled` (see
@@ -1298,6 +1579,105 @@ fn run_retire(mut service_name: String, fingerprint: [u8; FINGERPRINT_LEN]) -> R
     }
 }
 
+// Where `wrap`, or `protect --key-file-path`, will write its key file,
+// once every check that needs nothing secret has passed: `checked` is the
+// path `require_real_folder` returned, which every filesystem call uses;
+// `shown` is the operator's spelling, for messages.
+struct KeyFileTarget {
+    checked: PathBuf,
+    shown: String,
+    force: bool,
+    group: Option<(libc::gid_t, String)>,
+}
+
+// The key file checks, made before the DEK or secret is read or any
+// provider is touched.
+fn prepare_key_file_target(key_file_path: String, force: bool, group: Option<String>) -> Result<KeyFileTarget, String> {
+    // Before anything else -- reading the DEK, any provider work -- the key
+    // file's folder must be a real folder at its spelled location. Every
+    // filesystem call below then uses the path that check returns, never
+    // `key_file_path` as given (see require_real_folder); messages still
+    // show the operator's spelling. Checked again, with the open
+    // descriptor, when the file is replaced and created below.
+    let checked = require_real_folder(Path::new(&key_file_path))?;
+    // Someone the library would trust with a key file: under the
+    // production model, root or a deployer, or nothing is written.
+    require_may_persist_key_files()?;
+    // And not in a folder (or under one) that someone untrusted can write
+    // to, sticky /tmp included: the library would refuse to read the key
+    // file there, so refuse to write it (see require_unshared_folder).
+    let trust = admin::key_file_writer_trust().map_err(|e| e.message)?;
+    require_unshared_folder(Path::new(&key_file_path), &checked, &*trust)?;
+
+    // Fast, friendly pre-check: fail before reading the DEK or touching
+    // the provider if the output path obviously already exists and --force
+    // wasn't passed. The final `create_new` open below is the actual
+    // correctness guarantee against the exists-then-create race; this is
+    // purely a fail-fast convenience on top of it.
+    if path_is_taken(&checked) && !force {
+        return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
+    }
+    let group = group.as_deref().map(resolve_key_file_group).transpose()?;
+    Ok(KeyFileTarget { checked, shown: key_file_path, force, group })
+}
+
+// The KEK this payload was actually sealed to, as the library embedded
+// it in the payload it just returned -- not from a separate
+// hkdfguard_kek_fingerprint call, so there is no window between "which
+// KEK?" and "wrap under it", and what is checked and printed is exactly
+// what the output will carry. With --fingerprint, this is the operator's
+// assertion of which KEK the secret may be committed to: on a mismatch
+// (the service's KEK replaced, re-provisioned, or on another provider
+// than expected) nothing is written, and with --force the existing key
+// file is left as it was. `function` and `what` name the wrap call and
+// what it wrapped, for the messages.
+fn confirm_fingerprint(
+    wrapped: &[u8],
+    expected: Option<[u8; FINGERPRINT_LEN]>,
+    service_name: &str,
+    function: &str,
+    what: &str,
+) -> Result<[u8; FINGERPRINT_LEN], String> {
+    let used = admin::payload_fingerprint(wrapped)
+        .ok_or_else(|| format!("{function} returned a payload with no readable KEK fingerprint; nothing was written"))?;
+    if let Some(expected) = expected {
+        if used != expected {
+            return Err(format!(
+                "fingerprint mismatch for service \"{service_name}\": the service's KEK is {}, not {}; nothing was \
+                 written -- {what} was NOT committed to that key",
+                hex(&used),
+                hex(&expected)
+            ));
+        }
+    }
+    Ok(used)
+}
+
+// The line every successful wrap prints about the KEK it used.
+fn fingerprint_line(used: &[u8; FINGERPRINT_LEN], confirmed: bool) -> String {
+    format!(
+        "fingerprint: {}{}",
+        hex(used),
+        if confirmed { " (confirmed)" } else { " -- confirm it matches the one recorded when this service was provisioned" }
+    )
+}
+
+// Writes `wrapped` to the key file: in full to a temporary file beside it
+// first, then under its real name, so until that last step the folder
+// holds exactly what it held before, whatever fails. Returns who may
+// access the file, for the success message.
+fn write_key_file(target: &KeyFileTarget, wrapped: &[u8]) -> Result<String, String> {
+    let mode = if target.group.is_some() { KEY_FILE_GROUP_MODE } else { KEY_FILE_MODE };
+    let staged = stage_key_file(&target.checked, &target.shown, wrapped, target.group.as_ref(), mode)?;
+    if let Some(warning) = publish_key_file(staged, &target.checked, &target.shown, target.force)? {
+        eprintln!("{PROGRAM_NAME}: warning: {warning}");
+    }
+    Ok(match &target.group {
+        Some((_, name)) => format!("owner read/write + {name} read-only"),
+        None => "owner read/write".to_string(),
+    })
+}
+
 // `wrap`: no setup calls. The wrap is completed in memory before the
 // existing key file (if any) is touched, so a failure -- most likely "no
 // KEK provisioned" -- never costs the caller the key file they had.
@@ -1309,33 +1689,7 @@ fn run_wrap(
     group: Option<String>,
     expected_fingerprint: Option<[u8; FINGERPRINT_LEN]>,
 ) -> Result<(), String> {
-    // Before anything else -- reading the DEK, any provider work -- the key
-    // file's folder must be a real folder at its spelled location. Every
-    // filesystem call below then uses the path that check returns, never
-    // `key_file_path` as given (see require_real_folder); messages still
-    // show the operator's spelling. Checked again, with the open
-    // descriptor, when the file is replaced and created below.
-    let checked = require_real_folder(Path::new(&key_file_path))?;
-    let path = checked.as_path();
-    // Someone the library would trust with a key file: under the
-    // production model, root or a deployer, or nothing is written.
-    require_may_persist_key_files()?;
-    // And not in a folder (or under one) that someone untrusted can write
-    // to, sticky /tmp included: the library would refuse to read the key
-    // file there, so refuse to write it (see require_unshared_folder).
-    let trust = admin::key_file_writer_trust().map_err(|e| e.message)?;
-    require_unshared_folder(Path::new(&key_file_path), path, &*trust)?;
-
-    // Fast, friendly pre-check: fail before reading the DEK or touching
-    // the provider if the output path obviously already exists and --force
-    // wasn't passed. The final `create_new` open below is the actual
-    // correctness guarantee against the exists-then-create race; this is
-    // purely a fail-fast convenience on top of it.
-    if path_is_taken(path) && !force {
-        return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
-    }
-    let group = group.as_deref().map(resolve_key_file_group).transpose()?;
-
+    let target = prepare_key_file_target(key_file_path, force, group)?;
     let service_c = prepare_service(&mut service_name)?;
 
     let wrapped = {
@@ -1356,55 +1710,76 @@ fn run_wrap(
         // this point.
     };
 
-    // The KEK this payload was actually sealed to, as the library embedded
-    // it in the payload it just returned -- not from a separate
-    // hkdfguard_kek_fingerprint call, so there is no window between "which
-    // KEK?" and "wrap under it", and what is checked and printed is exactly
-    // what the file will carry. With --fingerprint, this is the operator's
-    // assertion of which KEK the secret may be committed to: on a mismatch
-    // (the service's KEK replaced, re-provisioned, or on another provider
-    // than expected) nothing is written, and with --force the existing key
-    // file is left as it was.
-    let used_fingerprint = admin::payload_fingerprint(&wrapped)
-        .ok_or("hkdfguard_wrap_dek returned a payload with no readable KEK fingerprint; nothing was written")?;
-    if let Some(expected) = expected_fingerprint {
-        if used_fingerprint != expected {
-            return Err(format!(
-                "fingerprint mismatch for service \"{service_name}\": the service's KEK is {}, not {}; nothing was \
-                 written -- the DEK was NOT committed to that key",
-                hex(&used_fingerprint),
-                hex(&expected)
-            ));
-        }
-    }
-
-    // Only now, with a complete wrapped payload in hand, write it: in full
-    // to a temporary file beside the key file first, then under its real
-    // name. Until that last step the folder holds exactly what it held
-    // before, whatever fails.
-    let mode = if group.is_some() { KEY_FILE_GROUP_MODE } else { KEY_FILE_MODE };
-    let staged = stage_key_file(path, &key_file_path, &wrapped, group.as_ref(), mode)?;
-    if let Some(warning) = publish_key_file(staged, path, &key_file_path, force)? {
-        eprintln!("{PROGRAM_NAME}: warning: {warning}");
-    }
-
-    let access = match &group {
-        Some((_, name)) => format!("owner read/write + {name} read-only"),
-        None => "owner read/write".to_string(),
-    };
+    let used_fingerprint =
+        confirm_fingerprint(&wrapped, expected_fingerprint, &service_name, "hkdfguard_wrap_dek", "the DEK")?;
+    let access = write_key_file(&target, &wrapped)?;
     println!(
-        "wrapped key written to {key_file_path} ({} bytes, {access}, service \"{service_name}\")",
+        "wrapped key written to {} ({} bytes, {access}, service \"{service_name}\")",
+        target.shown,
         wrapped.len()
     );
-    println!(
-        "fingerprint: {}{}",
-        hex(&used_fingerprint),
-        if expected_fingerprint.is_some() {
-            " (confirmed)"
-        } else {
-            " -- confirm it matches the one recorded when this service was provisioned"
+    println!("{}", fingerprint_line(&used_fingerprint, expected_fingerprint.is_some()));
+    Ok(())
+}
+
+// `protect`: `wrap`, for a secret (a password) bound to a secret name,
+// written to a key file exactly as `wrap` writes one -- or, with --stdout,
+// printed as base64 for the caller to store. No setup calls.
+fn run_protect(
+    mut service_name: String,
+    secret_name: String,
+    source: DekSource,
+    base64: bool,
+    output: ProtectOutput,
+    expected_fingerprint: Option<[u8; FINGERPRINT_LEN]>,
+) -> Result<(), String> {
+    // Every check that needs nothing secret, first.
+    let target = match output {
+        ProtectOutput::KeyFile { key_file_path, force, group } => {
+            Some(prepare_key_file_target(key_file_path, force, group)?)
         }
-    );
+        ProtectOutput::Stdout => None,
+    };
+    let name_c = validate_secret_name(&secret_name)?;
+    let service_c = prepare_service(&mut service_name)?;
+
+    let wrapped = {
+        // As in `run_wrap`: the plaintext lives only in the locked scratch
+        // buffer, zeroed when this block ends.
+        let mut scratch = SecretScratch::new();
+        let secret = load_secret(&source, base64, &mut scratch)?;
+        wrap_secret(&service_c, &service_name, &name_c, secret)?
+    };
+
+    let used_fingerprint =
+        confirm_fingerprint(&wrapped, expected_fingerprint, &service_name, "hkdfguard_wrap_secret", "the secret")?;
+    let fingerprint = fingerprint_line(&used_fingerprint, expected_fingerprint.is_some());
+    match target {
+        Some(target) => {
+            let access = write_key_file(&target, &wrapped)?;
+            println!(
+                "protected secret written to {} ({} bytes, {access}, service \"{service_name}\", secret \"{secret_name}\")",
+                target.shown,
+                wrapped.len()
+            );
+            println!("{fingerprint}");
+        }
+        None => {
+            // stdout carries the payload alone, so it can be captured as
+            // is; everything else goes to stderr.
+            let mut text = [0u8; INITIAL_SECRET_WRAPPED_CAPACITY.div_ceil(3) * 4];
+            // `wrap_secret` never returns more than INITIAL_SECRET_WRAPPED_CAPACITY bytes.
+            let encoded = Base64::encode(&wrapped, &mut text).expect("`text` holds the base64 of the largest payload");
+            println!("{encoded}");
+            eprintln!(
+                "protected secret printed as base64 ({} bytes wrapped, service \"{service_name}\", secret \"{secret_name}\"). \
+                 Store it where only root or a deployer can write: anyone who can replace it, and can wrap under \
+                 this service's KEK, can substitute a secret they know",
+                wrapped.len()
+            );
+            eprintln!("{fingerprint}");
+        }
+    }
     Ok(())
 }
 
@@ -1586,6 +1961,14 @@ fn run(command: Command) -> Result<(), String> {
             expected_fingerprint,
         } => run_wrap(key_file_path, service_name, dek_source, force, group, expected_fingerprint),
         Command::Retire { service_name, fingerprint } => run_retire(service_name, fingerprint),
+        Command::Protect {
+            service_name,
+            secret_name,
+            source,
+            base64,
+            output,
+            expected_fingerprint,
+        } => run_protect(service_name, secret_name, source, base64, output, expected_fingerprint),
     }
 }
 
@@ -2483,6 +2866,190 @@ mod tests {
     }
 
     #[test]
+    fn parse_protect_takes_exactly_one_output() {
+        let to_file = parse_args(argv(&[
+            "prog", "protect", "-sn", "svc", "-sid", "ssl.certificate", "--secret-stdin", "-kf", "cert.pass", "-g", "app", "-f",
+        ]));
+        let Ok(ParseOutcome::Run(Command::Protect { service_name, secret_name, source, base64, output, expected_fingerprint })) = to_file else { panic!("expected a protect command, got {:?}", to_file.err()) };
+        assert_eq!((service_name.as_str(), secret_name.as_str()), ("svc", "ssl.certificate"));
+        assert_eq!(source, DekSource::Stdin);
+        assert!(!base64 && expected_fingerprint.is_none());
+        assert_eq!(output, ProtectOutput::KeyFile { key_file_path: "cert.pass".into(), force: true, group: Some("app".into()) });
+        let to_stdout = parse_args(argv(&[
+            "prog", "protect", "--service-name", "svc", "--secret-name", "vault.password", "--secret-file", "/s", "--base64", "--stdout",
+        ]));
+        let Ok(ParseOutcome::Run(Command::Protect { source, base64, output, .. })) = to_stdout else { panic!("expected a protect command, got {:?}", to_stdout.err()) };
+        assert_eq!(source, DekSource::File("/s".into()));
+        assert!(base64);
+        assert_eq!(output, ProtectOutput::Stdout);
+
+        // --fingerprint (-fp) carries the KEK fingerprint to confirm.
+        let fp = "ab".repeat(FINGERPRINT_LEN);
+        let confirmed = parse_args(argv(&["prog", "protect", "-sn", "svc", "-sid", "a", "--secret-stdin", "--stdout", "-fp", &fp]));
+        let Ok(ParseOutcome::Run(Command::Protect { expected_fingerprint, .. })) = confirmed else { panic!("expected a protect command, got {:?}", confirmed.err()) };
+        assert_eq!(expected_fingerprint, Some([0xAB; FINGERPRINT_LEN]));
+    }
+
+    #[test]
+    fn parse_protect_refuses_ambiguous_or_incomplete_commands() {
+        static FP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "ab".repeat(FINGERPRINT_LEN));
+        let base = ["prog", "protect", "-sn", "svc", "-sid", "vault.password", "--secret-stdin"];
+        let with = |extra: &[&'static str]| -> Vec<&'static str> { base.iter().copied().chain(extra.iter().copied()).collect() };
+        for (args, why) in [
+            (with(&[]), "no output"),
+            (with(&["-kf", "k", "--stdout"]), "two outputs"),
+            (with(&["--stdout", "--stdout"]), "--stdout twice"),
+            (with(&["--stdout", "--force"]), "--force without a key file"),
+            (with(&["--stdout", "-g", "app"]), "--group without a key file"),
+            (with(&["--stdout", "--secret-file", "/s"]), "two sources"),
+            (with(&["--stdout", "--dek-stdin"]), "a DEK flag"),
+            (with(&["--stdout", "--base64", "--base64"]), "--base64 twice"),
+            (with(&["--stdout", "-sid", "other"]), "two secret names"),
+            (with(&["--stdout", "--bogus"]), "an unknown argument"),
+            (with(&["--stdout", "-sn", "other"]), "two services"),
+            (with(&["--stdout", "--secret-stdin"]), "--secret-stdin twice"),
+            (with(&["-kf", "k", "-kf", "k"]), "two key files"),
+            (with(&["-kf", "k", "-f", "-f"]), "--force twice"),
+            (with(&["-kf", "k", "-g", "a", "-g", "b"]), "two groups"),
+            (with(&["--stdout", "-fp", FP.as_str(), "-fp", FP.as_str()]), "two fingerprints"),
+            (with(&["--stdout", "-sn"]), "-sn without a value"),
+            (with(&["--stdout", "-sid"]), "-sid without a value"),
+            (with(&["--stdout", "-kf"]), "-kf without a value"),
+            (with(&["--stdout", "--secret-file"]), "--secret-file without a value"),
+            (with(&["--stdout", "-g"]), "-g without a value"),
+            (with(&["--stdout", "-fp"]), "-fp without a value"),
+            (with(&["--stdout", "-fp", "not-hex"]), "a malformed fingerprint"),
+            (vec!["prog", "protect", "-sn", "svc", "--secret-stdin", "--stdout"], "no secret name"),
+            (vec!["prog", "protect", "-sid", "n", "--secret-stdin", "--stdout"], "no service"),
+            (vec!["prog", "protect", "-sn", "svc", "-sid", "n", "--stdout"], "no source"),
+        ] {
+            assert!(parse_args(argv(&args)).is_err(), "{why}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn protect_help_is_help() {
+        assert!(matches!(parse_args(argv(&["prog", "protect", "-sn", "svc", "--help"])), Ok(ParseOutcome::Help)));
+    }
+
+    #[test]
+    fn run_protect_refuses_a_bad_command_before_reading_any_secret() {
+        // Each is refused before the secret source is opened: the path below doesn't exist.
+        let source = || DekSource::File("/nonexistent/hkdfguard/secret".into());
+        let err = run_protect("svc".into(), "Vault".into(), source(), false, ProtectOutput::Stdout, None).unwrap_err();
+        assert!(err.contains("--secret-name"), "{err}");
+        let err = run_protect("bad service".into(), "vault.password".into(), source(), false, ProtectOutput::Stdout, None).unwrap_err();
+        assert!(err.contains("service"), "{err}");
+        let dir = private_tempdir();
+        let existing = dir.path().join("cert.pass");
+        fs::write(&existing, b"old").unwrap();
+        let output = ProtectOutput::KeyFile { key_file_path: existing.to_str().unwrap().into(), force: false, group: None };
+        let err = run_protect("svc".into(), "vault.password".into(), source(), false, output, None).unwrap_err();
+        // An existing file without --force -- or, in a build that reads the
+        // host's real policy, the security-model check just before it.
+        assert!(err.contains("already exists") || err.contains("--force") || err.contains("hkdfguard_security_model"), "{err}");
+        assert_eq!(fs::read(&existing).unwrap(), b"old", "left as it was");
+    }
+
+    #[test]
+    fn decode_secret_takes_the_input_as_is_or_as_base64() {
+        let mut out = [0u8; MAX_SECRET_DECODED_LEN];
+        assert_eq!(decode_secret(b"hunter2", false, &mut out).unwrap(), b"hunter2");
+        assert_eq!(decode_secret(b"hunter2\n", false, &mut out).unwrap(), b"hunter2", "one newline is framing");
+        assert_eq!(decode_secret(b"hunter2\r\n", false, &mut out).unwrap(), b"hunter2");
+        assert_eq!(decode_secret(b"hunter2\n\n", false, &mut out).unwrap(), b"hunter2\n", "only one");
+        assert_eq!(decode_secret(b"\xEF\xBB\xBFhunter2", false, &mut out).unwrap(), b"hunter2", "a UTF-8 BOM is skipped");
+        assert_eq!(decode_secret(b" spaced out ", false, &mut out).unwrap(), b" spaced out ", "no other trimming");
+        assert_eq!(decode_secret("pässwörd".as_bytes(), false, &mut out).unwrap(), "pässwörd".as_bytes());
+        let longest = [b'x'; SECRET_MAX_LEN];
+        assert_eq!(decode_secret(&longest, false, &mut out).unwrap(), &longest[..]);
+
+        let binary = [0u8, 1, 2, b'\n', 0xFF];
+        let b64 = STANDARD.encode(binary);
+        assert_eq!(decode_secret(format!("{b64}\n").as_bytes(), true, &mut out).unwrap(), &binary[..]);
+        let longest_b64 = STANDARD.encode([7u8; SECRET_MAX_LEN]);
+        assert_eq!(decode_secret(longest_b64.as_bytes(), true, &mut out).unwrap(), &[7u8; SECRET_MAX_LEN][..]);
+        assert!(MAX_SECRET_INPUT_LEN >= 3 + longest_b64.len() + 2, "the input limit fits the longest base64 secret");
+
+        for (text, base64, why) in [
+            (&b""[..], false, "empty"),
+            (b"\n", false, "newline only"),
+            (&[b'x'; SECRET_MAX_LEN + 1][..], false, "too long"),
+            (b"\xFF\xFEh\0i\0", false, "UTF-16"),
+            (b"not base64!", true, "not base64"),
+            (b"aGk", true, "unpadded"),
+            (b"", true, "empty base64"),
+        ] {
+            assert!(decode_secret(text, base64, &mut out).is_err(), "{why}");
+        }
+        let too_long_b64 = STANDARD.encode([7u8; SECRET_MAX_LEN + 1]);
+        let err = decode_secret(too_long_b64.as_bytes(), true, &mut out).unwrap_err();
+        assert!(err.contains("1 to 256 bytes"), "{err}");
+        assert!(out.iter().all(|&b| b == 0), "a refused decode leaves nothing behind");
+        let err = decode_secret(b"!!!!", true, &mut out).unwrap_err();
+        assert!(!err.contains("!!!!"), "no input in messages: {err}");
+        // Raw input past the decode buffer (which is sized for base64) is
+        // refused before it is copied; within it but past 256, after.
+        let err = decode_secret(&[b'x'; MAX_SECRET_DECODED_LEN + 1], false, &mut out).unwrap_err();
+        assert_eq!(err, format!("the secret is longer than {SECRET_MAX_LEN} bytes"));
+        let err = decode_secret(&[b'x'; MAX_SECRET_DECODED_LEN], false, &mut out).unwrap_err();
+        assert!(err.contains(&format!("got {MAX_SECRET_DECODED_LEN}")), "{err}");
+        assert!(out.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn an_input_file_must_belong_to_root_or_this_user() {
+        assert!(require_trusted_input_owner("--secret-file", "/s", 0, 1000).is_ok(), "root");
+        assert!(require_trusted_input_owner("--secret-file", "/s", 1000, 1000).is_ok(), "this user");
+        let err = require_trusted_input_owner("--secret-file", "/s", 1001, 1000).unwrap_err();
+        assert_eq!(err, "--secret-file /s is owned by uid 1001, which is neither root nor this process's user");
+    }
+
+    #[test]
+    fn every_input_folder_problem_names_the_flag_the_file_and_the_folder() {
+        let dir = Path::new("/srv/in");
+        let cases = [
+            (admin::DirProblem::Owner(1001), "is owned by uid 1001"),
+            (admin::DirProblem::Writable { mode: 0o1777 }, "(mode 1777) (sticky, like /tmp, which is not enough)"),
+            (admin::DirProblem::Writable { mode: 0o775 }, "(mode 775), so"),
+            (admin::DirProblem::NotADirectory, "folder /srv/in: not a directory"),
+            (admin::DirProblem::Unexaminable("vanished".into()), "folder /srv/in: vanished"),
+        ];
+        for (problem, expected) in cases {
+            let msg = describe_input_folder_problem("--secret-file", "the secret", "/srv/in/s", dir, problem);
+            assert!(msg.contains("--secret-file /srv/in/s") && msg.contains("/srv/in"), "{msg}");
+            assert!(msg.contains(expected), "expected {expected:?} in {msg}");
+        }
+    }
+
+    #[test]
+    fn secret_names_follow_the_library_rule() {
+        for ok in ["vault.password", "ssl.certificate", "db_admin-2", &"a".repeat(SECRET_NAME_MAX_LEN)] {
+            assert!(validate_secret_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "Vault.password", "vault password", "vault/password", "pässword", &"a".repeat(SECRET_NAME_MAX_LEN + 1)] {
+            assert!(validate_secret_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_secret_limits_mirror_the_header() {
+        let header = include_str!("../../include/hkdfguard.h");
+        for expected in [
+            format!("#define HKDFGUARD_SECRET_MAX_LEN {SECRET_MAX_LEN}"),
+            format!("#define HKDFGUARD_SECRET_NAME_MAX_LEN {SECRET_NAME_MAX_LEN}"),
+        ] {
+            assert!(header.contains(&expected), "include/hkdfguard.h must contain `{expected}`");
+        }
+        let max_wrapped: usize = header
+            .lines()
+            .find_map(|l| l.strip_prefix("#define HKDFGUARD_SECRET_WRAPPED_MAX_LEN "))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("HKDFGUARD_SECRET_WRAPPED_MAX_LEN");
+        assert!(INITIAL_SECRET_WRAPPED_CAPACITY >= max_wrapped, "protect never needs to retry");
+    }
+
+    #[test]
     fn parse_wrap_takes_an_optional_group_once() {
         match expect_run(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--group", "orders"])) {
             Command::Wrap { group, .. } => assert_eq!(group.as_deref(), Some("orders")),
@@ -2529,7 +3096,7 @@ mod tests {
         }
         let bad = format!("{}zz", "ab".repeat(31));
         assert!(expect_parse_err(argv(&["prog", "retire", "-sn", "svc", "-fp", &bad])).contains("only hex characters"));
-        assert!(expect_parse_err(argv(&["prog", "frobnicate"])).contains("expected `provision`, `wrap` or `retire`"));
+        assert!(expect_parse_err(argv(&["prog", "frobnicate"])).contains("expected `provision`, `wrap`, `protect` or `retire`"));
     }
 
     #[test]

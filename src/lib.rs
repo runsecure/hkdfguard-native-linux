@@ -347,6 +347,94 @@ pub extern "C" fn hkdfguard_unwrap_dek(
     }
 }
 
+/// Wraps a secret -- a password, such as a certificate's or a vault's --
+/// of 1..=256 bytes under the persistent KEK identified by `service`,
+/// bound to the secret name `secret_name`. See `include/hkdfguard.h` for
+/// the full contract.
+///
+/// The wrapping key is derived under the SP 800-108 label
+/// `"hkdfguard-secret-v1/" || secret_name` (see [`crypto::wrap_secret`]),
+/// so the payload opens only through [`hkdfguard_unwrap_secret`] with the
+/// same `service` and `secret_name`: never as a DEK, and never as a secret
+/// of another name.
+///
+/// # Parameters
+/// - `service`: as for [`hkdfguard_wrap_dek`].
+/// - `secret_name`: NUL-terminated, 1..=64 bytes of lowercase ASCII
+///   letters, digits, `.`, `_` and `-` (e.g. `"vault.password"`). Not
+///   normalized: anything else, including uppercase, is
+///   [`status::INVALID_ARGUMENT`].
+/// - `secret` / `secret_len`: the secret, 1..=256 bytes.
+/// - `out` / `out_len`: as for [`hkdfguard_wrap_dek`], with
+///   `HKDFGUARD_SECRET_WRAPPED_MAX_LEN` as the size that always fits.
+///
+/// # Safety
+/// As for [`hkdfguard_wrap_dek`]; `secret_name` must be a valid,
+/// NUL-terminated, readable C string pointer, and `secret` readable for
+/// `secret_len` bytes.
+#[no_mangle]
+pub extern "C" fn hkdfguard_wrap_secret(
+    service: *const c_char,
+    secret_name: *const c_char,
+    secret: *const u8,
+    secret_len: c_int,
+    out: *mut u8,
+    out_len: *mut c_int,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wrap_secret_impl(service, secret_name, secret, secret_len, out, out_len)
+    })) {
+        Ok(code) => code,
+        Err(_) => {
+            report_caught_panic("hkdfguard_wrap_secret", Some((audit::Op::WrapSecret, service)));
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+/// Unwraps a payload produced by [`hkdfguard_wrap_secret`] for the same
+/// `service` and `secret_name`. See `include/hkdfguard.h` for the full
+/// contract.
+///
+/// # Parameters
+/// - `service`, `secret_name`: as for [`hkdfguard_wrap_secret`]; either
+///   one differing from the wrap's yields [`status::PAYLOAD_AUTH_FAILED`]
+///   (or [`status::KEK_FINGERPRINT_MISMATCH`] for a service with another
+///   KEK). A DEK payload is [`status::PAYLOAD_MALFORMED`].
+/// - `wrapped` / `wrapped_len`: the wrapped payload bytes.
+/// - `out` / `out_len`: `*out_len` must be at least 256
+///   (`HKDFGUARD_SECRET_MAX_LEN`), checked before any provider is
+///   reached; below that, [`status::BUFFER_TOO_SMALL`] with `*out_len`
+///   set to 256. On success the secret is written to `out` -- not
+///   NUL-terminated -- and `*out_len` set to its length. On any failure,
+///   the caller's whole declared buffer is zeroed, as for
+///   [`hkdfguard_unwrap_dek`].
+///
+/// # Safety
+/// As for [`hkdfguard_unwrap_dek`], plus `secret_name` as for
+/// [`hkdfguard_wrap_secret`].
+#[no_mangle]
+pub extern "C" fn hkdfguard_unwrap_secret(
+    service: *const c_char,
+    secret_name: *const c_char,
+    wrapped: *const u8,
+    wrapped_len: c_int,
+    out: *mut u8,
+    out_len: *mut c_int,
+) -> c_int {
+    let capacity = declared_capacity(out_len);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unwrap_secret_impl(service, secret_name, wrapped, wrapped_len, out, out_len, capacity)
+    })) {
+        Ok(code) => code,
+        Err(_) => {
+            zero_caller_buffer(out, capacity); // first: the reporting below runs host code
+            report_caught_panic("hkdfguard_unwrap_secret", Some((audit::Op::UnwrapSecret, service)));
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
 // Audits a panic caught at an ABI boundary as INTERNAL_ERROR (event
 // 2005), as the Windows build audits anything that escapes. Only when the
 // service name is valid: an invalid one is a caller mistake, never audited.
@@ -1063,6 +1151,187 @@ fn unwrap_impl(
     status::OK
 }
 
+// Validates the caller's `secret_name` C string: 1..=SECRET_NAME_MAX_LEN
+// bytes that `crypto::is_valid_secret_name` accepts. Read with the same
+// bounded scan as `cstr_to_service`, so an unterminated buffer is never
+// over-read. Not normalized: a name is used exactly as given.
+fn cstr_to_secret_name(ptr: *const c_char) -> Result<String, c_int> {
+    if ptr.is_null() {
+        return Err(status::INVALID_ARGUMENT);
+    }
+    let mut len = 0usize;
+    loop {
+        if len > crypto::SECRET_NAME_MAX_LEN {
+            return Err(status::INVALID_ARGUMENT); // no NUL within the limit: too long, or unterminated
+        }
+        // SAFETY: caller contract guarantees a readable, NUL-terminated
+        // string; each read is at offset len <= SECRET_NAME_MAX_LEN and the
+        // loop stops at the first NUL, so nothing past it is read.
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    // SAFETY: the loop established that `len` bytes at `ptr` are readable.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    match std::str::from_utf8(bytes) {
+        Ok(name) if crypto::is_valid_secret_name(name) => Ok(name.to_owned()),
+        _ => Err(status::INVALID_ARGUMENT),
+    }
+}
+
+// The actual logic behind `hkdfguard_wrap_secret`; the same shape as
+// `wrap_impl`.
+fn wrap_secret_impl(
+    service: *const c_char,
+    secret_name: *const c_char,
+    secret: *const u8,
+    secret_len: c_int,
+    out: *mut u8,
+    out_len: *mut c_int,
+) -> c_int {
+    if secret.is_null() || out_len.is_null() {
+        return status::INVALID_ARGUMENT;
+    }
+    if secret_len < 1 || secret_len as usize > crypto::SECRET_MAX_LEN {
+        return status::INVALID_ARGUMENT; // a secret is 1..=256 bytes
+    }
+    // SAFETY: out_len is non-null (checked above), and per caller contract
+    // points at a valid, initialized `int`.
+    let capacity = unsafe { *out_len };
+    if capacity < 0 {
+        return status::INVALID_ARGUMENT;
+    }
+    let service_str = match cstr_to_service(service) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let name = match cstr_to_secret_name(secret_name) {
+        Ok(n) => n,
+        Err(code) => return code,
+    };
+
+    // Buffer checks that need no provider, as in `wrap_impl`.
+    if out.is_null() && capacity > 0 {
+        return status::INVALID_ARGUMENT;
+    }
+    if (capacity as usize) < crypto::MIN_SECRET_WRAPPED_LEN {
+        // SAFETY: out_len is non-null (checked above).
+        unsafe { *out_len = crypto::MAX_SECRET_WRAPPED_LEN as c_int };
+        return status::BUFFER_TOO_SMALL;
+    }
+
+    // SAFETY: secret is non-null and 1 <= secret_len <= SECRET_MAX_LEN;
+    // caller contract guarantees it is readable for that many bytes.
+    // `crypto::wrap_secret` copies it into its own stack block; no other
+    // copy is made here.
+    let secret_slice = unsafe { std::slice::from_raw_parts(secret, secret_len as usize) };
+
+    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
+    let wrapped = match crypto::wrap_secret(&service_str, &name, secret_slice) {
+        Ok(w) => w,
+        Err(e) => {
+            log::error!("hkdfguard: wrap_secret failed for service \"{service_str}\", secret \"{name}\": {e}"); // the name is public; the secret is never logged
+            let code = e.status_code();
+            audit::operation_failed(audit::Op::WrapSecret, &service_str, code);
+            return code;
+        }
+    };
+
+    if (capacity as usize) < wrapped.len() {
+        // SAFETY: out_len is non-null (checked above).
+        unsafe { *out_len = wrapped.len() as c_int };
+        return status::BUFFER_TOO_SMALL;
+    }
+    // SAFETY: out is non-null and writable for capacity >= wrapped.len() bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(wrapped.as_ptr(), out, wrapped.len());
+        *out_len = wrapped.len() as c_int;
+    }
+    audit::secret_operation(audit::Op::WrapSecret, &service_str, &name, &wrapped);
+    status::OK
+}
+
+// The actual logic behind `hkdfguard_unwrap_secret`; the same shape as
+// `unwrap_impl`, zeroing the caller's buffer on every failure.
+fn unwrap_secret_impl(
+    service: *const c_char,
+    secret_name: *const c_char,
+    wrapped: *const u8,
+    wrapped_len: c_int,
+    out: *mut u8,
+    out_len: *mut c_int,
+    capacity: c_int, // *out_len as declared on entry (0 if out_len is NULL)
+) -> c_int {
+    let zero_out_buffer = || zero_caller_buffer(out, capacity);
+
+    if out_len.is_null() {
+        return status::INVALID_ARGUMENT; // no declared capacity, so nothing can be safely zeroed
+    }
+    if wrapped.is_null() || wrapped_len < 0 || capacity < 0 {
+        zero_out_buffer();
+        return status::INVALID_ARGUMENT;
+    }
+    let service_str = match cstr_to_service(service) {
+        Ok(s) => s,
+        Err(code) => {
+            zero_out_buffer();
+            return code;
+        }
+    };
+    let name = match cstr_to_secret_name(secret_name) {
+        Ok(n) => n,
+        Err(code) => {
+            zero_out_buffer();
+            return code;
+        }
+    };
+
+    // Before any provider work: the secret's length isn't known until it
+    // is decrypted, so `out` must be able to hold the longest one.
+    if (capacity as usize) < crypto::SECRET_MAX_LEN {
+        zero_out_buffer();
+        // SAFETY: out_len is non-null (checked above).
+        unsafe { *out_len = crypto::SECRET_MAX_LEN as c_int };
+        return status::BUFFER_TOO_SMALL;
+    }
+    if out.is_null() {
+        return status::INVALID_ARGUMENT; // a declared capacity with nowhere to write
+    }
+
+    // SAFETY: wrapped is non-null and wrapped_len >= 0; caller contract
+    // guarantees it is readable for that many bytes.
+    let wrapped_slice = unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) };
+
+    let _policy = policy::snapshot_for_call();
+    let secret = match crypto::unwrap_secret(&service_str, &name, wrapped_slice) {
+        Ok(s) => s, // the padded block, on the stack, scrubbed on drop
+        Err(e) => {
+            log::error!("hkdfguard: unwrap_secret failed for service \"{service_str}\", secret \"{name}\": {e}");
+            zero_out_buffer();
+            let code = e.status_code();
+            audit::operation_failed(audit::Op::UnwrapSecret, &service_str, code);
+            return code;
+        }
+    };
+
+    // Before the secret is written, as in `unwrap_impl`: `out` may be the
+    // caller's `wrapped` buffer. `wrapped_slice` is not read after this.
+    if policy::audit_unwrap_success() {
+        audit::secret_operation(audit::Op::UnwrapSecret, &service_str, &name, wrapped_slice);
+    }
+
+    let bytes = secret.as_bytes();
+    // SAFETY: out is non-null and writable for capacity >= SECRET_MAX_LEN
+    // >= bytes.len(). `secret` is our own copy, so it never overlaps `out`.
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        *out_len = bytes.len() as c_int;
+    }
+    drop(secret); // scrubbed now rather than at scope exit
+    status::OK
+}
+
 /// Reports the security model in force and whether a key file this
 /// process writes would be trusted under it -- the Windows build's
 /// function, value for value. See [`security_model`].
@@ -1240,11 +1509,38 @@ fn key_file_principal_trusted_impl(principal: *const c_char, out_trusted: *mut c
 #[no_mangle]
 pub extern "C" fn hkdfguard_open_file(path: *const c_char, out: *mut u8, out_len: *mut c_int) -> c_int {
     let capacity = declared_capacity(out_len);
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_file_impl(path, out, out_len, capacity))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_file_impl(key_file::Kind::Dek, path, out, out_len, capacity)
+    })) {
         Ok(code) => code,
         Err(_) => {
             zero_caller_buffer(out, capacity); // first: the reporting below runs host code
             report_caught_panic("hkdfguard_open_file", None);
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+/// [`hkdfguard_open_file`], for a file holding a payload from
+/// [`hkdfguard_wrap_secret`] (as `hkdfguard protect --key-file-path`
+/// writes): the same ownership, permission and directory checks, against
+/// the secret payload's sizes, with `HKDFGUARD_SECRET_WRAPPED_MAX_LEN` as
+/// the capacity that always fits. No plaintext-key detection: a secret
+/// saved unwrapped is shorter than any secret payload, so it is
+/// [`status::FILE_TOO_SHORT`]. See `include/hkdfguard.h`.
+///
+/// # Safety
+/// As for [`hkdfguard_open_file`].
+#[no_mangle]
+pub extern "C" fn hkdfguard_open_secret_file(path: *const c_char, out: *mut u8, out_len: *mut c_int) -> c_int {
+    let capacity = declared_capacity(out_len);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_file_impl(key_file::Kind::Secret, path, out, out_len, capacity)
+    })) {
+        Ok(code) => code,
+        Err(_) => {
+            zero_caller_buffer(out, capacity); // first: the reporting below runs host code
+            report_caught_panic("hkdfguard_open_secret_file", None);
             status::INTERNAL_ERROR
         }
     }
@@ -1285,7 +1581,11 @@ fn cstr_to_path(ptr: *const c_char) -> Result<std::path::PathBuf, c_int> {
 
 // The actual logic behind `hkdfguard_open_file`, running inside the
 // `catch_unwind` wrapper above.
-fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capacity: c_int) -> c_int {
+fn open_file_impl(kind: key_file::Kind, path: *const c_char, out: *mut u8, out_len: *mut c_int, capacity: c_int) -> c_int {
+    let function = match kind {
+        key_file::Kind::Dek => "hkdfguard_open_file",
+        key_file::Kind::Secret => "hkdfguard_open_secret_file",
+    };
     if out_len.is_null() {
         return status::INVALID_ARGUMENT; // no declared capacity, so nothing can be safely zeroed
     }
@@ -1312,8 +1612,8 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
     };
     // Too small for any payload (including the 0 of a size probe):
     // answered without opening the file, as hkdfguard_wrap_dek does.
-    if (capacity as usize) < crypto::MIN_WRAPPED_LEN {
-        return too_small(crypto::MAX_WRAPPED_LEN as c_int);
+    if (capacity as usize) < kind.min_len() {
+        return too_small(kind.max_len() as c_int);
     }
     if out.is_null() {
         return fail(status::INVALID_ARGUMENT); // a declared capacity with nowhere to write
@@ -1325,11 +1625,15 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
     let trust = match security_model::Trust::current() {
         Ok(trust) => trust,
         Err(e) => {
-            log::error!("hkdfguard: hkdfguard_open_file can't decide whose key files to trust: {e}");
+            log::error!("hkdfguard: {function} can't decide whose key files to trust: {e}");
             return fail(e.status_code());
         }
     };
-    let wrapped = match key_file::read(&path, &trust) {
+    let read = match kind {
+        key_file::Kind::Dek => key_file::read(&path, &trust),
+        key_file::Kind::Secret => key_file::read_secret(&path, &trust),
+    };
+    let wrapped = match read {
         Ok(contents) => {
             if trust.model() == security_model::SecurityModel::Developer {
                 audit::developer_model_key_file(&path); // once per process
@@ -1337,7 +1641,14 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
             contents // wiped when it drops at the end of this function
         }
         Err(e) => {
-            log::error!("hkdfguard: hkdfguard_open_file refused key file {}: {}", path.display(), e.describe());
+            let hint = match (kind, e) {
+                // Nothing recognises a secret saved unwrapped; its size is the one clue.
+                (key_file::Kind::Secret, key_file::KeyFileError::TooShort) => {
+                    " (if it holds the secret itself rather than its wrapped form, treat the secret as exposed)"
+                }
+                _ => "",
+            };
+            log::error!("hkdfguard: {function} refused key file {}: {}{hint}", path.display(), e.describe());
             let code = e.status_code();
             // Audited: a possible key exposure (event 2006), and a file
             // that could have been replaced or isn't a payload (2003).
@@ -1349,7 +1660,7 @@ fn open_file_impl(path: *const c_char, out: *mut u8, out_len: *mut c_int, capaci
             return fail(code);
         }
     };
-    let len = wrapped.as_slice().len(); // at most MAX_WRAPPED_LEN, so it fits a c_int
+    let len = wrapped.as_slice().len(); // at most kind.max_len(), so it fits a c_int
     if len > capacity as usize {
         return too_small(len as c_int);
     }
@@ -1745,6 +2056,168 @@ mod ffi_tests {
             assert_eq!(rc, status::OK);
             assert_eq!(out_len, 32);
             assert_eq!(out, dek); // must recover exactly the original DEK
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn ffi_secret_round_trip_and_contract() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders").unwrap();
+            let name = CString::new("ssl.certificate").unwrap();
+            create_kek_for_test(&service);
+            let secret = b"p@ss\0word"; // binary-safe: an embedded NUL is just a byte
+
+            // Size probe: answered without a provider, with the max size.
+            let mut probe: c_int = 0;
+            let rc = hkdfguard_wrap_secret(service.as_ptr(), name.as_ptr(), secret.as_ptr(), secret.len() as c_int, ptr::null_mut(), &mut probe);
+            assert_eq!(rc, status::BUFFER_TOO_SMALL);
+            assert_eq!(probe as usize, crypto::MAX_SECRET_WRAPPED_LEN);
+
+            let mut wrapped = [0u8; crypto::MAX_SECRET_WRAPPED_LEN];
+            let mut wrapped_len = wrapped.len() as c_int;
+            let rc = hkdfguard_wrap_secret(service.as_ptr(), name.as_ptr(), secret.as_ptr(), secret.len() as c_int, wrapped.as_mut_ptr(), &mut wrapped_len);
+            assert_eq!(rc, status::OK);
+
+            // Unwrap needs room for the longest secret, checked up front, zeroing.
+            let mut small = [0xEEu8; crypto::SECRET_MAX_LEN - 1];
+            let mut small_len = small.len() as c_int;
+            let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), wrapped.as_ptr(), wrapped_len, small.as_mut_ptr(), &mut small_len);
+            assert_eq!(rc, status::BUFFER_TOO_SMALL);
+            assert_eq!(small_len as usize, crypto::SECRET_MAX_LEN);
+            assert!(small.iter().all(|&b| b == 0));
+
+            let mut out = [0xEEu8; crypto::SECRET_MAX_LEN];
+            let mut out_len = out.len() as c_int;
+            let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), wrapped.as_ptr(), wrapped_len, out.as_mut_ptr(), &mut out_len);
+            assert_eq!(rc, status::OK);
+            assert_eq!(&out[..out_len as usize], secret);
+
+            // In place: `out` is the `wrapped` buffer itself.
+            let mut inplace = wrapped;
+            let mut inplace_len = inplace.len() as c_int;
+            let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), inplace.as_ptr(), wrapped_len, inplace.as_mut_ptr(), &mut inplace_len);
+            assert_eq!(rc, status::OK);
+            assert_eq!(&inplace[..inplace_len as usize], secret);
+
+            // The wrong name: auth failure, and the caller's buffer zeroed.
+            let other = CString::new("vault.password").unwrap();
+            let mut out = [0xEEu8; crypto::SECRET_MAX_LEN];
+            let mut out_len = out.len() as c_int;
+            let rc = hkdfguard_unwrap_secret(service.as_ptr(), other.as_ptr(), wrapped.as_ptr(), wrapped_len, out.as_mut_ptr(), &mut out_len);
+            assert_eq!(rc, status::PAYLOAD_AUTH_FAILED);
+            assert!(out.iter().all(|&b| b == 0));
+
+            // A secret payload is not a DEK, and a DEK payload not a secret.
+            let mut dek_out = [0xEEu8; 32];
+            let mut dek_out_len = 32;
+            assert_eq!(hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped_len, dek_out.as_mut_ptr(), &mut dek_out_len), status::PAYLOAD_MALFORMED);
+            let dek = [7u8; 32];
+            let mut dek_wrapped = [0u8; 512];
+            let mut dek_wrapped_len = dek_wrapped.len() as c_int;
+            assert_eq!(hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, dek_wrapped.as_mut_ptr(), &mut dek_wrapped_len), status::OK);
+            let mut out_len = out.len() as c_int;
+            assert_eq!(
+                hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), dek_wrapped.as_ptr(), dek_wrapped_len, out.as_mut_ptr(), &mut out_len),
+                status::PAYLOAD_MALFORMED
+            );
+        });
+    }
+
+    #[test]
+    fn ffi_secret_arguments_are_checked_before_any_provider() {
+        // No KEK, no policy: each of these is refused on its arguments alone.
+        let service = CString::new("com.company.nokek").unwrap();
+        let name = CString::new("vault.password").unwrap();
+        let unterminated = [b'a'; crypto::SECRET_NAME_MAX_LEN + 8]; // no NUL anywhere: the bounded scan must stop
+        let mut buf = [0u8; crypto::MAX_SECRET_WRAPPED_LEN];
+        let secret = [1u8; crypto::SECRET_MAX_LEN + 1];
+        let wrap = |svc: *const c_char, nm: *const c_char, len: c_int, buf: &mut [u8]| {
+            let mut out_len = buf.len() as c_int;
+            hkdfguard_wrap_secret(svc, nm, secret.as_ptr(), len, buf.as_mut_ptr(), &mut out_len)
+        };
+        for bad_name in ["", "Vault.password", "vault password"] {
+            let bad = CString::new(bad_name).unwrap();
+            assert_eq!(wrap(service.as_ptr(), bad.as_ptr(), 4, &mut buf), status::INVALID_ARGUMENT, "{bad_name:?}");
+        }
+        assert_eq!(wrap(service.as_ptr(), ptr::null(), 4, &mut buf), status::INVALID_ARGUMENT);
+        assert_eq!(wrap(service.as_ptr(), unterminated.as_ptr().cast(), 4, &mut buf), status::INVALID_ARGUMENT);
+        assert_eq!(wrap(service.as_ptr(), name.as_ptr(), 0, &mut buf), status::INVALID_ARGUMENT);
+        assert_eq!(wrap(service.as_ptr(), name.as_ptr(), (crypto::SECRET_MAX_LEN + 1) as c_int, &mut buf), status::INVALID_ARGUMENT);
+        assert_eq!(wrap(ptr::null(), name.as_ptr(), 4, &mut buf), status::INVALID_SERVICE_NAME);
+
+        let mut out = [0xEEu8; crypto::SECRET_MAX_LEN];
+        let mut out_len = out.len() as c_int;
+        let rc = hkdfguard_unwrap_secret(service.as_ptr(), unterminated.as_ptr().cast(), buf.as_ptr(), 10, out.as_mut_ptr(), &mut out_len);
+        assert_eq!(rc, status::INVALID_ARGUMENT);
+        assert!(out.iter().all(|&b| b == 0), "a refused unwrap zeroes the buffer too");
+    }
+
+    #[test]
+    fn ffi_secret_pointer_and_capacity_arguments_are_checked_before_any_provider() {
+        let service = CString::new("com.company.nokek").unwrap();
+        let name = CString::new("vault.password").unwrap();
+        let secret = b"hunter2";
+        let mut buf = [0xEEu8; crypto::MAX_SECRET_WRAPPED_LEN];
+        let wrap = |sec: *const u8, out: *mut u8, out_len: *mut c_int| {
+            hkdfguard_wrap_secret(service.as_ptr(), name.as_ptr(), sec, secret.len() as c_int, out, out_len)
+        };
+        let mut cap = crypto::MAX_SECRET_WRAPPED_LEN as c_int;
+        assert_eq!(wrap(ptr::null(), buf.as_mut_ptr(), &mut cap), status::INVALID_ARGUMENT, "NULL secret");
+        assert_eq!(wrap(secret.as_ptr(), buf.as_mut_ptr(), ptr::null_mut()), status::INVALID_ARGUMENT, "NULL out_len");
+        let mut negative: c_int = -1;
+        assert_eq!(wrap(secret.as_ptr(), buf.as_mut_ptr(), &mut negative), status::INVALID_ARGUMENT, "negative capacity");
+        assert_eq!(negative, -1, "*out_len left alone");
+        assert_eq!(wrap(secret.as_ptr(), ptr::null_mut(), &mut cap), status::INVALID_ARGUMENT, "NULL out, positive capacity");
+        assert!(buf.iter().all(|&b| b == 0xEE), "a refused wrap writes nothing");
+
+        let unwrap = |svc: *const c_char, wrapped: *const u8, wrapped_len: c_int, out: *mut u8, out_len: *mut c_int| {
+            hkdfguard_unwrap_secret(svc, name.as_ptr(), wrapped, wrapped_len, out, out_len)
+        };
+        let mut out = [0xEEu8; crypto::SECRET_MAX_LEN];
+        let reset = |out: &mut [u8; crypto::SECRET_MAX_LEN]| out.fill(0xEE);
+        let cap = crypto::SECRET_MAX_LEN as c_int;
+
+        assert_eq!(unwrap(service.as_ptr(), buf.as_ptr(), 10, out.as_mut_ptr(), ptr::null_mut()), status::INVALID_ARGUMENT);
+        assert!(out.iter().all(|&b| b == 0xEE), "no out_len: no declared capacity, so nothing is zeroed");
+
+        for (svc, wrapped, wrapped_len, why, expected) in [
+            (service.as_ptr(), ptr::null(), 10, "NULL wrapped", status::INVALID_ARGUMENT),
+            (service.as_ptr(), buf.as_ptr(), -1, "negative wrapped_len", status::INVALID_ARGUMENT),
+            (ptr::null(), buf.as_ptr(), 10, "NULL service", status::INVALID_SERVICE_NAME),
+        ] {
+            reset(&mut out);
+            let mut out_len = cap;
+            assert_eq!(unwrap(svc, wrapped, wrapped_len, out.as_mut_ptr(), &mut out_len), expected, "{why}");
+            assert!(out.iter().all(|&b| b == 0), "{why}: the buffer is zeroed");
+        }
+        let mut negative: c_int = -1;
+        assert_eq!(unwrap(service.as_ptr(), buf.as_ptr(), 10, out.as_mut_ptr(), &mut negative), status::INVALID_ARGUMENT, "negative capacity");
+        let mut out_len = cap;
+        assert_eq!(unwrap(service.as_ptr(), buf.as_ptr(), 10, ptr::null_mut(), &mut out_len), status::INVALID_ARGUMENT, "NULL out, room declared");
+    }
+
+    #[test]
+    #[serial]
+    fn ffi_secret_wrap_reports_the_exact_size_when_only_the_minimum_fits() {
+        // Every payload is MIN_SECRET_WRAPPED_LEN plus its key id; a buffer
+        // of just the minimum gets the exact length back, and is untouched.
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders.exactsize").unwrap();
+            let name = CString::new("vault.password").unwrap();
+            create_kek_for_test(&service);
+            let secret = b"hunter2";
+            let mut buf = [0xEEu8; crypto::MIN_SECRET_WRAPPED_LEN];
+            let mut len = buf.len() as c_int;
+            let rc = hkdfguard_wrap_secret(service.as_ptr(), name.as_ptr(), secret.as_ptr(), secret.len() as c_int, buf.as_mut_ptr(), &mut len);
+            assert_eq!(rc, status::BUFFER_TOO_SMALL);
+            assert!(len as usize > crypto::MIN_SECRET_WRAPPED_LEN && len as usize <= crypto::MAX_SECRET_WRAPPED_LEN, "{len}");
+            assert!(buf.iter().all(|&b| b == 0xEE), "BUFFER_TOO_SMALL writes nothing");
+
+            let mut exact = vec![0u8; len as usize];
+            let mut exact_len = len;
+            let rc = hkdfguard_wrap_secret(service.as_ptr(), name.as_ptr(), secret.as_ptr(), secret.len() as c_int, exact.as_mut_ptr(), &mut exact_len);
+            assert_eq!((rc, exact_len), (status::OK, len), "the reported size is enough");
         });
     }
 
@@ -2661,6 +3134,106 @@ mod ffi_tests {
         });
     }
 
+    // ---- hkdfguard_open_secret_file ----
+
+    fn open_secret_file(path: &CString, capacity: usize) -> (c_int, Vec<u8>, c_int) {
+        let mut out = vec![0xAAu8; capacity];
+        let mut out_len = capacity as c_int;
+        let rc = hkdfguard_open_secret_file(path.as_ptr(), out.as_mut_ptr(), &mut out_len);
+        (rc, out, out_len)
+    }
+
+    #[test]
+    #[serial]
+    fn open_secret_file_then_unwrap_secret_recovers_the_secret() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.orders.opensecret").unwrap();
+            let name = CString::new("ssl.certificate").unwrap();
+            create_kek_for_test(&service);
+            let secret = b"pkcs12 passphrase";
+            let mut buf = [0u8; crypto::MAX_SECRET_WRAPPED_LEN];
+            let mut len = buf.len() as c_int;
+            let rc = hkdfguard_wrap_secret(service.as_ptr(), name.as_ptr(), secret.as_ptr(), secret.len() as c_int, buf.as_mut_ptr(), &mut len);
+            assert_eq!(rc, status::OK);
+            let wrapped = buf[..len as usize].to_vec();
+            let (_dir, path) = key_file_with(&wrapped);
+
+            // A size probe gets the secret maximum, without opening the file.
+            let (rc, _, probe) = open_secret_file(&path, 0);
+            assert_eq!((rc, probe as usize), (status::BUFFER_TOO_SMALL, crypto::MAX_SECRET_WRAPPED_LEN));
+
+            let (rc, out, out_len) = open_secret_file(&path, crypto::MAX_SECRET_WRAPPED_LEN);
+            assert_eq!(rc, status::OK);
+            assert_eq!(&out[..out_len as usize], &wrapped[..]);
+
+            let mut recovered = [0u8; crypto::SECRET_MAX_LEN];
+            let mut recovered_len = recovered.len() as c_int;
+            let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), out.as_ptr(), out_len, recovered.as_mut_ptr(), &mut recovered_len);
+            assert_eq!(rc, status::OK);
+            assert_eq!(&recovered[..recovered_len as usize], secret);
+
+            // hkdfguard_open_file refuses the same file: a secret is not a DEK.
+            assert_eq!(open_file(&path, crypto::MAX_SECRET_WRAPPED_LEN).0, status::FILE_TOO_LONG);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn open_secret_file_refuses_what_is_not_a_wrapped_secret_and_zeroes_the_buffer() {
+        let _policy = developer_policy();
+        let secret_payload = payload::Payload {
+            ciphertext: vec![3; crypto::SECRET_BLOCK_LEN + crypto::TAG_LEN],
+            ..payload::Payload::from_bytes(&sample_wrapped_bytes()).unwrap()
+        }
+        .to_bytes();
+        let mut wrong_ct_len = secret_payload.clone();
+        let ct_len_at = 4 + b"ephemeral:com.company.orders".len() + payload::SALT_LEN + payload::NONCE_LEN;
+        wrong_ct_len[ct_len_at] ^= 1;
+        let cases: [(&str, Vec<u8>, c_int); 6] = [
+            ("a plaintext password", b"hunter2\n".to_vec(), status::FILE_TOO_SHORT),
+            ("the longest plaintext secret", vec![b'p'; crypto::SECRET_MAX_LEN], status::FILE_TOO_SHORT),
+            ("a wrapped DEK", sample_wrapped_bytes(), status::FILE_TOO_SHORT),
+            ("truncated", secret_payload[..secret_payload.len() - 1].to_vec(), status::FILE_TOO_SHORT),
+            ("oversized", vec![0u8; crypto::MAX_SECRET_WRAPPED_LEN + 1], status::FILE_TOO_LONG),
+            ("a ciphertext length no wrap produces", wrong_ct_len, status::FILE_MALFORMED),
+        ];
+        for (name, contents, expected) in cases {
+            let (_dir, path) = key_file_with(&contents);
+            let (rc, out, out_len) = open_secret_file(&path, crypto::MAX_SECRET_WRAPPED_LEN);
+            assert_eq!(rc, expected, "{name}");
+            assert_eq!(out_len, crypto::MAX_SECRET_WRAPPED_LEN as c_int, "{name}: *out_len left as the caller set it");
+            assert!(out.iter().all(|&b| b == 0), "{name}: the whole buffer is zeroed");
+        }
+        // The well-formed one passes the file checks (it unwraps nowhere: its KEK is made up).
+        let (_dir, path) = key_file_with(&secret_payload);
+        assert_eq!(open_secret_file(&path, crypto::MAX_SECRET_WRAPPED_LEN).0, status::OK);
+    }
+
+    // The hooks the fuzz harnesses check `hkdfguard_open_secret_file` and
+    // the name rule against are the library's own.
+    #[cfg(hkdfguard_test_paths)]
+    #[test]
+    fn fuzz_support_secret_hooks_are_the_library_rules() {
+        use crate::fuzz_support as fs;
+        assert_eq!(fs::key_file_check_secret(b"hunter2"), Err(status::FILE_TOO_SHORT));
+        assert_eq!(fs::key_file_check_secret(&[0; crypto::MAX_SECRET_WRAPPED_LEN + 1]), Err(status::FILE_TOO_LONG));
+        assert_eq!(fs::SECRET_CIPHERTEXT_LEN, crypto::SECRET_BLOCK_LEN + crypto::TAG_LEN);
+        assert!(fs::is_valid_secret_name("vault.password") && !fs::is_valid_secret_name("Vault.password"));
+    }
+
+    #[test]
+    #[serial]
+    fn open_secret_file_fails_closed_on_a_policy_it_cannot_use() {
+        // Whose key files to trust comes from the policy; a broken one is
+        // POLICY_INVALID, with the buffer zeroed, never a guess.
+        let (_dir, path) = key_file_with(&[0u8; crypto::MIN_SECRET_WRAPPED_LEN]);
+        let _broken = policy::test_support::TestPolicy::exact("security_model = [not toml");
+        let (rc, out, out_len) = open_secret_file(&path, crypto::MAX_SECRET_WRAPPED_LEN);
+        assert_eq!(rc, status::POLICY_INVALID);
+        assert_eq!(out_len, crypto::MAX_SECRET_WRAPPED_LEN as c_int);
+        assert!(out.iter().all(|&b| b == 0));
+    }
+
     #[test]
     #[serial]
     fn open_file_accepts_an_exact_size_buffer() {
@@ -2966,6 +3539,24 @@ mod ffi_tests {
         let records = audit::captured_containing("service=\"com.company.audit.quiet\"");
         assert!(records.iter().any(|r| r.contains("event=1002 ")), "wrap is still audited: {records:?}");
         assert!(!records.iter().any(|r| r.contains("event=1003 ")), "unwrap success is not: {records:?}");
+
+        // The same for a secret: its wrap is audited by name, its unwrap is not.
+        let name = CString::new("vault.password").unwrap();
+        let mut wrapped = [0u8; crypto::MAX_SECRET_WRAPPED_LEN];
+        let mut wrapped_len = wrapped.len() as c_int;
+        let rc = hkdfguard_wrap_secret(service.as_ptr(), name.as_ptr(), b"hunter2".as_ptr(), 7, wrapped.as_mut_ptr(), &mut wrapped_len);
+        assert_eq!(rc, status::OK);
+        let mut out = [0u8; crypto::SECRET_MAX_LEN];
+        let mut out_len = out.len() as c_int;
+        let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), wrapped.as_ptr(), wrapped_len, out.as_mut_ptr(), &mut out_len);
+        assert_eq!((rc, &out[..out_len as usize]), (status::OK, &b"hunter2"[..]));
+        let records = audit::captured_containing("secret=\"vault.password\"");
+        assert!(
+            records.iter().any(|r| r.contains("op=hkdfguard_wrap_secret result=OK service=\"com.company.audit.quiet\" secret=\"vault.password\" provider=EPHEMERAL")),
+            "the secret's wrap is audited, with its provider: {records:?}"
+        );
+        assert!(!records.iter().any(|r| r.contains("op=hkdfguard_unwrap_secret")), "its unwrap is not: {records:?}");
+        assert!(!records.iter().any(|r| r.contains("hunter2")), "never the secret");
     }
 
     #[test]
@@ -3144,7 +3735,24 @@ mod ffi_tests {
 #[cfg(hkdfguard_test_paths)]
 #[doc(hidden)]
 pub mod fuzz_support {
-    pub use crate::crypto::{MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN};
+    pub use crate::crypto::{
+        MAX_KEY_ID_LEN, MAX_SECRET_WRAPPED_LEN, MAX_WRAPPED_LEN, MIN_SECRET_WRAPPED_LEN, MIN_WRAPPED_LEN, SECRET_MAX_LEN,
+        SECRET_NAME_MAX_LEN,
+    };
+
+    /// The one ciphertext length (tag included) a secret wrap produces.
+    pub const SECRET_CIPHERTEXT_LEN: usize = crate::crypto::SECRET_BLOCK_LEN + crate::crypto::TAG_LEN;
+
+    /// `key_file::check_kind(.., Kind::Secret)`: what `hkdfguard_open_secret_file`
+    /// requires of a file's bytes; the status code it would return on `Err`.
+    pub fn key_file_check_secret(bytes: &[u8]) -> Result<(), i32> {
+        crate::key_file::check_kind(bytes, crate::key_file::Kind::Secret).map_err(|e| e.status_code())
+    }
+
+    /// `crypto::is_valid_secret_name`: the library's secret-name rule.
+    pub fn is_valid_secret_name(name: &str) -> bool {
+        crate::crypto::is_valid_secret_name(name)
+    }
 
     /// `Policy::from_toml_str`: the parse and validation
     /// `/etc/hkdfguard/policy.toml` goes through; the refusal on `Err`.

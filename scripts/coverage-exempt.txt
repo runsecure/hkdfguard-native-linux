@@ -1,0 +1,2 @@
+# path<TAB>source line (stripped)<TAB>why it is exempt and which test runs it
+src/bin/hkdfguard.rs	eprintln!("{PROGRAM_NAME}: warning: {warning}");	cli_round_trip::cli_protect_force_warns_when_the_old_file_cannot_be_overwritten asserts this warning; its CLI runs under RLIMIT_FSIZE, so its coverage profile is truncated at exit

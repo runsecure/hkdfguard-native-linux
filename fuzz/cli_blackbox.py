@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Black-box fuzzer for the `hkdfguard` CLI: runs the real binary, as a
 separate process, under randomly generated and mutated command lines,
-stdin contents, --dek-file contents and key-file paths, and records every
-run that crashes (a signal), panics, reports an internal error, or hangs.
+stdin contents, --dek-file / --secret-file contents and key-file paths --
+`wrap` and `protect` both -- and records every run that crashes (a
+signal), panics, reports an internal error, hangs, or (for `protect`)
+echoes the secret it was given.
 An ordinary refusal (exit 1 or 2 with a message) is the expected outcome
 of most runs and is not a finding.
 
@@ -25,6 +27,7 @@ import sys
 import time
 
 BIN, ROOT, SECONDS, WORKERS = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4])
+BIN = os.path.abspath(BIN)  # each run's cwd is a worker's key folder
 TIMEOUT = 20
 
 SERVICES = ["com.fuzz.alpha", "com.fuzz.beta"]
@@ -37,8 +40,14 @@ FLAGS = [
     "--service-name", "-sn", "--key-file-path", "-kf", "--dek-stdin", "--dek-file", "--force", "-f",
     "--group", "-g", "--fingerprint", "-fp", "--help", "-h", "help", "--", "-", "---", "--Service-Name",
     "--service-name=x", "-sn=x", "--dek-stdin=1",
+    "--secret-name", "-sid", "--secret-stdin", "--secret-file", "--base64", "--stdout", "--secret-name=x",
 ]
-SUBCOMMANDS = ["provision", "wrap", "retire", "Wrap", "unwrap", "", "--help", "help", "-h"]
+SUBCOMMANDS = ["provision", "wrap", "protect", "retire", "Wrap", "Protect", "unwrap", "", "--help", "help", "-h"]
+SECRET_NAMES = ["vault.password", "ssl.certificate", "a", "0", "db_admin-2", "x" * 64]
+SECRET_NAME_POOL = SECRET_NAMES + [
+    "", "Vault.password", "VAULT", "x" * 65, "x" * 4096, "a b", "a/b", "a\tb", "pässword", "🔑", "-", ".", "..",
+    "vault.password ", "vault.password\0",
+]
 GROUP_POOL = ["root", "0", "65534", "nogroup", "users", str(os.getgid()), "nosuchgroup", "", "x" * 300, "1" * 20, "-1", "4294967295", "4294967296"]
 
 
@@ -142,6 +151,36 @@ class Worker:
             return link
         return path
 
+    def secret_content(self):
+        """What `protect` might be given: a password, its base64, or junk."""
+        r = self.rng
+        kind = r.randrange(10)
+        pw = bytes(r.randrange(32, 127) for _ in range(r.choice([1, 8, 32, 255, 256, 257, 300])))
+        if kind <= 2:
+            return pw + r.choice([b"", b"\n", b"\r\n", b"\n\n"])
+        if kind == 3:
+            return base64.b64encode(os.urandom(r.choice([1, 16, 256, 257, 262]))) + r.choice([b"", b"\n"])
+        if kind == 4:
+            return b"\xef\xbb\xbf" + pw
+        if kind == 5:
+            return r.choice([b"\xff\xfe", b"\xfe\xff"]) + pw.decode().encode("utf-16-le")
+        if kind == 6:
+            return r.choice([b"", b"\n", b"\r\n", b"\xef\xbb\xbf"])
+        if kind == 7:
+            return os.urandom(r.choice([1, 256, 349, 350, 351, 4096]))
+        return self.stdin_content()
+
+    def secret_file(self):
+        r = self.rng
+        if r.randrange(6) == 0:
+            return r.choice(["/dev/null", "/etc/passwd", "/nonexistent", self.deks, "/dev/zero", "/proc/self/status", ""])
+        self.n += 1  # `protect --stdout` never calls key_path, which otherwise advances it
+        path = os.path.join(self.deks, f"s{self.n}.txt")
+        with open(path, "wb") as f:
+            f.write(self.secret_content())
+        os.chmod(path, r.choice([0o600, 0o600, 0o400, 0o640, 0o000, 0o644]))
+        return path
+
     def stdin_content(self):
         r = self.rng
         kind = r.randrange(12)
@@ -167,7 +206,7 @@ class Worker:
     def structured(self):
         """A mostly valid command line, then mutated."""
         r = self.rng
-        sub = r.choice(["wrap", "wrap", "wrap", "provision", "retire"])
+        sub = r.choice(["wrap", "wrap", "wrap", "protect", "protect", "protect", "provision", "retire"])
         svc = r.choice(SERVICES + SERVICE_POOL[:4]) if r.random() < 0.8 else r.choice(SERVICE_POOL)
         argv = [sub]
         stdin = None
@@ -183,6 +222,27 @@ class Worker:
                 argv.append(r.choice(["--force", "-f"]))
             if r.random() < 0.3:
                 argv += [r.choice(["--group", "-g"]), r.choice(GROUP_POOL)]
+            if r.random() < 0.3:
+                argv += [r.choice(["--fingerprint", "-fp"]), r.choice(fingerprint_pool())]
+        elif sub == "protect":
+            argv += [r.choice(["--service-name", "-sn"]), svc]
+            name = r.choice(SECRET_NAMES) if r.random() < 0.8 else r.choice(SECRET_NAME_POOL)
+            argv += [r.choice(["--secret-name", "-sid"]), name]
+            if r.random() < 0.6:
+                argv.append("--secret-stdin")
+                stdin = self.secret_content()
+            else:
+                argv += ["--secret-file", self.secret_file()]
+            if r.random() < 0.3:
+                argv.append("--base64")
+            if r.random() < 0.5:
+                argv.append("--stdout")
+            else:
+                argv += [r.choice(["--key-file-path", "-kf"]), self.key_path()]
+                if r.random() < 0.3:
+                    argv.append(r.choice(["--force", "-f"]))
+                if r.random() < 0.3:
+                    argv += [r.choice(["--group", "-g"]), r.choice(GROUP_POOL)]
             if r.random() < 0.3:
                 argv += [r.choice(["--fingerprint", "-fp"]), r.choice(fingerprint_pool())]
         elif sub == "provision":
@@ -241,6 +301,8 @@ class Worker:
             finding = "internal error"
         elif rc not in (0, 1, 2):
             finding = f"exit {rc}"
+        elif argv[:1] == [b"protect"] and stdin and len(stdin.strip()) >= 8 and stdin.strip() in out + err:
+            finding = "secret echoed"  # the secret (or its base64) must never appear in output
         if finding:
             key = finding + ":" + (err.split(b"panicked at")[1][:80].decode("utf-8", "replace") if b"panicked at" in err else "")
             self.record(key, finding, argv, stdin, rc, out, err)
@@ -250,7 +312,7 @@ class Worker:
                     os.remove(os.path.join(self.keys, name))
         if len(os.listdir(self.deks)) > 500:
             for name in os.listdir(self.deks):
-                if name.startswith(("d", "l")):
+                if name.startswith(("d", "l", "s")):
                     os.remove(os.path.join(self.deks, name))
         return rc, finding
 

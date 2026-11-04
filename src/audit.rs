@@ -46,6 +46,8 @@ pub(crate) enum Op {
     Wrap,
     GenerateAndWrap,
     Unwrap,
+    WrapSecret,
+    UnwrapSecret,
     OpenFile,
     KekFingerprint,
     RetireKek,
@@ -59,6 +61,8 @@ impl Op {
             Op::Wrap => "hkdfguard_wrap_dek",
             Op::GenerateAndWrap => "hkdfguard_generate_and_wrap_dek",
             Op::Unwrap => "hkdfguard_unwrap_dek",
+            Op::WrapSecret => "hkdfguard_wrap_secret",
+            Op::UnwrapSecret => "hkdfguard_unwrap_secret",
             Op::OpenFile => "hkdfguard_open_file",
             Op::KekFingerprint => "hkdfguard_kek_fingerprint",
             // Not a C function: the CLI's `retire`, through the library's
@@ -183,6 +187,29 @@ pub(crate) fn dek_operation(op: Op, service: &str, payload: &[u8]) {
     );
 }
 
+/// A secret was wrapped (`WrapSecret`) or unwrapped (`UnwrapSecret`): the
+/// DEK events' IDs and fields, plus the secret's name, which is public.
+/// Never the secret.
+pub(crate) fn secret_operation(op: Op, service: &str, name: &str, payload: &[u8]) {
+    let (provider, fingerprint) = match Payload::from_bytes(payload) {
+        Ok(p) => (p.provider_type.as_str(), hex(&p.fingerprint)),
+        Err(_) => ("(unknown)", "(unavailable)".to_string()),
+    };
+    let unwrap = op == Op::UnwrapSecret;
+    emit(
+        Severity::Info,
+        if unwrap { DEK_UNWRAPPED } else { DEK_WRAPPED },
+        &format!(
+            "op={} result=OK service={} secret={} provider={provider} kek_fingerprint={fingerprint} payload_sha256={}",
+            op.name(),
+            quote(service.as_bytes()),
+            quote(name.as_bytes()),
+            hex(&Sha256::digest(payload))
+        ),
+        if unwrap { "secret unwrapped" } else { "secret wrapped" },
+    );
+}
+
 /// `op` failed with `code`, for `service`. Only the failures worth an
 /// administrator's attention are written -- the Windows build's list --
 /// plus PROVIDER_UNAVAILABLE, which on Linux means no allowed provider
@@ -201,7 +228,7 @@ pub(crate) fn operation_failed(op: Op, service: &str, code: i32) {
             "a KEK exists under this service name but is corrupt or not one this library would create; it was left untouched",
         ),
         status::PAYLOAD_AUTH_FAILED | status::KEK_FINGERPRINT_MISMATCH | status::PAYLOAD_MALFORMED | status::PAYLOAD_UNSUPPORTED => {
-            if op != Op::Unwrap {
+            if !matches!(op, Op::Unwrap | Op::UnwrapSecret) {
                 return;
             }
             let meaning = match code {
@@ -454,6 +481,34 @@ mod tests {
         assert!(record.contains(&format!(" uid={uid} ")), "{record}");
         assert!(record.contains(&format!(" pid={} ", std::process::id())), "{record}");
         assert!(record.contains(" exe=\"/"), "{record}");
+    }
+
+    #[test]
+    fn secret_records_use_the_dek_events_and_name_the_secret_never_its_value() {
+        // A payload the parser can't read still yields a record: the
+        // provider and fingerprint are marked unavailable, nothing fails.
+        let payload = b"not a payload";
+        secret_operation(Op::WrapSecret, "audit.test.secret", "vault.password", payload);
+        let record = last_with("op=hkdfguard_wrap_secret result=OK service=\"audit.test.secret\"");
+        assert!(record.contains("event=1002 "), "{record}");
+        assert!(
+            record.contains(" secret=\"vault.password\" provider=(unknown) kek_fingerprint=(unavailable) payload_sha256="),
+            "{record}"
+        );
+        assert!(record.contains(&hex(&Sha256::digest(payload))), "{record}");
+        assert!(record.ends_with("msg=\"secret wrapped\""), "{record}");
+
+        secret_operation(Op::UnwrapSecret, "audit.test.secret", "ssl.certificate", payload);
+        let record = last_with("op=hkdfguard_unwrap_secret result=OK service=\"audit.test.secret\"");
+        assert!(record.contains("event=1003 ") && record.contains(" secret=\"ssl.certificate\" "), "{record}");
+        assert!(record.ends_with("msg=\"secret unwrapped\""), "{record}");
+
+        // An integrity failure on a secret unwrap is audited as on a DEK
+        // unwrap; the same code on a secret wrap is not.
+        operation_failed(Op::UnwrapSecret, "audit.test.secret.integrity", status::PAYLOAD_AUTH_FAILED);
+        assert_eq!(captured_containing("audit.test.secret.integrity").len(), 1);
+        operation_failed(Op::WrapSecret, "audit.test.secret.wraponly", status::PAYLOAD_AUTH_FAILED);
+        assert!(captured_containing("audit.test.secret.wraponly").is_empty());
     }
 
     #[test]

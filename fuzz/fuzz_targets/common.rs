@@ -17,7 +17,9 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::OnceLock;
 
-use hkdfguard::{hkdfguard_create_kek, hkdfguard_unwrap_dek, hkdfguard_wrap_dek, status};
+use hkdfguard::{
+    hkdfguard_create_kek, hkdfguard_unwrap_dek, hkdfguard_unwrap_secret, hkdfguard_wrap_dek, hkdfguard_wrap_secret, status,
+};
 
 /// The service whose ephemeral KEK the harness creates at startup.
 pub const SERVICE: &str = "com.hkdfguard.fuzz";
@@ -207,4 +209,105 @@ pub fn check_contract(ret: &Ret, call: &Call, zero_on_failure: bool) {
     if zero_on_failure && ret.rc != status::OK && !call.out_len_null && !call.out_null {
         assert!(ret.zeroed(), "failure (rc {}) left bytes in the caller's buffer", ret.rc);
     }
+}
+
+// ---- secrets (hkdfguard_wrap_secret / hkdfguard_unwrap_secret) ----
+
+/// The secret name the genuine secret payload is wrapped under.
+pub const SECRET_NAME: &str = "vault.password";
+/// Another valid name: the genuine payload must never open under it.
+pub const OTHER_SECRET_NAME: &str = "ssl.certificate";
+/// `HKDFGUARD_SECRET_MAX_LEN`: the capacity unwrap_secret requires.
+pub const SECRET_MAX: usize = 256;
+
+pub fn known_secret() -> &'static [u8] {
+    b"correct horse battery staple\0\xff"
+}
+
+/// A genuine secret payload for [`SERVICE`], [`SECRET_NAME`] and [`known_secret`].
+pub fn genuine_secret_payload() -> &'static Vec<u8> {
+    static PAYLOAD: OnceLock<Vec<u8>> = OnceLock::new();
+    PAYLOAD.get_or_init(|| {
+        setup();
+        let (rc, payload) = wrap_secret_ok(SERVICE, SECRET_NAME, known_secret());
+        assert_eq!(rc, status::OK, "fuzz setup: hkdfguard_wrap_secret");
+        payload
+    })
+}
+
+/// `hkdfguard_wrap_secret` with a generous buffer.
+pub fn wrap_secret_ok(service: &str, name: &str, secret: &[u8]) -> (c_int, Vec<u8>) {
+    let (svc, nm) = (CString::new(service).unwrap(), CString::new(name).unwrap());
+    let mut out = vec![0u8; BIG];
+    let mut out_len: c_int = BIG as c_int;
+    let rc = hkdfguard_wrap_secret(svc.as_ptr(), nm.as_ptr(), secret.as_ptr(), secret.len() as c_int, out.as_mut_ptr(), &mut out_len);
+    out.truncate(if rc == status::OK { out_len as usize } else { 0 });
+    (rc, out)
+}
+
+/// The library's secret-name rule, restated independently: 1..=64 bytes
+/// of `[a-z0-9._-]`, no normalization.
+pub fn name_is_valid(name: &[u8]) -> bool {
+    (1..=64).contains(&name.len()) && name.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+
+#[derive(Arbitrary, Debug, Clone)]
+pub enum SecretName {
+    Genuine,
+    Other,
+    /// The genuine name in uppercase: a different name, not a spelling.
+    Upper,
+    Raw(Vec<u8>),
+    /// More than 64 bytes with no NUL inside the limit: the bounded scan must stop.
+    Unterminated,
+    Null,
+}
+
+impl SecretName {
+    /// The bytes to pass and whether they're NUL-terminated within the
+    /// buffer; `None` is a NULL pointer.
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        let mut b: Vec<u8> = match self {
+            SecretName::Genuine => SECRET_NAME.into(),
+            SecretName::Other => OTHER_SECRET_NAME.into(),
+            SecretName::Upper => SECRET_NAME.to_ascii_uppercase().into(),
+            SecretName::Raw(b) => {
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                b[..end].to_vec()
+            }
+            SecretName::Unterminated => return Some(vec![b'a'; 65 + 7]), // read at most 65 bytes in
+            SecretName::Null => return None,
+        };
+        b.push(0);
+        Some(b)
+    }
+
+    /// The name as C would see it, when it is a terminated string.
+    pub fn as_c(&self) -> Option<Vec<u8>> {
+        match self {
+            SecretName::Unterminated | SecretName::Null => None,
+            _ => self.bytes().map(|mut b| {
+                b.pop();
+                b
+            }),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.as_c().is_some_and(|n| name_is_valid(&n))
+    }
+
+    pub fn is_genuine(&self) -> bool {
+        self.as_c().as_deref() == Some(SECRET_NAME.as_bytes())
+    }
+}
+
+/// `hkdfguard_unwrap_secret` under `service`/`name`, with the buffer `call` describes.
+pub fn unwrap_secret(service: &Service, name: &SecretName, payload: &[u8], call: &Call) -> Ret {
+    let svc = service.cstring();
+    let svc_ptr = svc.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+    let name_buf = name.bytes();
+    let name_ptr = name_buf.as_ref().map_or(ptr::null(), |b| b.as_ptr().cast());
+    let len: c_int = payload.len().try_into().expect("payload longer than c_int");
+    with_buffer(call, |out, out_len| hkdfguard_unwrap_secret(svc_ptr, name_ptr, payload.as_ptr(), len, out, out_len))
 }

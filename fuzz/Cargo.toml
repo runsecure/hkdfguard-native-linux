@@ -76,3 +76,24 @@ path = "fuzz_targets/path_walk.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "unwrap_secret"
+path = "fuzz_targets/unwrap_secret.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wrap_secret_round_trip"
+path = "fuzz_targets/wrap_secret_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_secret_file"
+path = "fuzz_targets/open_secret_file.rs"
+test = false
+doc = false
+bench = false

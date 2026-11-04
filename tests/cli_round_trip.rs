@@ -46,7 +46,7 @@ mod test_tmp;
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
     Ok(test_tmp::private_tempdir())
 }
-use hkdfguard::{hkdfguard_open_file, hkdfguard_unwrap_dek, status};
+use hkdfguard::{hkdfguard_open_file, hkdfguard_open_secret_file, hkdfguard_unwrap_dek, hkdfguard_unwrap_secret, status};
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
 // through the inherited environment, by every CLI process it spawns --
@@ -752,5 +752,294 @@ fn production_trusts_only_key_files_a_deployer_wrote() {
             );
             assert_eq!(out, dek);
         });
+    });
+}
+
+// `hkdfguard protect -sn <service> -sid <name> --secret-stdin [extra]`,
+// with `input` written to the subprocess's stdin.
+fn run_protect_stdin(service: &str, name: &str, input: &[u8], extra_args: &[&str]) -> Output {
+    let mut child = cli()
+        .arg("protect")
+        .args(["--service-name", service, "--secret-name", name, "--secret-stdin"])
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hkdfguard protect");
+    match child.stdin.as_mut().expect("stdin was piped").write_all(input) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("failed to write the secret to the CLI's stdin: {e}"),
+    }
+    drop(child.stdin.take());
+    child.wait_with_output().expect("failed to run hkdfguard protect")
+}
+
+fn unwrap_secret_via_library(service: &str, name: &str, wrapped: &[u8]) -> (c_int, Vec<u8>) {
+    let service = CString::new(service).unwrap();
+    let name = CString::new(name).unwrap();
+    let mut out = [0u8; 256];
+    let mut out_len = out.len() as c_int;
+    let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), wrapped.as_ptr(), wrapped.len() as c_int, out.as_mut_ptr(), &mut out_len);
+    (rc, if rc == status::OK { out[..out_len as usize].to_vec() } else { Vec::new() })
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_to_a_key_file_opens_and_unwraps_under_its_secret_name_only() {
+    with_provisioned_external_secret("com.example.certs", || {
+        let out_dir = tempdir().unwrap();
+        let key_path = out_dir.path().join("cert.pass");
+        let output = run_protect_stdin(
+            "com.example.certs",
+            "ssl.certificate",
+            b"pkcs12 passphrase\n",
+            &["--key-file-path", key_path.to_str().unwrap()],
+        );
+        assert!(output.status.success(), "protect failed: {}", stderr_of(&output));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fingerprint: "));
+        assert_eq!(fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let path = CString::new(key_path.to_str().unwrap()).unwrap();
+        let mut wrapped = [0u8; 502];
+        let mut wrapped_len = wrapped.len() as c_int;
+        assert_eq!(hkdfguard_open_secret_file(path.as_ptr(), wrapped.as_mut_ptr(), &mut wrapped_len), status::OK);
+        let wrapped = &wrapped[..wrapped_len as usize];
+
+        assert_eq!(
+            unwrap_secret_via_library("com.example.certs", "ssl.certificate", wrapped),
+            (status::OK, b"pkcs12 passphrase".to_vec()),
+            "one trailing newline is framing, not part of the secret"
+        );
+        assert_eq!(unwrap_secret_via_library("com.example.certs", "vault.password", wrapped).0, status::PAYLOAD_AUTH_FAILED);
+        assert_eq!(unwrap_via_library("com.example.certs", wrapped).0, status::PAYLOAD_MALFORMED, "not a DEK");
+        let mut buf = [0u8; 512];
+        let mut buf_len = buf.len() as c_int;
+        assert_eq!(hkdfguard_open_file(path.as_ptr(), buf.as_mut_ptr(), &mut buf_len), status::FILE_TOO_LONG, "not a DEK file");
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_to_stdout_prints_only_the_payload_and_takes_base64_input() {
+    with_provisioned_external_secret("com.example.vault", || {
+        let secret = [0u8, 1, 2, b'\n', 0xFF]; // binary, with a newline inside: needs --base64
+        let output = run_protect_stdin("com.example.vault", "vault.password", STANDARD.encode(secret).as_bytes(), &["--base64", "--stdout"]);
+        assert!(output.status.success(), "protect failed: {}", stderr_of(&output));
+        assert!(stderr_of(&output).contains("fingerprint: "), "status goes to stderr");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let wrapped = STANDARD.decode(stdout.trim_end()).expect("stdout is exactly the base64 payload");
+        assert_eq!(unwrap_secret_via_library("com.example.vault", "vault.password", &wrapped), (status::OK, secret.to_vec()));
+
+        // Without a provisioned KEK nothing is printed, and the fix is named.
+        let output = run_protect_stdin("com.example.unprovisioned", "vault.password", b"x", &["--stdout"]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(stderr_of(&output).contains("provision"), "{}", stderr_of(&output));
+    });
+}
+
+// `protect` with `input` on stdin, after `pre_exec` has run in the child --
+// for resource limits that make one step of the run fail.
+fn run_protect_stdin_in(service: &str, name: &str, input: &[u8], extra_args: &[&str], pre_exec: fn() -> std::io::Result<()>) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = cli();
+    command
+        .arg("protect")
+        .args(["--service-name", service, "--secret-name", name, "--secret-stdin"])
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: `pre_exec` callers below only call setrlimit and signal, both async-signal-safe.
+    unsafe { command.pre_exec(pre_exec) };
+    let mut child = command.spawn().expect("failed to spawn hkdfguard protect");
+    let _ = child.stdin.as_mut().expect("stdin was piped").write_all(input);
+    drop(child.stdin.take());
+    child.wait_with_output().expect("failed to run hkdfguard protect")
+}
+
+fn set_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> std::io::Result<()> {
+    let limit = libc::rlimit { rlim_cur: value, rlim_max: value };
+    // SAFETY: setrlimit reads a valid rlimit.
+    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_reads_a_private_secret_file_and_refuses_a_loose_one() {
+    with_provisioned_external_secret("com.example.secretfile", || {
+        let dir = tempdir().unwrap();
+        let secret_path = dir.path().join("vault.pass");
+        fs::write(&secret_path, b"correct horse\n").unwrap();
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let protect = |path: &Path| {
+            cli()
+                .arg("protect")
+                .args(["-sn", "com.example.secretfile", "-sid", "vault.password", "--stdout"])
+                .args(["--secret-file", path.to_str().unwrap()])
+                .output()
+                .expect("failed to run hkdfguard protect")
+        };
+
+        let output = protect(&secret_path);
+        assert!(output.status.success(), "protect failed: {}", stderr_of(&output));
+        let wrapped = STANDARD.decode(String::from_utf8(output.stdout).unwrap().trim_end()).unwrap();
+        assert_eq!(
+            unwrap_secret_via_library("com.example.secretfile", "vault.password", &wrapped),
+            (status::OK, b"correct horse".to_vec())
+        );
+
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let output = protect(&secret_path);
+        assert!(!output.status.success(), "a group-readable secret file is refused");
+        assert!(output.stdout.is_empty());
+        assert!(stderr_of(&output).contains("--secret-file") && stderr_of(&output).contains("too broad"), "{}", stderr_of(&output));
+        assert!(!stderr_of(&output).contains("correct horse"), "the secret never appears in a message");
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_refuses_to_read_the_secret_from_a_terminal() {
+    with_policy("[selection]\nmode = \"prefer\"\n", || {
+        use std::os::fd::FromRawFd;
+        let (mut controller, mut device) = (-1, -1);
+        // SAFETY: openpty writes two descriptors into the given ints; the rest are optional (NULL).
+        let rc = unsafe { libc::openpty(&mut controller, &mut device, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
+        if rc != 0 {
+            eprintln!("skipping: no pseudo-terminal available ({})", std::io::Error::last_os_error());
+            return;
+        }
+        // SAFETY: both descriptors were just returned by openpty and are owned here.
+        let (controller, device) = unsafe { (std::fs::File::from_raw_fd(controller), std::fs::File::from_raw_fd(device)) };
+        let output = cli()
+            .arg("protect")
+            .args(["-sn", "com.example.terminal", "-sid", "vault.password", "--secret-stdin", "--stdout"])
+            .stdin(Stdio::from(device))
+            .output()
+            .expect("failed to run hkdfguard protect");
+        drop(controller);
+        assert!(!output.status.success(), "reading the secret from a terminal must be refused");
+        assert!(stderr_of(&output).contains("interactive terminal"), "says why: {}", stderr_of(&output));
+        assert!(output.stdout.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_reports_a_provider_failure_by_its_status() {
+    // A KEK file the provider refuses (group-readable): not "no KEK", so
+    // no advice to provision -- the library's status, described.
+    let dir = tempdir().unwrap();
+    let kek = dir.path().join("com.example.loosekek");
+    fs::write(&kek, [7u8; 32]).unwrap();
+    fs::set_permissions(&kek, fs::Permissions::from_mode(0o640)).unwrap();
+    with_policy(&external_secret_policy(dir.path()), || {
+        let output = run_protect_stdin("com.example.loosekek", "vault.password", b"hunter2", &["--stdout"]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = stderr_of(&output);
+        assert!(stderr.contains("hkdfguard_wrap_secret failed: ") && !stderr.contains("provision --service-name"), "{stderr}");
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_warns_when_the_secret_buffer_cannot_be_locked() {
+    // RLIMIT_MEMLOCK 0: mlock of the scratch buffer fails. The run goes on
+    // (the buffer is still wiped), and says the secret could reach swap.
+    with_provisioned_external_secret("com.example.nomlock", || {
+        let output = run_protect_stdin_in("com.example.nomlock", "vault.password", b"hunter2", &["--stdout"], || {
+            set_limit(libc::RLIMIT_MEMLOCK, 0)
+        });
+        assert!(output.status.success(), "protect failed: {}", stderr_of(&output));
+        assert!(stderr_of(&output).contains("could not lock the key material's buffer into memory"), "{}", stderr_of(&output));
+        let wrapped = STANDARD.decode(String::from_utf8(output.stdout).unwrap().trim_end()).unwrap();
+        assert_eq!(unwrap_secret_via_library("com.example.nomlock", "vault.password", &wrapped).0, status::OK);
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_force_warns_when_the_old_file_cannot_be_overwritten() {
+    // RLIMIT_FSIZE below the old file's size, SIGXFSZ ignored: the new key
+    // file is written and published, then the overwrite of the old one
+    // fails with EFBIG. The replace stands; the warning says the old bytes
+    // were not destroyed.
+    with_provisioned_external_secret("com.example.noshred", || {
+        let out_dir = tempdir().unwrap();
+        let key_path = out_dir.path().join("cert.pass");
+        fs::write(&key_path, [0x5Au8; 4096]).unwrap();
+        let output = run_protect_stdin_in(
+            "com.example.noshred",
+            "ssl.certificate",
+            b"hunter2",
+            &["-kf", key_path.to_str().unwrap(), "--force"],
+            || {
+                // SAFETY: setting a signal's disposition to SIG_IGN is async-signal-safe.
+                unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+                set_limit(libc::RLIMIT_FSIZE, 1024)
+            },
+        );
+        assert!(output.status.success(), "protect failed: {}", stderr_of(&output));
+        assert!(stderr_of(&output).contains("was replaced, but the old file was not securely overwritten"), "{}", stderr_of(&output));
+        let wrapped = fs::read(&key_path).unwrap();
+        assert_eq!(unwrap_secret_via_library("com.example.noshred", "ssl.certificate", &wrapped), (status::OK, b"hunter2".to_vec()));
+    });
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_protect_refuses_bad_input_a_wrong_fingerprint_and_an_unwritable_folder() {
+    with_provisioned_external_secret("com.example.refusals", || {
+        // More on stdin than any secret or its base64: refused, never truncated.
+        let output = run_protect_stdin("com.example.refusals", "vault.password", &[b'x'; 1024], &["--stdout"]);
+        assert!(!output.status.success() && output.stdout.is_empty());
+        assert!(stderr_of(&output).contains("the secret on stdin"), "{}", stderr_of(&output));
+
+        // A fingerprint that isn't this KEK's: nothing printed, nothing written.
+        let out_dir = tempdir().unwrap();
+        let key_path = out_dir.path().join("cert.pass");
+        let wrong = "00".repeat(32);
+        let output = run_protect_stdin("com.example.refusals", "ssl.certificate", b"hunter2", &["-kf", key_path.to_str().unwrap(), "-fp", &wrong]);
+        assert!(!output.status.success());
+        assert!(stderr_of(&output).contains("fingerprint"), "{}", stderr_of(&output));
+        assert!(!key_path.exists(), "nothing written");
+
+        // The right fingerprint is confirmed.
+        let output = run_protect_stdin("com.example.refusals", "ssl.certificate", b"hunter2", &["--stdout"]);
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        let stderr = stderr_of(&output);
+        let fp = stderr.lines().find_map(|l| l.strip_prefix("fingerprint: ")).unwrap().split_whitespace().next().unwrap().to_string();
+        let output = run_protect_stdin("com.example.refusals", "ssl.certificate", b"hunter2", &["-kf", key_path.to_str().unwrap(), "-fp", &fp]);
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("(confirmed)"));
+
+        // A folder this user can't write to (root could): the wrap is
+        // done, the write fails, and nothing is left behind.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let locked = tempdir().unwrap();
+            fs::set_permissions(locked.path(), fs::Permissions::from_mode(0o500)).unwrap();
+            let key_path = locked.path().join("cert.pass");
+            let output = run_protect_stdin("com.example.refusals", "ssl.certificate", b"hunter2", &["-kf", key_path.to_str().unwrap()]);
+            fs::set_permissions(locked.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!output.status.success());
+            assert!(stderr_of(&output).contains(key_path.to_str().unwrap()), "{}", stderr_of(&output));
+            assert_eq!(fs::read_dir(locked.path()).unwrap().count(), 0, "nothing left behind");
+        }
     });
 }
