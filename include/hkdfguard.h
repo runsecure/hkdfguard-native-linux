@@ -114,7 +114,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_IO (-34)             /* key file is not a regular file, or reading it failed */
 #define HKDFGUARD_ERR_FILE_TOO_SHORT (-35)      /* key file is shorter than a wrapped DEK, or than its own header declares */
 #define HKDFGUARD_ERR_FILE_TOO_LONG (-36)       /* key file is longer than a wrapped DEK, or than its own header declares */
-#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex): treat as a key exposure */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), or its base64 or hex): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-38)      /* key file is the right length but not a well-formed wrapped DEK */
 #define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust, or writable by someone else (sticky, /tmp-style, included): someone else could have replaced it */
 /* -40..-63 reserved for future common codes. */
@@ -579,7 +579,9 @@ int hkdfguard_key_file_principal_trusted(
  * The file's length is checked against the payload's own header (the
  * header declares the payload's exact length):
  *   HKDFGUARD_ERR_FILE_PLAINTEXT_KEY - the file is 32 bytes (the size of an
- *       UNWRAPPED DEK), or is 32 bytes written as text -- base64 (standard
+ *       UNWRAPPED DEK), or is 32 raw bytes followed by one line ending (LF
+ *       or CRLF: 33 bytes ending in LF, or 34 ending in CR LF), or is 32
+ *       bytes written as text -- base64 (standard
  *       or URL-safe, padded or not; the CLI's DEK input is standard base64)
  *       or hex -- with any surrounding whitespace. Most likely the plaintext key
  *       saved where its wrapped form belongs: treat it as a key exposure. A

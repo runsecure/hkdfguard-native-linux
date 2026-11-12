@@ -15,13 +15,14 @@
 //!   length must be ones a wrap can produce, and the whole must parse;
 //!   otherwise [`KeyFileError::Malformed`].
 //! - **An unprotected key.** A file holding what looks like an *unwrapped*
-//!   DEK -- 32 raw bytes, or 32 bytes as text: base64 (standard or URL-safe,
-//!   padded or not; the CLI's DEK input is standard base64) or hex, with any
+//!   DEK -- 32 raw bytes, optionally followed by one line ending (LF or
+//!   CRLF), or 32 bytes as text: base64 (standard or URL-safe, padded or
+//!   not; the CLI's DEK input is standard base64) or hex, with any
 //!   surrounding whitespace -- is [`KeyFileError::PlaintextKey`]: most likely the DEK itself saved
 //!   where its wrapped form belongs. A 32-byte file is refused from its size
-//!   alone, normally without its contents being read into this process. Neither
-//!   form can be mistaken for a payload: both are shorter than the smallest
-//!   one.
+//!   alone, normally without its contents being read into this process. No
+//!   such form can be mistaken for a payload: all are shorter than the
+//!   smallest one.
 //! - **Integrity.** The file must be owned by someone the security model
 //!   trusts, and must not be writable by anyone else; otherwise
 //!   [`KeyFileError::Untrusted`]. Under the production model (the
@@ -154,7 +155,8 @@ impl KeyFileError {
             KeyFileError::TooLong => "the file is longer than a wrapped DEK, or than its header declares",
             KeyFileError::Malformed => "the file is not a well-formed wrapped DEK",
             KeyFileError::PlaintextKey => {
-                "the file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex); treat it as a key exposure"
+                "the file looks like an UNWRAPPED DEK (32 raw bytes, optionally followed by one line ending, or its \
+                 base64 or hex); treat it as a key exposure"
             }
         }
     }
@@ -313,15 +315,21 @@ const HEX_DEK_LEN: usize = 2 * DEK_LEN;
 /// length up to this is far below [`MIN_WRAPPED_LEN`], so no payload can
 /// ever be mistaken for a plaintext key, however it is padded.
 const MAX_PLAINTEXT_TEXT_LEN: usize = 96;
+/// Longest raw form recognised: 32 raw bytes and a CRLF.
+const MAX_PLAINTEXT_RAW_LEN: usize = DEK_LEN + 2;
 // Checked at compile time: plaintext detection can never refuse a real payload.
 const _: () = assert!(MAX_PLAINTEXT_TEXT_LEN < MIN_WRAPPED_LEN && DEK_LEN < MIN_WRAPPED_LEN);
+const _: () = assert!(MAX_PLAINTEXT_RAW_LEN <= MAX_PLAINTEXT_TEXT_LEN && MAX_PLAINTEXT_RAW_LEN < MIN_WRAPPED_LEN);
 
-// 32 raw bytes, or 32 bytes written as text: base64 (standard or URL-safe,
-// with or without its `=` padding -- the CLI's own DEK input format is
-// standard, padded) or hex (either case), with any leading or trailing
-// whitespace an editor or `echo` adds. Every one of these is refused as
-// TooShort anyway; recognising them is what turns "wrong file" into "this
-// key is exposed".
+// 32 raw bytes, optionally followed by one line ending (LF or CRLF, as
+// `echo`, `> file` or an editor adds: 33 bytes ending in LF, or 34 ending in
+// CR LF -- decided by length and those trailing bytes alone, never by
+// trimming, since the key's own last bytes may be whitespace values), or 32
+// bytes written as text: base64 (standard or URL-safe, with or without its
+// `=` padding -- the CLI's own DEK input format is standard, padded) or hex
+// (either case), with any leading or trailing whitespace an editor or
+// `echo` adds. Every one of these is refused as TooShort anyway;
+// recognising them is what turns "wrong file" into "this key is exposed".
 //
 // Constant-time in the contents: the only branches are on the length,
 // which the file's size already gives away. Every byte is visited twice
@@ -342,7 +350,8 @@ fn looks_like_plaintext_dek(bytes: &[u8]) -> bool {
     if bytes.len() > MAX_PLAINTEXT_TEXT_LEN {
         return false;
     }
-    ct::looks_like_text_dek(bytes) == 1
+    // Both tests always run and are folded without short-circuiting.
+    (ct::raw_dek_with_line_ending(bytes) | ct::looks_like_text_dek(bytes)) == 1
 }
 
 /// Branch-free byte classification for [`looks_like_plaintext_dek`]. Every
@@ -387,6 +396,20 @@ mod ct {
             | (62 & s62.wrapping_neg())
             | (63 & s63.wrapping_neg());
         (upper | lower | digit | s62 | s63, value)
+    }
+
+    /// 1 if `bytes` is 32 raw bytes followed by exactly one LF (33 bytes)
+    /// or one CR LF (34 bytes), else 0. Branches only on the length; the
+    /// line-ending bytes are compared branch-free, the key bytes not at all.
+    pub(super) fn raw_dek_with_line_ending(bytes: &[u8]) -> u32 {
+        use super::DEK_LEN;
+        if bytes.len() == DEK_LEN + 1 {
+            eq(bytes[DEK_LEN] as u32, 0x0A)
+        } else if bytes.len() == DEK_LEN + 2 {
+            eq(bytes[DEK_LEN] as u32, 0x0D) & eq(bytes[DEK_LEN + 1] as u32, 0x0A)
+        } else {
+            0
+        }
     }
 
     /// 1 if `bytes` (at most `MAX_PLAINTEXT_TEXT_LEN` long) is a DEK as
@@ -595,6 +618,59 @@ mod tests {
         assert_eq!(check(&[0xFFu8; DEK_LEN]), Err(KeyFileError::PlaintextKey));
     }
 
+    #[test]
+    fn raw_dek_followed_by_one_line_ending_is_a_plaintext_key() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut random_dek = move || {
+            let mut dek = [0u8; DEK_LEN];
+            for b in dek.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *b = state as u8;
+            }
+            dek
+        };
+        let with = |dek: [u8; DEK_LEN], tail: &[u8]| [&dek[..], tail].concat();
+        for _ in 0..64 {
+            let dek = random_dek();
+            assert_eq!(check(&with(dek, b"\n")), Err(KeyFileError::PlaintextKey), "LF");
+            assert_eq!(check(&with(dek, b"\r\n")), Err(KeyFileError::PlaintextKey), "CRLF");
+        }
+        // The key's own last byte is a whitespace value: no trimming confusion.
+        for last in [0x0Au8, 0x20, 0x0D, 0x09] {
+            let mut dek = random_dek();
+            dek[DEK_LEN - 1] = last;
+            assert_eq!(check(&with(dek, b"\n")), Err(KeyFileError::PlaintextKey), "last byte {last:#04x}, LF");
+            assert_eq!(check(&with(dek, b"\r\n")), Err(KeyFileError::PlaintextKey), "last byte {last:#04x}, CRLF");
+        }
+        // Any key bytes at all, the line ending's own values included.
+        assert_eq!(check(&[0x0Au8; DEK_LEN + 1]), Err(KeyFileError::PlaintextKey));
+        assert_eq!(check(&with([0x0D; DEK_LEN], b"\r\n")), Err(KeyFileError::PlaintextKey));
+    }
+
+    #[test]
+    fn other_line_endings_after_raw_bytes_are_not_a_plaintext_key() {
+        // Non-text key bytes, so the text rule can't claim these either.
+        let dek = [0x80u8; DEK_LEN];
+        let with = |key: &[u8], tail: &[u8]| [key, tail].concat();
+        for (name, bytes) in [
+            ("CR only", with(&dek, b"\r")),
+            ("LF LF", with(&dek, b"\n\n")),
+            ("LF CR", with(&dek, b"\n\r")),
+            ("CR CR", with(&dek, b"\r\r")),
+            ("33 bytes, LF", with(&[0x80u8; DEK_LEN + 1], b"\n")),
+            // 31 bytes in all: a short key and its line ending. (31 key bytes
+            // and an LF make 32, which the exactly-32 rule already refuses.)
+            ("30 bytes, LF", with(&dek[..DEK_LEN - 2], b"\n")),
+            ("29 bytes, CRLF", with(&dek[..DEK_LEN - 3], b"\r\n")),
+            ("32 bytes, CRLF, LF", with(&dek, b"\r\n\n")),
+        ] {
+            assert!(!looks_like_plaintext_dek(&bytes), "{name}");
+            assert_eq!(check(&bytes), Err(KeyFileError::TooShort), "{name}");
+        }
+    }
+
     // Every text form of one DEK whose bytes need '+' and '/' in standard
     // base64 (so '-' and '_' in URL-safe): the encodings really differ.
     fn text_forms_of_a_dek() -> Vec<(&'static str, String)> {
@@ -625,8 +701,8 @@ mod tests {
     }
 
     // The decoder-based definition the constant-time detector replaced:
-    // trim, then hex, or any of the base64 crate's four engines yielding 32
-    // bytes. Kept here as the reference the new code must agree with.
+    // 32 raw bytes plus one LF or CRLF, or trim, then hex, or any of the
+    // base64 crate's four engines yielding 32 bytes. Kept here as the reference the new code must agree with.
     fn reference_looks_like_plaintext_dek(bytes: &[u8]) -> bool {
         use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
         if bytes.len() == DEK_LEN {
@@ -634,6 +710,9 @@ mod tests {
         }
         if bytes.len() > MAX_PLAINTEXT_TEXT_LEN {
             return false;
+        }
+        if (bytes.len() == DEK_LEN + 1 && bytes.ends_with(b"\n")) || (bytes.len() == DEK_LEN + 2 && bytes.ends_with(b"\r\n")) {
+            return true;
         }
         let text = bytes.trim_ascii();
         match text.len() {
@@ -767,13 +846,15 @@ mod tests {
         long.push(0);
         let mut bad_version = valid();
         bad_version[0] = 9;
-        let cases: [(&str, Vec<u8>, KeyFileError); 7] = [
+        let cases: [(&str, Vec<u8>, KeyFileError); 9] = [
             ("empty", vec![], KeyFileError::TooShort),
             ("short", valid()[..100].to_vec(), KeyFileError::TooShort),
             ("long", long, KeyFileError::TooLong),
             ("huge", vec![0u8; 1024 * 1024], KeyFileError::TooLong),
             ("malformed", bad_version, KeyFileError::Malformed),
             ("raw-dek", vec![7u8; DEK_LEN], KeyFileError::PlaintextKey),
+            ("raw-dek-lf", [&[7u8; DEK_LEN][..], b"\n"].concat(), KeyFileError::PlaintextKey),
+            ("raw-dek-crlf", [&[7u8; DEK_LEN][..], b"\r\n"].concat(), KeyFileError::PlaintextKey),
             ("b64-dek", format!("{}\n", base64_dek()).into_bytes(), KeyFileError::PlaintextKey),
         ];
         for (name, contents, expected) in cases {

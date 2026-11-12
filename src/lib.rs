@@ -3259,13 +3259,15 @@ mod ffi_tests {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode([9u8; 32]) + "\n"
         };
-        let cases: [(&str, Vec<u8>, c_int); 8] = [
+        let cases: [(&str, Vec<u8>, c_int); 10] = [
             ("empty", vec![], status::FILE_TOO_SHORT),
             ("truncated", valid[..valid.len() - 1].to_vec(), status::FILE_TOO_SHORT),
             ("appended", long, status::FILE_TOO_LONG),
             ("oversized", vec![0u8; crypto::MAX_WRAPPED_LEN + 1], status::FILE_TOO_LONG),
             ("bad version", bad_version, status::FILE_MALFORMED),
             ("raw DEK", vec![9u8; 32], status::FILE_PLAINTEXT_KEY),
+            ("raw DEK + LF", [&[9u8; 32][..], b"\n"].concat(), status::FILE_PLAINTEXT_KEY),
+            ("raw DEK + CRLF", [&[9u8; 32][..], b"\r\n"].concat(), status::FILE_PLAINTEXT_KEY),
             ("base64 DEK", b64_dek.into_bytes(), status::FILE_PLAINTEXT_KEY),
             ("garbage", vec![0xEEu8; 200], status::FILE_MALFORMED),
         ];

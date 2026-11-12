@@ -66,7 +66,7 @@ pub mod status {
     pub const FILE_IO: i32 = -34; // key file is not a regular file, or reading it failed
     pub const FILE_TOO_SHORT: i32 = -35; // key file is shorter than a wrapped DEK, or than its own header declares
     pub const FILE_TOO_LONG: i32 = -36; // key file is longer than a wrapped DEK, or than its own header declares
-    pub const FILE_PLAINTEXT_KEY: i32 = -37; // key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex) -- a likely key exposure
+    pub const FILE_PLAINTEXT_KEY: i32 = -37; // key file looks like an UNWRAPPED DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), or its base64 or hex) -- a likely key exposure
     pub const FILE_MALFORMED: i32 = -38; // key file is the right length but not a payload a wrap could have produced
     pub const FILE_UNTRUSTED: i32 = -39; // key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust or writable by someone else (or was swapped mid-open): someone else could have replaced it
     // -40..-63 reserved for future common codes.
