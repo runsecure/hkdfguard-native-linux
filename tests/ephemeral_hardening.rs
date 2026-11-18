@@ -69,4 +69,60 @@ fn creating_an_ephemeral_key_hardens_the_process_and_locks_the_key_away() {
         status::OK
     );
     assert_eq!(dek_len, 32);
+
+    // A forked child has none of this process's ephemeral keys -- and must
+    // know it. The key page reads as zeroes there (MADV_WIPEONFORK), so a
+    // child that still believed it had the key would wrap under an all-zero
+    // KEK anyone can reproduce. It reports through its exit status, never by
+    // panicking: it is a copy of the test harness. 0 is a pass; anything
+    // else names the first check that failed.
+    // SAFETY: the child only calls this library and _exit.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+    if pid == 0 {
+        let mut out = [0u8; 512];
+        let mut out_len = out.len() as c_int;
+        let mut child_dek = [0xAAu8; 32];
+        let mut child_dek_len = child_dek.len() as c_int;
+        let code = if hkdfguard_generate_and_wrap_dek(service.as_ptr(), out.as_mut_ptr(), &mut out_len) != status::KEK_NOT_FOUND {
+            1 // wrapped under a key the child doesn't have
+        } else if hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped_len, child_dek.as_mut_ptr(), &mut child_dek_len)
+            == status::OK
+            || child_dek != [0u8; 32]
+        {
+            2 // unwrapped the parent's payload, or left something in the buffer
+        } else if hkdfguard_create_kek(service.as_ptr()) != status::OK {
+            3 // a child may create a key of its own
+        } else {
+            out_len = out.len() as c_int;
+            child_dek_len = child_dek.len() as c_int;
+            if hkdfguard_generate_and_wrap_dek(service.as_ptr(), out.as_mut_ptr(), &mut out_len) != status::OK {
+                4
+            } else if hkdfguard_unwrap_dek(service.as_ptr(), out.as_ptr(), out_len, child_dek.as_mut_ptr(), &mut child_dek_len)
+                != status::OK
+            {
+                5 // its own key must work
+            } else if hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped_len, child_dek.as_mut_ptr(), &mut child_dek_len)
+                != status::KEK_FINGERPRINT_MISMATCH
+            {
+                6 // and be a different key from the parent's
+            } else {
+                0
+            }
+        };
+        // SAFETY: _exit takes a status and does not return.
+        unsafe { libc::_exit(code) };
+    }
+    let mut child_status = 0;
+    // SAFETY: waitpid writes the status of the child just forked.
+    assert_eq!(unsafe { libc::waitpid(pid, &mut child_status, 0) }, pid);
+    assert!(libc::WIFEXITED(child_status), "the forked child did not exit normally (status {child_status:#x})");
+    assert_eq!(libc::WEXITSTATUS(child_status), 0, "forked-child check failed: see the numbered checks above");
+
+    // The parent's key is untouched by any of that.
+    dek_len = dek.len() as c_int;
+    assert_eq!(
+        hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped_len, dek.as_mut_ptr(), &mut dek_len),
+        status::OK
+    );
 }

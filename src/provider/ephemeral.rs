@@ -36,13 +36,23 @@
 //! exits, and nothing it wrapped could ever be unwrapped. Nor does a key
 //! spread to a child: on Linux 4.14 and later the keys' page is marked
 //! `MADV_WIPEONFORK`, so a child created with `fork()` sees zeroes there.
+//!
+//! A forked child starts with no ephemeral keys at all. The store's index
+//! is ordinary heap memory, which `fork()` copies, so the child would
+//! otherwise still believe every service has a key -- in a page that now
+//! holds zeroes -- and wrap under an all-zero KEK anyone can reproduce. The
+//! store therefore belongs to the process that filled it
+//! ([`KeyStore::forget_if_forked`]): a child's first call wipes and unmaps
+//! what it inherited, and its services are unprovisioned until it creates
+//! keys of its own, in pages of its own. An all-zero slot is never handed
+//! out as a key either ([`KeyStore::load`]).
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{KekHandle, KekProvider, PrfOutput, ProviderType, KEK_LEN}; // the traits/types this module implements
 use std::collections::HashMap; // service name -> slot index
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock}; // guards the store so concurrent calls don't race
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const KEY_LEN: usize = KEK_LEN; // one HMAC-SHA-256 key
 
@@ -58,8 +68,10 @@ pub fn refuse_in_this_process() {
     REFUSED.store(true, Ordering::SeqCst);
 }
 
-/// One page of anonymous memory holding up to `len / KEY_LEN` keys. Mapped once, never moved and never unmapped, so no copy of a
-/// key is ever left behind by a reallocation.
+/// One page of anonymous memory holding up to `len / KEY_LEN` keys. Mapped
+/// once and never moved, so no copy of a key is ever left behind by a
+/// reallocation, and unmapped only by a forked child discarding what it
+/// inherited ([`KeyPage::discard`]).
 struct KeyPage {
     base: *mut u8,
     len: usize,
@@ -147,6 +159,17 @@ impl KeyPage {
         // mutex) makes this the only reference.
         unsafe { &mut *self.base.add(i * KEY_LEN).cast::<[u8; KEY_LEN]>() }
     }
+
+    /// Wipes the page and unmaps it. Wiped first: where `MADV_WIPEONFORK`
+    /// isn't available, a forked child's copy still holds the parent's keys.
+    fn discard(self) {
+        // SAFETY: `base..base+len` is this page's own mapping, readable and
+        // writable, and `self` is consumed, so nothing refers to it afterwards.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.base, self.len).zeroize();
+            libc::munmap(self.base.cast(), self.len);
+        }
+    }
 }
 
 /// Every ephemeral key in this process.
@@ -155,9 +178,43 @@ struct KeyStore {
     index: HashMap<String, usize>, // service name -> slot number across `pages`
     pages: Vec<KeyPage>,
     used: usize,
+    /// The process this store's keys belong to: 0 until first used.
+    owner: libc::pid_t,
 }
 
 impl KeyStore {
+    /// Empties the store if it was filled by another process -- that is, if
+    /// this process is a forked child of the one that created its keys (see
+    /// the module docs). Called before every use. The inherited pages are
+    /// wiped and unmapped rather than reused: `mlock` is not inherited, so
+    /// the child's own keys go into pages mapped, locked and marked afresh.
+    fn forget_if_forked(&mut self) {
+        // SAFETY: getpid takes no arguments and cannot fail.
+        let pid = unsafe { libc::getpid() };
+        if self.owner == pid {
+            return;
+        }
+        if !self.index.is_empty() {
+            crate::provider::log_once(
+                log::Level::Warn,
+                "hkdfguard: this process was forked from one holding ephemeral KEKs; they stay with that \
+                 process, so this one has none until it creates its own, and cannot unwrap what the other wrapped"
+                    .to_string(),
+            );
+        }
+        self.forget();
+        self.owner = pid;
+    }
+
+    /// Drops every key: the index, and the pages with their contents.
+    fn forget(&mut self) {
+        self.index.clear();
+        self.used = 0;
+        for page in self.pages.drain(..) {
+            page.discard();
+        }
+    }
+
     fn slot(&mut self, n: usize) -> &mut [u8; KEY_LEN] {
         let per_page = self.pages[0].slots();
         self.pages[n / per_page].slot(n % per_page)
@@ -165,7 +222,17 @@ impl KeyStore {
 
     fn load(&mut self, service: &str) -> Option<Zeroizing<[u8; KEY_LEN]>> {
         let n = *self.index.get(service)?;
-        Some(Zeroizing::new(*self.slot(n)))
+        let key = Zeroizing::new(*self.slot(n));
+        // No generated key is all zeroes: this is a page the kernel wiped
+        // (`MADV_WIPEONFORK`) in a descendant `forget_if_forked` could not
+        // tell from the store's owner -- one given the pid that process had
+        // before it exited. Never a key: HMAC under it is something anyone can compute. Folded
+        // without branching on any one byte of what is otherwise a key.
+        if key.iter().fold(0u8, |acc, b| acc | b) == 0 {
+            self.forget();
+            return None;
+        }
+        Some(key)
     }
 
     /// Generates and stores a key for `service`, which has none yet.
@@ -245,10 +312,11 @@ impl KekProvider for EphemeralProvider {
     }
 
     fn kek_exists(&self, service: &str) -> Result<bool> {
-        let keys = self
+        let mut keys = self
             .keys
             .lock()
             .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?;
+        keys.forget_if_forked();
         Ok(keys.index.contains_key(service))
     }
 
@@ -266,6 +334,7 @@ impl KekProvider for EphemeralProvider {
             .keys
             .lock() // acquire the mutex; blocks if another call is using the store right now
             .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?; // a prior panic while holding the lock would poison it
+        keys.forget_if_forked(); // a forked child starts with no keys
 
         let key = match keys.load(service) {
             Some(existing) => existing,
@@ -371,6 +440,48 @@ mod tests {
         assert_eq!(first, again, "every key must survive the store growing");
         let distinct: std::collections::HashSet<_> = first.iter().collect();
         assert_eq!(distinct.len(), services.len());
+    }
+
+    // A store of its own, not PROCESS_KEYS: forgetting that one would take
+    // the keys out from under every other test in this process.
+    fn store_with_key(service: &str) -> (KeyStore, [u8; KEY_LEN]) {
+        let mut store = KeyStore::default();
+        store.forget_if_forked();
+        let key = *store.create(service).unwrap();
+        (store, key)
+    }
+
+    #[test]
+    fn a_forked_child_starts_with_no_keys_and_makes_its_own() {
+        let service = "com.company.fork-test";
+        let (mut store, parents_key) = store_with_key(service);
+        store.forget_if_forked();
+        assert_eq!(*store.load(service).unwrap(), parents_key, "the owning process keeps its keys");
+
+        // What a forked child sees: a store another process filled.
+        store.owner += 1;
+        store.forget_if_forked();
+        assert!(store.load(service).is_none(), "a child must not have the parent's key, nor a zeroed one");
+        assert!(store.index.is_empty() && store.pages.is_empty() && store.used == 0);
+
+        let childs_key = *store.create(service).unwrap();
+        assert_ne!(childs_key, parents_key);
+        assert_ne!(childs_key, [0u8; KEY_LEN]);
+        store.forget_if_forked();
+        assert_eq!(*store.load(service).unwrap(), childs_key, "the child keeps the key it created");
+    }
+
+    #[test]
+    fn a_wiped_slot_is_never_handed_out_as_a_key() {
+        let service = "com.company.wiped-page-test";
+        let (mut store, _) = store_with_key(service);
+        store.create("com.company.wiped-page-test.other").unwrap();
+        // What MADV_WIPEONFORK leaves in a child the pid check missed.
+        for n in 0..store.used {
+            store.slot(n).fill(0);
+        }
+        assert!(store.load(service).is_none(), "an all-zero slot is not a key");
+        assert!(store.index.is_empty() && store.pages.is_empty(), "and the rest of the wiped store goes with it");
     }
 
     #[test]
