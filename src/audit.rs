@@ -83,6 +83,8 @@ pub(crate) const DEK_UNWRAPPED: u32 = 1003;
 // unrecoverable.
 pub(crate) const KEK_RETIRED: u32 = 1004;
 pub(crate) const DEVELOPER_MODEL_KEY_FILE: u32 = 1005;
+// Linux's own: a provider later in the policy order is serving a service.
+pub(crate) const PROVIDER_FALLBACK: u32 = 1006;
 pub(crate) const ACCESS_DENIED: u32 = 2000;
 pub(crate) const KEK_INVALID: u32 = 2002;
 pub(crate) const INTEGRITY_FAILURE: u32 = 2003;
@@ -142,6 +144,35 @@ pub(crate) fn kek_created(service: &str, provider: ProviderType, preferred: Opti
         ),
         _ => emit(Severity::Info, KEK_CREATED, &fields, &format!("{created} on {}", provider.as_str())),
     }
+}
+
+/// `provider` served a call for `service` although providers earlier in the
+/// policy order were tried first; `passed_over` names each and why (not
+/// present, or no key for the service). Written once per process for each
+/// distinct combination: it marks a state, not a call. Expected where the
+/// policy lists providers this host doesn't have; anywhere else it is the
+/// one sign that keys are landing under a weaker provider than intended.
+pub(crate) fn provider_fallback(service: &str, provider: ProviderType, passed_over: &str) {
+    static WRITTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let fields = format!("service={} provider={} passed_over={}", quote(service.as_bytes()), provider.as_str(), quote(passed_over.as_bytes()));
+    {
+        let mut written = WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if written.contains(&fields) {
+            return;
+        }
+        written.push(fields.clone());
+    }
+    emit(
+        Severity::Warning,
+        PROVIDER_FALLBACK,
+        &fields,
+        &format!(
+            "{} is serving this service in place of a provider earlier in the policy order; if that isn't intended, \
+             make the earlier provider available, or take it out of preferred_order (logged once per process for \
+             each service)",
+            provider.as_str()
+        ),
+    );
 }
 
 /// A KEK was retired: deleted from `provider` for good, after its

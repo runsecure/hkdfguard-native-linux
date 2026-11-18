@@ -176,6 +176,15 @@ impl KekProvider for ExternalSecretProvider {
         self.dir.is_some() || self.refused.is_some()
     }
 
+    // No mount at all: not present, unless policy pins a key for this
+    // service -- which says its KEK is an external secret.
+    fn claims_while_absent(&self, service: &str) -> Result<()> {
+        match service_pins(service)? {
+            Pins::OneOf(_) => Err(pinned_but_missing()),
+            Pins::Any | Pins::Unpinned => Ok(()),
+        }
+    }
+
     // Loads the key exactly as `load_kek` would -- open, trust checks, read,
     // parse -- so "exists" means "exists *and* is a usable key", and a
     // malformed secret is reported when it is provisioned rather than at
@@ -188,10 +197,11 @@ impl KekProvider for ExternalSecretProvider {
         if !is_safe_file_name(service) {
             return Ok(false); // can never name a provisioned secret file
         }
-        let Some(dir) = self.dir.as_ref() else {
-            return Ok(false); // no mount at all
-        };
         let pins = service_pins(service)?;
+        let Some(dir) = self.dir.as_ref() else {
+            // no mount at all
+            return if matches!(pins, Pins::OneOf(_)) { Err(pinned_but_missing()) } else { Ok(false) };
+        };
         if matches!(pins, Pins::Unpinned) {
             return Ok(false); // the allowlist is on and this service isn't on it
         }
@@ -200,6 +210,7 @@ impl KekProvider for ExternalSecretProvider {
                 check_pins(&key, &pins)?;
                 Ok(true)
             } // the parsed key drops (and zeroizes) here
+            None if matches!(pins, Pins::OneOf(_)) => Err(pinned_but_missing()),
             None => Ok(false),
         }
     }
@@ -216,20 +227,23 @@ impl KekProvider for ExternalSecretProvider {
                 "this service name cannot be used as an external secret file name".into(), // never the name itself: service names stay out of the log
             ));
         }
-        let dir = self
-            .dir
-            .as_ref()
-            .ok_or(Error::KeyNotProvisioned("no external secret mount found"))?; // no mount at all -> decline immediately
-
         let pins = service_pins(service)?;
+        // A pinned service keeps its KEK here, by the administrator's own
+        // statement. Its secret not being mounted (yet, or any more) is an
+        // outage, not "no key": declining would send the call on to the
+        // next provider.
+        let missing = || match pins {
+            Pins::OneOf(_) => pinned_but_missing(),
+            Pins::Any | Pins::Unpinned => Error::KeyNotProvisioned("no secret file provisioned for this service"),
+        };
+        let dir = self.dir.as_ref().ok_or_else(missing)?; // no mount at all
+
         if matches!(pins, Pins::Unpinned) && !create_if_missing {
             return Err(Error::KeyNotProvisioned(
                 "external_secret.require_pinned_keys is set and policy pins no key for this service",
             ));
         }
-        let key = read_key(dir, service)?.ok_or(Error::KeyNotProvisioned(
-            "no secret file provisioned for this service", // mount exists, but nothing provisioned for this service yet
-        ))?;
+        let key = read_key(dir, service)?.ok_or_else(missing)?; // mount exists, but nothing there for this service
         if matches!(pins, Pins::Unpinned) {
             // Provisioning here means a root-owned policy edit, which this
             // process can't make itself. Do the part it can: report the
@@ -306,6 +320,17 @@ fn check_pins(key: &[u8; KEK_LEN], pins: &Pins) -> Result<()> {
         hex(&fingerprint),
         accepted.join(", ")
     )))
+}
+
+/// The error for a service policy pins a key for, when no secret is mounted
+/// for it. Never "not provisioned": see `load_kek`.
+fn pinned_but_missing() -> Error {
+    Error::Provider(
+        "policy pins an external secret for this service (external_secret.pinned_keys), but none is mounted. \
+         Refusing rather than using a weaker provider: mount the secret; or, if this service no longer keeps its \
+         KEK in one, remove its pin from the policy"
+            .into(),
+    )
 }
 
 /// The message `provision` gets for an unpinned service under
@@ -909,6 +934,39 @@ mod tests {
             // Pins are per service: an unpinned one is unaffected without the allowlist.
             provision(dir, "com.company.billing", planted);
             provider.load_kek("com.company.billing", false).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_pinned_service_with_no_secret_mounted_is_an_error_not_unprovisioned() {
+        // The pin is the administrator saying this service's KEK is an
+        // external secret. One that isn't mounted -- not yet, or not any
+        // more -- is an outage; read as "not provisioned", the chain would
+        // move on and wrap under whatever provider comes next.
+        let refused = |result: Result<()>| match result {
+            Err(Error::Provider(msg)) => assert!(msg.contains("pins an external secret") && msg.contains("none is mounted"), "{msg}"),
+            other => panic!("expected an error, got {other:?}"),
+        };
+        with_dir(|provider, _dir| {
+            let _policy = pin_policy(false, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&random_key())));
+            refused(provider.kek_exists("com.company.orders").map(|_| ()));
+            for create_if_missing in [false, true] {
+                refused(provider.load_kek("com.company.orders", create_if_missing).map(|_| ()));
+            }
+            // An unpinned service with nothing mounted still just declines.
+            assert!(!provider.kek_exists("com.company.billing").unwrap());
+            assert!(matches!(provider.load_kek("com.company.billing", false), Err(Error::KeyNotProvisioned(_))));
+
+            // And with no mount at all, where the provider is otherwise
+            // skipped without being asked about any service.
+            let absent = ExternalSecretProvider { dir: None, refused: None };
+            assert!(!absent.probe());
+            refused(absent.claims_while_absent("com.company.orders"));
+            refused(absent.kek_exists("com.company.orders").map(|_| ()));
+            refused(absent.load_kek("com.company.orders", false).map(|_| ()));
+            absent.claims_while_absent("com.company.billing").unwrap();
+            assert!(!absent.kek_exists("com.company.billing").unwrap());
         });
     }
 

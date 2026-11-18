@@ -125,7 +125,7 @@ use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11}; // loads the
 use cryptoki::error::{Error as CryptokiError, RvError}; // to recognize the two return codes that mean "already done" rather than failure
 use cryptoki::mechanism::Mechanism; // the mechanism enum (GenericSecretKeyGen, Sha256Hmac, ...)
 use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle}; // PKCS#11 object attributes/handles
-use cryptoki::session::{Session, UserType}; // an open session against a slot/token, and the login role
+use cryptoki::session::{Session, SessionState, UserType}; // an open session against a slot/token, its login state, and the login role
 use cryptoki::slot::Slot; // identifies a PKCS#11 slot
 use cryptoki::types::AuthPin; // wraps a PIN for login
 
@@ -776,7 +776,10 @@ fn find_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
         .find_objects(&labelled_template(service)) // C_FindObjects
         .map_err(|e| Error::Provider(format!("PKCS#11 find_objects failed: {e}")))?;
     let handle = match found.as_slice() {
-        [] => return Ok(None),
+        [] => {
+            require_user_session(session)?;
+            return Ok(None);
+        }
         [one] => *one,
         many => {
             return Err(Error::Provider(format!(
@@ -799,6 +802,32 @@ fn find_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
     }
     check_protections(session, handle)?;
     Ok(Some(handle))
+}
+
+/// Refuses to read an empty search result as "no key" unless the session is
+/// logged in as the user. A service's key is a private object, and a
+/// session that isn't logged in is simply not shown private objects: the
+/// search comes back empty, exactly as if no key had ever been made.
+///
+/// The login is the application's, not the session's -- every session this
+/// process has on the token shares it -- so it can end underneath a call:
+/// the host application (or another library in it) using the same module
+/// calls `C_Logout` or `C_CloseAllSessions`. Read as "no key", that would
+/// send the chain on to the next provider, and every wrap after it to a
+/// weaker KEK, while the real one sits on the token. Checked after the
+/// search rather than before, so a logout at any point up to here is seen.
+fn require_user_session(session: &Session) -> Result<()> {
+    let info = session
+        .get_session_info()
+        .map_err(|e| Error::Provider(format!("PKCS#11 get_session_info failed: {e}")))?;
+    match info.session_state() {
+        SessionState::RoUser | SessionState::RwUser => Ok(()),
+        state => Err(Error::Provider(format!(
+            "the PKCS#11 session is not logged in as the user (state {state:?}), so the token would not show this \
+             service's key if it had one: something else in this process logged out of the token. Refusing to \
+             treat that as \"no key\" rather than using a weaker provider"
+        ))),
+    }
 }
 
 /// The attribute values every key `generate_key` makes carries. This is
@@ -1303,6 +1332,46 @@ mod tests {
         assert_ne!(crate::crypto::kek_fingerprint(&*again).unwrap(), fingerprint);
         drop(again);
         with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_logged_out_session_is_an_error_not_a_missing_key() {
+        // The login belongs to the process, not the session: anything else
+        // in the process using the module can end it. The token then hides
+        // every private object, and the search for the service's key comes
+        // back empty -- which must not read as "no key here, try the next
+        // provider".
+        let service = "com.hkdfguard.test.loggedout";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| destroy_all_for(open, service));
+        assert!(!provider.kek_exists(service).unwrap(), "logged in, and no key: a plain no");
+        drop(provider.load_kek(service, true).unwrap());
+
+        with_open(&provider, |open| open.session.logout().unwrap());
+
+        let refused = |result: Result<()>| match result {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("not logged in as the user"), "{msg}");
+                assert!(!msg.contains(service), "errors must not name the service: {msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        };
+        refused(provider.kek_exists(service).map(|_| ()));
+        refused(provider.load_kek(service, false).map(|_| ())); // not KeyNotProvisioned: the chain must stop here
+        refused(provider.load_kek(service, true).map(|_| ())); // and no second key is generated beside the hidden one
+        refused(provider.retire_kek(service, &[0x11; 32]));
+
+        // A fresh provider logs in again, and finds the one key still there.
+        drop(provider);
+        let provider = Pkcs11Provider::new();
+        assert!(provider.kek_exists(service).unwrap());
+        with_open(&provider, |open| {
+            assert_eq!(count_labelled(&open.session, service).unwrap(), 1);
+            destroy_all_for(open, service);
+        });
     }
 
     #[test]

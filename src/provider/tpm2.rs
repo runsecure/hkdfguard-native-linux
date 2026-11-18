@@ -581,31 +581,52 @@ pub struct Tpm2Provider {
     // it: the TPM is there, but whether it is this service's provider
     // depends on the service (see `unreachable_for`).
     unreachable: Option<String>,
+    // Set when the default device doesn't exist at all. The provider is
+    // then not present (`probe()` is false) -- except for a service that
+    // has a TPM key file, whose TPM has gone missing (see `unreachable_for`).
+    no_device: Option<String>,
 }
 
 impl Tpm2Provider {
     pub fn new() -> Self {
         // try to connect once, at construction time
-        let (context, refused, unreachable) = match open_context() {
-            Backend::Ready(ctx) => (Some(ctx), None, None),
-            Backend::Absent => (None, None, unreachable_default_device(Path::new(DEFAULT_DEVICE))),
+        let (context, refused, unreachable, no_device) = match open_context() {
+            Backend::Ready(ctx) => (Some(ctx), None, None, None),
+            Backend::Absent => {
+                let device = Path::new(DEFAULT_DEVICE);
+                let unreachable = unreachable_default_device(device);
+                let no_device = unreachable.is_none().then(|| missing_default_device(device));
+                (None, None, unreachable, no_device)
+            }
             Backend::Refused(reason) => {
                 crate::provider::log_once(log::Level::Error, format!("hkdfguard: TPM refused: {reason}"));
-                (None, Some(reason), None)
+                (None, Some(reason), None, None)
             }
         };
-        Tpm2Provider { context: Arc::new(Mutex::new(context)), refused, unreachable }
+        Tpm2Provider { context: Arc::new(Mutex::new(context)), refused, unreachable, no_device }
     }
 
-    /// For a provider whose TPM device exists but couldn't be opened: the
+    /// For a provider whose TPM couldn't be opened -- the device exists but
+    /// this process can't open it, or there is no device at all: the
     /// error a call for `service` must fail with -- because the service has
     /// a TPM key file, so the TPM is its provider and the chain must not
     /// move past it -- or `None` when it has none and the TPM was never
-    /// its provider. `None` too for a provider that connected or found no
-    /// device at all.
+    /// its provider. `None` too for a provider that connected.
+    ///
+    /// A device that has gone is held to this as much as one that can't be
+    /// opened: a TPM driver that didn't load, a vTPM detached from the VM,
+    /// or a container started without the device would otherwise turn a
+    /// TPM-backed service into one wrapping under whatever comes next in
+    /// the policy order, with no call failing.
     fn unreachable_for(&self, service: &str) -> Result<Option<Error>> {
-        let Some(reason) = &self.unreachable else {
-            return Ok(None);
+        let (reason, remedy) = match (&self.unreachable, &self.no_device) {
+            (Some(reason), _) => (reason, "restore this process's access to the TPM"),
+            (None, Some(reason)) => (
+                reason,
+                "restore the TPM; or, if this service no longer keeps its KEK on one, remove that key file (and its \
+                 .tpmauth file)",
+            ),
+            (None, None) => return Ok(None),
         };
         let path = key_file_path(&key_dir()?, service);
         let present = match std::fs::symlink_metadata(&path) {
@@ -625,7 +646,7 @@ impl Tpm2Provider {
         Ok(present.then(|| {
             Error::Provider(format!(
                 "this service has a TPM key file ({}), but {reason}. Refusing rather than using a weaker provider: \
-                 restore this process's access to the TPM",
+                 {remedy}",
                 path.display()
             ))
         }))
@@ -655,6 +676,15 @@ fn unreachable_default_device(device: &Path) -> Option<String> {
             device.display()
         )
     })
+}
+
+/// What to say of a default TPM device that doesn't exist.
+fn missing_default_device(device: &Path) -> String {
+    format!(
+        "there is no TPM device at {} (the kernel's TPM driver isn't loaded, the TPM or vTPM was removed or \
+         disabled, or the device isn't passed into this container)",
+        device.display()
+    )
 }
 
 impl Default for Tpm2Provider {
@@ -1441,6 +1471,14 @@ impl KekProvider for Tpm2Provider {
         self.refused.is_some() || self.connected() || self.unreachable.is_some()
     }
 
+    // No device at all: not present, unless this service has a key file.
+    fn claims_while_absent(&self, service: &str) -> Result<()> {
+        match self.unreachable_for(service)? {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     // A service has a KEK here when it has a usable key file and authValue
     // file -- and, under `tpm.require_pinned_names`, a pinned Name. Side-
     // effect free: nothing is sent to the TPM. A key file without its
@@ -2160,7 +2198,74 @@ mod tests {
             context: Arc::new(Mutex::new(None)),
             refused: None,
             unreachable: unreachable_default_device(device.path()),
+            no_device: None,
         }
+    }
+
+    // A provider in the state `new()` leaves it in when there is no
+    // `/dev/tpmrm0` at all.
+    fn no_device_provider() -> Tpm2Provider {
+        Tpm2Provider {
+            context: Arc::new(Mutex::new(None)),
+            refused: None,
+            unreachable: None,
+            no_device: Some(missing_default_device(Path::new(DEFAULT_DEVICE))),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_missing_tpm_device_is_absent_except_for_a_service_with_a_key_file() {
+        with_key_dir(|_| {
+            let tpm = no_device_provider();
+            assert!(!tpm.probe(), "no device: the TPM takes no part in the chain");
+            tpm.claims_while_absent(SERVICE).expect("no key file: nothing ties the service to the TPM");
+
+            // With a key file, the TPM is this service's provider, and its
+            // disappearance is an outage: every path refuses, so the chain
+            // can't hand the service's wraps to whatever comes next.
+            write_key_file(SERVICE, &fake_blob(&fake_service_public())).unwrap();
+            assert!(!tpm.probe());
+            let refused = |result: Result<()>| match result {
+                Err(Error::Provider(msg)) => assert!(
+                    msg.contains("has a TPM key file") && msg.contains("there is no TPM device at /dev/tpmrm0") && msg.contains("restore the TPM"),
+                    "{msg}"
+                ),
+                other => panic!("expected the TPM to refuse, got {other:?}"),
+            };
+            refused(tpm.claims_while_absent(SERVICE));
+            refused(tpm.kek_exists(SERVICE).map(|_| ()));
+            refused(tpm.load_kek(SERVICE, false).map(|_| ()));
+            refused(tpm.load_kek(SERVICE, true).map(|_| ()));
+            refused(tpm.retire_kek(SERVICE, &[0; crate::payload::FINGERPRINT_LEN]));
+            tpm.claims_while_absent("com.company.billing").expect("another service, with no key file, is unaffected");
+        });
+    }
+
+    // The same through the chain, on a host that really has no TPM device:
+    // the wrap fails naming the TPM, rather than reporting no KEK (which a
+    // caller answers by creating one somewhere weaker) or using a later
+    // provider's.
+    #[test]
+    #[serial]
+    fn the_chain_stops_at_a_tpm_key_file_whose_tpm_is_gone() {
+        with_key_dir(|_| {
+            if Tpm2Provider::new().no_device.is_none() {
+                eprintln!("skipping: this host has a TPM device, or the test harness names a TCTI");
+                return;
+            }
+            write_key_file(SERVICE, &fake_blob(&fake_service_public())).unwrap();
+            for result in [
+                crate::provider::select_existing(SERVICE).map(|_| ()),
+                crate::provider::create_kek(SERVICE).map(|_| ()),
+                crate::provider::kek_exists(SERVICE).map(|_| ()),
+            ] {
+                match result {
+                    Err(Error::Provider(msg)) => assert!(msg.starts_with("TPM2: ") && msg.contains("there is no TPM device"), "{msg}"),
+                    other => panic!("expected the TPM to stop the chain, got {other:?}"),
+                }
+            }
+        });
     }
 
     #[test]

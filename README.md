@@ -211,9 +211,9 @@ caller isn't steered into creating a key somewhere weaker.
 
 | Provider | Absent (the walk moves on) | Present but failing (the call fails) |
 |---|---|---|
-| TPM2 | no TPM device; or the default device exists but this process can't open it (not in `tss`) and the service has no TPM key file | the default device can't be opened but the service *has* a key file (lost `tss` membership, a missing TCTI plugin); leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a service's key file present but untrusted or unreadable (a missing one is "not provisioned" for that service: the walk moves on); a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
-| PKCS#11 | no module configured; under the developer security model, a configured module whose PIN file doesn't exist | a configured module whose PIN file doesn't exist (production model); untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt |
-| External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
+| TPM2 | no TPM device, or the default device exists but this process can't open it (not in `tss`) -- and, either way, the service has no TPM key file | the default device is missing or can't be opened but the service *has* a key file (a TPM driver that didn't load, a detached vTPM, a container without the device, lost `tss` membership, a missing TCTI plugin); leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; a service's key file present but untrusted or unreadable (a missing one is "not provisioned" for that service: the walk moves on); a policy-named owner authorization file that is missing or untrusted, or a wrong owner password; failed or unrunnable self-test |
+| PKCS#11 | no module configured; under the developer security model, a configured module whose PIN file doesn't exist | a configured module whose PIN file doesn't exist (production model); untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure; a PIN the token rejected (no further login from this process until the PIN file changes); a token reporting its user PIN locked or on its final attempt; a session that is no longer logged in when the service's key is looked up (something else in the process logged out of the token, which hides the key) |
+| External secret | no mount found, and policy pins no key for the service | configured `external_secret.dir` missing; a service's secret file present but untrusted; a service with a key pinned in `external_secret.pinned_keys` but no secret mounted |
 | (any) | -- | policy present but unusable |
 
 | # | Provider | Module | Feature flag | Built by default |
@@ -308,7 +308,7 @@ the host does about logging. The records use facility `authpriv` and tag
 `hkdfguard`, sent straight to `/dev/log`. On systemd hosts they land in the
 journal (`journalctl -t hkdfguard`); elsewhere in `/var/log/secure` or
 `/var/log/auth.log`. These are the Windows build's Event Log events, with the
-same IDs, meanings and severities (1004 aside), so one set of alerts covers both:
+same IDs, meanings and severities (1004 and 1006 aside), so one set of alerts covers both:
 
 | ID | Severity | When |
 |---|---|---|
@@ -318,6 +318,7 @@ same IDs, meanings and severities (1004 aside), so one set of alerts covers both
 | 1003 | info | A DEK was unwrapped. |
 | 1004 | warning | A KEK was retired (`hkdfguard retire`): deleted for good, after its fingerprint was confirmed. Names the fingerprint. Every DEK wrapped under it can no longer be unwrapped. |
 | 1005 | warning | A key file was read under the developer security model, which trusts files the calling account owns. Logged once per process; names the file. |
+| 1006 | warning | A provider later in the policy order served a service, because the ones before it were absent or held no key for it; `passed_over` names each and why. Logged once per process for each service. Expected where the policy order lists providers the host doesn't have (trim `preferred_order` to silence it); anywhere else, keys are landing under a weaker provider than intended. |
 | 2000 | warning | `KEK_ACCESS_DENIED`: under the production security model, a non-root caller tried to create a KEK that doesn't exist, or to retire one. |
 | 2002 | error | `KEK_INVALID`. |
 | 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. Or `hkdfguard_open_file` refused a key file someone else could have replaced (`FILE_UNTRUSTED`), or one that isn't a well-formed payload (`FILE_MALFORMED`, `FILE_TOO_SHORT`, `FILE_TOO_LONG`); names the file. |

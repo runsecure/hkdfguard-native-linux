@@ -35,6 +35,12 @@ that is present but **failing** (wrong file permissions, a wrong PIN, a TPM
 that fails its self-test) ends the call with an error instead. Falling
 through would quietly protect new DEKs with a weaker key.
 
+So does a provider that has gone missing while still holding the service's
+key: a TPM key file on a host whose TPM device has disappeared, or a
+service with a key pinned in `external_secret.pinned_keys` and no secret
+mounted. When a later provider does serve a service, audit event 1006
+records it, once per process for each service.
+
 Each wrapped DEK records which provider wrapped it, and is always unwrapped
 by that same provider.
 

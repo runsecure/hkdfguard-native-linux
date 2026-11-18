@@ -180,6 +180,19 @@ pub trait KekProvider: Send + Sync {
     /// Must not create or persist anything.
     fn probe(&self) -> bool;
 
+    /// For a provider that is not present (`probe()` is false): `Err` if
+    /// `service` is nonetheless known to keep its KEK here -- a TPM key
+    /// file on a host whose TPM device has gone, an external secret that
+    /// policy pins but nothing mounts. The chain then stops with that error
+    /// instead of skipping the provider: the key's home disappearing is an
+    /// outage, and treating it as "never there" would hand every new wrap
+    /// to a weaker provider. `Ok` when nothing ties the service to this
+    /// provider. Must not create or persist anything.
+    fn claims_while_absent(&self, service: &str) -> Result<()> {
+        let _ = service;
+        Ok(())
+    }
+
     /// Whether a persistent KEK already exists for `service`, without
     /// creating one. Must be side-effect-free.
     fn kek_exists(&self, service: &str) -> Result<bool>;
@@ -361,7 +374,9 @@ fn reset_warn_once() {
 /// constructed.
 ///
 /// The walk moves on past a provider in exactly two cases: it isn't
-/// present at all (`probe()` is false -- see [`Backend::Absent`]), or it is
+/// present at all (`probe()` is false -- see [`Backend::Absent`]) and
+/// nothing says this service's key lives there
+/// ([`KekProvider::claims_while_absent`]), or it is
 /// present but has no key for this service ([`Error::KeyNotProvisioned`]).
 /// Any other error from a present provider ends the walk and is returned:
 /// a TPM, token, or secret mount that is there but failing must not quietly
@@ -387,6 +402,8 @@ fn walk_chain(
             continue; // not compiled into this build (policy can name a type the build lacks)
         };
         if !provider.probe() {
+            // Gone, but this service's key lives there: stop, don't skip.
+            provider.claims_while_absent(service).map_err(|e| attribute(provider_type, e))?;
             log::debug!("hkdfguard: provider {} not present, trying next", provider_type.as_str());
             passed_over.push(format!("{}: not present", provider_type.as_str()));
             continue;
@@ -396,6 +413,9 @@ fn walk_chain(
             Ok(handle) => {
                 log::debug!("hkdfguard: using provider {} for this call", provider_type.as_str());
                 if !passed_over.is_empty() {
+                    // The audit trail too: the `log` line below goes nowhere
+                    // in a host that installs no logger.
+                    crate::audit::provider_fallback(service, provider_type, &passed_over.join("; "));
                     warn_once(format!(
                         "hkdfguard: {} is serving calls in place of a provider earlier in the policy order ({}); \
                          if that isn't intended, make the earlier provider available, or take it out of \
@@ -499,6 +519,7 @@ pub fn kek_exists(service: &str) -> Result<bool> {
             continue;
         };
         if !provider.probe() {
+            provider.claims_while_absent(service).map_err(|e| attribute(provider_type, e))?;
             continue;
         }
         // An error is returned, not read as "no key": the caller would
@@ -995,6 +1016,18 @@ mod tests {
             assert!(lines[0].contains("EPHEMERAL"), "names the provider that served the call: {}", lines[0]);
             assert!(lines[0].contains("EXTERNAL_SECRET: "), "says what was passed over, and why: {}", lines[0]);
             assert!(!lines[0].contains("fallbackwarn"), "never names the service: {}", lines[0]);
+
+            // And in the audit trail, which reaches syslog whether or not
+            // the host installed a logger: once too, naming the service.
+            let records = crate::audit::captured_containing("\"com.company.fallbackwarn\"");
+            let fallbacks: Vec<&String> = records.iter().filter(|r| r.contains("event=1006 ")).collect();
+            assert_eq!(fallbacks.len(), 1, "{records:#?}");
+            assert!(fallbacks[0].starts_with("<84>"), "a Warning: {}", fallbacks[0]);
+            assert!(
+                fallbacks[0].contains("provider=EPHEMERAL passed_over=\"EXTERNAL_SECRET: "),
+                "says who served it and what was passed over: {}",
+                fallbacks[0]
+            );
         }
     }
 
@@ -1032,6 +1065,42 @@ mod tests {
                 Ok(false)
             ));
 
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn an_absent_provider_that_holds_the_services_key_stops_the_chain() {
+        #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+        {
+            // Policy pins an external secret for the service, and no secret
+            // mount exists on this host at all: the provider is absent, and
+            // would be skipped without a word -- leaving Ephemeral, which
+            // policy allows, to take every wrap. The pin says where the key
+            // lives, so the chain stops there instead.
+            let service = "com.company.pinnedbutgone";
+            let _policy = write_policy(&format!(
+                "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n\
+                 [external_secret.pinned_keys]\n\"{service}\" = \"{}\"\n",
+                "ab".repeat(32)
+            ));
+            if external_secret::ExternalSecretProvider::new().probe() {
+                eprintln!("skipping: this host has a conventional secret mount");
+                return;
+            }
+            for result in [create_kek(service).map(|_| ()), select_existing(service).map(|_| ()), kek_exists(service).map(|_| ())] {
+                match result {
+                    Err(Error::Provider(msg)) => {
+                        assert!(msg.starts_with("EXTERNAL_SECRET: ") && msg.contains("none is mounted"), "{msg}")
+                    }
+                    other => panic!("expected external-secret to stop the chain, got {other:?}"),
+                }
+            }
+            assert!(matches!(ephemeral::EphemeralProvider::new().kek_exists(service), Ok(false)), "nothing created on Ephemeral");
+
+            // A service policy doesn't pin still moves on.
+            let (provider, _) = create_kek("com.company.notpinned").unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
         }
     }
 
