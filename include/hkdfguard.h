@@ -233,8 +233,7 @@ int hkdfguard_create_kek(const char* service);
  * Reports whether a persistent KEK already exists for `service`, without
  * creating one. Subject to the same startup latency floor and
  * serialization as hkdfguard_create_kek above; "exists" and "doesn't
- * exist" take the same time. On TPM2, always 1 when the TPM is reachable
- * unless policy sets `tpm.require_pinned_names` (see hkdfguard_create_kek).
+ * exist" take the same time.
  *
  * service:  see hkdfguard_wrap_dek below.
  * exists:   out-parameter; on HKDFGUARD_OK, set to 1 if a KEK exists for
@@ -242,7 +241,11 @@ int hkdfguard_create_kek(const char* service);
  *           nothing has one yet" -- call hkdfguard_create_kek to
  *           provision one). Untouched on any other return code.
  *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code:
+ * HKDFGUARD_ERR_PROVIDER_UNAVAILABLE, not a 0 answer, when no provider the
+ * policy allows is present on this host at all -- there is then nothing
+ * to provision on. hkdfguard_wrap_dek and hkdfguard_kek_fingerprint return
+ * it in the same case, rather than HKDFGUARD_ERR_KEK_NOT_FOUND.
  */
 int hkdfguard_kek_exists(const char* service, int* exists);
 

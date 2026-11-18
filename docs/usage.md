@@ -185,7 +185,7 @@ warning (`memory not locked as a whole`).
 |---|---|---|
 | -1 | `HKDFGUARD_ERR_INVALID_ARGUMENT` | Null pointer, DEK length other than 32, negative capacity |
 | -2 | `HKDFGUARD_ERR_BUFFER_TOO_SMALL` | `*out_len` now holds the size needed |
-| -3 | `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` | No allowed provider is available on this host |
+| -3 | `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` | No allowed provider is available on this host (the TPM a `require` policy names, for example). Wrap and `hkdfguard_kek_exists` return this, not -17 or a 0 answer: there is nothing to provision on |
 | -4 | `HKDFGUARD_ERR_PROVIDER_ERROR` | A provider is present but failing |
 | -5 | `HKDFGUARD_ERR_CRYPTO_ERROR` | A cryptographic step failed for a reason other than authentication, such as the OS random number generator failing |
 | -6 | `HKDFGUARD_ERR_INTERNAL_ERROR` | An internal failure: a bug in the library (a caught panic) |

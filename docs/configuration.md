@@ -674,11 +674,6 @@ without its authValue another service's key file is useless. List each
 service's group in `tpm.auth_groups` before provisioning it; the services
 still need the directory's group to reach their files.
 
-A file provisioned before 0.9.2 took the directory's group, so every
-member of `hkdfguard` can use that key. Give each such file its service's
-own group (`sudo chgrp orders /var/lib/hkdfguard/tpm/com.company.orders.tpmauth`),
-and add the matching `tpm.auth_groups` entry so a re-provision keeps it.
-
 The same holds for any file above that a group can read: every member of
 that group holds the key it protects, not just read access to a file. An
 external secret *is* the KEK's private key, so whoever can read it can

@@ -383,7 +383,9 @@ fn reset_warn_once() {
 /// hand the call to a weaker provider, because every DEK wrapped meanwhile
 /// would land under that weaker KEK -- or, with Ephemeral, under one that
 /// is gone at the next restart. `not_found_err` is returned if the walk
-/// runs out of providers.
+/// runs out of providers after at least one present provider declined;
+/// [`Error::NoProviderAvailable`] if none was present at all (see
+/// [`nothing_present`]).
 ///
 /// The returned error is logged by the caller (the C ABI layer), not here;
 /// an `Error::Provider` is prefixed with the provider's name so that one
@@ -396,12 +398,15 @@ fn walk_chain(
     // Every provider this call passed over, and why: if a later one serves
     // the call, an operator should know a preferred one didn't.
     let mut passed_over: Vec<String> = Vec::new();
+    let mut any_present = false;
     for provider_type in allowed_types()? {
         // priority order, per the configured policy (or the default compiled-in order)
         let Some(provider) = construct_provider(provider_type) else {
             continue; // not compiled into this build (policy can name a type the build lacks)
         };
-        if !provider.probe() {
+        let present = provider.probe();
+        any_present |= present;
+        if !present {
             // Gone, but this service's key lives there: stop, don't skip.
             provider.claims_while_absent(service).map_err(|e| attribute(provider_type, e))?;
             log::debug!("hkdfguard: provider {} not present, trying next", provider_type.as_str());
@@ -446,7 +451,17 @@ fn walk_chain(
         // `provider` drops here: session logged out / module finalized /
         // TCTI closed before the next candidate is even constructed.
     }
-    Err(not_found_err)
+    Err(if any_present { not_found_err } else { nothing_present() })
+}
+
+/// The error for a chain walk that found no policy-allowed provider on
+/// this host at all. Never "no KEK for this service" (`KEK_NOT_FOUND`): that
+/// says provisioning is all that's missing, is deliberately not audited,
+/// and would send a caller to `hkdfguard_create_kek` -- when what is
+/// missing is the provider itself, such as the TPM a `require` policy names.
+/// `PROVIDER_UNAVAILABLE` is audited (event 2005).
+fn nothing_present() -> Error {
+    Error::NoProviderAvailable
 }
 
 // Names the provider in a `Provider` error's message, for the caller's log line.
@@ -483,7 +498,6 @@ pub fn create_kek(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHan
 /// create one either.
 pub fn create_kek_unprivileged(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
     match walk_chain(service, |provider_type| provider_type == ProviderType::Ephemeral, Error::KekNotFound) {
-        Err(Error::KekNotFound) if !any_provider_present()? => Err(Error::NoProviderAvailable),
         Err(Error::KekNotFound) => Err(Error::AccessDenied(
             "no KEK exists for this service, and under the production security model only root creates one \
              (run `hkdfguard provision` as root)",
@@ -492,16 +506,12 @@ pub fn create_kek_unprivileged(service: &str) -> Result<(Arc<dyn KekProvider>, B
     }
 }
 
-// Whether any policy-allowed provider is present on this host.
-fn any_provider_present() -> Result<bool> {
-    Ok(allowed_types()?.into_iter().filter_map(construct_provider).any(|provider| provider.probe()))
-}
-
 /// Walks the policy-allowed priority chain looking for a provider that
 /// already has a persistent KEK for `service`, loading (never creating)
 /// it. Backs `wrap`. Fails with [`Error::KekNotFound`] if the whole chain
 /// is walked without finding one -- the caller must call [`create_kek`]
-/// first.
+/// first -- or [`Error::NoProviderAvailable`] if no allowed provider is
+/// present to walk.
 pub fn select_existing(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
     walk_chain(service, |_| false, Error::KekNotFound)
 }
@@ -510,10 +520,13 @@ pub fn select_existing(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn K
 /// exists for `service`, without creating one anywhere. `Ok(false)` (not an
 /// error) means the chain was fully walked, every present provider answered,
 /// and none has one yet -- call
-/// [`create_kek`] to provision one. Backs `hkdfguard_kek_exists`. Like
+/// [`create_kek`] to provision one. With no allowed provider present at
+/// all, there is nothing to answer, and it fails as [`walk_chain`] does
+/// ([`Error::NoProviderAvailable`]). Backs `hkdfguard_kek_exists`. Like
 /// [`walk_chain`], constructs providers one at a time and stops at the
 /// first that has the key.
 pub fn kek_exists(service: &str) -> Result<bool> {
+    let mut any_present = false;
     for provider_type in allowed_types()? {
         let Some(provider) = construct_provider(provider_type) else {
             continue;
@@ -522,6 +535,7 @@ pub fn kek_exists(service: &str) -> Result<bool> {
             provider.claims_while_absent(service).map_err(|e| attribute(provider_type, e))?;
             continue;
         }
+        any_present = true;
         // An error is returned, not read as "no key": the caller would
         // otherwise go on to `create_kek`, and a strong provider that is
         // failing must not be the reason a key gets created somewhere weaker.
@@ -529,7 +543,7 @@ pub fn kek_exists(service: &str) -> Result<bool> {
             return Ok(true);
         }
     }
-    Ok(false)
+    if any_present { Ok(false) } else { Err(nothing_present()) }
 }
 
 /// Looks up a specific provider by the type recorded in a wrapped payload
@@ -1065,6 +1079,47 @@ mod tests {
                 Ok(false)
             ));
 
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_required_provider_that_is_absent_is_unavailable_and_audited_not_kek_not_found() {
+        #[cfg(feature = "external-secret")]
+        {
+            // Policy requires one provider and the host doesn't have it. That
+            // is an outage, not "this service isn't provisioned yet":
+            // KEK_NOT_FOUND would go unaudited and send the caller off to
+            // hkdfguard_create_kek, and kek_exists answering 0 would too.
+            let _isolated = crate::policy::test_support::TestPolicy::absent();
+            let _policy = write_policy("[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n");
+            if external_secret::ExternalSecretProvider::new().probe() {
+                eprintln!("skipping: this host has a conventional secret mount");
+                return;
+            }
+            let service = "com.company.requiredabsent";
+            assert!(matches!(expect_err(select_existing(service)), Error::NoProviderAvailable));
+            assert!(matches!(kek_exists(service), Err(Error::NoProviderAvailable)));
+
+            let c = std::ffi::CString::new(service).unwrap();
+            let dek = [0x11u8; 32];
+            let mut out = [0u8; 512];
+            let mut out_len: std::os::raw::c_int = 512;
+            assert_eq!(
+                crate::hkdfguard_wrap_dek(c.as_ptr(), dek.as_ptr(), 32, out.as_mut_ptr(), &mut out_len),
+                crate::status::PROVIDER_UNAVAILABLE
+            );
+            let mut exists: std::os::raw::c_int = -1;
+            assert_eq!(crate::hkdfguard_kek_exists(c.as_ptr(), &mut exists), crate::status::PROVIDER_UNAVAILABLE);
+            assert_eq!(exists, -1, "untouched on error");
+
+            let records = crate::audit::captured_containing("\"com.company.requiredabsent\"");
+            for op in ["hkdfguard_wrap_dek", "hkdfguard_kek_exists"] {
+                assert!(
+                    records.iter().any(|r| r.contains(&format!("event=2005 op={op} result=PROVIDER_UNAVAILABLE(-3)"))),
+                    "{op} must be audited: {records:#?}"
+                );
+            }
         }
     }
 

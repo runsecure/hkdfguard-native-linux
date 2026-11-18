@@ -189,7 +189,9 @@ exit 0
   provider; audit event 1006 records fallbacks. TPM authValue files are
   root:<group> 0440 for the group in the new tpm.auth_groups policy table,
   else root:root 0400, never the key directory's group; provisioning always
-  creates a new authValue.
+  creates a new authValue. With no policy-allowed provider present, wrap,
+  kek_exists and kek_fingerprint return PROVIDER_UNAVAILABLE (audited)
+  instead of KEK_NOT_FOUND or a 0 answer.
 
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys
