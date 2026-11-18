@@ -123,10 +123,30 @@ sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 On a `.deb` system, record a different owner or mode with
 `dpkg-statoverride` or an upgrade puts `root:hkdfguard 0750` back.
 
-`hkdfguard provision` then creates both files there, owned by root, with
-the directory's group, mode `0440`. The library refuses either file, or a
-directory above it, that anyone else could write to, so never put the
-directory under `/tmp`. `tpm.key_dir` moves it.
+**3. Each service's own group.** The authValue file is what lets an
+account use one service's key, so it is never given the directory's group,
+which every TPM-using service is in. Name the group of each service that
+doesn't run as root:
+
+```toml
+[tpm.auth_groups]
+"com.company.orders" = "orders"
+```
+
+`hkdfguard provision` then creates both files there, owned by root: the key
+file with the directory's group, mode `0440`, and the authValue file with
+the service's group from `tpm.auth_groups`, mode `0440` -- or, with no
+entry, `root:root 0400`, which only a service running as root can use. A
+group that covers essentially every account (`users`, `nogroup`, `root`,
+`wheel` and the like) is refused. To change a provisioned service's group,
+`chgrp` its `.tpmauth` file; the library accepts any group on a root-owned
+`0440` file. The library refuses either file, or a directory above it,
+that anyone else could write to, so never put the directory under `/tmp`.
+`tpm.key_dir` moves it.
+
+Provisioning always creates a new authValue. An authValue file left with
+no key file beside it (a retire that couldn't delete it, a key file
+deleted by hand) is replaced, never reused.
 
 #### Back up the key files
 
@@ -143,7 +163,7 @@ changes the TPM's seed, and no key file made before it can be loaded
 again. If DEKs must survive the hardware, keep a copy of each somewhere
 other than this host, protected by a key not tied to it.
 
-**3. Pin each service's key (recommended).** A key file is checked for
+**4. Pin each service's key (recommended).** A key file is checked for
 the attributes every key this library creates has, but a key file someone
 with root put there is otherwise taken as is. With `require_pinned_names`,
 only services listed in the policy have a key, and each one's key must
@@ -172,7 +192,7 @@ sudo hkdfguard provision -sn com.company.orders
 Add the line as printed, then run `provision` again; it reports "already
 provisioned".
 
-**4. The TPM bus traffic is encrypted; pin the storage root key for
+**5. The TPM bus traffic is encrypted; pin the storage root key for
 provisioning.** On a *discrete* TPM (a separate chip), the wrapping key
 each wrap and unwrap computes (the output of `TPM2_HMAC`) crosses the
 motherboard bus. It is always encrypted, and its response authenticated,
@@ -198,7 +218,7 @@ cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning \
 
 `scripts/native-tpm-test.sh` runs this, and a full check of your TPM, for you.
 
-**5. Protect the TPM hierarchy (recommended on shared hosts).** Anyone who
+**6. Protect the TPM hierarchy (recommended on shared hosts).** Anyone who
 can open the TPM can, with the default empty passwords, *clear* it, which
 makes every key file unloadable. Set a lockout password and disable
 clearing:
@@ -215,8 +235,10 @@ under can't be re-created without that password either. It changes no
 existing key. But other
 software on the host that uses the owner hierarchy with an empty password
 (for example `systemd-cryptenroll --tpm2-device`) stops working until it is
-given the password. See the README's "Protect the hierarchy the keys
-live under" for the steps.
+given the password. Every service using TPM keys must be able to read the
+file, so each of them holds the Owner hierarchy's password, not only its
+own key. See the README's "Protect the hierarchy the keys live under" for
+the steps.
 
 **Other TPM settings.**
 
@@ -440,7 +462,7 @@ itself, for example with `hkdfguard_generate_and_wrap_dek`.
 
 Each example is a complete `policy.toml`. Replace the placeholder Names
 (`000b<64 hex chars>`) with the values your TPM gives you (see
-[step 3](#tpm-20)).
+[step 4](#tpm-20)).
 
 **Strongest: TPM only, everything pinned.** For a host with a TPM, where no
 weaker fallback is acceptable:
@@ -461,6 +483,9 @@ pinned_session_salt_key_name = "000b<64 hex chars>"  # the storage root key prov
 
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"
+
+[tpm.auth_groups]
+"com.company.orders" = "orders"      # only the orders service's group reads its authValue
 ```
 
 **Any hardware, TPM preferred.** For a fleet where some hosts have a TPM and
@@ -619,8 +644,8 @@ permissions so that only the service's own account can do both.
 | `/etc/hkdfguard/policy.toml` | `root:root 0644` | Readable by services; changeable only by root |
 | `/var/lib/hkdfguard/tpm/` | `root:<key-users> 0750` | Only root may add or replace a key; its group is the group of each key file in it |
 | `/var/lib/hkdfguard/tpm/<service>.tpmkey` | `root:<key-users> 0440` (`provision` sets it) | Readable by the services allowed to use TPM keys |
-| `/var/lib/hkdfguard/tpm/<service>.tpmauth` | `root:<key-users> 0440` (`provision` sets it); better `root:<service-group> 0440` | The key's authValue: only that service should read it |
-| `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | As above |
+| `/var/lib/hkdfguard/tpm/<service>.tpmauth` | `root:<service-group> 0440`, the group from `tpm.auth_groups`; `root:root 0400` with none (`provision` sets it) | The key's authValue: only that service may read it |
+| `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | Every TPM-using service must read it, and so holds the Owner hierarchy's password |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
 | External secret `<dir>/<service>` | root or the service's user, `0400`; or `root:<group> 0440` | Only that service (or the pod's `fsGroup`) |
 | Wrapped key files (CLI output) | root or a deployer, `:<service-group> 0640` | Only that service can read its wrapped DEK; under the production model, only root's and deployers' are trusted |
@@ -643,16 +668,16 @@ sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 # and its wrapped key files are group-owned by that service's own group.
 ```
 
-As provisioned, every member of `hkdfguard` can use every service's TPM
-key: both files take the directory's group. To give each service its own,
-change its authValue file's group to that service's own group after
-`provision` (`sudo chgrp orders /var/lib/hkdfguard/tpm/com.company.orders.tpmauth`);
-the services still need the directory's group to reach it. Without its
-authValue, another service's key file is useless to them. Without that,
-what stops one service from recovering
-another's DEK is that it can't read the other's wrapped key files. Wrapped
-files are meant to be storable openly (in backups, for example), so treat
-this as defence in depth, not a hard boundary.
+Every member of `hkdfguard` can read every service's key file, but only a
+service's own group (from `tpm.auth_groups`) its authValue file, and
+without its authValue another service's key file is useless. List each
+service's group in `tpm.auth_groups` before provisioning it; the services
+still need the directory's group to reach their files.
+
+A file provisioned before 0.9.2 took the directory's group, so every
+member of `hkdfguard` can use that key. Give each such file its service's
+own group (`sudo chgrp orders /var/lib/hkdfguard/tpm/com.company.orders.tpmauth`),
+and add the matching `tpm.auth_groups` entry so a re-provision keeps it.
 
 The same holds for any file above that a group can read: every member of
 that group holds the key it protects, not just read access to a file. An
@@ -696,6 +721,9 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"     # default: unset (empty ow
 require_pinned_names = false
 session_encryption = "on"                             # on | off (off: test harnesses only)
 pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; pin it before provisioning on a discrete TPM
+
+[tpm.auth_groups]                                     # default: none (every .tpmauth file root:root 0400)
+"com.company.orders" = "orders"                       # its .tpmauth file root:orders 0440
 
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"

@@ -379,7 +379,20 @@ struct TpmPolicy {
     /// storage primary key every key file is loaded under -- and so from
     /// using this crate's KEKs at all. Adding it changes no KEK.
     owner_auth_file: Option<String>,
+    /// The group whose members may read a service's authValue file, per
+    /// service: `"com.company.orders" = "orders"`. Root writes the file
+    /// `root:<group> 0440` when it provisions the service. A service with
+    /// no entry gets `root:root 0400`, readable by root alone: the
+    /// authValue is what lets an account use the service's key, so it is
+    /// never shared with the key directory's group, which every service
+    /// using TPM keys belongs to.
+    #[serde(default)]
+    auth_groups: BTreeMap<String, String>,
 }
+
+/// Longest group name `tpm.auth_groups` accepts: generous for directory
+/// (LDAP, AD) names, and bounded so a typo'd value is caught at load time.
+const MAX_GROUP_NAME_LEN: usize = 256;
 
 /// TCTI kinds tss-esapi can open; anything else is rejected at load time.
 const TCTI_KINDS: &[&str] = &["device", "tabrmd", "mssim", "swtpm"];
@@ -577,6 +590,8 @@ pub struct Policy {
     tpm_tcti: Option<String>,
     tpm_key_dir: Option<PathBuf>,
     tpm_owner_auth_file: Option<PathBuf>,
+    /// Normalized service name -> the group that may read its authValue file.
+    tpm_auth_groups: BTreeMap<String, String>,
     external_secret_dir: Option<PathBuf>,
     require_external_pinned_keys: bool,
     /// Normalized service name -> every KEK fingerprint accepted for it.
@@ -726,6 +741,24 @@ impl Policy {
             .as_deref()
             .map(|f| absolute_path("tpm.owner_auth_file", f))
             .transpose()?;
+        // Group names are only checked for shape here; whether each names a
+        // real, narrow group is decided when root provisions the service
+        // (`security_model::service_group_gid`), on the host that has it.
+        let mut tpm_auth_groups = BTreeMap::new();
+        for (service, group) in &raw.tpm.auth_groups {
+            let field = format!("tpm.auth_groups[\"{service}\"]");
+            if group.is_empty() || group.len() > MAX_GROUP_NAME_LEN || group.starts_with('-') || group.contains(['\0', '/', ':', '\n']) {
+                return Err(Error::Policy(format!(
+                    "hkdfguard policy: {field} = \"{}\" is not a group name",
+                    group.escape_debug()
+                )));
+            }
+            if tpm_auth_groups.insert(crate::normalize_service(service), group.clone()).is_some() {
+                return Err(Error::Policy(format!(
+                    "hkdfguard policy: tpm.auth_groups lists \"{service}\" more than once (names are compared case-insensitively)"
+                )));
+            }
+        }
 
         let external_secret_dir = raw
             .external_secret
@@ -785,6 +818,7 @@ impl Policy {
             tpm_tcti: raw.tpm.tcti,
             tpm_key_dir,
             tpm_owner_auth_file,
+            tpm_auth_groups,
             external_secret_dir,
             require_external_pinned_keys: raw.external_secret.require_pinned_keys,
             pinned_external_keys,
@@ -807,6 +841,12 @@ impl Policy {
     /// The Owner-hierarchy authorization file (`tpm.owner_auth_file`), if policy sets one.
     pub fn tpm_owner_auth_file(&self) -> Option<&std::path::Path> {
         self.tpm_owner_auth_file.as_deref()
+    }
+
+    /// The group that may read `service`'s TPM authValue file
+    /// (`tpm.auth_groups`), if policy names one.
+    pub fn tpm_auth_group(&self, service: &str) -> Option<&str> {
+        self.tpm_auth_groups.get(&crate::normalize_service(service)).map(String::as_str)
     }
 
     /// TPM session parameter-encryption mode (`tpm.session_encryption`).
@@ -1198,6 +1238,19 @@ pub(crate) fn tpm_key_dir() -> Result<Option<PathBuf>> {
 pub(crate) fn tpm_owner_auth_file() -> Result<Option<PathBuf>> {
     match load() {
         Some(Ok(policy)) => Ok(policy.tpm_owner_auth_file().map(std::path::Path::to_path_buf)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// The group policy names for `service`'s TPM authValue file
+/// (`tpm.auth_groups`), if any. `Err` on a policy file that exists but can't
+/// be trusted: provisioning then fails rather than writing the file for a
+/// group the administrator may not have meant.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_auth_group(service: &str) -> Result<Option<String>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.tpm_auth_group(service).map(str::to_owned)),
         Some(Err(e)) => Err(e),
         None => Ok(None),
     }
@@ -1928,6 +1981,26 @@ mod tests {
     }
 
     #[test]
+    fn tpm_auth_groups_are_read_per_normalized_service_and_shape_checked() {
+        let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        assert_eq!(Policy::from_toml_str(base).unwrap().tpm_auth_group("com.company.orders"), None, "none by default");
+
+        let policy =
+            Policy::from_toml_str(&format!("{base}[tpm.auth_groups]\n\"com.company.Orders\" = \"orders\"\n\"com.company.billing\" = \"billing-svc\"\n"))
+                .unwrap();
+        assert_eq!(policy.tpm_auth_group("com.company.orders"), Some("orders"), "matched case-insensitively");
+        assert_eq!(policy.tpm_auth_group("com.company.billing"), Some("billing-svc"));
+        assert_eq!(policy.tpm_auth_group("com.company.other"), None);
+
+        for bad in ["", "-orders", "a/b", "a:b", "a\\nb", &"g".repeat(MAX_GROUP_NAME_LEN + 1)] {
+            let doc = format!("{base}[tpm.auth_groups]\n\"com.company.orders\" = \"{bad}\"\n");
+            assert!(matches!(Policy::from_toml_str(&doc), Err(Error::Policy(_))), "{bad:?} must be refused");
+        }
+        let dup = format!("{base}[tpm.auth_groups]\n\"com.company.orders\" = \"a\"\n\"com.company.ORDERS\" = \"b\"\n");
+        assert!(matches!(Policy::from_toml_str(&dup), Err(Error::Policy(msg)) if msg.contains("more than once")));
+    }
+
+    #[test]
     fn tpm_owner_auth_file_is_read_and_must_be_absolute() {
         let base = "[selection]\nmode = \"prefer\"\n";
         assert_eq!(Policy::from_toml_str(base).unwrap().tpm_owner_auth_file(), None);
@@ -2422,6 +2495,7 @@ mod tests {
         assert!(policy.tpm_tcti().is_none());
         assert!(policy.tpm_key_dir().is_none());
         assert!(policy.tpm_owner_auth_file().is_none());
+        assert!(policy.tpm_auth_group("com.company.orders").is_none());
         assert!(policy.external_secret_dir().is_none());
         assert_eq!(policy.pkcs11(), &Pkcs11Settings::default());
     }

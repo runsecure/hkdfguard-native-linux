@@ -214,9 +214,27 @@ impl PrincipalTrust for Trust {
 // would trust every account's key files. Fails closed: if a listed group
 // can't be looked up, whether it is this gid can't be ruled out.
 fn vetted(name: &str, group: Group) -> Result<DeployerGroup> {
-    let refuse = |why: String| Err(Error::GroupInvalid(format!("deployer group \"{name}\" (gid {}): {why}", group.gid)));
+    vetted_as("deployer group", name, group)
+}
+
+/// The gid of `name`, a group meant to cover one service's accounts -- a
+/// TPM authValue file's (`tpm.auth_groups`). Refused, as a deployer group
+/// is, when it is over-broad, missing, or can't be looked up: a file only
+/// one service should read must not become readable by essentially every
+/// account through a typo or a default group.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn service_group_gid(name: &str) -> Result<libc::gid_t> {
+    let group = lookup_group(name)
+        .map_err(|e| Error::GroupInvalid(format!("tpm.auth_groups: could not look up group \"{name}\": {e}")))?
+        .ok_or_else(|| Error::GroupInvalid(format!("tpm.auth_groups: \"{name}\" does not name a group on this host")))?;
+    Ok(vetted_as("tpm.auth_groups group", name, group)?.gid)
+}
+
+// `role` names what the group is for, in the refusal.
+fn vetted_as(role: &str, name: &str, group: Group) -> Result<DeployerGroup> {
+    let refuse = |why: String| Err(Error::GroupInvalid(format!("{role} \"{name}\" (gid {}): {why}", group.gid)));
     if group.gid == 0 || group.gid == 65534 || OVER_BROAD_GROUPS.contains(&group.name.as_str()) {
-        return refuse("an over-broad group can't be a deployer group".to_string());
+        return refuse(format!("an over-broad group can't be a {role}"));
     }
     for broad in OVER_BROAD_GROUPS {
         match lookup_group(broad) {
@@ -369,6 +387,34 @@ mod tests {
 
     fn me() -> (libc::uid_t, String, libc::gid_t) {
         Trust::this_user_for_tests()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "looks groups up through NSS, which Miri can't")]
+    fn a_service_group_must_exist_and_not_be_over_broad() {
+        match service_group_gid("hkdfguard-test-no-such-group") {
+            Err(Error::GroupInvalid(msg)) => assert!(msg.contains("does not name a group"), "{msg}"),
+            other => panic!("expected GroupInvalid, got {other:?}"),
+        }
+        if lookup_group("root").ok().flatten().is_some() {
+            match service_group_gid("root") {
+                Err(Error::GroupInvalid(msg)) => assert!(msg.contains("over-broad") && msg.contains("tpm.auth_groups"), "{msg}"),
+                other => panic!("expected GroupInvalid, got {other:?}"),
+            }
+        }
+        // This process's own primary group, unless that is itself over-broad.
+        let (_, _, gid) = me();
+        // SAFETY: getgrgid returns null or a pointer to a static entry, read at once.
+        let name = unsafe {
+            let entry = libc::getgrgid(gid);
+            (!entry.is_null()).then(|| std::ffi::CStr::from_ptr((*entry).gr_name).to_string_lossy().into_owned())
+        };
+        match name {
+            Some(name) if gid != 0 && gid != 65534 && !OVER_BROAD_GROUPS.contains(&name.as_str()) => {
+                assert_eq!(service_group_gid(&name).unwrap(), gid)
+            }
+            _ => eprintln!("skipping the positive case: this process's primary group is over-broad or unnamed"),
+        }
     }
 
     #[test]

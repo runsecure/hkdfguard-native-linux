@@ -58,10 +58,12 @@
 //!   symmetric secret, so this holds against a quantum computer too. See
 //!   the "Session parameter encryption" section below.
 //! - **Access control per service.** Using the key takes the key file, the
-//!   authValue file and the TPM. Both files are `root:<key-users> 0440`
-//!   when written (see [`write_new_file`]); giving a service's authValue
-//!   file that service's own group keeps every other service in
-//!   `<key-users>` from using its key.
+//!   authValue file and the TPM. Root writes the key file
+//!   `root:<key-users> 0440`, the key directory's group, and the authValue
+//!   file `root:<group> 0440` for the group `tpm.auth_groups` names for the
+//!   service, else `root:root 0400` (see [`auth_file_readers`]). So every
+//!   service in `<key-users>` can read every key file, but only a
+//!   service's own group its authValue: no other service can use its key.
 //!
 //! What it does not guarantee: anyone who can read both files *and* open
 //! the TPM can use the key, as the PKCS#11 PIN is for that provider. And a
@@ -69,7 +71,8 @@
 //! every key file becomes permanently unloadable.
 //!
 //! Provisioning is real: `load_kek(service, true)` creates the authValue
-//! file and then the key file if there is none, and a service with no key
+//! file -- always a new value -- and then the key file if there is none,
+//! holding a lock on the key directory throughout, and a service with no key
 //! file has no KEK here ([`Error::KeyNotProvisioned`]), so the provider
 //! chain moves on. A key file without its authValue file is an error.
 //! `retire_kek` deletes both.
@@ -80,6 +83,7 @@ use crate::provider::{Backend, KekHandle, KekProvider, PrfOutput, ProviderType, 
 use crate::secure_file::{FileIdentity, Owner};
 use sha2::{Digest as ShaDigest, Sha256}; // the payload's key_id tag and TPM Names (aliased to avoid clashing with tss-esapi's own `Digest`)
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd; // the key directory's descriptor, for flock
 use std::path::{Path, PathBuf}; // the key directory and key files
 use std::str::FromStr; // brings `TctiNameConf::from_str` into scope
 use std::sync::{Arc, Mutex, OnceLock}; // shared, lock-protected TPM context; `OnceLock` for the per-process conformance verdict
@@ -107,7 +111,7 @@ use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its c
 const DEFAULT_KEY_DIR: &str = "/var/lib/hkdfguard/tpm";
 
 /// A key file's name is the service name plus this. Service names never
-/// start with '.', so the hidden temporary files [`write_new_file`] makes
+/// start with '.', so the hidden temporary files [`write_key_dir_file`] makes
 /// can never be mistaken for one.
 const KEY_FILE_SUFFIX: &str = ".tpmkey";
 
@@ -238,6 +242,15 @@ fn read_auth_file(service: &str) -> Result<Option<Auth>> {
     let mut file = match check_location(&path, owner).and_then(|()| open_checked(&path, &requirements)) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // The OS refused the open: a trust refusal carries no OS error.
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
+            return Err(fail(format!(
+                "can't be read by this process ({e}). Only root, and the group policy names for this service in \
+                 tpm.auth_groups, may read it: add the service's own group there (\"<service>\" = \"<group>\") and \
+                 give the file that group (chgrp <group> {})",
+                path.display()
+            )))
+        }
         Err(e) => return Err(fail(format!("is present but can't be trusted: {e}"))),
     };
     let mut raw = SecretBuffer::read_from(&mut file, AUTH_VALUE_LEN).map_err(|e| fail(format!("could not be read: {e}")))?;
@@ -260,26 +273,57 @@ fn generate_auth_value() -> Result<zeroize::Zeroizing<[u8; AUTH_VALUE_LEN]>> {
     }
 }
 
-/// `service`'s authValue, creating its file first if it has none. Two
-/// processes provisioning at once both end up with the one on disk (see
-/// [`write_new_file`]), so they create their keys with the same value.
+/// A fresh authValue for `service`, written to its authValue file, for a
+/// key about to be created. Called only under [`KeyDirLock`], and only when
+/// the service has no key file: any authValue file already there belongs to
+/// no key (one left by a retire that couldn't delete it, or by a key file
+/// deleted by hand), and is replaced rather than reused. A value that has
+/// sat in the directory may have been read by whoever could read it then --
+/// a group the file had before, a backup -- and a new key must not inherit
+/// that exposure.
+///
+/// Who may read the file is [`auth_file_readers`].
 fn provision_auth_file(service: &str) -> Result<Auth> {
-    if let Some(auth) = read_auth_file(service)? {
-        return Ok(auth);
-    }
-    write_new_file(service, AUTH_FILE_SUFFIX, "TPM authValue", &generate_auth_value()?[..])?;
+    let readers = auth_file_readers(service)?;
+    write_key_dir_file(service, AUTH_FILE_SUFFIX, "TPM authValue", &generate_auth_value()?[..], readers, Publish::Replace)?;
     read_auth_file(service)?.ok_or_else(|| Error::Provider("the TPM authValue file vanished right after it was written".into()))
+}
+
+/// Who may read `service`'s authValue file when root writes it: the group
+/// `tpm.auth_groups` names for the service, else root alone. Never the key
+/// directory's group: every service using TPM keys is in it, and whoever
+/// reads a service's authValue (and can open the TPM) can use its key.
+/// Irrelevant when anyone else writes it: the file is then `0400`, its
+/// writer's own.
+fn auth_file_readers(service: &str) -> Result<Readers> {
+    if !running_as_root() {
+        return Ok(Readers::OwnerOnly);
+    }
+    match crate::policy::tpm_auth_group(service)? {
+        Some(group) => Ok(Readers::Group(crate::security_model::service_group_gid(&group)?)),
+        None => Ok(Readers::OwnerOnly),
+    }
+}
+
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// `service`'s authValue, for a key file that exists. A key file whose
 /// authValue file is missing can't be used, and is an error rather than
-/// "not provisioned".
+/// "not provisioned". Nor can it be retired: retiring confirms the key's
+/// fingerprint on the TPM, which takes the authValue.
 fn required_auth_file(service: &str) -> Result<Auth> {
     read_auth_file(service)?.ok_or_else(|| {
-        let path = key_dir().map(|dir| auth_file_path(&dir, service).display().to_string()).unwrap_or_default();
+        let (key, auth) = key_dir()
+            .map(|dir| (key_file_path(&dir, service).display().to_string(), auth_file_path(&dir, service).display().to_string()))
+            .unwrap_or_default();
         Error::Provider(format!(
-            "this service's TPM key file has no authValue file ({path}), so its key can't be used. Restore the file \
-             from a backup, or retire the service and provision it again"
+            "this service's TPM key file has no authValue file ({auth}), so its key can't be used, or retired (which \
+             confirms the key's fingerprint on the TPM). Restore the file from the backup taken with the key file. \
+             If there is none, the key can never be used again: delete {key} by hand and provision the service \
+             again; every DEK wrapped under the old key is lost"
         ))
     })
 }
@@ -287,31 +331,37 @@ fn required_auth_file(service: &str) -> Result<Auth> {
 /// Writes `service`'s key file.
 fn write_key_file(service: &str, blob: &KeyBlob) -> Result<()> {
     let pem = tpm_key_file::encode(blob).map_err(|e| Error::Provider(format!("could not encode the TPM key file: {e}")))?;
-    write_new_file(service, KEY_FILE_SUFFIX, "TPM key", pem.as_bytes())
+    write_key_dir_file(service, KEY_FILE_SUFFIX, "TPM key", pem.as_bytes(), Readers::DirGroup, Publish::IfAbsent)
 }
 
-/// Writes `<service><suffix>` into the key directory, unless it appeared
-/// first. `what` names the file in messages.
-///
-/// The key directory must already exist, set up by an administrator: its
-/// group decides who may read the files. A file written by root takes the
-/// directory's group, mode `0440`, so with the directory `root:<key-users>`
-/// every service in that group can read it -- until an administrator gives
-/// a service's authValue file that service's own group, which keeps every
-/// other service from using its key. One written by another user (the
-/// developer model) is `0400`, since a group-readable file its own user
-/// owns is refused (see [`read_key_file`]).
-///
-/// The file is written to a hidden temporary name, synced, then
-/// hard-linked to its real name, which fails if that name exists: two
-/// processes provisioning the same service at once can't overwrite each
-/// other's file, and a crash never leaves a partial file under the real
-/// name. The loser's contents are discarded unused and everyone uses the
-/// winner's -- so the caller re-reads the file rather than trusting
-/// `contents`.
-fn write_new_file(service: &str, suffix: &str, what: &str, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
+/// Who besides its owner may read a file root writes into the key
+/// directory. A file anyone else writes is always `0400`: a group-readable
+/// file its own (non-root) user owns is refused (see [`read_key_file`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readers {
+    /// The key directory's group (`root:<key-users> 0440`): for key files,
+    /// useless without their authValue.
+    DirGroup,
+    /// One named group (`root:<group> 0440`).
+    Group(libc::gid_t),
+    /// Nobody (`root:root 0400`).
+    OwnerOnly,
+}
 
+/// What [`write_key_dir_file`] does when the file already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publish {
+    /// Leave it, and discard what was to be written: a key file is never
+    /// replaced.
+    IfAbsent,
+    /// Replace it, in one step.
+    Replace,
+}
+
+/// The key directory, resolved and checked: it must already exist, set up
+/// by an administrator, and nobody but [`key_owner`] may be able to change
+/// it or anything above it.
+fn checked_key_dir() -> Result<PathBuf> {
     let configured = key_dir()?;
     let dir = match std::fs::canonicalize(&configured) {
         Ok(dir) => dir,
@@ -326,6 +376,56 @@ fn write_new_file(service: &str, suffix: &str, what: &str, contents: &[u8]) -> R
     };
     crate::secure_file::check_dir_chain(&dir, key_owner()?)
         .map_err(|e| Error::Provider(format!("TPM key directory {} can't be trusted: {e}", dir.display())))?;
+    Ok(dir)
+}
+
+/// An exclusive `flock` on the key directory, held while a service's files
+/// are created or deleted, so provisioning and retiring are one step each
+/// as far as every other process doing either is concerned: a provisioner
+/// that finds no key file can be sure no one else is half-way through
+/// writing one, and so that any authValue file there belongs to no key.
+/// Readers don't take it; the files they read only ever appear whole.
+/// Released when dropped (the descriptor closes).
+struct KeyDirLock {
+    _dir: std::fs::File,
+}
+
+impl KeyDirLock {
+    fn acquire() -> Result<KeyDirLock> {
+        let dir = checked_key_dir()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&dir)
+            .map_err(|e| Error::Provider(format!("could not open TPM key directory {} to lock it: {e}", dir.display())))?;
+        loop {
+            // SAFETY: `file` is an open descriptor for the life of this call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(KeyDirLock { _dir: file });
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(Error::Provider(format!("could not lock TPM key directory {}: {e}", dir.display())));
+            }
+        }
+    }
+}
+
+/// Writes `<service><suffix>` into the key directory. `what` names the file
+/// in messages; `readers` says who besides its owner may read it, when root
+/// writes it.
+///
+/// The file is written to a hidden temporary name and synced, then given
+/// its real name: with [`Publish::IfAbsent`] by a hard link, which fails if
+/// the name exists -- two processes provisioning the same service at once
+/// can't overwrite each other's key file, and the loser's is discarded
+/// unused, so the caller re-reads the file rather than trusting `contents`;
+/// with [`Publish::Replace`] by a `rename(2)` over whatever is there. Either
+/// way a crash never leaves a partial file under the real name.
+fn write_key_dir_file(service: &str, suffix: &str, what: &str, contents: &[u8], readers: Readers, publish: Publish) -> Result<()> {
+    use std::io::Write;
+
+    let dir = checked_key_dir()?;
     let dir_gid = std::fs::metadata(&dir)
         .map_err(|e| Error::Provider(format!("TPM key directory {}: {e}", dir.display())))?
         .gid();
@@ -336,8 +436,6 @@ fn write_new_file(service: &str, suffix: &str, what: &str, contents: &[u8]) -> R
     let target = dir.join(format!("{service}{suffix}"));
     let fail = |doing: &str, e: std::io::Error| Error::Provider(format!("could not {doing} {what} file {}: {e}", target.display()));
 
-    // SAFETY: geteuid has no preconditions.
-    let as_root = unsafe { libc::geteuid() } == 0;
     let written = (|| -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -345,9 +443,16 @@ fn write_new_file(service: &str, suffix: &str, what: &str, contents: &[u8]) -> R
             .mode(0o400)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temp)?;
-        if as_root {
-            std::os::unix::fs::fchown(&file, None, Some(dir_gid))?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o440))?;
+        if running_as_root() {
+            // Explicitly, whatever group a setgid directory or root's own
+            // primary group would have given the file.
+            let (gid, mode) = match readers {
+                Readers::DirGroup => (dir_gid, 0o440),
+                Readers::Group(gid) => (gid, 0o440),
+                Readers::OwnerOnly => (0, 0o400),
+            };
+            std::os::unix::fs::fchown(&file, None, Some(gid))?;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
         file.write_all(contents)?;
         file.sync_all()
@@ -356,14 +461,28 @@ fn write_new_file(service: &str, suffix: &str, what: &str, contents: &[u8]) -> R
         let _ = std::fs::remove_file(&temp);
         return Err(fail("write", e));
     }
-    let linked = std::fs::hard_link(&temp, &target);
-    let _ = std::fs::remove_file(&temp);
-    match linked {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            log::info!("hkdfguard: another process provisioned the {what} file for this service first; using its file");
+    match publish {
+        Publish::IfAbsent => {
+            let linked = std::fs::hard_link(&temp, &target);
+            let _ = std::fs::remove_file(&temp);
+            match linked {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    log::info!("hkdfguard: another process provisioned the {what} file for this service first; using its file");
+                }
+                Err(e) => return Err(fail("create", e)),
+            }
         }
-        Err(e) => return Err(fail("create", e)),
+        Publish::Replace => {
+            let replacing = std::fs::symlink_metadata(&target).is_ok();
+            if let Err(e) = std::fs::rename(&temp, &target) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(fail("create", e));
+            }
+            if replacing {
+                log::info!("hkdfguard: replaced a {what} file that belonged to no key file with a new one");
+            }
+        }
     }
     sync_dir(&dir).map_err(|e| fail("persist", e))
 }
@@ -1518,18 +1637,25 @@ impl KekProvider for Tpm2Provider {
             Some(file) => (file, required_auth_file(service)?),
             None if !create_if_missing => return Err(Error::KeyNotProvisioned("no TPM key file for this service")),
             None => {
-                // The authValue file first: a concurrent provisioner then
-                // finds it and creates its key with the same value, so
-                // whichever key file wins below matches it.
-                let auth = provision_auth_file(service)?;
-                let blob = with_context(&self.context, |ctx| create_service_key(ctx, &auth))?;
-                write_key_file(service, &blob)?;
-                // Re-read rather than trusting `blob`: a concurrent
-                // provisioning may have won, and the file on disk is the
-                // key every later call uses.
-                let file = read_key_file(service)?
-                    .ok_or_else(|| Error::Provider("the TPM key file vanished right after it was written".into()))?;
-                (file, auth)
+                // One provisioner at a time (see `KeyDirLock`). Whoever held
+                // the lock before may have provisioned the service: look
+                // again under it.
+                let _lock = KeyDirLock::acquire()?;
+                match read_key_file(service)? {
+                    Some(file) => (file, required_auth_file(service)?),
+                    None => {
+                        // The authValue file first, so the key file never
+                        // exists without one.
+                        let auth = provision_auth_file(service)?;
+                        let blob = with_context(&self.context, |ctx| create_service_key(ctx, &auth))?;
+                        write_key_file(service, &blob)?;
+                        // Re-read rather than trusting `blob`: the file on
+                        // disk is the key every later call uses.
+                        let file = read_key_file(service)?
+                            .ok_or_else(|| Error::Provider("the TPM key file vanished right after it was written".into()))?;
+                        (file, auth)
+                    }
+                }
             }
         };
         if !pin_allows(service, &file.public)? {
@@ -1574,6 +1700,10 @@ impl KekProvider for Tpm2Provider {
         let Some(file) = read_key_file(service)? else {
             return Err(Error::KekNotFound);
         };
+        // No provisioning of this service can interleave with the deletes.
+        // A key file replaced between the read above and here is caught by
+        // the identity check before the delete.
+        let _lock = KeyDirLock::acquire()?;
         let handle = Tpm2Handle {
             key_id: Vec::new(),
             service: service.to_string(),
@@ -1596,8 +1726,8 @@ impl KekProvider for Tpm2Provider {
         std::fs::remove_file(&path)
             .map_err(|e| Error::Provider(format!("could not delete TPM key file {}: {e}", path.display())))?;
         // The key file is gone, so the key is retired: an authValue file
-        // left behind by a failure here is harmless, and provisioning the
-        // service again reuses it.
+        // left behind by a failure here authorizes nothing, and provisioning
+        // the service again replaces it with a new one.
         let auth_path = auth_file_path(&dir, service);
         if let Err(e) = std::fs::remove_file(&auth_path) {
             log::warn!("hkdfguard: retired the TPM key, but could not delete its authValue file {}: {e}", auth_path.display());
@@ -2128,7 +2258,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn provisioning_an_auth_file_writes_32_private_bytes_and_reuses_them() {
+    fn provisioning_an_auth_file_writes_32_fresh_private_bytes_every_time() {
         with_key_dir(|dir| {
             assert!(read_auth_file(SERVICE).unwrap().is_none(), "no file: none provisioned");
             let first = provision_auth_file(SERVICE).unwrap();
@@ -2136,14 +2266,71 @@ mod tests {
             let bytes = std::fs::read(&path).unwrap();
             assert_eq!(bytes.len(), AUTH_VALUE_LEN);
             assert_ne!(bytes[AUTH_VALUE_LEN - 1], 0, "the TPM would drop a trailing zero");
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o400);
+            // Whoever writes it, no group may read it unless policy names
+            // one: as root, root:root 0400; as anyone else, their own 0400.
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o400);
+            if running_as_root() {
+                assert_eq!(meta.gid(), 0, "never the key directory's group");
+            }
             assert_eq!(first.value(), bytes.as_slice());
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "no temporary file left behind");
 
-            // Provisioning again -- or a concurrent provisioner that lost
-            // the race -- uses the value on disk, never a new one.
-            assert_eq!(provision_auth_file(SERVICE).unwrap().value(), bytes.as_slice());
-            assert_eq!(std::fs::read(&path).unwrap(), bytes);
-            assert_ne!(provision_auth_file("com.company.billing").unwrap().value(), bytes.as_slice(), "one value per service");
+            // Called again -- only ever for a service with no key file, so
+            // the file there belongs to no key -- it is replaced, never
+            // reused: a value that sat in the directory may have been read.
+            let second = provision_auth_file(SERVICE).unwrap();
+            assert_ne!(second.value(), bytes.as_slice(), "a fresh value");
+            assert_eq!(std::fs::read(&path).unwrap(), second.value(), "the file holds it");
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "replaced in place, nothing left behind");
+            assert_ne!(provision_auth_file("com.company.billing").unwrap().value(), second.value(), "one value per service");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn an_auth_file_this_process_cannot_read_says_how_to_grant_it() {
+        if running_as_root() {
+            eprintln!("skipping: root reads any file");
+            return;
+        }
+        with_key_dir(|dir| {
+            let path = dir.join("com.company.orders.tpmauth");
+            std::fs::write(&path, [7u8; AUTH_VALUE_LEN]).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            match read_auth_file(SERVICE) {
+                Err(Error::Provider(msg)) => {
+                    assert!(msg.contains("can't be read by this process") && msg.contains("tpm.auth_groups"), "{msg}");
+                    assert!(msg.contains(&format!("chgrp <group> {}", path.display())), "{msg}");
+                }
+                other => panic!("expected an error, got {:?}", other.map(|a| a.map(|_| ()))),
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn the_key_dir_lock_excludes_every_other_holder_until_dropped() {
+        with_key_dir(|dir| {
+            let try_lock = || {
+                let other = std::fs::File::open(dir).unwrap(); // its own open file description, as another process's
+                // SAFETY: `other` is open for the duration of the call.
+                let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                (rc == 0, std::io::Error::last_os_error().raw_os_error())
+            };
+            let lock = KeyDirLock::acquire().unwrap();
+            assert_eq!(try_lock(), (false, Some(libc::EWOULDBLOCK)), "held: nobody else gets it");
+            drop(lock);
+            assert!(try_lock().0, "dropped: free again");
+        });
+        // A missing key directory: the same instructions as writing into one.
+        let dir = crate::secure_file::private_tempdir();
+        with_policy(&format!("[tpm]\nkey_dir = \"{}\"\n", dir.path().join("not-yet").display()), || {
+            match KeyDirLock::acquire() {
+                Err(Error::Provider(msg)) => assert!(msg.contains("install -d -m 0750"), "{msg}"),
+                other => panic!("expected instructions, got {:?}", other.map(|_| ())),
+            }
         });
     }
 
@@ -2182,7 +2369,13 @@ mod tests {
         with_key_dir(|_| {
             write_key_file(SERVICE, &fake_blob(&fake_service_public())).unwrap();
             match required_auth_file(SERVICE) {
-                Err(Error::Provider(msg)) => assert!(msg.contains("no authValue file") && msg.contains(".tpmauth"), "{msg}"),
+                Err(Error::Provider(msg)) => {
+                    assert!(msg.contains("no authValue file") && msg.contains(".tpmauth"), "{msg}");
+                    // Retiring needs the authValue too, so the message must
+                    // not send the operator there: it names what works.
+                    assert!(!msg.contains("retire the service"), "{msg}");
+                    assert!(msg.contains("delete") && msg.contains("com.company.orders.tpmkey by hand"), "{msg}");
+                }
                 other => panic!("expected an error, got {:?}", other.map(|_| ())),
             }
         });
@@ -2794,12 +2987,30 @@ mod tests {
             assert!(matches!(tpm.kek_exists(SERVICE), Err(Error::Provider(_))));
             assert!(matches!(tpm.load_kek(SERVICE, false), Err(Error::Provider(_))));
             assert!(matches!(tpm.load_kek(SERVICE, true), Err(Error::Provider(_))), "provisioning never replaces a lost authValue");
+            // Nor can it be retired -- and the error says what can be done.
+            match tpm.retire_kek(SERVICE, &right) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("by hand"), "{msg}"),
+                other => panic!("expected an error, got {other:?}"),
+            }
+            assert!(key_path.exists(), "nothing deleted");
             std::fs::write(&auth_path, &saved).unwrap();
             std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o400)).unwrap();
             assert_eq!(fingerprint(&*tpm.load_kek(SERVICE, false).unwrap()), right, "restored from backup, it works again");
 
             tpm.retire_kek(SERVICE, &right).unwrap();
             assert!(!key_path.exists() && !auth_path.exists(), "retiring deletes both");
+
+            // An authValue file left with no key file -- a retire that
+            // couldn't delete it, a key file deleted by hand -- is never
+            // what the next key is created with: whoever read it then could
+            // use the new key.
+            std::fs::write(&auth_path, &saved).unwrap();
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let again = fingerprint(&*tpm.load_kek(SERVICE, true).unwrap());
+            assert_ne!(again, right, "a new key");
+            assert_ne!(std::fs::read(&auth_path).unwrap(), saved, "under a new authValue, not the orphan");
+            prf_output(SERVICE, false, b"input").unwrap();
+            tpm.retire_kek(SERVICE, &again).unwrap();
         });
     }
 

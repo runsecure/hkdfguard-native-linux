@@ -1,3 +1,27 @@
+hkdfguard (0.9.2-1) trixie; urgency=medium
+
+  * Secrets: hkdfguard_wrap_secret, hkdfguard_unwrap_secret and
+    hkdfguard_open_secret_file wrap a password (1 to 256 bytes) bound to
+    a secret name; the CLI's new `protect` command writes one.
+  * The plaintext-key check on key files also catches a DEK followed by a
+    CRLF line ending.
+  * Ephemeral provider: a forked child no longer wraps under the all-zero
+    key it inherits; it has no ephemeral keys until it creates its own.
+  * A provider that has gone missing while holding a service's KEK (a TPM
+    device that disappeared, a pinned external secret not mounted, a
+    PKCS#11 session logged out underneath a call) fails the call instead
+    of handing it to a weaker provider. Audit event 1006 records each
+    service served by a provider later in the policy order.
+  * TPM authValue files (<service>.tpmauth) are no longer given the key
+    directory's group: root writes each as root:<group> 0440 for the group
+    named in the new tpm.auth_groups policy table, or root:root 0400.
+    Non-root services need an entry before they are provisioned. Files
+    provisioned by 0.9.1 keep their group; chgrp them.
+  * Provisioning always creates a new authValue, under a lock on the key
+    directory, rather than reusing one left without its key file.
+
+ -- runsecure <torin@torinblair.com>  Tue, 17 Nov 2026 12:00:00 +0000
+
 hkdfguard (0.9.1-1) trixie; urgency=medium
 
   * Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1).

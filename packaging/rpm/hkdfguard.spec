@@ -21,7 +21,7 @@
 %global linked_licenses Apache-2.0 AND BSD-3-Clause AND ISC AND MIT AND (Apache-2.0 OR MIT) AND (MIT OR Unlicense)
 
 Name:           hkdfguard
-Version:        0.9.1
+Version:        0.9.2
 Release:        1%{?dist}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK (CLI)
 License:        MPL-2.0 AND %{linked_licenses}
@@ -178,6 +178,19 @@ exit 0
 %{_libdir}/libhkdfguard.a
 
 %changelog
+* Tue Nov 17 2026 runsecure <torin@torinblair.com> - 0.9.2-1
+- Secrets: hkdfguard_wrap_secret, hkdfguard_unwrap_secret and
+  hkdfguard_open_secret_file wrap a password (1 to 256 bytes) bound to a
+  secret name; the CLI's new `protect` command writes one. The
+  plaintext-key check also catches a DEK followed by CRLF. A forked child
+  of a process holding ephemeral keys no longer wraps under the all-zero
+  key it inherits. A provider that has gone missing while holding a
+  service's KEK fails the call instead of handing it to a weaker
+  provider; audit event 1006 records fallbacks. TPM authValue files are
+  root:<group> 0440 for the group in the new tpm.auth_groups policy table,
+  else root:root 0400, never the key directory's group; provisioning always
+  creates a new authValue.
+
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys
   carry a per-service authValue (<service>.tpmauth) that keys session

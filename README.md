@@ -435,18 +435,27 @@ What the TPM guarantees:
 What it does not: **anyone who can read a key file and its authValue file,
 and open the TPM, can use that KEK.** Read access to the two files is the
 access control, as the PIN file is for PKCS#11. The packages create the
-directory as `root:hkdfguard 0750`, so the members of `hkdfguard` may use
-TPM keys; give a service's `.tpmauth` file that service's own group to
-keep the others from using its key. Without the packages, create the
-directory as root:
+directory as `root:hkdfguard 0750`, so the members of `hkdfguard` may reach
+TPM key files. Without the packages, create the directory as root:
 
 ```sh
 install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 ```
 
-`provision` (root only, under the production security model) creates each
-key file there: owned by root, with the directory's group, mode `0440`.
-`tpm.key_dir` moves the directory. The library refuses a key file that is
+`provision` (root only, under the production security model) creates both
+files there, owned by root. The key file takes the directory's group, mode
+`0440`. The authValue file is readable by the service alone: it takes the
+group `tpm.auth_groups` names for the service, mode `0440`, or with no entry
+stays `root:root 0400`, for a service that runs as root. So name each
+non-root service's own group before provisioning it:
+
+```toml
+[tpm.auth_groups]
+"com.company.orders" = "orders"
+```
+
+A group that covers essentially every account (`users`, `nogroup`, `root`
+and the like) is refused. `tpm.key_dir` moves the directory. The library refuses a key file that is
 group- or world-writable, readable by others, a symlink, owned by anyone
 but root (or, under the developer model, the calling user), or in a
 directory chain someone else could change -- never as "not provisioned",
@@ -599,7 +608,15 @@ until the file or the policy entry changes: every wrong attempt counts
 toward the TPM's dictionary-attack limit, which is TPM-wide (a Hyper-V
 vTPM allows 3 per 1000 s), so a service retrying would otherwise lock the
 whole TPM within seconds. After fixing the file, the next call tries again;
-nothing needs restarting. Back the file up with the key files. The owner
+nothing needs restarting. Back the file up with the key files.
+
+Every process that uses a TPM key re-creates the SRK on each call, so every
+service using TPM keys must read this file -- and with it holds the Owner
+hierarchy's password itself, not only access to its own key: it can create
+and evict objects under the Owner hierarchy and change its password. Give
+the file a group only those services share, and count the password as
+exposed to each of them. The per-service authValue files, not the owner
+password, are what keep one service from using another's key. The owner
 password applies to the whole Owner hierarchy, so anything else on the
 host that creates keys under it with an empty password --
 `systemd-cryptenroll --tpm2-device`, tpm2-tss FAPI, `tpm2_createprimary -C o`
@@ -823,7 +840,7 @@ target.
 
 One `debian/` directory serves both Debian-family targets. Built on
 Ubuntu, `packaging/build-deb.sh` adds the customary backport changelog
-entry, so the Ubuntu packages are versioned `0.9.1-1~ubuntu24.04.1` for
+entry, so the Ubuntu packages are versioned `0.9.2-1~ubuntu24.04.1` for
 release `noble`. One spec serves all three RPM targets. On SUSE it follows
 SUSE's naming policy and runs `ldconfig` from scriptlets:
 
@@ -916,7 +933,7 @@ taken out of one -- with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify hkdfguard_0.9.1-1_amd64.deb \
+gh attestation verify hkdfguard_0.9.2-1_amd64.deb \
     --repo runsecure/hkdfguard-native-linux \
     --signer-workflow runsecure/hkdfguard-native-linux/.github/workflows/release.yml
 ```
@@ -932,11 +949,11 @@ workflow and tag:
 
 ```sh
 cosign verify-blob-attestation --new-bundle-format \
-    --bundle hkdfguard-0.9.1.sigstore.json \
+    --bundle hkdfguard-0.9.2.sigstore.json \
     --type https://slsa.dev/provenance/v1 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.1 \
-    hkdfguard_0.9.1-1_amd64.deb
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.2 \
+    hkdfguard_0.9.2-1_amd64.deb
 ```
 
 [docs/installation.md](docs/installation.md#download-and-verify) has a
@@ -978,7 +995,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-tctildr0t64 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.1 / /
+COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.2 / /
 ```
 
 - **Debian-family images only**, with glibc 2.39 or newer: Ubuntu 24.04+
@@ -1008,12 +1025,12 @@ Sigstore, and signs each with cosign (keyless, as the release workflow;
 the job fails unless the signature then verifies). To verify one:
 
 ```sh
-gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.1 \
+gh attestation verify oci://ghcr.io/runsecure/hkdfguard-overlay:0.9.2 \
     --repo runsecure/hkdfguard-native-linux
 # or the cosign signature, with cosign 3.0+:
-cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.1 \
+cosign verify ghcr.io/runsecure/hkdfguard-overlay:0.9.2 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.1
+    --certificate-identity https://github.com/runsecure/hkdfguard-native-linux/.github/workflows/release.yml@refs/tags/v0.9.2
 ```
 
 In a build, verify the image's digest and copy from that digest, not the
@@ -1372,6 +1389,9 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password
 
 [tpm.pinned_names]                  # per-service expected TPM Name; refuse any other key
 "com.company.orders" = "000b<64 hex>"
+
+[tpm.auth_groups]                   # per-service group that may read its .tpmauth file (root:<group> 0440);
+"com.company.orders" = "orders"     # a service with none gets root:root 0400. Over-broad groups are refused
 
 [external_secret]
 dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, the only place looked

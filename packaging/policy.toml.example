@@ -96,18 +96,19 @@ mode = "prefer"
 
 # Directory of TPM key files: a <service>.tpmkey and its authValue,
 # <service>.tpmauth, per service, created by `hkdfguard provision`. Whoever
-# can read both files and open the TPM can use that KEK, so the directory's
-# group is the services that use TPM keys; both files take that group, mode
-# 0440. Give each .tpmauth file its own service's group to keep the others
-# out. The packages create the default directory as root:hkdfguard 0750; a
-# key_dir of your own needs
+# can read both files and open the TPM can use that KEK. The key file takes
+# the directory's group (the services that use TPM keys), mode 0440; the
+# .tpmauth file the service's own group from [tpm.auth_groups] below, or
+# root:root 0400 with none. The packages create the default directory as
+# root:hkdfguard 0750; a key_dir of your own needs
 #   install -d -m 0750 -o root -g <key-users> <dir>
 # Back both files up: losing either loses the KEK. A key file is useless on
 # any other TPM; the .tpmauth file is a secret.
 #key_dir = "/var/lib/hkdfguard/tpm"
 
 # File holding the Owner hierarchy's password, if you set one. Unset: an
-# empty password. Root-owned, mode 0400 (or 0440 with the service's group).
+# empty password. Root-owned, mode 0400 (or 0440 with the services' group).
+# Every service using TPM keys must read it, and so holds the password.
 #owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 
 # true: only services listed in [tpm.pinned_names] have a KEK on the TPM,
@@ -127,6 +128,13 @@ mode = "prefer"
 # The TPM Name each service's key must have; any other key is refused.
 # Quote the service names: unquoted dots would make nested tables.
 #"com.company.orders" = "000b<64 hex chars>"
+
+[tpm.auth_groups]
+# The group whose members may read each service's .tpmauth file, its key's
+# authValue: root writes it root:<group> 0440. A service with no entry gets
+# root:root 0400, usable only by a service running as root. A group covering
+# essentially every account (users, nogroup, root, wheel, ...) is refused.
+#"com.company.orders" = "orders"
 
 [external_secret]
 # Directory holding one KEK file per service, named after the service. It,
