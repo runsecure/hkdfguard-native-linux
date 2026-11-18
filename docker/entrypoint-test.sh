@@ -115,6 +115,12 @@ test_cargo test --features tpm2 -- --ignored --test-threads=1
 section "cargo test --features pkcs11 -- --ignored (against SoftHSM2)"
 test_cargo test --features pkcs11 -- --ignored --test-threads=1
 
+# The PKCS#11 module's own unit tests (PIN file, latch, token selection)
+# need no token, but are compiled only with the feature -- which no pass
+# above runs without --ignored.
+section "cargo test --features pkcs11 --lib provider::pkcs11 (its unit tests)"
+test_cargo test --features pkcs11 --lib provider::pkcs11
+
 unset HKDFGUARD_POLICY_FILE TPM2TOOLS_TCTI
 
 section "C ABI round trip via examples/wrap_unwrap.c (default providers)"

@@ -141,7 +141,9 @@
 //! descriptor opened, and checked, before the rename (see
 //! [`open_for_shredding`]); a file with more than one hard link is refused
 //! up front, and one that turns out to still have a name afterwards is
-//! left alone. The overwrite is a best-effort measure against a plain read
+//! left alone. One this account may not write to is replaced without being
+//! overwritten, and the tool warns that it wasn't (see [`OldKeyFile`]).
+//! The overwrite is a best-effort measure against a plain read
 //! of the disk: it cannot guarantee erasure on copy-on-write or
 //! log-structured filesystems (e.g. btrfs, ZFS), or on flash storage doing
 //! wear-leveling remaps, where the original blocks may still exist
@@ -1385,12 +1387,14 @@ const MAX_REPLACEABLE_KEY_FILE_LEN: u64 = 64 * 1024;
 // spells (`require_opened_at`), so nothing swapped in between gets
 // overwritten either.
 //
-// `Ok(None)` if the file can't be opened for writing (EACCES/EPERM -- this
-// tool doesn't own it): it is still replaced, but not overwritten first.
-// Destroying the old bytes is worth attempting, but not worth failing the
-// whole command over when this process isn't even allowed to write to the
-// file it's replacing -- matches this project's macOS/Windows tools.
-fn open_for_shredding(path: &Path) -> Result<Option<(File, usize)>, String> {
+// `OldKeyFile::Unwritable` if the file can't be opened for writing
+// (EACCES/EPERM -- this tool doesn't own it): it is still replaced, but
+// not overwritten first, and the caller warns that it wasn't. Destroying
+// the old bytes is worth attempting, but not worth failing the whole
+// command over when this process isn't even allowed to write to the file
+// it's replacing -- matches this project's macOS/Windows tools. Never
+// silent: an operator relying on the overwrite must hear it didn't happen.
+fn open_for_shredding(path: &Path) -> Result<OldKeyFile, String> {
     let refuse = |why: &str| format!("{} {why}; refusing to replace it", path.display());
     let check = |meta: &fs::Metadata| -> Result<usize, String> {
         if !meta.file_type().is_file() {
@@ -1422,7 +1426,8 @@ fn open_for_shredding(path: &Path) -> Result<Option<(File, usize)>, String> {
         .open(&spelled)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None), // checked above: a regular file with one name
+        // Checked above: a regular file with one name.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(OldKeyFile::Unwritable(e)),
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refuse("changed to a symlink")),
         Err(e) => return Err(format!("failed to open {} to replace it: {e}", path.display())),
     };
@@ -1432,7 +1437,16 @@ fn open_for_shredding(path: &Path) -> Result<Option<(File, usize)>, String> {
     }
     require_opened_at(&file, path, &spelled)?;
     let len = check(&opened)?;
-    Ok(Some((file, len)))
+    Ok(OldKeyFile::Shred(file, len))
+}
+
+// The file `--force` replaces, as `open_for_shredding` found it.
+enum OldKeyFile {
+    // Opened for writing: `shred_replaced` overwrites it after the rename.
+    Shred(File, usize),
+    // This account may not write to it, so it is replaced without being
+    // overwritten. Why the open was refused.
+    Unwritable(std::io::Error),
 }
 
 // Overwrites the file `--force` just replaced for `SECURE_DELETE_ROUNDS`
@@ -1878,8 +1892,8 @@ fn stage_key_file(
 // or the new one at every moment, never neither. The old file is opened
 // and checked first (`open_for_shredding`); anything refused there leaves
 // both as they were. Once the rename is done the new key file is in place,
-// so a failure overwriting the old one is returned as a warning, not an
-// error.
+// so a failure overwriting the old one -- or not being allowed to try -- is
+// returned as a warning, not an error.
 fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool) -> Result<Option<String>, String> {
     let StagedKeyFile { file, temp } = staged;
     let fail = |e: String| {
@@ -1898,7 +1912,7 @@ fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool
     }
     let old = if replacing {
         match open_for_shredding(&spelled) {
-            Ok(old) => old,
+            Ok(old) => Some(old),
             Err(e) => return fail(e),
         }
     } else {
@@ -1935,11 +1949,17 @@ fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool
     }
     sync_parent_folder(&spelled).map_err(|e| format!("failed to flush the folder of {shown} to storage: {e}"))?;
 
-    Ok(old.and_then(|(old_file, len)| {
-        shred_replaced(old_file, len, path)
+    Ok(match old {
+        None => None,
+        Some(OldKeyFile::Shred(old_file, len)) => shred_replaced(old_file, len, path)
             .err()
-            .map(|e| format!("{shown} was replaced, but the old file was not securely overwritten: {e}"))
-    }))
+            .map(|e| format!("{shown} was replaced, but the old file was not securely overwritten: {e}")),
+        Some(OldKeyFile::Unwritable(e)) => Some(format!(
+            "{shown} was replaced, but the old file was not overwritten first: this account may not write to it \
+             ({e}), so its contents may remain on the disk until those blocks are reused. Run --force as the \
+             file's owner (or root) to have it overwritten"
+        )),
+    })
 }
 
 // fsync on the folder, so the key file's directory entry -- not just its
@@ -2234,6 +2254,26 @@ mod tests {
         held.read_to_end(&mut after).unwrap();
         assert_eq!(after.len(), old.len());
         assert_ne!(after, old, "the old payload was overwritten before it was released");
+    }
+
+    #[test]
+    fn force_warns_when_it_may_not_overwrite_the_file_it_replaces() {
+        // A key file this account can't write (another deployer's, or a
+        // 0400 one): replaced, since the folder allows it, but not
+        // overwritten -- and the operator is told so, not left assuming it was.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes through any mode
+        }
+        let dir = private_tempdir();
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        fs::write(&key, b"old payload").unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let warning = write_key(&key, b"new payload", true).unwrap().expect("a warning, not silence");
+        assert!(warning.contains("was not overwritten first") && warning.contains("may not write to it"), "{warning}");
+        assert_eq!(fs::read(&key).unwrap(), b"new payload", "the replacement still happened");
+        assert_only(dir.path(), &["wrapped.key"]);
     }
 
     #[test]

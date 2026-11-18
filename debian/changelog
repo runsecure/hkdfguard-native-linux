@@ -25,6 +25,13 @@ hkdfguard (0.9.2-1) trixie; urgency=medium
   * PKCS#11: a key under a service's label is used only if it is also
     CKA_LOCAL (generated on the token, not derived or unwrapped) and not
     modifiable or copyable, as hkdfguard generates its keys.
+  * PKCS#11: every PIN-class C_Login failure (incorrect, invalid, wrong
+    length, expired, locked) stops further logins until the PIN file
+    changes, keyed to the exact file version the PIN was read from.
+  * CLI: wrap --force warns when it may not overwrite the key file it
+    replaces, instead of skipping the overwrite silently.
+  * Unwrap refuses a payload longer than any wrap produces before parsing
+    it, rather than copying it first.
 
  -- runsecure <torin@torinblair.com>  Tue, 17 Nov 2026 12:00:00 +0000
 

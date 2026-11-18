@@ -413,6 +413,15 @@ fn seal<const N: usize>(label: &[u8], service: &str, plaintext: &[u8; N]) -> Res
 // caller -- never in a heap buffer at any point, and never in a buffer
 // that a panic could leave un-wiped.
 fn open<const N: usize>(label: &[u8], service: &str, wrapped: &[u8]) -> Result<Zeroizing<[u8; N]>> {
+    // No wrap of an N-byte block is longer than this (MAX_WRAPPED_LEN for a
+    // DEK, MAX_SECRET_WRAPPED_LEN for a secret). Refused before parsing:
+    // parsing copies the key_id and ciphertext into allocations of whatever
+    // size the payload declares, so a caller passing a huge buffer would
+    // otherwise have the library allocate and copy that much first.
+    let longest = FIXED_WRAPPED_LEN - DEK_LEN + N + MAX_KEY_ID_LEN;
+    if wrapped.len() > longest {
+        return Err(Error::Malformed("wrapped payload is longer than any wrap produces"));
+    }
     let payload = Payload::from_bytes(wrapped)?; // parse and structurally validate the wire format (ciphertext stays a heap Vec, but it's ciphertext, not a secret)
 
     if payload.ciphertext.len() != N + TAG_LEN {
@@ -587,16 +596,43 @@ mod tests {
             // the key_id is bound into the wrapping key.
             assert!(matches!(unwrap("com.company.orders", &longest.to_bytes()), Err(Error::AuthFailed)));
             // One past it, and far past it: refused as malformed, never sent
-            // to the provider as an over-long PRF input.
+            // to the provider as an over-long PRF input -- by the payload
+            // length bound, which an over-long key_id always trips first.
             for payload in [too_long, huge] {
                 let err = unwrap("com.company.orders", &payload.to_bytes()).unwrap_err();
-                assert!(matches!(err, Error::Malformed(msg) if msg.contains("key_id")), "{err:?}");
+                assert!(matches!(err, Error::Malformed(_)), "{err:?}");
             }
             // And with no KEK at all for the service, the length check still
             // answers first: nothing was looked up.
             let orphan = Payload { key_id: vec![0x41; 60_000], ..Payload::from_bytes(&genuine).unwrap() };
             assert!(matches!(unwrap("com.company.never-created", &orphan.to_bytes()), Err(Error::Malformed(_))));
         });
+    }
+
+    #[test]
+    fn a_payload_longer_than_any_wrap_is_refused_before_it_is_parsed() {
+        // A well-formed header declaring a ciphertext as long as the buffer:
+        // parsing it would copy every byte. The length bound refuses it
+        // first, for a DEK and for a secret, and nothing past the bound is
+        // read. Exactly at the bound, it is parsed (and refused for its
+        // content, as it should be).
+        for (longest, unwrap_it) in [
+            (MAX_WRAPPED_LEN, (|w: &[u8]| unwrap("com.company.orders", w).map(|_| ())) as fn(&[u8]) -> Result<()>),
+            (MAX_SECRET_WRAPPED_LEN, |w: &[u8]| unwrap_secret("com.company.orders", "vault.password", w).map(|_| ())),
+        ] {
+            let mut huge = vec![0u8; 4 * 1024 * 1024];
+            huge[0] = crate::payload::VERSION;
+            match unwrap_it(&huge) {
+                Err(Error::Malformed(msg)) => assert!(msg.contains("longer than any wrap"), "{msg}"),
+                other => panic!("expected Malformed, got {:?}", other.err()),
+            }
+            match unwrap_it(&huge[..longest + 1]) {
+                Err(Error::Malformed(msg)) => assert!(msg.contains("longer than any wrap"), "{msg}"),
+                other => panic!("one past the bound: expected Malformed, got {:?}", other.err()),
+            }
+            let at_bound = unwrap_it(&huge[..longest]).unwrap_err();
+            assert!(!format!("{at_bound:?}").contains("longer than any wrap"), "at the bound it is parsed: {at_bound:?}");
+        }
     }
 
     #[test]

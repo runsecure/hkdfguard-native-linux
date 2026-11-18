@@ -342,7 +342,9 @@ int hkdfguard_wrap_dek(
  *                HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED. An invalid service string (see
  *                hkdfguard_wrap_dek) returns HKDFGUARD_ERR_INVALID_SERVICE_NAME.
  * wrapped:       pointer to the wrapped payload bytes.
- * wrapped_len:   length of `wrapped` in bytes.
+ * wrapped_len:   length of `wrapped` in bytes. Above HKDFGUARD_WRAPPED_MAX_LEN,
+ *                refused with HKDFGUARD_ERR_PAYLOAD_MALFORMED before any of
+ *                it is parsed.
  * out:           buffer to receive the recovered 32-byte DEK. May be the
  *                same buffer as `wrapped` (or overlap it): `wrapped` is
  *                read in full before anything is written to `out`.
@@ -441,7 +443,9 @@ int hkdfguard_wrap_secret(
  *
  * service, secret_name: as for hkdfguard_wrap_secret.
  * wrapped:       pointer to the wrapped payload bytes.
- * wrapped_len:   length of `wrapped` in bytes.
+ * wrapped_len:   length of `wrapped` in bytes. Above
+ *                HKDFGUARD_SECRET_WRAPPED_MAX_LEN, refused with
+ *                HKDFGUARD_ERR_PAYLOAD_MALFORMED before any of it is parsed.
  * out:           buffer to receive the secret. NOT NUL-terminated: use
  *                *out_len. May be the same buffer as `wrapped`.
  * out_len:       in: capacity of `out`, which must be at least

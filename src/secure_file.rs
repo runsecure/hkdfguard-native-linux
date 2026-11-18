@@ -504,6 +504,13 @@ impl FileIdentity {
         Some(Self::from_meta(&std::fs::symlink_metadata(path).ok()?))
     }
 
+    /// The identity of the open file `file`: exactly the one read through
+    /// it, whatever has happened at its path since.
+    #[cfg_attr(not(any(feature = "pkcs11", test)), allow(dead_code))]
+    pub(crate) fn of_file(file: &std::fs::File) -> Option<Self> {
+        Some(Self::from_meta(&file.metadata().ok()?))
+    }
+
     fn from_meta(m: &Metadata) -> Self {
         FileIdentity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()) }
     }

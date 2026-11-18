@@ -238,7 +238,9 @@ Replace an existing
 The new payload is written to a temporary file in the same folder first,
 then renamed over the old file in one step, so a failed wrap or write
 never touches it. The replaced file is then overwritten; that cannot
-guarantee erasure on copy-on-write filesystems or flash storage. With
+guarantee erasure on copy-on-write filesystems or flash storage. A file
+this account may not write to is replaced without being overwritten, and
+a warning says so. With
 .BR protect ,
 only with
 .BR \-\-key\-file\-path .

@@ -338,6 +338,27 @@ fn pin_login_blocked(pin_file: &Path, current: Option<FileIdentity>) -> Option<S
     Some(latches[i].2.clone())
 }
 
+/// Why `C_Login` failing with `rv` means the configured PIN was rejected --
+/// wrong, malformed, the wrong length, expired, or locked -- or `None` for a
+/// failure that says nothing about the PIN. Every PIN-class answer latches
+/// (see [`PIN_LATCHES`]), not only `CKR_PIN_INCORRECT`: tokens differ in
+/// which of them count against the user's attempts, many never set the
+/// final-try flag `open_session` checks first, and the same PIN tried again
+/// can't get a different answer.
+fn pin_rejection(rv: RvError) -> Option<String> {
+    match rv {
+        RvError::PinExpired => Some(
+            "the token reports the configured PIN expired (CKR_PIN_EXPIRED): change it with the vendor's tools, then \
+             write the new one to the PIN file"
+                .to_string(),
+        ),
+        RvError::PinIncorrect | RvError::PinInvalid | RvError::PinLenRange | RvError::PinLocked => {
+            Some(format!("the token rejected the configured PIN ({rv:?})"))
+        }
+        _ => None,
+    }
+}
+
 /// Records that the token rejected the PIN read from `pin_file` (which had
 /// identity `identity` at the time), so no further login is attempted with
 /// it -- see [`PIN_LATCHES`].
@@ -360,7 +381,12 @@ fn latch_pin_login(pin_file: &Path, identity: Option<FileIdentity>, reason: Stri
 /// The raw file bytes live in a self-wiping `SecretBuffer` that is wiped
 /// explicitly before this returns -- on every path -- and the PIN itself
 /// comes back as an `AuthPin`, which zeroizes its own storage on drop.
-fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
+///
+/// Also returns the identity of the file the PIN was read from, taken from
+/// the open descriptor, not the path: a latch (see [`PIN_LATCHES`]) must
+/// name exactly the version of the file whose PIN the token rejected, not
+/// whatever an operator's rewrite put at the path a moment later.
+fn read_pin_file(path: &Path) -> std::result::Result<(AuthPin, Option<FileIdentity>), std::io::Error> {
     use crate::secure_file::{check_location, config_owner, open_checked, FileRequirements, SecretBuffer, FORBID_GROUP_OTHER_ACCESS};
     use std::io::{Error as IoError, ErrorKind};
 
@@ -373,6 +399,7 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
     check_location(path, config_owner())?;
     let mut file = open_checked(path, &requirements)?;
     let mut raw = SecretBuffer::read_from(&mut file, MAX_PIN_FILE_LEN)?;
+    let identity = FileIdentity::of_file(&file);
 
     let mut pin = raw.as_slice();
     if let Some(stripped) = pin.strip_suffix(b"\n") {
@@ -396,7 +423,7 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
             })
     };
     raw.wipe();
-    result
+    result.map(|pin| (pin, identity))
 }
 
 // Loads the PIN, loads the module, initializes the library, picks a slot,
@@ -429,8 +456,8 @@ fn open_session() -> Backend<OpenSession> {
     };
 
     let pin_path = settings.pin_file.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_PIN_FILE));
-    let pin = match read_pin_file(&pin_path) {
-        Ok(pin) => pin,
+    let (pin, pin_identity) = match read_pin_file(&pin_path) {
+        Ok(read) => read,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if matches!(crate::security_model::current(), Ok(crate::security_model::SecurityModel::Developer)) {
                 crate::provider::log_once(
@@ -452,8 +479,8 @@ fn open_session() -> Backend<OpenSession> {
     };
     // A PIN this process has already seen the token reject is not tried
     // again until the file changes: see `PIN_LATCHES`. Checked here to fail
-    // fast, and again under `PIN_LOGIN_GATE` just before the login.
-    let pin_identity = FileIdentity::of(&pin_path);
+    // fast, and again under `PIN_LOGIN_GATE` just before the login --
+    // against the identity of the file this PIN came from.
     let login_disabled = |reason: String| {
         Backend::Refused(format!(
             "PKCS#11 login disabled in this process: {reason}; correct the PIN file {} (any change to it re-enables \
@@ -554,11 +581,11 @@ fn open_session() -> Backend<OpenSession> {
     // login instead.
     match session.login(UserType::User, Some(&pin)) {
         Ok(()) | Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
-        // The token rejected the configured PIN, or is now locked. One
-        // attempt was spent finding that out; none more will be, from this
-        // process, until the PIN file changes.
-        Err(CryptokiError::Pkcs11(rv @ (RvError::PinIncorrect | RvError::PinLocked), _)) => {
-            let reason = format!("the token rejected the configured PIN ({rv:?})");
+        // The token rejected the configured PIN. One attempt was spent
+        // finding that out; none more will be, from this process, until the
+        // PIN file changes.
+        Err(CryptokiError::Pkcs11(rv, _)) if pin_rejection(rv).is_some() => {
+            let reason = pin_rejection(rv).unwrap_or_default();
             latch_pin_login(&pin_path, pin_identity, reason.clone());
             return Backend::Refused(format!(
                 "C_Login failed: {reason}; no further login will be attempted by this process until the PIN file {} \
@@ -1013,6 +1040,11 @@ mod tests {
         }
     }
 
+    // The PIN alone, for the tests that don't look at the file's identity.
+    fn read_pin_file(path: &Path) -> std::io::Result<AuthPin> {
+        super::read_pin_file(path).map(|(pin, _)| pin)
+    }
+
     fn pin_file(contents: &[u8], mode: u32) -> PinFile {
         let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("pkcs11.pin");
@@ -1063,6 +1095,28 @@ mod tests {
     }
 
     #[test]
+    fn the_pin_files_identity_is_the_one_read_not_what_the_path_names_later() {
+        // A latch must name the version of the file whose PIN the token
+        // rejected. Taken by path after the read, an operator's correction
+        // landing in between would be latched against the old PIN's
+        // rejection, and stay blocked until the next change.
+        let f = pin_file(b"1234\n", 0o600);
+        let (_, read_identity) = super::read_pin_file(f.path()).unwrap();
+        assert_eq!(read_identity, FileIdentity::of(f.path()), "unchanged: the same");
+
+        // Replaced at its path (a new inode, as `install` or a Secret
+        // update makes) after the read: the read's identity stays the old one.
+        let replacement = f.path().with_extension("new");
+        std::fs::write(&replacement, b"5678\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(&replacement, f.path()).unwrap();
+        assert_ne!(read_identity, FileIdentity::of(f.path()));
+        let (pin, now) = super::read_pin_file(f.path()).unwrap();
+        assert_eq!(pin.expose_secret(), "5678");
+        assert_eq!(now, FileIdentity::of(f.path()));
+    }
+
+    #[test]
     fn pin_file_readable_by_group_or_others_is_rejected() {
         // SAFETY: geteuid has no preconditions.
         let root = unsafe { libc::geteuid() } == 0;
@@ -1083,6 +1137,20 @@ mod tests {
 
         let f = pin_file(&[0xFF, 0xFE, b'\n'], 0o600);
         assert_eq!(read_pin_file(f.path()).err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn every_pin_class_login_failure_latches_and_nothing_else_does() {
+        for rv in [RvError::PinIncorrect, RvError::PinInvalid, RvError::PinLenRange, RvError::PinLocked] {
+            let reason = pin_rejection(rv).unwrap_or_else(|| panic!("{rv:?} must latch"));
+            assert!(reason.contains("rejected the configured PIN") && reason.contains(&format!("{rv:?}")), "{reason}");
+        }
+        let expired = pin_rejection(RvError::PinExpired).expect("an expired PIN must latch");
+        assert!(expired.contains("expired") && expired.contains("change it"), "{expired}");
+        // Not about the PIN: a retry may well succeed.
+        for rv in [RvError::DeviceError, RvError::SessionHandleInvalid, RvError::GeneralError, RvError::UserTypeInvalid] {
+            assert_eq!(pin_rejection(rv), None, "{rv:?}");
+        }
     }
 
     #[test]

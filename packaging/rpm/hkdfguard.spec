@@ -192,7 +192,10 @@ exit 0
   creates a new authValue. With no policy-allowed provider present, wrap,
   kek_exists and kek_fingerprint return PROVIDER_UNAVAILABLE (audited)
   instead of KEK_NOT_FOUND or a 0 answer. PKCS#11 keys must also be
-  CKA_LOCAL and neither modifiable nor copyable to be used.
+  CKA_LOCAL and neither modifiable nor copyable to be used; every
+  PIN-class login failure latches. wrap --force warns when it can't
+  overwrite the file it replaces. Unwrap refuses over-long payloads before
+  parsing them.
 
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys
