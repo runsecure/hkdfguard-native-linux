@@ -63,6 +63,8 @@ License:        MPL-2.0 AND %{linked_licenses}
 # distributions, shadow on SUSE.
 Requires(pre):  /usr/bin/getent
 Requires(pre):  /usr/sbin/groupadd
+# %%post creates the TPM key directory when it is missing.
+Requires(post): /usr/bin/install
 # The group %%pre creates. SUSE's rpm turns the TPM key directory's
 # %%attr group into a Requires on group(hkdfguard), so say who provides it.
 Provides:       group(hkdfguard)
@@ -145,6 +147,15 @@ for group in hkdfguard hkdfguard-deployers; do
 done
 exit 0
 
+# The TPM key directory, root:hkdfguard 0750 -- created here, only if it is
+# missing, rather than installed: rpm reapplies the owner and mode of every
+# file it installs on each upgrade, which would undo an administrator's
+# choice (a narrower group, say) without a word. %%files lists it as
+# %%ghost, so rpm still owns it but never sets its attributes.
+%post -n %{libpkg}
+[ -d %{_sharedstatedir}/hkdfguard/tpm ] || install -d -m 0750 -o root -g hkdfguard %{_sharedstatedir}/hkdfguard/tpm
+exit 0
+
 %if 0%{?suse_version}
 # SUSE policy; Fedora-family glibc runs ldconfig from a file trigger.
 %ldconfig_scriptlets -n %{libpkg}
@@ -160,11 +171,12 @@ exit 0
 %doc README.md
 %{_libdir}/libhkdfguard.so.1
 %dir %{_sysconfdir}/hkdfguard
-# The TPM key directory: its group decides who may use TPM keys (each key
-# file takes it). %%pre creates the group before this lands. Left in place,
-# key files and all, on erase.
+# The TPM key directory: its group decides who may reach the key files
+# (each key file takes it). %%ghost: %%post creates it, and rpm never resets
+# its owner or mode on upgrade (see %%post). Left in place, key files and
+# all, on erase.
 %dir %attr(0755,root,root) %{_sharedstatedir}/hkdfguard
-%dir %attr(0750,root,hkdfguard) %{_sharedstatedir}/hkdfguard/tpm
+%ghost %dir %attr(0750,root,hkdfguard) %{_sharedstatedir}/hkdfguard/tpm
 %dir %{_datadir}/hkdfguard
 %{_datadir}/hkdfguard/policy.toml.example
 %{_prefix}/lib/sysusers.d/hkdfguard.conf
@@ -196,7 +208,8 @@ exit 0
   PIN-class login failure latches. wrap --force warns when it can't
   overwrite the file it replaces. Unwrap refuses over-long payloads before
   parsing them. The build refuses the release profile with
-  --cfg hkdfguard_test_paths.
+  --cfg hkdfguard_test_paths. The TPM key directory is created by %post
+  and never reset on upgrade.
 
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys

@@ -3,14 +3,21 @@ set -e
 
 #DEBHELPER#
 
-# The TPM key directory: its group decides who may use TPM keys (each key
-# file `hkdfguard provision` writes takes it), so it belongs to hkdfguard,
-# which the sysusers snippet above has just created. Set on every configure
-# unless an administrator has recorded their own owner and mode with
-# dpkg-statoverride.
-if [ "$1" = configure ] && ! dpkg-statoverride --list /var/lib/hkdfguard/tpm >/dev/null; then
-    chown root:hkdfguard /var/lib/hkdfguard/tpm
-    chmod 0750 /var/lib/hkdfguard/tpm
+# The TPM key directory. Its group decides who may reach the key files (each
+# key file `hkdfguard provision` writes takes it), so it starts out
+# root:hkdfguard 0750; hkdfguard is the group the sysusers snippet above has
+# just created.
+#
+# Only while it is still the root:root 0755 directory dpkg itself makes: on
+# a first install, or a reinstall after dpkg removed it empty. Any other
+# owner or mode is an administrator's choice, and an upgrade must not undo
+# it -- a narrower group, say, that the next upgrade would otherwise widen
+# back to hkdfguard without a word. dpkg-statoverride is honored as well.
+dir=/var/lib/hkdfguard/tpm
+if [ "$1" = configure ] && ! dpkg-statoverride --list "$dir" >/dev/null \
+    && [ "$(stat -c '%U:%G %a' "$dir")" = "root:root 755" ]; then
+    chown root:hkdfguard "$dir"
+    chmod 0750 "$dir"
 fi
 
 exit 0

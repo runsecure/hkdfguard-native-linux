@@ -69,6 +69,25 @@ done
 # The TPM key directory, group-owned by hkdfguard so its members can use TPM keys.
 [ "$(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm)" = "root:hkdfguard 750" ] \
     || { echo "/var/lib/hkdfguard/tpm must be root:hkdfguard 0750, is $(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm 2>&1)" >&2; exit 1; }
+
+section "an administrator's owner and mode on the TPM key directory survive a reinstall"
+# What an upgrade runs: the postinst / %post again, and rpm reapplying the
+# attributes of what it installs. Neither may put root:hkdfguard 0750 back
+# over a deliberate choice.
+chgrp hkdfguard-deployers /var/lib/hkdfguard/tpm
+chmod 0710 /var/lib/hkdfguard/tpm
+if command -v apt-get >/dev/null; then
+    apt-get install -y --reinstall "$pkgs"/libhkdfguard1_*.deb
+elif command -v dnf >/dev/null; then
+    dnf -y reinstall "${rpms[@]}"
+else
+    zypper --non-interactive install --force --allow-unsigned-rpm "${rpms[@]}"
+fi
+[ "$(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm)" = "root:hkdfguard-deployers 710" ] \
+    || { echo "a reinstall reset /var/lib/hkdfguard/tpm to $(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm 2>&1)" >&2; exit 1; }
+chgrp hkdfguard /var/lib/hkdfguard/tpm
+chmod 0750 /var/lib/hkdfguard/tpm
+echo "kept root:hkdfguard-deployers 0710 across the reinstall."
 example_policy=/usr/share/hkdfguard/policy.toml.example
 [ "$(stat -c '%U:%G %a' "$example_policy")" = "root:root 644" ] \
     || { echo "$example_policy must be installed, root:root 0644" >&2; exit 1; }

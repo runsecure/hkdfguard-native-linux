@@ -120,8 +120,9 @@ packages, create it as root:
 sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 ```
 
-On a `.deb` system, record a different owner or mode with
-`dpkg-statoverride` or an upgrade puts `root:hkdfguard 0750` back.
+The packages set `root:hkdfguard 0750` only when they create the
+directory. An owner or mode you give it afterwards survives upgrades and
+reinstalls, `.deb` and `.rpm` alike.
 
 **3. Each service's own group.** The authValue file is what lets an
 account use one service's key, so it is never given the directory's group,

@@ -34,6 +34,8 @@ hkdfguard (0.9.2-1) trixie; urgency=medium
     it, rather than copying it first.
   * The build refuses the release profile with --cfg hkdfguard_test_paths
     (the test harnesses' policy override), so it can't leak into a release.
+  * The TPM key directory gets root:hkdfguard 0750 only when it is
+    created; an owner or mode an administrator sets survives upgrades.
 
  -- runsecure <torin@torinblair.com>  Tue, 17 Nov 2026 12:00:00 +0000
 
