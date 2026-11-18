@@ -1325,8 +1325,11 @@ build:
   `HKDFGUARD_POLICY_FILE` (and accepts config owned by the invoking user
   rather than root), and it says so in its log. No ordinary build setting
   -- a cargo feature, a profile, `--all-features` -- can turn it on, and
-  nothing that ships is built with it. Without it, the tests that need it
-  are reported as ignored, naming the flag.
+  nothing that ships is built with it: `build.rs` refuses the release
+  profile with this cfg (fuzzing builds, `--cfg fuzzing`, aside), so one
+  leaked into a release job fails the build. Build test harnesses in the
+  debug profile. Without it, the tests that need it are reported as
+  ignored, naming the flag.
 
 `scripts/native-tpm-test.sh`, `docker/entrypoint-test.sh` and CI build these
 into `target/test-paths`, write a harness policy naming the TPM, a scratch

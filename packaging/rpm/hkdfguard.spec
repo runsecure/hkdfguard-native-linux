@@ -195,7 +195,8 @@ exit 0
   CKA_LOCAL and neither modifiable nor copyable to be used; every
   PIN-class login failure latches. wrap --force warns when it can't
   overwrite the file it replaces. Unwrap refuses over-long payloads before
-  parsing them.
+  parsing them. The build refuses the release profile with
+  --cfg hkdfguard_test_paths.
 
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys

@@ -290,6 +290,21 @@ if as_ci "$TEST_BIN"/hkdfguard provision --service-name com.hkdfguard.dockertest
 fi
 echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE and failed, as designed."
 
+# And a release can't be built as a test build at all: build.rs refuses the
+# release profile with --cfg hkdfguard_test_paths, so a RUSTFLAGS leaked
+# into a packaging or release job fails the build instead of shipping. Not
+# for fuzzing (cargo fuzz: release profile, --cfg fuzzing), never shipped.
+# `cargo check` runs build.rs without the release build's codegen.
+guard_check() { as_ci env RUSTFLAGS="$1" CARGO_TARGET_DIR=target/release-guard cargo check --release --lib --features tpm2,pkcs11 2>&1; }
+if OUT=$(guard_check "--cfg hkdfguard_test_paths"); then
+    echo "FAIL: a release-profile build with --cfg hkdfguard_test_paths was allowed" >&2; exit 1
+fi
+grep -q "refusing to build hkdfguard in the release profile with \`--cfg hkdfguard_test_paths\`" <<<"$OUT" \
+    || { echo "FAIL: the release build failed, but not on the test-paths guard: $OUT" >&2; exit 1; }
+OUT=$(guard_check "--cfg hkdfguard_test_paths --cfg fuzzing") \
+    || { echo "FAIL: the guard refused a fuzzing build: $OUT" >&2; exit 1; }
+echo "release profile + --cfg hkdfguard_test_paths: refused by build.rs; a fuzzing build: allowed."
+
 section "a TPM key file that can't be trusted refuses; it never falls back to a weaker provider"
 # The TPM is reachable (swtpm, via tpm.tcti) and a weaker provider is ready
 # to serve: an external-secret KEK in the standard mount. The service's
