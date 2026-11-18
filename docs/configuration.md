@@ -300,9 +300,10 @@ encrypt, decrypt, wrap or unwrap), and neither modifiable nor copyable, so
 none of that can be relaxed later. Only private objects are ever looked up,
 so nothing someone creates on the token without the PIN is ever used. A key
 found under a service's label is used only if it still has all of these
-protections, and also `CKA_ALWAYS_SENSITIVE` and `CKA_NEVER_EXTRACTABLE`,
-which a token sets only on a key generated on it: an imported key, whose
-value someone may know, is refused. Only secret keys are looked up, so an
+protections, and also `CKA_ALWAYS_SENSITIVE`, `CKA_NEVER_EXTRACTABLE` and
+`CKA_LOCAL`, which a token sets only on a key it generated itself: an
+imported key, whose value someone may know, or one derived from another
+key, is refused. Only secret keys are looked up, so an
 EC key pair left under the same label by the pre-release ECDH format is
 ignored, not used or refused; delete it from the token by hand.
 

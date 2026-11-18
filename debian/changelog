@@ -22,6 +22,9 @@ hkdfguard (0.9.2-1) trixie; urgency=medium
     missing, say), wrap and hkdfguard_kek_fingerprint return
     PROVIDER_UNAVAILABLE, audited as event 2005, instead of the unaudited
     KEK_NOT_FOUND; hkdfguard_kek_exists returns it instead of answering 0.
+  * PKCS#11: a key under a service's label is used only if it is also
+    CKA_LOCAL (generated on the token, not derived or unwrapped) and not
+    modifiable or copyable, as hkdfguard generates its keys.
 
  -- runsecure <torin@torinblair.com>  Tue, 17 Nov 2026 12:00:00 +0000
 

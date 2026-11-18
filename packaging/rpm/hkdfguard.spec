@@ -191,7 +191,8 @@ exit 0
   else root:root 0400, never the key directory's group; provisioning always
   creates a new authValue. With no policy-allowed provider present, wrap,
   kek_exists and kek_fingerprint return PROVIDER_UNAVAILABLE (audited)
-  instead of KEK_NOT_FOUND or a 0 answer.
+  instead of KEK_NOT_FOUND or a 0 answer. PKCS#11 keys must also be
+  CKA_LOCAL and neither modifiable nor copyable to be used.
 
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys

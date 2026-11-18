@@ -77,10 +77,11 @@
 //! bytes, as it is.
 //!
 //! A key found under a service's label is used only if it still carries
-//! those protections, including `CKA_ALWAYS_SENSITIVE` and
-//! `CKA_NEVER_EXTRACTABLE`, which the token sets only on a key generated
-//! on it and never exposed -- so an imported key with a known value,
-//! labelled and tagged to match, is refused (see `check_protections`).
+//! those protections -- not modifiable or copyable included -- and
+//! `CKA_ALWAYS_SENSITIVE`, `CKA_NEVER_EXTRACTABLE` and `CKA_LOCAL`, which
+//! the token sets only on a key it generated itself and never exposed --
+//! so an imported or derived key, labelled and tagged to match, is refused
+//! (see `check_protections`).
 //! It is `CKA_PRIVATE`, and only private objects are ever looked up, so
 //! nothing made by a session without the PIN is seen at all (see
 //! `labelled_template`).
@@ -836,6 +837,23 @@ fn require_user_session(session: &Session) -> Result<()> {
 /// key that was generated on it and never had its value exposed. A key
 /// imported from outside (`C_CreateObject`, `C_UnwrapKey`) has them false,
 /// whatever else its template says.
+///
+/// Those two say the value was never exposed, not that the token made the
+/// key itself, or that it will stay as it is:
+///
+/// - `CKA_LOCAL` is true only for a key made by `C_GenerateKey` (or a key
+///   pair's). A key made by `C_DeriveKey` from a sensitive base can still
+///   be always-sensitive and never-extractable, but its value is a function
+///   of a base key and data its maker chose.
+/// - `CKA_MODIFIABLE` false keeps every attribute as checked here: on a
+///   modifiable key, anyone with the PIN could later turn on `CKA_DERIVE`
+///   or `CKA_WRAP` -- `C_DeriveKey` with a mechanism that mixes in a key of
+///   theirs is a known way to get material out of a non-extractable key.
+/// - `CKA_COPYABLE` false keeps `C_CopyObject` from making a copy with
+///   different attributes.
+///
+/// `generate_key` sets the last two in its template, so a token that
+/// generated the key accepted them; the check costs no compatibility.
 fn required_protections() -> Vec<Attribute> {
     // CKA_PRIVATE again after the find template: a token that ignores an
     // attribute in a search template must not slip a public object through.
@@ -849,6 +867,9 @@ fn required_protections() -> Vec<Attribute> {
         Attribute::Extractable(false),
         Attribute::AlwaysSensitive(true),
         Attribute::NeverExtractable(true),
+        Attribute::Local(true),
+        Attribute::Modifiable(false),
+        Attribute::Copyable(false),
     ]
 }
 
@@ -1532,6 +1553,98 @@ mod tests {
         assert!(!msg.contains(service), "errors must not name the service: {msg}");
         assert!(provider.kek_exists(service).is_err(), "kek_exists must not answer either way");
 
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_generated_key_that_could_be_altered_or_copied_later_is_refused() {
+        // Generated on the token, never exposed, right label and ID: it
+        // passes every check but these. Left modifiable, a PIN holder could
+        // turn on CKA_DERIVE afterwards; left copyable, copy it with other
+        // attributes. Each is refused on its own, by name.
+        let service = "com.hkdfguard.test.alterable";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        let locked = [Attribute::Sensitive(true), Attribute::Extractable(false), Attribute::Derive(false)];
+        for (loosened, name) in [(Attribute::Modifiable(true), "Modifiable"), (Attribute::Copyable(true), "Copyable")] {
+            with_open(&provider, |open| {
+                destroy_all_for(open, service);
+                let mut extra = locked.to_vec();
+                extra.push(loosened.clone());
+                extra.push(if name == "Modifiable" { Attribute::Copyable(false) } else { Attribute::Modifiable(false) });
+                plant_key_with(open, service, key_id(service), &extra);
+            });
+            let msg = provider.load_kek(service, true).err().expect("a key that can be altered must be refused").to_string();
+            assert!(msg.contains("lacks the protections") && msg.contains(name), "{name}: {msg}");
+            assert!(!msg.contains(service), "errors must not name the service: {msg}");
+            assert!(provider.kek_exists(service).is_err(), "{name}: kek_exists must not answer either way");
+        }
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_derived_key_is_refused_though_it_was_never_exposed() {
+        // C_DeriveKey from a sensitive base key: always-sensitive and
+        // never-extractable, so only CKA_LOCAL tells it from a generated
+        // one -- and its value is a function of a base key and data its
+        // maker chose. (CKM_AES_CBC_ENCRYPT_DATA: the derivation SoftHSM2
+        // implements for secret keys.)
+        let service = "com.hkdfguard.test.derivedkey";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        let derived = with_open(&provider, |open| {
+            destroy_all_for(open, service);
+            let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
+            let base = rw
+                .generate_key(
+                    &Mechanism::AesKeyGen,
+                    &[
+                        Attribute::Class(ObjectClass::SECRET_KEY),
+                        Attribute::KeyType(KeyType::AES),
+                        Attribute::ValueLen((KEK_LEN as u64).into()),
+                        Attribute::Token(false),
+                        Attribute::Sensitive(true),
+                        Attribute::Extractable(false),
+                        Attribute::Derive(true),
+                    ],
+                )
+                .unwrap();
+            let data = [0x5au8; KEK_LEN]; // chosen by the key's maker; a whole number of AES blocks
+            let params = cryptoki::mechanism::ekdf::AesCbcDeriveParams::new([0u8; 16], &data);
+            rw.derive_key(
+                &Mechanism::AesCbcEncryptData(params),
+                base,
+                &[
+                    Attribute::Class(ObjectClass::SECRET_KEY),
+                    Attribute::KeyType(KeyType::GENERIC_SECRET),
+                    Attribute::ValueLen((KEK_LEN as u64).into()),
+                    Attribute::Token(true),
+                    Attribute::Private(true),
+                    Attribute::Sensitive(true),
+                    Attribute::Extractable(false),
+                    Attribute::Sign(true),
+                    Attribute::Derive(false),
+                    Attribute::Modifiable(false),
+                    Attribute::Copyable(false),
+                    Attribute::Label(key_label(service).into_bytes()),
+                    Attribute::Id(key_id(service)),
+                ],
+            )
+            .map(|key| rw.get_attributes(key, &[AttributeType::Local, AttributeType::AlwaysSensitive]).unwrap())
+        });
+        let Ok(attrs) = derived else {
+            eprintln!("skipping: this token can't derive with CKM_AES_CBC_ENCRYPT_DATA");
+            with_open(&provider, |open| destroy_all_for(open, service));
+            return;
+        };
+        assert!(attrs.contains(&Attribute::Local(false)), "a derived key is not local: {attrs:?}");
+
+        let msg = provider.load_kek(service, true).err().expect("a derived key must be refused").to_string();
+        assert!(msg.contains("lacks the protections") && msg.contains("Local"), "{msg}");
         with_open(&provider, |open| destroy_all_for(open, service));
     }
 
