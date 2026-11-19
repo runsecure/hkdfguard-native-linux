@@ -203,7 +203,9 @@ exit 0
   of a process holding ephemeral keys no longer wraps under the all-zero
   key it inherits. A provider that has gone missing while holding a
   service's KEK fails the call instead of handing it to a weaker
-  provider; audit event 1006 records fallbacks. TPM authValue files are
+  provider; audit event 1006 records fallbacks. A PKCS#11 logout during a
+  call is seen even when followed by a new login, and a forked child
+  initializes the PKCS#11 module again for itself. TPM authValue files are
   root:<group> 0440 for the group in the new tpm.auth_groups policy table,
   else root:root 0400, never the key directory's group; provisioning always
   creates a new authValue. With no policy-allowed provider present, wrap,

@@ -107,7 +107,9 @@
 //! A provider is constructed per C ABI call and dropped with it, and so is
 //! its session and login. The module itself is different: `C_Initialize`
 //! and `C_Finalize` are process-wide, so the module is loaded and
-//! initialized once per process and never finalized (see [`MODULES`]).
+//! initialized once per process and never finalized (see [`MODULES`]); a
+//! child created with `fork()` initializes it again for itself, as
+//! PKCS#11 asks.
 //! Finalizing per call, while another thread's call is inside the module,
 //! is undefined behavior and in practice fails both calls. Because a login
 //! is per application per token, overlapping calls share one logged-in
@@ -142,6 +144,60 @@ struct OpenSession {
     session: Session,
     pkcs11: Pkcs11,
     slot: Slot,
+    /// Proof the login hasn't ended since this call logged in; `None` on a
+    /// token that can't hold one (see [`LoginWitness`]).
+    witness: Option<LoginWitness>,
+}
+
+/// A private session object, created right after this call's login, that
+/// shows whether the process has been logged out of the token since.
+///
+/// A login is the application's, not a session's, so something else in the
+/// process using the same module -- the host application, another library
+/// -- can call `C_Logout` underneath a call, and `C_Login` again. While it
+/// is logged out the token hides every private object, so a search for a
+/// service's key comes back empty. Checking the session state after the
+/// search catches a logout that is still in effect, but not one followed
+/// by a new login before the check. This does: `C_Logout` destroys every
+/// private session object the application has, and a later login doesn't
+/// bring them back. So if this object is still there, with the random value
+/// it was created with, the login was never interrupted, and an empty search
+/// really means no key.
+///
+/// It is a `CKO_DATA` object, `CKA_TOKEN` false, so it never reaches the
+/// token's storage and goes away when the session closes.
+struct LoginWitness {
+    handle: ObjectHandle,
+    value: [u8; 16],
+}
+
+impl LoginWitness {
+    /// `Err` saying why if it couldn't create one.
+    fn create(session: &Session) -> std::result::Result<LoginWitness, String> {
+        let mut value = [0u8; 16];
+        // A random value, so an object that happens to reuse the handle
+        // after a logout can't pass for this one. Not a secret.
+        getrandom::fill(&mut value).map_err(|e| format!("no random value for it: {e}"))?;
+        let handle = session
+            .create_object(&[
+                Attribute::Class(ObjectClass::DATA),
+                Attribute::Token(false),
+                Attribute::Private(true),
+                Attribute::Label(b"hkdfguard login witness".to_vec()),
+                Attribute::Value(value.to_vec()),
+            ])
+            .map_err(|e| e.to_string())?;
+        Ok(LoginWitness { handle, value })
+    }
+
+    /// Whether the object is still there with its value: no logout has
+    /// happened since it was created.
+    fn intact(&self, session: &Session) -> bool {
+        matches!(
+            session.get_attributes(self.handle, &[AttributeType::Value]).as_deref(),
+            Ok([Attribute::Value(v)]) if v.as_slice() == self.value
+        )
+    }
 }
 
 /// Every PKCS#11 module this process has loaded and initialized, by
@@ -158,33 +214,73 @@ struct OpenSession {
 /// authority: sessions and logins are still opened per call and closed
 /// when the call's provider drops (see [`OpenSession`]), and a login lasts
 /// only while the process has a session open on the token.
-static MODULES: Mutex<Vec<(PathBuf, Pkcs11)>> = Mutex::new(Vec::new());
+///
+/// Each entry also records the process that initialized it. PKCS#11 asks a
+/// child created with `fork()` to call `C_Initialize` itself before using
+/// a module it inherited: the parent's sessions, logins and (for a network
+/// HSM) connections are not the child's, and most modules refuse every
+/// call from a child that hasn't, with `CKR_CRYPTOKI_NOT_INITIALIZED`. So
+/// an entry from another pid is initialized again before it is handed out
+/// -- once per process, like the first time. Forking is supported from a
+/// process with one thread, as POSIX only lets a child of a multithreaded
+/// process call async-signal-safe functions until it `exec`s; a lock some
+/// other thread held at the fork would stay held in the child.
+static MODULES: Mutex<Vec<Module>> = Mutex::new(Vec::new());
+
+struct Module {
+    path: PathBuf,
+    pkcs11: Pkcs11,
+    /// The process that last ran `C_Initialize` on it (or found it already
+    /// initialized).
+    initialized_by: libc::pid_t,
+}
+
+fn this_process() -> libc::pid_t {
+    // SAFETY: getpid takes no arguments and cannot fail.
+    unsafe { libc::getpid() }
+}
+
+// `C_Initialize`, telling the module it may be called from several OS
+// threads. "Already initialized" is success: something else in this
+// process (the host application, another library) initialized the module,
+// or the module is not fork-aware and still counts the parent's
+// initialization. It is usable as it is, and must never be finalized by
+// code that did not initialize it -- which keeping it in the registry
+// guarantees.
+fn initialize_module(pkcs11: &Pkcs11, checked: &Path) -> std::result::Result<(), String> {
+    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
+        Ok(()) => Ok(()),
+        Err(CryptokiError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {
+            log::debug!("hkdfguard: PKCS#11 module {} was already initialized in this process", checked.display());
+            Ok(())
+        }
+        Err(e) => Err(format!("C_Initialize failed: {e}")),
+    }
+}
 
 // The initialized context for the module at `checked` (a canonical path
 // that has passed `validate_module_path`), loading and initializing it the
-// first time it is asked for. Serialized by the registry lock, so two
-// first-time callers cannot both try to initialize.
+// first time this process asks for it. Serialized by the registry lock, so
+// two first-time callers cannot both try to initialize.
 fn load_module(checked: &Path) -> std::result::Result<Pkcs11, String> {
     let mut modules = MODULES.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((_, pkcs11)) = modules.iter().find(|(path, _)| path == checked) {
-        return Ok(pkcs11.clone()); // a clone shares the one underlying library handle
+    let pid = this_process();
+    if let Some(module) = modules.iter_mut().find(|m| m.path == checked) {
+        if module.initialized_by != pid {
+            // Inherited from the process this one was forked from. A
+            // failure leaves the entry as it was, so the next call tries
+            // again.
+            initialize_module(&module.pkcs11, checked)
+                .map_err(|e| format!("{e} (re-initializing the module in a process forked from the one that loaded it)"))?;
+            module.initialized_by = pid;
+        }
+        return Ok(module.pkcs11.clone()); // a clone shares the one underlying library handle
     }
     let pkcs11 = Pkcs11::new(checked).map_err(|e| format!("could not load module {}: {e}", checked.display()))?;
-    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
-        // telling the module we may call it from multiple OS threads
-        Ok(()) => {}
-        // Something else in this process (the host application, another
-        // library) initialized this module already. It is usable as it is,
-        // and must never be finalized by code that did not initialize it --
-        // which keeping it in the registry guarantees.
-        Err(CryptokiError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {
-            log::debug!("hkdfguard: PKCS#11 module {} was already initialized in this process", checked.display());
-        }
-        // `pkcs11` drops here, which unloads the module without calling
-        // C_Finalize (cryptoki finalizes only when asked to explicitly).
-        Err(e) => return Err(format!("C_Initialize failed: {e}")),
-    }
-    modules.push((checked.to_path_buf(), pkcs11.clone()));
+    // On failure `pkcs11` drops, which unloads the module without calling
+    // C_Finalize (cryptoki finalizes only when asked to explicitly).
+    initialize_module(&pkcs11, checked)?;
+    modules.push(Module { path: checked.to_path_buf(), pkcs11: pkcs11.clone(), initialized_by: pid });
     Ok(pkcs11)
 }
 
@@ -604,7 +700,26 @@ fn open_session() -> Backend<OpenSession> {
     }
     drop(pin); // AuthPin zeroizes its storage on drop; don't keep the PIN around for the session's lifetime
 
-    Backend::Ready(OpenSession { session, pkcs11, slot })
+    // Straight after the login, before any search it is to vouch for. A
+    // token that can't hold one (a module that refuses session objects in
+    // a read-only session, say) still gets the session-state check; only a
+    // logout immediately followed by a new login, both inside one key
+    // search, then goes unseen.
+    let witness = match LoginWitness::create(&session) {
+        Ok(witness) => Some(witness),
+        Err(e) => {
+            crate::provider::log_once(
+                log::Level::Warn,
+                format!(
+                    "hkdfguard: the PKCS#11 token could not create a private session object ({e}); a logout by \
+                     other code in this process, followed at once by a new login, could go unnoticed during a key search"
+                ),
+            );
+            None
+        }
+    };
+
+    Backend::Ready(OpenSession { session, pkcs11, slot, witness })
 }
 
 // Handle type returned from `load_kek`: the service's key, already located
@@ -691,7 +806,7 @@ impl KekProvider for Pkcs11Provider {
         let open = guard
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
-        Ok(find_key(&open.session, service)?.is_some())
+        Ok(find_key(&open.session, service, open)?.is_some())
     }
 
     // Locates the service's key on the token now -- generating it if
@@ -713,7 +828,7 @@ impl KekProvider for Pkcs11Provider {
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
 
-        let key = match find_key(&open.session, service)? {
+        let key = match find_key(&open.session, service, open)? {
             Some(key) => key,
             None if create_if_missing => generate_key(open, service)?, // none exists yet and creation was requested
             None => {
@@ -749,7 +864,7 @@ impl KekProvider for Pkcs11Provider {
             .open_rw_session(open.slot)
             .map_err(|e| Error::Provider(format!("PKCS#11 could not open a read/write session to retire a key: {e}")))?;
 
-        let key = find_key(&rw, service)?.ok_or(Error::KekNotFound)?;
+        let key = find_key(&rw, service, open)?.ok_or(Error::KekNotFound)?;
         if crate::crypto::kek_fingerprint(&SessionKey { session: &rw, key })? != *expected_fingerprint {
             return Err(Error::KekFingerprintMismatch);
         }
@@ -806,13 +921,15 @@ fn labelled_template(service: &str) -> [Attribute; 4] {
 // to the next -- or one planted alongside the real one. The match must
 // also carry the CKA_ID `generate_key` gives it. Errors never name the
 // service: the C ABI logs them, and service names stay out of the log.
-fn find_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
+// `session` is the one searched; `open` is this call's, whose login
+// witness says whether an empty result can be trusted.
+fn find_key(session: &Session, service: &str, open: &OpenSession) -> Result<Option<ObjectHandle>> {
     let found = session
         .find_objects(&labelled_template(service)) // C_FindObjects
         .map_err(|e| Error::Provider(format!("PKCS#11 find_objects failed: {e}")))?;
     let handle = match found.as_slice() {
         [] => {
-            require_user_session(session)?;
+            require_user_session(session, open)?;
             return Ok(None);
         }
         [one] => *one,
@@ -850,18 +967,32 @@ fn find_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
 /// calls `C_Logout` or `C_CloseAllSessions`. Read as "no key", that would
 /// send the chain on to the next provider, and every wrap after it to a
 /// weaker KEK, while the real one sits on the token. Checked after the
-/// search rather than before, so a logout at any point up to here is seen.
-fn require_user_session(session: &Session) -> Result<()> {
+/// search rather than before, so a logout at any point up to here is seen:
+/// one still in effect by the session state, and one followed by a new
+/// login -- which the state alone would miss -- by the call's
+/// [`LoginWitness`] having gone.
+fn require_user_session(session: &Session, open: &OpenSession) -> Result<()> {
     let info = session
         .get_session_info()
         .map_err(|e| Error::Provider(format!("PKCS#11 get_session_info failed: {e}")))?;
     match info.session_state() {
-        SessionState::RoUser | SessionState::RwUser => Ok(()),
-        state => Err(Error::Provider(format!(
-            "the PKCS#11 session is not logged in as the user (state {state:?}), so the token would not show this \
-             service's key if it had one: something else in this process logged out of the token. Refusing to \
-             treat that as \"no key\" rather than using a weaker provider"
-        ))),
+        SessionState::RoUser | SessionState::RwUser => {}
+        state => {
+            return Err(Error::Provider(format!(
+                "the PKCS#11 session is not logged in as the user (state {state:?}), so the token would not show \
+                 this service's key if it had one: something else in this process logged out of the token. \
+                 Refusing to treat that as \"no key\" rather than using a weaker provider"
+            )))
+        }
+    }
+    match &open.witness {
+        Some(witness) if !witness.intact(&open.session) => Err(Error::Provider(
+            "the PKCS#11 login was interrupted during this call: something else in this process logged out of the \
+             token (and in again), so the search for this service's key may have run while the token hid it. \
+             Refusing to treat that as \"no key\" rather than using a weaker provider"
+                .into(),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1006,7 +1137,7 @@ fn generate_key(open: &OpenSession, service: &str) -> Result<ObjectHandle> {
         } // the read/write session closes here; its object handles are no longer valid
 
         // Through the read-only session, whose handle the caller keeps.
-        if let Some(key) = find_key(&open.session, service)? {
+        if let Some(key) = find_key(&open.session, service, open)? {
             return Ok(key);
         }
         // Nothing left: the other process yielded at the same moment. Generate again.
@@ -1473,6 +1604,107 @@ mod tests {
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
     #[serial_test::serial]
+    fn a_logout_followed_by_a_new_login_is_still_seen() {
+        // Logged out and straight back in: the session state reads
+        // "logged in" again, so only the login witness -- a private
+        // session object, which C_Logout destroyed -- can tell that the
+        // token was hiding private objects in between.
+        let service = "com.hkdfguard.test.relogin";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| {
+            destroy_all_for(open, service);
+            let witness = open.witness.as_ref().expect("SoftHSM2 creates the login witness");
+            assert!(witness.intact(&open.session), "intact while the login lasts");
+        });
+        assert!(!provider.kek_exists(service).unwrap(), "logged in throughout, and no key: a plain no");
+
+        let pin_path = crate::policy::pkcs11_settings().unwrap().pin_file.unwrap_or_else(|| PathBuf::from(DEFAULT_PIN_FILE));
+        let pin = read_pin_file(&pin_path).unwrap();
+        with_open(&provider, |open| {
+            open.session.logout().unwrap();
+            open.session.login(UserType::User, Some(&pin)).unwrap();
+            let state = open.session.get_session_info().unwrap().session_state();
+            assert!(matches!(state, SessionState::RoUser), "logged in again: {state:?}");
+        });
+
+        let refused = |result: Result<()>| match result {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("login was interrupted"), "{msg}");
+                assert!(!msg.contains(service), "errors must not name the service: {msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        };
+        refused(provider.kek_exists(service).map(|_| ()));
+        refused(provider.load_kek(service, false).map(|_| ())); // not KeyNotProvisioned: the chain must stop here
+        refused(provider.load_kek(service, true).map(|_| ())); // nor generate a key beside one it may not have seen
+        refused(provider.retire_kek(service, &[0x11; 32]));
+        with_open(&provider, |open| assert_eq!(count_labelled(&open.session, service).unwrap(), 0, "nothing generated"));
+
+        // A fresh provider has a witness of its own, and answers again.
+        drop(provider);
+        let provider = Pkcs11Provider::new();
+        assert!(!provider.kek_exists(service).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_forked_child_initializes_the_module_for_itself() {
+        // The parent loads and initializes the module; a child created with
+        // fork() must run C_Initialize again before using it, as PKCS#11
+        // asks, and then work like any other process. The child reports
+        // through its exit status, never by panicking: it is a copy of the
+        // test harness. 0 is a pass; anything else names the failed check.
+        let service = "com.hkdfguard.test.forked";
+        let parent = Pkcs11Provider::new();
+        assert!(parent.probe(), "no PKCS#11 session available");
+        with_open(&parent, |open| destroy_all_for(open, service));
+        let expected = prf_of(&*parent.load_kek(service, true).unwrap(), b"input");
+        drop(parent);
+        let parent_pid = this_process();
+        let initialized_by = || {
+            let modules = MODULES.lock().unwrap();
+            modules.iter().map(|m| m.initialized_by).collect::<Vec<_>>()
+        };
+        assert_eq!(initialized_by(), vec![parent_pid]);
+
+        // SAFETY: this test runs alone (serial), so no other thread holds a
+        // lock the child needs; the child only calls this module and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let child = Pkcs11Provider::new();
+            let code = if !child.connected() {
+                1 // refused: the inherited module wasn't usable
+            } else if initialized_by() != vec![this_process()] {
+                2 // the module wasn't initialized again in this process
+            } else {
+                match child.load_kek(service, false).and_then(|h| h.prf(&[b"input"])).map(|out| *out[0]) {
+                    Ok(out) if out == expected => 0,
+                    Ok(_) => 3, // a different key
+                    Err(_) => 4,
+                }
+            };
+            // SAFETY: _exit takes a status and does not return.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: waitpid writes the status of the child just forked.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "the forked child did not exit normally (status {status:#x})");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "forked-child check failed: see the numbered checks above");
+
+        // The parent's own entry is untouched, and it still works.
+        assert_eq!(initialized_by(), vec![parent_pid]);
+        let parent = Pkcs11Provider::new();
+        assert_eq!(prf_of(&*parent.load_kek(service, false).unwrap(), b"input"), expected);
+        with_open(&parent, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
     fn retire_kek_refuses_a_duplicate_key_rather_than_choosing_one_to_delete() {
         let service = "com.hkdfguard.test.retire.duplicate";
         let provider = Pkcs11Provider::new();
@@ -1689,38 +1921,61 @@ mod tests {
                 )
                 .unwrap();
             let data = [0x5au8; KEK_LEN]; // chosen by the key's maker; a whole number of AES blocks
-            let params = cryptoki::mechanism::ekdf::AesCbcDeriveParams::new([0u8; 16], &data);
-            rw.derive_key(
-                &Mechanism::AesCbcEncryptData(params),
-                base,
-                &[
-                    Attribute::Class(ObjectClass::SECRET_KEY),
-                    Attribute::KeyType(KeyType::GENERIC_SECRET),
-                    Attribute::ValueLen((KEK_LEN as u64).into()),
-                    Attribute::Token(true),
-                    Attribute::Private(true),
-                    Attribute::Sensitive(true),
-                    Attribute::Extractable(false),
-                    Attribute::Sign(true),
-                    Attribute::Derive(false),
-                    Attribute::Modifiable(false),
-                    Attribute::Copyable(false),
-                    Attribute::Label(key_label(service).into_bytes()),
-                    Attribute::Id(key_id(service)),
-                ],
-            )
-            .map(|key| rw.get_attributes(key, &[AttributeType::Local, AttributeType::AlwaysSensitive]).unwrap())
+            let base_template = [
+                Attribute::Class(ObjectClass::SECRET_KEY),
+                Attribute::KeyType(KeyType::GENERIC_SECRET),
+                Attribute::ValueLen((KEK_LEN as u64).into()),
+                Attribute::Token(true),
+                Attribute::Private(true),
+                Attribute::Sensitive(true),
+                Attribute::Extractable(false),
+                Attribute::Sign(true),
+                Attribute::Label(key_label(service).into_bytes()),
+                Attribute::Id(key_id(service)),
+            ];
+            // hkdfguard's other protections, set where the token lets a
+            // derivation set them: some SoftHSM2 builds (RHEL 9's 2.6.1)
+            // refuse one as read-only (CKR_ATTRIBUTE_READ_ONLY). Each left
+            // out is then expected among the reasons the key is refused.
+            let optional = [Attribute::Modifiable(false), Attribute::Copyable(false), Attribute::Derive(false)];
+            let mut last = None;
+            for mask in 0u8..(1 << optional.len()) {
+                let left_out: Vec<AttributeType> =
+                    optional.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, a)| a.attribute_type()).collect();
+                let mut template = base_template.to_vec();
+                template.extend(optional.iter().filter(|a| !left_out.contains(&a.attribute_type())).cloned());
+                let params = cryptoki::mechanism::ekdf::AesCbcDeriveParams::new([0u8; 16], &data);
+                match rw.derive_key(&Mechanism::AesCbcEncryptData(params), base, &template) {
+                    Ok(key) => {
+                        let attrs = rw.get_attributes(key, &[AttributeType::Local, AttributeType::AlwaysSensitive]).unwrap();
+                        return Ok((attrs, left_out));
+                    }
+                    Err(e @ CryptokiError::Pkcs11(RvError::AttributeReadOnly, _)) => last = Some(e),
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(last.unwrap())
         });
-        let Ok(attrs) = derived else {
-            eprintln!("skipping: this token can't derive with CKM_AES_CBC_ENCRYPT_DATA");
+        // No skip: the suites run these tests against SoftHSM2, which
+        // implements this derivation, and output is captured -- a skip
+        // would print `ok` like a pass and prove nothing.
+        let (attrs, left_out) = derived.unwrap_or_else(|e| {
             with_open(&provider, |open| destroy_all_for(open, service));
-            return;
-        };
+            panic!("the token couldn't derive a key with CKM_AES_CBC_ENCRYPT_DATA: {e}")
+        });
         assert!(attrs.contains(&Attribute::Local(false)), "a derived key is not local: {attrs:?}");
 
+        // Refused, for CKA_LOCAL -- and for nothing else but what the token
+        // wouldn't let the derivation set.
         let msg = provider.load_kek(service, true).err().expect("a derived key must be refused").to_string();
-        assert!(msg.contains("lacks the protections") && msg.contains("Local"), "{msg}");
         with_open(&provider, |open| destroy_all_for(open, service));
+        assert!(msg.contains("lacks the protections"), "{msg}");
+        let listed = msg.split_once("generates its keys with (").and_then(|(_, rest)| rest.split_once(')')).map(|(l, _)| l);
+        let listed: Vec<&str> = listed.unwrap_or_else(|| panic!("no list of protections: {msg}")).split(", ").collect();
+        let allowed: Vec<String> =
+            std::iter::once("Local".to_string()).chain(left_out.iter().map(|t| format!("{t:?}"))).collect();
+        assert!(listed.contains(&"Local"), "{msg}");
+        assert!(listed.iter().all(|l| allowed.iter().any(|a| a == l)), "refused for {listed:?}; expected only {allowed:?}");
     }
 
     #[test]
@@ -1806,7 +2061,7 @@ mod tests {
             let info = open.session.get_session_info().unwrap();
             assert!(!info.read_write(), "the provider's own session must be read-only");
 
-            let key = find_key(&open.session, service).unwrap().unwrap();
+            let key = find_key(&open.session, service, open).unwrap().unwrap();
             let wanted = [
                 Attribute::Modifiable(false),
                 Attribute::Copyable(false),

@@ -1,6 +1,11 @@
 # Audit of `unsafe` code
 
-**Date:** 2026-10-29 · **Version:** 0.9.1 · **Scope:** every `unsafe` block in `src/` and `src/bin/`
+**Date:** 2026-11-18 · **Version:** 0.9.2 · **Scope:** every `unsafe` block in `src/` and `src/bin/`
+
+First done for 0.9.1 (2026-10-29). Re-reviewed for 0.9.2: the secret ABI
+functions, the ephemeral provider's fork handling, the TPM key directory
+lock and the POSIX ACL calls are new; the rest was re-checked against
+the same invariants.
 
 This records what each kind of `unsafe` code relies on, how that was
 checked, and what the checks could not reach. Re-run it after any change
@@ -14,9 +19,10 @@ that establishes it. Miri, Rust's undefined-behaviour checker, ran every
 test it can execute in the modules that hold pointer or memory logic and
 reported nothing.
 
-The audit changed no behaviour. It added four missing safety comments,
-corrected one, and added `cfg(miri)` accommodations that exist only when
-Miri runs (listed below).
+The 0.9.1 audit changed no behaviour. It added four missing safety
+comments, corrected one, and added `cfg(miri)` accommodations that exist
+only when Miri runs (listed below). The 0.9.2 code arrived with its safety
+comments and its own accommodations.
 
 ## Method
 
@@ -34,14 +40,17 @@ Miri runs (listed below).
 
 ### C ABI entry points (`src/lib.rs`)
 
-The ten `extern "C"` functions read and write caller memory through raw
-pointers.
+The fourteen `extern "C"` functions read and write caller memory through
+raw pointers. 0.9.2 added `hkdfguard_wrap_secret`,
+`hkdfguard_unwrap_secret` and `hkdfguard_open_secret_file`, which follow
+the DEK functions' pattern line for line.
 
 | Invariant | Where it is established |
 |---|---|
 | A pointer is dereferenced only after a null check | The first lines of every `*_impl` function; `out_len` and `out` are checked before any read or write |
 | A length is used as `usize` only once known non-negative | `capacity < 0` and `wrapped_len < 0` refused first |
-| A C string is read only up to its bound | `cstr_to_service`, `cstr_to_principal` and `cstr_to_path` scan byte by byte and stop at 129, 16 and 4096 bytes |
+| A C string is read only up to its bound | `cstr_to_service`, `cstr_to_secret_name`, `cstr_to_principal` and `cstr_to_path` scan byte by byte and stop at 129, 65, 16 and 4096 bytes |
+| A caller's buffer is read only for its declared length | `secret` is read for `secret_len` only after `1 <= secret_len <= 256` is checked; `wrapped` for `wrapped_len` only after `wrapped_len >= 0` |
 | `out` is written only within the declared capacity | Every copy follows a `capacity >= len` check; `zero_caller_buffer` writes exactly `capacity` bytes |
 | A panic never crosses into C | Every entry point runs its body under `catch_unwind`; `report_caught_panic` is itself wrapped |
 
@@ -51,7 +60,12 @@ the slice's last use comes before the DEK is written through `out`, so no
 live shared reference is invalidated. On failure the zeroing likewise
 follows the slice's last use. Miri confirmed this:
 `unwrap_in_place_recovers_the_dek_and_audits_the_payload_not_the_dek`
-passes under it.
+passes under it. `hkdfguard_unwrap_secret` allows the same and is built
+the same way: its audit record, the last use of the `wrapped` slice, is
+written before the secret is copied out, and the secret is the library's
+own copy, so the final `copy_nonoverlapping` never overlaps.
+`hkdfguard_wrap_secret` reads `secret` only inside `crypto::wrap_secret`,
+before anything is written to `out`.
 
 ### System calls with out-parameters
 
@@ -70,6 +84,29 @@ passes under it.
 - **Buffer growth is bounded.** `ERANGE` doubles the buffer up to 1 MiB,
   then reports the error.
 
+### POSIX ACLs (`src/secure_file.rs`)
+
+`fgetxattr`, `getxattr` and `fremovexattr` on `system.posix_acl_access`,
+new in 0.9.2.
+
+- **The buffer passed is the buffer sized.** `read_xattr` asks for the
+  size with a null buffer and size 0, allocates exactly that, and passes
+  that allocation's pointer and length; the kernel writes at most that
+  many bytes. If the attribute grew in between (`ERANGE`), it asks again.
+  Only the returned length is kept (`truncate`).
+- **Descriptors and names outlive the call.** The descriptor belongs to a
+  `File` borrowed for the call; the path is a `CString` local; the
+  attribute name is a `c"..."` literal.
+- **The bytes are parsed by safe code.** `parse_acl` takes a `&[u8]` and
+  refuses anything that isn't a version-2 header followed by whole 8-byte
+  entries.
+
+### File locking (`src/provider/tpm2.rs`)
+
+`flock` on the TPM key directory's descriptor (`KeyDirLock`), new in
+0.9.2. It takes a descriptor the `KeyDirLock` owns for as long as the
+lock is held, and integer flags. `EINTR` is retried.
+
 ### Ephemeral key pages (`src/provider/ephemeral.rs`)
 
 The one `unsafe impl` and the only raw-pointer arithmetic.
@@ -79,6 +116,13 @@ The one `unsafe impl` and the only raw-pointer arithmetic.
 - **`slot(i)` asserts `i < slots()`** before forming `&mut [u8; 32]` at
   `base + i * 32`. The alignment needed is 1, and `&mut self` behind the
   store's mutex makes it the only reference.
+- **`discard` wipes and unmaps a page** (0.9.2, for a forked child that
+  inherited its parent's pages). It takes `self` by value, so the borrow
+  checker has already ended every `&mut` that `slot()` handed out; the
+  zeroing covers exactly `base..base+len`, the mapping `new` created, and
+  nothing refers to it after `munmap`.
+- **`MADV_WIPEONFORK` and `getpid`** (0.9.2) take only the mapping's own
+  range, or nothing.
 - **`unsafe impl Send for KeyPage`.** It holds a raw pointer, but every
   `KeyPage` is reached only through the store's `Mutex`, so it is never
   shared between threads unsynchronised. It is not `Sync`, and nothing
@@ -100,8 +144,21 @@ The one `unsafe impl` and the only raw-pointer arithmetic.
 
 ### Calls with no preconditions
 
-`geteuid`, `getuid`, `getegid` and `sysconf` take no pointers and can't
-fail. 28 of the crate's 85 `unsafe` blocks are only these.
+`geteuid`, `getuid`, `getegid`, `getpid` and `sysconf` take no pointers
+and can't fail. 32 of the crate's 113 `unsafe` blocks (86 at 0.9.1) are
+only these. (`getpid` is how the ephemeral store and the PKCS#11 module
+registry notice they are in a forked child.)
+
+### Tests only
+
+`setxattr` (to give a test file a real ACL), `mkfifo`, `flock` with
+`LOCK_NB` (to show the key directory is locked), and `getgrgid` (one
+lookup, read at once; the library itself uses only the reentrant `_r`
+lookups). Each takes live, NUL-terminated locals. The PKCS#11 fork test
+calls `fork`, `waitpid` and `_exit` as the ephemeral one does: it runs
+serially, so no other thread holds a lock the child needs, and the child
+reports through `_exit` rather than unwinding through a copy of the test
+harness.
 
 ## Miri results
 
@@ -117,11 +174,14 @@ fail. 28 of the crate's 85 `unsafe` blocks are only these.
 | `audit` | 10 passed | 1 ignored: opens a Unix datagram socket |
 
 **What Miri can't reach.** It interprets Rust, so calls into C are
-outside it: the NSS lookups, `statvfs`, `prctl`, `setrlimit`, `madvise`,
-`mlock`, `mkfifo`, Unix sockets, and the TPM and PKCS#11 libraries. For
-those, the review above is the check. The TPM and PKCS#11 providers'
-`unsafe` code is only `geteuid` in tests; their foreign calls go through
-the `tss-esapi` and `cryptoki` crates, which are outside this audit.
+outside it: the NSS lookups, `statvfs`, the xattr calls, `flock`,
+`prctl`, `setrlimit`, `madvise`, `mlock`, `mkfifo`, `fork`, Unix
+sockets, and the TPM and PKCS#11 libraries. For
+those, the review above is the check. Beyond what is listed above (the
+key directory lock, `getpid`, the fork test), the TPM and PKCS#11
+providers' `unsafe` code is `geteuid` in tests; their foreign calls go
+through the `tss-esapi` and `cryptoki` crates, which are outside this
+audit.
 
 **`cfg(miri)` accommodations.** Present only when Miri runs, so no build
 that ships has them:
@@ -133,6 +193,9 @@ that ships has them:
 - `security_model`'s lookups report no such user or group.
 - `on_read_only_mount` reports no read-only mount, the answer for every
   test directory.
+- `acl_grants_of_file` and `acl_grants_of_path` report no ACL, and
+  `strip_acl` does nothing: no test file has an ACL except in the tests
+  that set one, which Miri skips.
 
 ## Re-running
 
