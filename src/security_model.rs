@@ -445,6 +445,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "looks this user up through NSS, which Miri can't")]
     fn developer_trusts_root_and_this_user_and_no_group() {
         let _dev = TestPolicy::write("security_model = \"developer\"\n");
         let trust = Trust::current().unwrap();
@@ -459,6 +460,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "looks this user up through NSS, which Miri can't")]
     fn production_trusts_root_and_deployers_only() {
         let (uid, name, gid) = me();
         if uid == 0 {
@@ -518,6 +520,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "looks this user up through NSS, which Miri can't")]
     fn this_user_and_its_primary_group_resolve() {
         let (_, name, _) = me();
         assert!(!name.is_empty());

@@ -2097,7 +2097,12 @@ mod ffi_tests {
             // In place: `out` is the `wrapped` buffer itself.
             let mut inplace = wrapped;
             let mut inplace_len = inplace.len() as c_int;
-            let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), inplace.as_ptr(), wrapped_len, inplace.as_mut_ptr(), &mut inplace_len);
+            // One pointer for both, as a C caller passes one buffer: a
+            // shared `as_ptr()` taken before `as_mut_ptr()` would be
+            // invalidated by it, and reading through it would be undefined
+            // behaviour on the test's side (Miri reports it).
+            let ptr = inplace.as_mut_ptr();
+            let rc = hkdfguard_unwrap_secret(service.as_ptr(), name.as_ptr(), ptr, wrapped_len, ptr, &mut inplace_len);
             assert_eq!(rc, status::OK);
             assert_eq!(&inplace[..inplace_len as usize], secret);
 

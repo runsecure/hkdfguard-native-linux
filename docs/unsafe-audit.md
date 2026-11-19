@@ -1,6 +1,6 @@
 # Audit of `unsafe` code
 
-**Date:** 2026-11-18 · **Version:** 0.9.2 · **Scope:** every `unsafe` block in `src/` and `src/bin/`
+**Date:** 2026-11-19 · **Version:** 0.9.2 · **Scope:** every `unsafe` block in `src/` and `src/bin/`
 
 First done for 0.9.1 (2026-10-29). Re-reviewed for 0.9.2: the secret ABI
 functions, the ephemeral provider's fork handling, the TPM key directory
@@ -13,11 +13,12 @@ to the code listed here.
 
 ## Result
 
-No undefined behaviour was found. Every `unsafe` block states the
-invariant it relies on, and each invariant was checked against the code
-that establishes it. Miri, Rust's undefined-behaviour checker, ran every
-test it can execute in the modules that hold pointer or memory logic and
-reported nothing.
+No undefined behaviour was found in the library. Every `unsafe` block
+states the invariant it relies on, and each invariant was checked against
+the code that establishes it. Miri, Rust's undefined-behaviour checker,
+ran every test it can execute in the modules that hold pointer or memory
+logic. For 0.9.2 it found one aliasing error in a test's own call (see
+"Miri results"), since fixed, and nothing in the library.
 
 The 0.9.1 audit changed no behaviour. It added four missing safety
 comments, corrected one, and added `cfg(miri)` accommodations that exist
@@ -162,16 +163,30 @@ harness.
 
 ## Miri results
 
+For 0.9.2 (2026-11-19, nightly `rustc 1.102.0-nightly (65ce8611f
+2026-11-18)`), the modules whose `unsafe` code changed or which exercise
+it were run again; the others are as 0.9.1 left them.
+
 | Module | Under Miri | Notes |
 |---|---|---|
-| C ABI (`ffi_tests`) | 58 passed | 4 ignored under Miri: 3 assert wall-clock speed, 1 needs the passwd database |
-| `payload` | 8 passed | |
-| `crypto` | 31 passed | About an hour: AES-GCM and HMAC fully interpreted |
-| `provider::ephemeral` | 8 passed | Includes the `mmap` pages and `slot()` |
-| `provider::tpm_key_file` | 7 passed | |
-| `key_file` | 44 passed | 3 ignored: 2 need the passwd database, 1 makes a FIFO |
-| `secure_file` | 23 passed | 1 ignored: makes a FIFO |
-| `audit` | 10 passed | 1 ignored: opens a Unix datagram socket |
+| C ABI (`ffi_tests`) | 65 passed (0.9.2) | 4 ignored under Miri: 3 assert wall-clock speed, 1 needs the passwd database. About 20 minutes. Includes the secret functions and their in-place unwrap |
+| `provider::ephemeral` | 10 passed (0.9.2) | Includes the `mmap` pages, `slot()`, and the forked-child store's `discard` |
+| `key_file` | 46 passed (0.9.2) | 3 ignored: 2 need the passwd database, 1 makes a FIFO. About 80 minutes |
+| `secure_file` | 25 passed (0.9.2) | 3 ignored: 1 makes a FIFO, 2 set a real ACL |
+| `security_model` | 8 passed (0.9.2) | 4 ignored: they need the passwd or group database. First run under Miri in 0.9.2 |
+| `payload` | 8 passed (0.9.1) | |
+| `crypto` | 31 passed (0.9.1) | About an hour: AES-GCM and HMAC fully interpreted. No `unsafe` code of its own |
+| `provider::tpm_key_file` | 7 passed (0.9.1) | |
+| `audit` | 10 passed (0.9.1) | 1 ignored: opens a Unix datagram socket |
+
+**What the 0.9.2 run found.** One Stacked Borrows violation, in a test,
+not the library: `ffi_secret_round_trip_and_contract` passed one buffer
+to `hkdfguard_unwrap_secret` as both `as_ptr()` and `as_mut_ptr()`, and
+taking the mutable pointer invalidated the shared one the library then
+read through. A C caller passes one pointer for both, as the DEK test
+always did; the secret test now does the same. Three `security_model`
+tests that look this user up through NSS, which Miri can't, now skip
+under it like the other passwd-dependent tests.
 
 **What Miri can't reach.** It interprets Rust, so calls into C are
 outside it: the NSS lookups, `statvfs`, the xattr calls, `flock`,
@@ -206,13 +221,16 @@ require (see `src/test_tmp.rs`):
 rustup component add miri --toolchain nightly
 export HKDFGUARD_TEST_TMPDIR=$HOME/.cache/hkdfguard-test-tmp   # 0700, private chain
 export MIRIFLAGS=-Zmiri-disable-isolation
-for m in ffi_tests payload:: crypto:: provider::ephemeral provider::tpm_key_file key_file:: secure_file:: audit::; do
+for m in ffi_tests payload:: crypto:: provider::ephemeral provider::tpm_key_file key_file:: secure_file:: security_model:: audit::; do
     cargo +nightly miri test --lib "$m" -- --test-threads=1
 done
 ```
 
 One Miri process per module, because Miri stops the whole test binary at
-the first unsupported operation. A full pass takes several hours.
+the first unsupported operation. A full pass takes several hours. Every
+directory above `HKDFGUARD_TEST_TMPDIR` must be writable by its owner
+only (`~/.cache` included: a `002` umask leaves it group-writable, and
+the tests then refuse to start).
 
 To check documentation:
 
