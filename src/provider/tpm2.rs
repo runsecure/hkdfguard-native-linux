@@ -443,7 +443,13 @@ fn write_key_dir_file(service: &str, suffix: &str, what: &str, contents: &[u8], 
             .mode(0o400)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temp)?;
-        if running_as_root() {
+        // A default ACL on the key directory is copied onto every file made
+        // in it: removed before a byte is written, so the file is readable
+        // by exactly its owner and group below, never by someone that ACL
+        // names. Its mode is then set explicitly, since the ACL also decides
+        // the mode a new file is created with.
+        crate::secure_file::strip_acl(&file)?;
+        let mode = if running_as_root() {
             // Explicitly, whatever group a setgid directory or root's own
             // primary group would have given the file.
             let (gid, mode) = match readers {
@@ -452,8 +458,11 @@ fn write_key_dir_file(service: &str, suffix: &str, what: &str, contents: &[u8], 
                 Readers::OwnerOnly => (0, 0o400),
             };
             std::os::unix::fs::fchown(&file, None, Some(gid))?;
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
+            mode
+        } else {
+            0o400
+        };
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.write_all(contents)?;
         file.sync_all()
     })();

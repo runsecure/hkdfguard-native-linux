@@ -43,8 +43,9 @@
 //!   private the directories beneath it (see
 //!   [`crate::secure_file::check_dir_chain`]); so must the directory the
 //!   resolved file sits in and every one above it. The one exception is
-//!   a read-only mount: a Kubernetes Secret volume is `1777` but mounted
-//!   read-only, so nobody can write to it, and it is fine. Otherwise
+//!   a sticky directory on a read-only mount: a Kubernetes Secret volume
+//!   is `1777` but mounted read-only, so nobody can write to it, and it is
+//!   fine. A disk-backed `emptyDir` (`0777`) is refused even read-only. Otherwise
 //!   another user could plant a KEK for a not-yet-provisioned service.
 //! - **A regular file.** Not a directory, device, or FIFO (which would
 //!   block the read forever).

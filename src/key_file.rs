@@ -46,8 +46,9 @@
 //!   `/var/tmp`, `/dev/shm` or any other sticky, world-writable directory
 //!   is refused, however private the directories beneath it: a key file
 //!   belongs in a directory only its owner (or root) can write to, all the
-//!   way up. The one exception is a read-only mount -- a Kubernetes Secret
-//!   or ConfigMap volume is `1777` but nobody can write to it. (The OS
+//!   way up. The one exception is a sticky directory on a read-only mount
+//!   -- a Kubernetes Secret or projected volume is `1777` but nobody can
+//!   write to it. (The OS
 //!   itself refusing to open the file -- e.g. `EACCES` -- is the separate
 //!   [`KeyFileError::AccessDenied`].)
 
@@ -232,6 +233,7 @@ fn read_with_proc_root(
     let mut file = secure_file::open_checked(&target_real, &req).map_err(untrusted)?;
     let meta = file.metadata().map_err(|_| KeyFileError::Io)?;
     secure_file::check_metadata_trusting(&meta, trust).map_err(untrusted)?;
+    secure_file::check_acl_trusting(&file, trust).map_err(untrusted)?;
     secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::Untrusted)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
     if kind == Kind::Dek && size == DEK_LEN as u64 {

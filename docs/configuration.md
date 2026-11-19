@@ -66,9 +66,25 @@ commented out at its default. Uncomment and change only what you need.
   directories such as `/tmp` are not exempt: nothing the library reads --
   the policy, secrets, the PIN file, the PKCS#11 module, key files -- may
   live anywhere under `/tmp`, `/var/tmp` or `/dev/shm`, however private
-  the directory inside them. The one exception is a read-only mount, such
-  as a Kubernetes Secret or ConfigMap volume (`1777`, but nobody can write
-  to it).
+  the directory inside them. The one exception is a sticky directory on a
+  read-only mount, such as a Kubernetes Secret or projected volume (`1777`:
+  nothing in the container can write to it, and the sticky bit stops
+  whatever writes it elsewhere from renaming or deleting entries it doesn't
+  own). A plain ConfigMap or disk-backed `emptyDir` volume is `0777`, not
+  sticky, and is refused even read-only. Ship the policy from a ConfigMap
+  through a `projected:` volume:
+
+  ```yaml
+  volumes:
+    - name: hkdfguard-policy
+      projected:
+        sources:
+          - configMap: { name: hkdfguard-policy }
+  ```
+- POSIX ACLs count. A named ACL entry that gives someone write access is
+  refused like the mode's write bits, and, on a secret, one that gives
+  anyone but root read access. With an ACL, `ls -l` shows its mask in the
+  group bits, not who it names: check with `getfacl`.
 - Only a *missing* file means "no policy". A file that exists but is wrongly
   owned, too broadly writable, unreadable or malformed makes every
   operation fail, rather than falling back to the defaults. Deleting or
@@ -263,9 +279,10 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
 
 - **The module**, its directory and every directory above it must be owned
   by root and not writable by group or others, sticky or not (so never under
-  `/tmp`). Nothing on that path can then be swapped for another library. A
-  directory on a read-only mount passes whatever its mode, so if the module
-  is bind-mounted read-only from somewhere writable, make sure the original
+  `/tmp`), and no POSIX ACL entry may give anyone else write access. Nothing
+  on that path can then be swapped for another library. A sticky directory
+  on a read-only mount passes whatever its write bits, so if the module is
+  bind-mounted read-only from somewhere writable, make sure the original
   directories are root-owned and unwritable as well: the module is code
   this process runs.
 - **The module's own configuration** is not checked. Most modules find
@@ -376,8 +393,11 @@ later.
 The mount and every directory above it must be owned by root or the
 service's user and not writable by anyone else -- sticky directories such as
 `/tmp` included, so a mount anywhere under `/tmp`, `/var/tmp` or `/dev/shm`
-is refused. A read-only mount is the one exception: a Kubernetes Secret
-volume is `1777`, but read-only, and is fine. Platform settings that meet
+is refused. A sticky directory on a read-only mount is the one exception:
+a Kubernetes Secret volume, or a memory-backed `emptyDir`, is `1777`, and
+mounted read-only is fine. A disk-backed `emptyDir` is `0777`, not sticky,
+and is refused even read-only: use `medium: Memory`, or mount a private
+subdirectory of it. Platform settings that meet
 the mode rule:
 
 | Mechanism | Setting |

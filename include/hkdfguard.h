@@ -564,11 +564,12 @@ int hkdfguard_key_file_principal_trusted(
  *           -- sticky or not, at any level: a key file anywhere under
  *           /tmp, /var/tmp, /dev/shm or any other sticky, world-writable
  *           directory is refused, however private the directories beneath
- *           it; HKDFGUARD_ERR_FILE_UNTRUSTED otherwise. A directory on a
- *           read-only mount counts as unwritable whatever its mode, so a
- *           Kubernetes Secret or ConfigMap volume (1777, read-only)
- *           passes. The CLI writes key files 0600, and refuses to write
- *           one into a folder this check would refuse -- or at all, under
+ *           it; HKDFGUARD_ERR_FILE_UNTRUSTED otherwise. A sticky directory
+ *           on a read-only mount counts as unwritable, so a Kubernetes
+ *           Secret or projected volume (1777, read-only) passes; a plain
+ *           ConfigMap volume (0777, not sticky) does not. The CLI writes
+ *           key files 0600, and refuses to write one into a folder this
+ *           check would refuse -- or at all, under
  *           the production model, unless it runs as root or a deployer.
  * out:      buffer to receive the wrapped payload. May be NULL only if
  *           *out_len is 0 (to probe the size).

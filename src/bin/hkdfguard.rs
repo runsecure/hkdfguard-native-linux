@@ -103,7 +103,7 @@
 //! group or others (e.g. mode `0400`/`0600`). Its folder, and every folder
 //! above it up to `/`, must be a real folder (no symbolic links), owned by
 //! root or this process's user, and not writable by group or others --
-//! sticky ones such as `/tmp` included -- unless it is on a read-only mount
+//! sticky ones such as `/tmp` included -- unless it is sticky and on a read-only mount
 //! (see [`require_private_dek_folder`]). A single trailing newline
 //! (optionally CRLF) is ignored on both paths.
 //!
@@ -729,6 +729,12 @@ fn read_private_input_file(flag: &str, what: &str, path: &str, buf: &mut [u8], e
             meta.mode() & 0o7777
         ));
     }
+    // Nor may a POSIX ACL entry let anyone else read or write it: with one,
+    // the mode's group bits are only the ACL's mask.
+    let grants = admin::acl_grants_of_file(&file).map_err(|e| format!("failed to check {flag} {path}: {e}"))?;
+    if let Some(problem) = admin::acl_problem(&grants, &admin::Owner::RootOrCurrentUser, true, true) {
+        return Err(format!("{flag} {path}: {problem}; remove the entry (setfacl -b {path})"));
+    }
 
     read_bounded_into(&mut file, flag, buf, expected)
 }
@@ -1311,6 +1317,13 @@ fn require_unshared_folder(path: &Path, spelled: &Path, trust: &dyn admin::Princ
                 path.display()
             )
         }
+        admin::DirProblem::Acl(problem) => format!(
+            "{which}, {}: {problem}; the library would refuse to read a key file at {} \
+             (HKDFGUARD_ERR_FILE_UNTRUSTED), because someone else could replace it. Remove the entry \
+             (setfacl -x), or write the key file elsewhere",
+            dir.display(),
+            path.display()
+        ),
         admin::DirProblem::NotADirectory => format!("failed to check folder {}: not a directory", dir.display()),
         admin::DirProblem::Unexaminable(e) => format!("failed to check folder {}: {e}", dir.display()),
     })
@@ -1322,7 +1335,7 @@ fn require_unshared_folder(path: &Path, spelled: &Path, trust: &dyn admin::Princ
 // others -- sticky (`/tmp`, `/var/tmp`, `/dev/shm`) or not. Otherwise
 // someone else could put a DEK of their choosing at the path, and the
 // application would end up encrypting under a key they know. As in the
-// library, a folder on a read-only mount is exempt: a Kubernetes Secret
+// library, a sticky folder on a read-only mount is exempt: a Kubernetes Secret
 // volume is `1777` but nobody can write to it. The judgment is the
 // library's (`admin::first_untrusted_dir`). `spelled` is what
 // `require_real_folder` returned, so its folder is the real one.
@@ -1350,6 +1363,11 @@ fn describe_input_folder_problem(flag: &str, what: &str, path: &str, dir: &Path,
                 dir.display()
             )
         }
+        admin::DirProblem::Acl(problem) => format!(
+            "{flag} {path}: folder {}: {problem}, so someone else could replace {what} file. Remove the entry \
+             (setfacl -x), or keep the file elsewhere",
+            dir.display()
+        ),
         admin::DirProblem::NotADirectory => format!("failed to check {flag} {path}'s folder {}: not a directory", dir.display()),
         admin::DirProblem::Unexaminable(e) => format!("failed to check {flag} {path}'s folder {}: {e}", dir.display()),
     }
@@ -1861,6 +1879,10 @@ fn stage_key_file(
         return Err(e);
     }
     let result = (|| {
+        // A default ACL on the folder was copied onto the new file: removed
+        // before a byte is written, so only the owner and --group can read
+        // it, and its mode, set below, is the whole story.
+        admin::strip_acl(&file).map_err(|e| format!("failed to remove the ACL {shown} inherited from its folder: {e}"))?;
         if let Some((gid, group_name)) = group {
             // SAFETY: a valid open descriptor; uid -1 leaves the owner as it is.
             if unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, *gid) } != 0 {
@@ -2986,8 +3008,16 @@ mod tests {
         let output = ProtectOutput::KeyFile { key_file_path: existing.to_str().unwrap().into(), force: false, group: None };
         let err = run_protect("svc".into(), "vault.password".into(), source(), false, output, None).unwrap_err();
         // An existing file without --force -- or, in a build that reads the
-        // host's real policy, the security-model check just before it.
-        assert!(err.contains("already exists") || err.contains("--force") || err.contains("hkdfguard_security_model"), "{err}");
+        // host's real policy (a package build: no policy, so production,
+        // run by an account that is neither root nor a deployer), the
+        // security-model check just before it.
+        assert!(
+            err.contains("already exists")
+                || err.contains("--force")
+                || err.contains("hkdfguard_security_model")
+                || err.contains("under the production security model this account"),
+            "{err}"
+        );
         assert_eq!(fs::read(&existing).unwrap(), b"old", "left as it was");
     }
 

@@ -1018,8 +1018,11 @@ const POLICY_FILE_REQUIREMENTS: crate::secure_file::FileRequirements = crate::se
 ///   UTF-8, or is malformed or self-contradictory; or the directory it
 ///   lives in (or would live in), or any directory above it, is one
 ///   someone untrusted could change: owned by someone else, or writable by
-///   group or others -- sticky (`/tmp`-style) or not -- unless it is on a
-///   read-only mount (see [`crate::secure_file::check_dir_chain`]).
+///   group or others -- sticky (`/tmp`-style) or not -- unless it is a
+///   sticky directory on a read-only mount (see
+///   [`crate::secure_file::check_dir_chain`]): a ConfigMap belongs in a
+///   `projected:` volume, as a plain `configMap:` volume's `0777` root is
+///   refused.
 ///   This **fails closed**: every wrap/unwrap/create/exists call fails
 ///   rather than falling back to the unrestricted default. Making the file
 ///   unreadable, or deleting it, must never be a way to switch policy off.

@@ -35,12 +35,13 @@ pub use error::status; // re-export the status-code constants as part of this cr
 pub mod admin {
     use super::*;
 
-    pub use secure_file::{DirProblem, Owner, PrincipalTrust};
+    pub use secure_file::{acl_grants_of_file, acl_problem, strip_acl, AclGrant, AclWho, DirProblem, Owner, PrincipalTrust};
     pub use security_model::{DEPLOYERS_GROUP, OVER_BROAD_GROUPS};
 
     /// The first of `dir` and its ancestors, up to `/`, that `trust`
     /// refuses, and why: the library's own per-directory rule (owner, write
-    /// bits, sticky directories never trusted, read-only mounts exempt), so
+    /// bits and POSIX ACL entries, sticky directories never trusted,
+    /// sticky directories on read-only mounts exempt), so
     /// the CLI judges folders exactly as the library will. `dir` must be
     /// canonical.
     pub fn first_untrusted_dir(dir: &std::path::Path, trust: &dyn PrincipalTrust) -> Option<(std::path::PathBuf, DirProblem)> {

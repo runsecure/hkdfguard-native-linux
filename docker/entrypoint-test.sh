@@ -575,7 +575,7 @@ expect_sticky_refusal "a missing policy file" as_ci env HKDFGUARD_POLICY_FILE="$
     "$TEST_BIN"/hkdfguard provision -sn $STICKY_SERVICE
 rm -rf "$TMP_POLICY"
 
-# The read-only exception, which Kubernetes Secret and ConfigMap volumes
+# The read-only exception, which Kubernetes Secret and projected volumes
 # depend on: docker/run-tests.sh mounts a volume read-only at $RO_MOUNT,
 # its root 1777 like a Secret volume's, holding a KEK for $RO_SERVICE (ci's,
 # 0400) both in the root itself and in a 0755 subdirectory -- a sticky
@@ -616,6 +616,18 @@ for sub in "" /hkdfguard; do
     echo "the same layout writable ($RW_MOUNT$sub): refused."
 done
 rm -rf "$RW_MOUNT" "$KEYS/ro.dek" "$KEYS/ro.key"
+
+# Only a sticky directory is exempt: a 0777 one on the same read-only mount
+# (a ConfigMap or emptyDir volume's mode) is refused, as whoever writes the
+# volume elsewhere could rename or delete what is in it.
+printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT/unsticky" \
+    > /etc/hkdfguard/policy.toml
+if OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1); then
+    echo "FAIL: a 0777 directory on a read-only mount ($RO_MOUNT/unsticky) was accepted: $OUT" >&2; exit 1
+fi
+grep -q 'writable by group or others (mode 777)' <<<"$OUT" \
+    || { echo "FAIL: $RO_MOUNT/unsticky refused, but not for its mode: $OUT" >&2; exit 1; }
+echo "a 0777 directory on a read-only mount ($RO_MOUNT/unsticky): refused."
 
 rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS" "$KEYS"
 

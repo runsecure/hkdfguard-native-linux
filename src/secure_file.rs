@@ -134,6 +134,18 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
         forbidden &= !GROUP_READ;
     }
     check_metadata(&meta, req.owner, forbidden)?;
+    // The same rules for anyone a POSIX ACL names: write only for an owner
+    // `req` accepts (root alone when it names none), and read for nobody
+    // but root where group read is forbidden. The root-owned group-read
+    // allowance is for the file's own group, not for named entries.
+    let forbid_write = req.forbidden_mode_bits & GROUP_WRITE != 0;
+    let forbid_read = req.forbidden_mode_bits & GROUP_READ != 0;
+    if forbid_write || forbid_read {
+        let writers = req.owner.unwrap_or(Owner::Root);
+        if let Some(problem) = acl_problem(&acl_grants_of_file(&file)?, &writers, forbid_write, forbid_read) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, problem));
+        }
+    }
     Ok(file)
 }
 
@@ -149,9 +161,13 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
 /// would rest on the owner checks of everything beneath -- one mistake there
 /// is enough.)
 ///
-/// The one exception: write bits are ignored on a read-only mount. A
-/// Kubernetes Secret or ConfigMap volume is `1777` but mounted read-only,
-/// so nobody can write to it.
+/// The one exception: write bits are ignored on a **sticky** directory on a
+/// read-only mount. A Kubernetes Secret or projected volume's root is
+/// `1777` but mounted read-only, so nothing in this container can write to
+/// it, and the sticky bit stops anyone writing the volume elsewhere from
+/// renaming or deleting entries they don't own. A directory that isn't
+/// sticky -- a ConfigMap or `emptyDir` volume's `0777` root -- is refused
+/// even read-only: a ConfigMap belongs in a `projected:` volume instead.
 ///
 /// Applied, through [`check_location`] or directly, to every file this
 /// crate reads: key files (`key_file::read`, behind `hkdfguard_open_file`),
@@ -172,7 +188,8 @@ pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
 /// must be one `trust` accepts, and a directory writable through its group
 /// passes only if `trust` accepts that group as a writer (a deployer group,
 /// for a key file under the production model). Writable by others never
-/// passes, sticky or not -- the read-only-mount exception aside.
+/// passes, sticky or not -- the sticky-and-read-only exception aside -- and
+/// neither does a POSIX ACL entry giving write to anyone else.
 pub fn check_dir_chain_trusting(dir: &Path, trust: &dyn PrincipalTrust) -> io::Result<()> {
     match first_untrusted_dir(dir, trust) {
         None => Ok(()),
@@ -185,6 +202,7 @@ pub fn check_dir_chain_trusting(dir: &Path, trust: &dyn PrincipalTrust) -> io::R
                     let sticky = if mode & STICKY != 0 { "; sticky, like /tmp, which is not enough" } else { "" };
                     format!("writable by group or others (mode {mode:o}{sticky}), so entries could be created or replaced in it")
                 }
+                DirProblem::Acl(problem) => format!("{problem}, so entries could be created or replaced in it"),
             };
             Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display())))
         }
@@ -202,15 +220,20 @@ pub enum DirProblem {
     Owner(u32),
     /// Someone `trust` doesn't accept can write to it: these are its
     /// permission bits (`0o7777`), sticky bit included. Never reported for
-    /// a read-only mount, which nobody can write to.
+    /// a sticky directory on a read-only mount, which nobody here can write
+    /// to.
     Writable { mode: u32 },
+    /// A POSIX ACL entry gives write access to someone `trust` doesn't
+    /// accept; says whom.
+    Acl(String),
 }
 
 /// Whether one directory is trustworthy under `trust`: a directory, owned
 /// by someone `trust` accepts, and writable by nobody else -- through its
 /// group only if `trust` accepts that group, by others never, sticky or
-/// not, unless it is on a read-only mount. The one rule every directory
-/// check in this crate, and the CLI's, applies.
+/// not, nor through a POSIX ACL entry -- unless it is sticky and on a
+/// read-only mount.
+/// The one rule every directory check in this crate, and the CLI's, applies.
 pub fn judge_dir(dir: &Path, trust: &dyn PrincipalTrust) -> Result<(), DirProblem> {
     let meta = std::fs::metadata(dir).map_err(|e| DirProblem::Unexaminable(e.to_string()))?;
     if !meta.is_dir() {
@@ -219,8 +242,20 @@ pub fn judge_dir(dir: &Path, trust: &dyn PrincipalTrust) -> Result<(), DirProble
     if !trust.trusts_owner(meta.uid()) {
         return Err(DirProblem::Owner(meta.uid()));
     }
-    if untrusted_write_bits(&meta, trust) != 0 && !on_read_only_mount(dir) {
+    // Sticky as well as read-only: a read-only mount says nothing about who
+    // writes the volume elsewhere (a sidecar's read-write mount, the node),
+    // and in a directory that isn't sticky any of them could rename or
+    // delete what is in it. A Kubernetes Secret or projected volume's root
+    // is sticky; a ConfigMap or emptyDir volume's is not.
+    let exempt = || meta.mode() & STICKY != 0 && on_read_only_mount(dir);
+    if untrusted_write_bits(&meta, trust) != 0 && !exempt() {
         return Err(DirProblem::Writable { mode: meta.mode() & 0o7777 });
+    }
+    let grants = acl_grants_of_path(dir).map_err(|e| DirProblem::Unexaminable(e.to_string()))?;
+    if let Some(problem) = acl_problem(&grants, trust, true, false) {
+        if !exempt() {
+            return Err(DirProblem::Acl(problem));
+        }
     }
     Ok(())
 }
@@ -421,6 +456,188 @@ fn on_read_only_mount(path: &Path) -> bool {
         return false;
     }
     st.f_flag & libc::ST_RDONLY != 0
+}
+
+// ---------------------------------------------------------------------
+// POSIX ACLs.
+//
+// Owner and mode bits are not the whole story: a POSIX access ACL can name
+// further users and groups, each with its own permissions. With such an
+// entry the mode's group bits are the ACL's *mask*, an upper bound on every
+// named entry -- so `root:svc 0440` can carry `user:mallory:r--` and still
+// look like a file only `svc` reads. Every check here that judges who may
+// read or write a file or directory also judges its named ACL entries.
+// ---------------------------------------------------------------------
+
+/// Whom a named POSIX ACL entry is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclWho {
+    User(u32),
+    Group(u32),
+}
+
+/// A named entry of a POSIX access ACL: someone the owner, group and other
+/// bits don't describe. `perm` is what the entry can actually do -- its
+/// permission bits (read 4, write 2, execute 1) masked by the ACL's mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AclGrant {
+    pub who: AclWho,
+    pub perm: u32,
+}
+
+const ACL_ACCESS_XATTR: &std::ffi::CStr = c"system.posix_acl_access";
+const ACL_XATTR_VERSION: u32 = 2;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP: u16 = 0x08;
+const ACL_MASK: u16 = 0x10;
+const ACL_READ: u32 = 4;
+const ACL_WRITE: u32 = 2;
+
+/// The named entries of the POSIX access ACL in `xattr` (the kernel's
+/// `system.posix_acl_access` format: a version, then 8-byte entries).
+/// Anything malformed is an error: an ACL that can't be read can't be
+/// judged, so it is refused rather than ignored.
+fn parse_acl(xattr: &[u8]) -> io::Result<Vec<AclGrant>> {
+    let bad = |why: &str| io::Error::new(io::ErrorKind::PermissionDenied, format!("unreadable POSIX ACL: {why}"));
+    let (header, entries) = xattr.split_at_checked(4).ok_or_else(|| bad("too short"))?;
+    if u32::from_le_bytes(header.try_into().unwrap()) != ACL_XATTR_VERSION {
+        return Err(bad("unknown version"));
+    }
+    let (entries, rest) = entries.as_chunks::<8>();
+    if !rest.is_empty() {
+        return Err(bad("truncated entry"));
+    }
+    let entries: Vec<(u16, u32, u32)> = entries
+        .iter()
+        .map(|e| {
+            let tag = u16::from_le_bytes([e[0], e[1]]);
+            let perm = u32::from(u16::from_le_bytes([e[2], e[3]]));
+            let id = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+            (tag, perm, id)
+        })
+        .collect();
+    // No mask entry with named entries present isn't a valid ACL; judge
+    // their own permissions, unmasked, rather than guess.
+    let mask = entries.iter().find(|(tag, _, _)| *tag == ACL_MASK).map_or(0o7, |(_, perm, _)| *perm);
+    Ok(entries
+        .iter()
+        .filter_map(|&(tag, perm, id)| match tag {
+            ACL_USER => Some(AclGrant { who: AclWho::User(id), perm: perm & mask }),
+            ACL_GROUP => Some(AclGrant { who: AclWho::Group(id), perm: perm & mask }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Reads an extended attribute through `get` (`getxattr` or `fgetxattr`,
+/// given the buffer and its size). `None` when there is none, or the
+/// filesystem has no extended attributes at all.
+fn read_xattr(get: impl Fn(*mut libc::c_void, usize) -> isize) -> io::Result<Option<Vec<u8>>> {
+    loop {
+        let size = get(std::ptr::null_mut(), 0);
+        if size < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        let mut buf = vec![0u8; size as usize];
+        let got = get(buf.as_mut_ptr().cast(), buf.len());
+        if got >= 0 {
+            buf.truncate(got as usize);
+            return Ok(Some(buf));
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ERANGE) => continue, // it grew between the two calls
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => return Ok(None),
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+/// The named entries of the open file's access ACL; none when it has no
+/// ACL beyond its mode bits. Every failure is `PermissionDenied`: an ACL
+/// that couldn't be read couldn't be judged.
+pub fn acl_grants_of_file(file: &File) -> io::Result<Vec<AclGrant>> {
+    use std::os::unix::io::AsRawFd;
+    // Miri can't call fgetxattr: under it no file has an ACL, as no test file does.
+    if cfg!(miri) {
+        return Ok(Vec::new());
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is open for the life of `file`; the buffer pointer and
+    // size come from `read_xattr`, which passes a live buffer of that size.
+    let raw = read_xattr(|buf, size| unsafe { libc::fgetxattr(fd, ACL_ACCESS_XATTR.as_ptr(), buf, size) })
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("could not read its POSIX ACL: {e}")))?;
+    raw.map_or(Ok(Vec::new()), |raw| parse_acl(&raw))
+}
+
+/// [`acl_grants_of_file`] for what `path` names, symlinks followed.
+pub fn acl_grants_of_path(path: &Path) -> io::Result<Vec<AclGrant>> {
+    use std::os::unix::ffi::OsStrExt;
+    if cfg!(miri) {
+        return Ok(Vec::new());
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "path contains a NUL byte"))?;
+    // SAFETY: `c_path` is NUL-terminated and outlives the call; the buffer
+    // pointer and size come from `read_xattr`.
+    let raw = read_xattr(|buf, size| unsafe { libc::getxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), buf, size) })
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("could not read its POSIX ACL: {e}")))?;
+    raw.map_or(Ok(Vec::new()), |raw| parse_acl(&raw))
+}
+
+/// Why `grants` give access `trust` doesn't allow, if they do: with
+/// `forbid_write`, write to a named user it doesn't trust as an owner, or a
+/// named group it doesn't trust as a writer -- the same rule the mode's
+/// group and other write bits are held to -- and with `forbid_read`, read
+/// to anyone but root.
+pub fn acl_problem(grants: &[AclGrant], trust: &dyn PrincipalTrust, forbid_write: bool, forbid_read: bool) -> Option<String> {
+    grants.iter().find_map(|g| {
+        let (kind, id, trusted_writer) = match g.who {
+            AclWho::User(uid) => ("user", uid, trust.trusts_owner(uid)),
+            AclWho::Group(gid) => ("group", gid, trust.trusts_group_writer(gid)),
+        };
+        if forbid_write && g.perm & ACL_WRITE != 0 && !trusted_writer {
+            return Some(format!("a POSIX ACL entry gives {kind} {id} write access"));
+        }
+        if forbid_read && g.perm & ACL_READ != 0 && g.who != AclWho::User(0) {
+            return Some(format!("a POSIX ACL entry gives {kind} {id} read access"));
+        }
+        None
+    })
+}
+
+/// Refuses an open file whose ACL gives write access to someone `trust`
+/// doesn't accept -- see [`acl_problem`]. `PermissionDenied`, with no
+/// `raw_os_error`, like every other trust refusal here.
+pub fn check_acl_trusting(file: &File, trust: &dyn PrincipalTrust) -> io::Result<()> {
+    match acl_problem(&acl_grants_of_file(file)?, trust, true, false) {
+        Some(problem) => Err(io::Error::new(io::ErrorKind::PermissionDenied, problem)),
+        None => Ok(()),
+    }
+}
+
+/// Removes any access ACL from a file this process just created, so it has
+/// exactly the owner, group and mode it is then given. A directory's
+/// default ACL is copied onto every file created in it; a key directory
+/// carrying one would otherwise make each new key or authValue file
+/// readable by whoever it names. No ACL, or no ACL support, is success.
+pub fn strip_acl(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    if cfg!(miri) {
+        return Ok(());
+    }
+    // SAFETY: a valid open descriptor and a NUL-terminated name.
+    if unsafe { libc::fremovexattr(file.as_raw_fd(), ACL_ACCESS_XATTR.as_ptr()) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(()),
+        _ => Err(e),
+    }
 }
 
 /// Checks that nobody `owner` doesn't cover can delete, rename, or replace
@@ -818,8 +1035,9 @@ mod tests {
         let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let shared = dir.ancestors().skip(1).any(|d| {
-            std::fs::metadata(d).map(|m| m.mode() & FORBID_GROUP_OTHER_WRITE != 0).unwrap_or(false)
-                && !on_read_only_mount(d)
+            std::fs::metadata(d)
+                .map(|m| m.mode() & FORBID_GROUP_OTHER_WRITE != 0 && !(m.mode() & STICKY != 0 && on_read_only_mount(d)))
+                .unwrap_or(false)
         });
         if !shared {
             eprintln!("skipping: {} has no group/other-writable ancestor", dir.display());
@@ -988,5 +1206,156 @@ mod tests {
         let no_follow = FileRequirements { follow_symlinks: false, ..OWNER_ONLY };
         let err = open_checked(&link, &no_follow).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    // ---- POSIX ACLs ----
+
+    // An access ACL in the kernel's xattr format, from (tag, perm, id).
+    fn acl_xattr(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut out = ACL_XATTR_VERSION.to_le_bytes().to_vec();
+        for &(tag, perm, id) in entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&perm.to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out
+    }
+    const USER_OBJ: u16 = 0x01;
+    const GROUP_OBJ: u16 = 0x04;
+    const OTHER: u16 = 0x20;
+    const UNDEF: u32 = u32::MAX;
+
+    // Owner rw, a named user and a named group each rw, the given mask.
+    fn acl_with_mask(mask: u16) -> Vec<u8> {
+        acl_xattr(&[
+            (USER_OBJ, 6, UNDEF),
+            (ACL_USER, 6, 54321),
+            (GROUP_OBJ, 4, UNDEF),
+            (ACL_GROUP, 6, 54322),
+            (ACL_MASK, mask, UNDEF),
+            (OTHER, 0, UNDEF),
+        ])
+    }
+
+    #[test]
+    fn named_acl_entries_are_masked_and_malformed_acls_refused() {
+        let grants = parse_acl(&acl_with_mask(4)).unwrap();
+        assert_eq!(
+            grants,
+            vec![AclGrant { who: AclWho::User(54321), perm: 4 }, AclGrant { who: AclWho::Group(54322), perm: 4 }],
+            "the mask caps each named entry"
+        );
+        assert!(parse_acl(&acl_with_mask(0)).unwrap().iter().all(|g| g.perm == 0), "a zero mask leaves them nothing");
+        let base_only = acl_xattr(&[(USER_OBJ, 6, UNDEF), (GROUP_OBJ, 4, UNDEF), (OTHER, 0, UNDEF)]);
+        assert!(parse_acl(&base_only).unwrap().is_empty(), "no named entries");
+        for bad in [vec![2u8, 0], vec![3, 0, 0, 0], { let mut v = acl_with_mask(6); v.pop(); v }] {
+            assert_eq!(parse_acl(&bad).unwrap_err().kind(), io::ErrorKind::PermissionDenied, "{bad:?}");
+        }
+    }
+
+    // A trust rule for the tests: these owners and these writer groups.
+    struct Trusting {
+        owners: Vec<u32>,
+        writer_groups: Vec<u32>,
+    }
+    impl PrincipalTrust for Trusting {
+        fn trusts_owner(&self, uid: u32) -> bool {
+            self.owners.contains(&uid)
+        }
+        fn trusts_group_writer(&self, gid: u32) -> bool {
+            self.writer_groups.contains(&gid)
+        }
+    }
+
+    #[test]
+    fn acl_entries_are_judged_as_owners_and_group_writers_are() {
+        let rw = |who| AclGrant { who, perm: 6 };
+        let r = |who| AclGrant { who, perm: 4 };
+        let trust = Trusting { owners: vec![0, 54321], writer_groups: vec![54322] };
+        assert_eq!(acl_problem(&[rw(AclWho::User(54321)), rw(AclWho::Group(54322))], &trust, true, false), None, "both trusted");
+        let problem = acl_problem(&[rw(AclWho::User(1002))], &trust, true, false).unwrap();
+        assert!(problem.contains("user 1002 write access"), "{problem}");
+        let problem = acl_problem(&[rw(AclWho::Group(2003))], &trust, true, false).unwrap();
+        assert!(problem.contains("group 2003 write access"), "{problem}");
+        assert_eq!(acl_problem(&[rw(AclWho::User(1002))], &trust, false, false), None, "write not forbidden");
+
+        // Read, where it is forbidden: nobody but root, trusted writer or not.
+        assert_eq!(acl_problem(&[r(AclWho::User(54321))], &trust, true, false), None);
+        let problem = acl_problem(&[r(AclWho::User(54321))], &trust, true, true).unwrap();
+        assert!(problem.contains("user 54321 read access"), "{problem}");
+        assert!(acl_problem(&[r(AclWho::Group(54322))], &trust, true, true).is_some());
+        assert_eq!(acl_problem(&[r(AclWho::User(0))], &trust, true, true), None, "root reads anything anyway");
+    }
+
+    // Sets `xattr` as `path`'s access ACL; false where the filesystem has
+    // no ACL support, so the test can say it skipped.
+    fn set_acl(path: &Path, xattr: &[u8]) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and name, and a live buffer of that length.
+        let rc = unsafe { libc::setxattr(c.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), xattr.as_ptr().cast(), xattr.len(), 0) };
+        if rc == 0 {
+            return true;
+        }
+        let e = io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTSUP), "setting an ACL failed: {e}");
+        false
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sets an extended attribute, which Miri can't")]
+    fn a_real_acl_is_read_back_and_strip_acl_removes_it() {
+        let f = temp_file_with(b"x", 0o600);
+        if !set_acl(f.path(), &acl_with_mask(6)) {
+            eprintln!("skipping: this filesystem has no POSIX ACLs");
+            return;
+        }
+        let file = File::open(f.path()).unwrap();
+        assert_eq!(
+            acl_grants_of_file(&file).unwrap(),
+            vec![AclGrant { who: AclWho::User(54321), perm: 6 }, AclGrant { who: AclWho::Group(54322), perm: 6 }]
+        );
+        assert_eq!(acl_grants_of_path(f.path()).unwrap(), acl_grants_of_file(&file).unwrap(), "by path, the same");
+
+        // With an ACL the mode's group bits are its mask: rw here.
+        assert_eq!(std::fs::metadata(f.path()).unwrap().mode() & 0o070, 0o060);
+        let me = Owner::RootOrCurrentUser;
+        let problem = check_acl_trusting(&file, &me).unwrap_err().to_string();
+        assert!(problem.contains("user 54321 write access"), "{problem}");
+
+        let writable = OpenOptions::new().write(true).open(f.path()).unwrap();
+        strip_acl(&writable).unwrap();
+        assert!(acl_grants_of_file(&file).unwrap().is_empty(), "removed");
+        strip_acl(&writable).unwrap(); // and removing none is fine
+        check_acl_trusting(&file, &me).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sets an extended attribute, which Miri can't")]
+    fn a_directory_writable_through_a_trusted_group_but_also_a_named_user_is_refused() {
+        // The case the mode bits can't show: group write is accepted for a
+        // trusted (deployer) group, and with an ACL that same group-class
+        // write is the mask -- which lets a named user write too.
+        let dir = private_tempdir();
+        let d = std::fs::canonicalize(dir.path()).unwrap();
+        // SAFETY: getuid/getgid take no arguments and cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let trust = Trusting { owners: vec![0, uid], writer_groups: vec![gid] };
+        chmod(&d, 0o770);
+        judge_dir(&d, &trust).expect("group write through a trusted group is fine");
+
+        let acl = acl_xattr(&[(USER_OBJ, 7, UNDEF), (ACL_USER, 7, 65534), (GROUP_OBJ, 7, UNDEF), (ACL_MASK, 7, UNDEF), (OTHER, 0, UNDEF)]);
+        if !set_acl(&d, &acl) {
+            eprintln!("skipping: this filesystem has no POSIX ACLs");
+            return;
+        }
+        assert_eq!(std::fs::metadata(&d).unwrap().mode() & 0o777, 0o770, "the mode alone looks the same");
+        match judge_dir(&d, &trust) {
+            Err(DirProblem::Acl(problem)) => assert!(problem.contains("user 65534 write access"), "{problem}"),
+            other => panic!("expected the ACL to be refused, got {other:?}"),
+        }
+        let err = check_dir_chain_trusting(&d, &trust).unwrap_err().to_string();
+        assert!(err.contains("POSIX ACL entry gives user 65534 write access"), "{err}");
+        chmod(&d, 0o700);
     }
 }

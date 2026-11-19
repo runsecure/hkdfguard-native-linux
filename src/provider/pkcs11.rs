@@ -41,8 +41,8 @@
 //!   then hands it the root-only PIN; the token's label and serial are its
 //!   own claims, so they can't tell. Set the module's configuration in a
 //!   root-owned file the service's environment can't override. **A
-//!   directory on a read-only mount passes whatever its mode**, as
-//!   everywhere in this crate: a read-only mount's mode bits don't say who
+//!   sticky directory on a read-only mount passes whatever its write
+//!   bits**, as everywhere in this crate: a read-only mount's mode bits don't say who
 //!   can write the same directory through another, writable mount of it
 //!   (a read-only bind mount of a host directory, say). For code that is
 //!   loaded and run, keep the module's directories root-owned and
@@ -282,6 +282,13 @@ fn validate_module_path(path: &Path) -> std::result::Result<PathBuf, String> {
     let file_meta = std::fs::metadata(&canonical).map_err(|e| format!("PKCS#11 module {}: {e}", canonical.display()))?;
     check_metadata(&file_meta, Some(Owner::Root), FORBID_GROUP_OTHER_WRITE)
         .map_err(|e| format!("refusing to load PKCS#11 module {}: {e}", canonical.display()))?;
+    // Code this process will run: nobody but root may be able to rewrite
+    // it, through a POSIX ACL entry either.
+    let grants = crate::secure_file::acl_grants_of_path(&canonical)
+        .map_err(|e| format!("refusing to load PKCS#11 module {}: {e}", canonical.display()))?;
+    if let Some(problem) = crate::secure_file::acl_problem(&grants, &Owner::Root, true, false) {
+        return Err(format!("refusing to load PKCS#11 module {}: {problem}", canonical.display()));
+    }
 
     let parent = canonical
         .parent()

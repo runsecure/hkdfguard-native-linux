@@ -2,7 +2,7 @@
 # run-vault-tests.sh): the hkdfguard CLI, the shared library,
 # cli_unwrap_check, and a policy that requires the external-secret provider.
 # Every scenario replaces that policy with its own, from a ConfigMap mounted
-# over /etc/hkdfguard, to pin its key. Built with default features only
+# (as a projected volume) over /etc/hkdfguard, to pin its key. Built with default features only
 # (external-secret, ephemeral): the tests are about how a real kubelet lays
 # out Secret files, not about the hardware providers.
 #

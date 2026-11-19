@@ -168,7 +168,8 @@ above it up to
 must be a real folder owned by root or the invoking user and not writable
 by group or others \(em sticky folders such as
 .I /tmp
-included, unless on a read-only mount.
+included, unless sticky and on a read-only mount. No POSIX ACL entry
+may give anyone else access to the file, or write access to a folder.
 .TP
 .BR \-\-secret\-name ", " \-sid " \fIname\fR"
 For
@@ -304,7 +305,9 @@ reads is trusted anywhere under
 .I /var/tmp
 or
 .IR /dev/shm ;
-only a read-only mount is exempt.
+only a sticky directory on a read-only mount (a Kubernetes Secret or
+projected volume) is exempt. POSIX ACL entries
+are held to the same rules as the mode bits.
 .TP
 .I /usr/share/hkdfguard/policy.toml.example
 Annotated example policy, every setting commented out at its default.

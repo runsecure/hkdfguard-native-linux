@@ -28,8 +28,9 @@ library refuses anything it reads anywhere under a sticky, world-writable
 directory, and the CLI refuses to write a key file or read a `--dek-file`
 there. [`run-tests.sh`](run-tests.sh) also mounts a read-only volume at
 `/run/hkdfguard-ro-secrets` whose root is `1777`, like a Kubernetes Secret
-volume, to prove the one exception: a read-only mount is accepted. The
-script:
+volume, to prove the one exception: a sticky directory on a read-only
+mount is accepted. A `0777` directory on the same mount, as a ConfigMap
+volume's root is, is refused. The script:
 
 1. `cargo build` / `cargo test` with the default features (external-secret,
    ephemeral) -- unit tests plus the CLI integration tests
@@ -182,7 +183,9 @@ delivers the key: as a Secret volume, or by storing it base64-encoded in a
 Vault dev server for a Vault Agent native sidecar to render, as the raw 32
 bytes, into a shared `emptyDir`. It also creates the
 scenario's `policy.toml` as a ConfigMap, mounted read-only over
-`/etc/hkdfguard`, which is how a deployment would ship it. In the pod,
+`/etc/hkdfguard` through a `projected:` volume, which is how a deployment
+should ship it: a plain `configMap:` volume's root is `0777`, not sticky,
+so the library refuses it. In the pod,
 [`k8s/pod-test.sh`](k8s/pod-test.sh) prints the policy and the mount's
 layout, then runs `hkdfguard provision`, wraps a fresh DEK with
 `hkdfguard wrap`, and unwraps it in a separate process through
@@ -194,8 +197,8 @@ vary:
 
 | Suite | Scenarios |
 |---|---|
-| Secret volume | the pod's user and `fsGroup`, and the Secret's `defaultMode` (`0400`, `0440`, `0444`); rotating the Secret while the pod runs; no pinning; pinning a different key; `require_pinned_keys` with no pin; `external_secret.dir` set to the mount, and set to a path that isn't mounted |
-| Vault Agent | the agent's user and the template's `perms`; a tmpfs or disk-backed `emptyDir`, mounted whole or as a private subdirectory; a root agent with `fsGroup`; a new key version in Vault mid-run; pinning a different key; a key **planted** in the shared directory, by a container running as the app's user, while the real key is still undelivered |
+| Secret volume | the pod's user and `fsGroup`, and the Secret's `defaultMode` (`0400`, `0440`, `0444`); rotating the Secret while the pod runs; no pinning; pinning a different key; `require_pinned_keys` with no pin; `external_secret.dir` set to the mount, and set to a path that isn't mounted; the policy in a plain `configMap:` volume (refused) |
+| Vault Agent | the agent's user and the template's `perms`; a tmpfs or disk-backed `emptyDir`, mounted whole (a disk-backed one is `0777` and refused) or as a private subdirectory; a root agent with `fsGroup`; a new key version in Vault mid-run; pinning a different key; a key **planted** in the shared directory, by a container running as the app's user, while the real key is still undelivered |
 
 Every Vault scenario sets `external_secret.dir = "/vault/secrets/hkdfguard"`,
 the configuration.md pinning example. The two planted-key scenarios are a

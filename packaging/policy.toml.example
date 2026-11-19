@@ -18,7 +18,10 @@
 # so must /etc/hkdfguard and every directory above it -- sticky ones such as
 # /tmp included: nothing the library reads (this file, the secrets, PIN and
 # module it names) may live anywhere under /tmp, /var/tmp or /dev/shm. Only
-# a read-only mount (a Kubernetes Secret or ConfigMap volume) is exempt.
+# a sticky directory on a read-only mount (a Kubernetes Secret or projected
+# volume) is exempt; mount a ConfigMap through a projected volume, as a
+# plain ConfigMap volume (0777, not sticky) is refused.
+# POSIX ACL entries count as the mode bits do.
 # A file that exists
 # but is wrongly owned, too broadly writable or malformed makes every
 # operation fail closed; only a missing file means "no policy". Unknown
@@ -140,7 +143,7 @@ mode = "prefer"
 # Directory holding one KEK file per service, named after the service. It,
 # and every directory above it, must be owned by root or the service's user
 # and not writable by group or others (so never under /tmp), unless it is a
-# read-only mount such as a Kubernetes Secret volume.
+# sticky directory on a read-only mount, such as a Kubernetes Secret volume.
 # When set, the only place looked. Unset: the first of these that exists:
 #   /var/run/secrets/hkdfguard, /run/secrets/hkdfguard,
 #   /vault/secrets/hkdfguard, /mnt/secrets-store/hkdfguard

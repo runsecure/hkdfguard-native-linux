@@ -248,7 +248,8 @@ created would vanish when it exits.
 The policy file (`/etc/hkdfguard/policy.toml`) must be owned by root and
 not writable by group or others, and so must `/etc/hkdfguard` and every
 directory above it -- sticky directories like `/tmp` included; only a
-read-only mount is exempt. The service's own user is deliberately not accepted: any
+sticky directory on a read-only mount (a Kubernetes Secret or projected
+volume) is exempt, and POSIX ACL entries count as the mode bits do. The service's own user is deliberately not accepted: any
 process running as that user could otherwise rewrite the policy, or
 delete it to switch policy off. Only a *missing* file in a trusted
 directory means "no policy"; a file that exists but is unreadable, too
@@ -1088,8 +1089,10 @@ held to the same standard as the PKCS#11 PIN and the TPM owner password.
   not writable by group or others -- sticky or not, so a mount anywhere
   under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however private the
   directories beneath it; so must the directory the resolved file sits in,
-  and every one above it. The one exception is a read-only mount: a
-  Kubernetes Secret volume is `1777` but read-only, and is fine. A mount
+  and every one above it. The one exception is a sticky directory on a
+  read-only mount: a Kubernetes Secret volume is `1777` but read-only, and
+  is fine. A `0777` directory (a disk-backed `emptyDir`'s root) is refused
+  even mounted read-only. A mount
   another user could write to would let them plant a KEK for a service
   that isn't provisioned yet, which `create_kek` would then adopt.
 
@@ -1236,7 +1239,8 @@ above it, as for the key file), and must be a regular file, not a symlink, owned
 the invoking user, with no group or other access (e.g. `0400`/`0600`). Its
 folder, and every folder above it up to `/`, must be owned by root or the
 invoking user and not writable by group or others -- sticky folders such as
-`/tmp` included, unless on a read-only mount -- or someone else could put a
+`/tmp` included, unless sticky and on a read-only mount -- and no
+POSIX ACL entry may give anyone else access, or someone else could put a
 DEK of their choosing there. These are the rules the library applies to the
 PKCS#11 PIN and the TPM owner password. On both paths the input is strict standard base64 (`+/`, padded), at
 most 64 bytes: one trailing newline (LF or CRLF) is ignored, and no other
@@ -1424,8 +1428,10 @@ root-owned and not group/other-writable, so nothing on the module's path
 can be swapped before it is `dlopen`ed. "Directories only root can
 change" means every one up to `/`, sticky directories such as `/tmp`
 included: nothing here may live anywhere under `/tmp`, `/var/tmp` or
-`/dev/shm`. Only a read-only mount (a Kubernetes Secret or ConfigMap
-volume) is exempt.
+`/dev/shm`. Only a sticky directory on a read-only mount (a Kubernetes
+Secret or projected volume) is exempt. A plain ConfigMap volume is `0777`,
+not sticky, and is refused: mount a ConfigMap through a `projected:`
+volume instead.
 
 Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
@@ -1536,8 +1542,15 @@ its default.
   kernel follows them, and the directory each link lives in checked like
   the rest. All of it applies with no exception for sticky directories, so nothing under `/tmp`, `/var/tmp` or
   `/dev/shm` is accepted, however private the directory beneath. The one
-  exception is a read-only mount: a Kubernetes Secret or ConfigMap volume
-  is `1777` but nobody can write to it. The refusal names the directory
+  exception is a sticky directory on a read-only mount: a Kubernetes
+  Secret or projected volume is `1777`, nothing in the container can write
+  to it, and the sticky bit stops whatever writes it elsewhere from
+  renaming or deleting entries it doesn't own. A plain ConfigMap or
+  disk-backed `emptyDir` volume is `0777`, not sticky, and is refused even
+  read-only; mount a ConfigMap through a `projected:` volume. POSIX
+  ACL entries are judged
+  as the mode bits are: write for anyone untrusted is refused, and on a
+  secret, read for anyone but root. The refusal names the directory
   and says when it was a sticky one. The CLI holds its own files to the
   same rule: `wrap` refuses to write a key file where it would be refused,
   and to read a `--dek-file` from such a directory.

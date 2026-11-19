@@ -154,11 +154,16 @@ exit 0
 # %%ghost, so rpm still owns it but never sets its attributes.
 %post -n %{libpkg}
 [ -d %{_sharedstatedir}/hkdfguard/tpm ] || install -d -m 0750 -o root -g hkdfguard %{_sharedstatedir}/hkdfguard/tpm
+%if 0%{?suse_version}
+# SUSE policy; Fedora-family glibc runs ldconfig from a file trigger. Here
+# rather than through %%ldconfig_scriptlets, whose own %%post would be a
+# second one.
+%{ldconfig}
+%endif
 exit 0
 
 %if 0%{?suse_version}
-# SUSE policy; Fedora-family glibc runs ldconfig from a file trigger.
-%ldconfig_scriptlets -n %{libpkg}
+%postun -n %{libpkg} -p %{ldconfig}
 %endif
 
 %files
@@ -209,7 +214,10 @@ exit 0
   overwrite the file it replaces. Unwrap refuses over-long payloads before
   parsing them. The build refuses the release profile with
   --cfg hkdfguard_test_paths. The TPM key directory is created by %post
-  and never reset on upgrade.
+  and never reset on upgrade. File trust checks judge POSIX ACL entries
+  too. Only a sticky directory on a read-only mount is exempt from the
+  write-bit checks, so a plain ConfigMap volume (0777) is refused: mount
+  a policy ConfigMap through a projected volume.
 
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys
