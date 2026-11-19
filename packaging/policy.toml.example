@@ -165,3 +165,14 @@ mode = "prefer"
 # With neither, exactly one initialized token must be present.
 #token_label = "hkdfguard-prod"
 #token_serial = "0123456789abcdef"
+# Serve only the services pinned below; `provision` then prints the line
+# to add for a new one.
+#require_pinned_keys = false
+
+[pkcs11.pinned_keys]
+# The fingerprint each service's key on the token must have (`provision`
+# prints it), or a list of them. Anyone holding the token's PIN can delete
+# a key or generate another under the same label; with a pin, a replaced
+# key is refused and a missing one is an error, not "no key here". Quote
+# the service names.
+#"com.company.orders" = "<64 hex chars>"

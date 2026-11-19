@@ -989,10 +989,10 @@ bundle for that exact library file (see below); only released images have
 it. `packaging/build-overlay.sh` fails if the image holds anything more. About
 6 MB, for `linux/amd64` and `linux/arm64`.
 
-| Tag | Policy |
+| Image | Policy |
 |---|---|
 | `ghcr.io/runsecure/hkdfguard-overlay:<version>` | None: the library's defaults (TPM2, PKCS#11 if configured, external secret; never ephemeral). Add your own `/etc/hkdfguard/policy.toml`. |
-| `ghcr.io/runsecure/hkdfguard-overlay:<version>-dev` | Adds `/etc/hkdfguard/policy.toml` from [`packaging/overlay/policy.dev.toml`](packaging/overlay/policy.dev.toml): SoftHSM2 when `/etc/hkdfguard/pkcs11.pin` exists, otherwise **ephemeral** keys that are lost when the process exits. Development and tests only. |
+| `ghcr.io/runsecure/hkdfguard-overlay-dev:<version>` | A separate image, so a mistyped tag can never select it. Adds `/etc/hkdfguard/policy.toml` from [`packaging/overlay/policy.dev.toml`](packaging/overlay/policy.dev.toml): SoftHSM2 when `/etc/hkdfguard/pkcs11.pin` exists, otherwise **ephemeral** keys that are lost when the process exits. Development and tests only. |
 
 ```dockerfile
 FROM ubuntu:24.04
@@ -1016,7 +1016,7 @@ COPY --from=ghcr.io/runsecure/hkdfguard-overlay:0.9.2 / /
 - **dpkg doesn't know about these files.** `apt` won't upgrade them, and
   installing the `libhkdfguard1` package later in the same image conflicts
   with them; update by changing the overlay tag.
-- **To use SoftHSM2 with the `-dev` tag**, install `softhsm2`, initialize
+- **To use SoftHSM2 with the `hkdfguard-overlay-dev` image**, install `softhsm2`, initialize
   a token labelled `hkdfguard`
   (`softhsm2-util --init-token --free --label hkdfguard ...`), and write
   its user PIN to `/etc/hkdfguard/pkcs11.pin` (root-owned, `0400`, or
@@ -1063,7 +1063,7 @@ To build and test locally, from `dist/packages/ubuntu24.04-<arch>/`
 (`DISTROS=ubuntu24.04 packaging/build-packages.sh`):
 
 ```sh
-packaging/build-overlay.sh    # hkdfguard-overlay:local and :local-dev for this architecture
+packaging/build-overlay.sh    # hkdfguard-overlay:local and hkdfguard-overlay-dev:local for this architecture
 ```
 
 ## External-secret file requirements
@@ -1422,6 +1422,11 @@ module = "/usr/lib/vendor/libhsm-pkcs11.so"   # PKCS#11 is used only when this i
 pin_file = "/etc/hkdfguard/pkcs11.pin"        # root-owned 0400, or 0440 with the service's group; this is the default
 token_label = "hkdfguard-prod"      # choose the token by label and/or serial; exactly one must match.
 token_serial = "0123456789abcdef"   # with neither, exactly one initialized token must be present
+require_pinned_keys = false         # true: only services in pinned_keys have a key on the token
+
+[pkcs11.pinned_keys]                # the fingerprint each service's key must have (provision prints it), or a list.
+"com.company.orders" = "<64 hex>"   # any PIN holder can delete or regenerate a key on the token: a pin makes a
+                                    # replaced key refused and a missing one an error (docs/configuration.md)
 ```
 
 The policy file must be owned by root and not writable by group or
@@ -1656,7 +1661,7 @@ packaging/
   release-assets.sh          Release tarballs, SHA256SUMS and attestation subjects from CI artifacts
   build-overlay.sh           Builds the scratch overlay images and tests them in consumer images
   overlay/Dockerfile         FROM scratch overlay: the library and CLI from the packages
-  overlay/policy.dev.toml    The -dev overlay's policy: SoftHSM2, else ephemeral
+  overlay/policy.dev.toml    The dev overlay image's policy: SoftHSM2, else ephemeral
   overlay/consumer-test.sh   Uses the overlay from a consumer image
   check-version.sh           Cargo.toml / debian/changelog / spec version agreement
   rpm/hkdfguard.spec         RPM packaging

@@ -311,7 +311,7 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   `module` is what turns PKCS#11 on, so with it set, a missing PIN file
   fails the call like any other problem: it is never a reason to try the
   next provider. The one exception is the developer security model, where
-  a missing PIN file skips PKCS#11 with a warning (the `-dev` overlay's
+  a missing PIN file skips PKCS#11 with a warning (the dev overlay image's
   "SoftHSM2, else ephemeral").
 - **Choose the token** by `token_label` and/or `token_serial`. Exactly one
   token must match. With neither set, exactly one initialized token must be
@@ -335,6 +335,48 @@ imported key, whose value someone may know, or one derived from another
 key, is refused. Only secret keys are looked up, so an
 EC key pair left under the same label by the pre-release ECDH format is
 ignored, not used or refused; delete it from the token by hand.
+
+#### What the PIN decides
+
+A PKCS#11 token has one authority over these keys: its user PIN. Every
+service that uses the token must be able to read the PIN file, so every
+one of them can do, with `pkcs11-tool` or a few lines of code, whatever
+the PIN allows -- whatever this library would have refused:
+
+- delete a service's key, which makes every DEK wrapped under it
+  unrecoverable;
+- delete it and generate another under the same label. The new key
+  passes every check above, being as token-generated as the first;
+- use any other service's key on the same token. Services sharing a token
+  are kept apart by labels only.
+
+Nobody can learn a key's value this way: the keys never leave the token.
+
+What to do about it:
+
+- **Give each service its own token or HSM partition**, with its own PIN
+  file, wherever one service must not be able to affect another's key.
+- **Pin each service's key.** `provision` prints the key's fingerprint;
+  record it in the policy, which only root writes:
+
+  ```toml
+  [pkcs11.pinned_keys]
+  "com.company.orders" = "<64 hex chars>"    # or a list of them
+  ```
+
+  A key with any other fingerprint is then refused, so a replaced key
+  can't be used. A pinned service whose key is gone fails every call,
+  instead of being treated as having no key -- which would let the next
+  provider in the policy order serve it. To provision a pinned service
+  again (after `retire`, say), remove its pin first, then pin the new
+  fingerprint.
+- **`require_pinned_keys = true`** in `[pkcs11]` makes the pins an
+  allowlist: a service with no pin has no KEK on the token. `provision`
+  then generates the key and fails with the line to add to the policy;
+  run it again once the pin is in place.
+
+Pinning detects a deleted or replaced key; it cannot prevent one. Where
+the HSM can make a key undeletable for the user role, do that as well.
 
 **What the HSM must allow.** Each wrap and unwrap is a single-part
 `C_Sign` with `CKM_SHA256_HMAC` on that key, which returns only the HMAC:
@@ -550,7 +592,7 @@ require_pinned_keys = true
 "com.company.orders" = "<64 hex chars>"
 ```
 
-**Development: SoftHSM2, else ephemeral.** The policy in the `-dev` container
+**Development: SoftHSM2, else ephemeral.** The policy in the `hkdfguard-overlay-dev` container
 overlay image. Never use it in production:
 
 ```toml
@@ -594,9 +636,14 @@ Under **production**:
   returns the existing KEK -- so an application may still call it at
   startup -- or `HKDFGUARD_ERR_KEK_ACCESS_DENIED` (-18) when there is none
   to return. An ephemeral KEK is the exception: it lives only in the
-  process that makes it. Retiring a KEK takes root too. On TPM2 and
-  PKCS#11 this is enforced directly (only root creates a key file, or
-  generates an HMAC secret key on the token); external-secret never creates a KEK
+  process that makes it. Retiring a KEK takes root too. On TPM2 the
+  filesystem enforces it: only root can create or delete a key file.
+  On PKCS#11 it is the library's rule, not the token's: the token's one
+  authority is its user PIN, which every service using it can read, and
+  a PIN holder can delete or regenerate a key with the token's own
+  tools (see [What the PIN decides](#what-the-pin-decides)). Pin each
+  service's key with `pkcs11.pinned_keys` so that is detected.
+  External-secret never creates a KEK
   (the delivered file is the provisioning). With
   `tpm.require_pinned_names = true`, a TPM service also needs its key's
   Name in the root-owned policy: `provision` prints it.
@@ -770,6 +817,10 @@ module = "/usr/lib/vendor/libvendor-pkcs11.so"   # default: unset (PKCS#11 not u
 pin_file = "/etc/hkdfguard/pkcs11.pin"
 token_label = "hkdfguard-prod"                   # 1 to 32 bytes
 token_serial = "0123456789abcdef"                # 1 to 16 bytes
+require_pinned_keys = false                      # true: only the services below have a key on the token
+
+[pkcs11.pinned_keys]                             # default: none
+"com.company.orders" = "<64 hex chars>"          # the fingerprint provision prints; or a list of them
 ```
 
 Notes:

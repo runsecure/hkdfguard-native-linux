@@ -273,6 +273,19 @@ struct Pkcs11Policy {
     /// hot-plugging; these are. Exactly one token must match.
     token_label: Option<String>,
     token_serial: Option<String>,
+    /// Expected KEK fingerprint, per service, as hex: the value `provision`
+    /// prints. One string, or a list while a rotation is in progress. When
+    /// a service has an entry here, the key the token holds for it must
+    /// have one of these fingerprints, and its absence is an error rather
+    /// than "no key here" -- see [`pinned_pkcs11_keys`] for what that
+    /// catches.
+    #[serde(default)]
+    pinned_keys: BTreeMap<String, PinnedKeys>,
+    /// Make `pinned_keys` the provider's allowlist: a service with no pin
+    /// is treated as having no KEK on the token, whatever key is there.
+    /// Default `false`.
+    #[serde(default)]
+    require_pinned_keys: bool,
 }
 
 /// The PKCS#11 settings policy supplies, validated.
@@ -470,6 +483,38 @@ fn parse_kek_fingerprint(field: &str, hex: &str) -> Result<[u8; FINGERPRINT_LEN]
     })
 }
 
+// Decodes one provider's `pinned_keys` table (`table` names it in
+// messages): normalized service name -> every fingerprint accepted for it.
+fn parse_pinned_keys(table: &str, raw: &BTreeMap<String, PinnedKeys>) -> Result<BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>> {
+    let mut pinned = BTreeMap::new();
+    for (service, pins) in raw {
+        let field = format!("{table}[\"{service}\"]");
+        let hexes = match pins {
+            PinnedKeys::One(hex) => std::slice::from_ref(hex),
+            PinnedKeys::Several(hexes) => hexes.as_slice(),
+        };
+        if hexes.is_empty() {
+            return Err(Error::Policy(format!(
+                "hkdfguard policy: {field} is an empty list; remove the entry to unpin the service"
+            )));
+        }
+        let mut fingerprints = Vec::with_capacity(hexes.len());
+        for hex in hexes {
+            let fingerprint = parse_kek_fingerprint(&field, hex)?;
+            if fingerprints.contains(&fingerprint) {
+                return Err(Error::Policy(format!("hkdfguard policy: {field} lists the same fingerprint more than once")));
+            }
+            fingerprints.push(fingerprint);
+        }
+        if pinned.insert(crate::normalize_service(service), fingerprints).is_some() {
+            return Err(Error::Policy(format!(
+                "hkdfguard policy: {table} lists \"{service}\" more than once (names are compared case-insensitively)"
+            )));
+        }
+    }
+    Ok(pinned)
+}
+
 // Decodes an even-length hex string. Returns `None` on any non-hex
 // character or odd length.
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
@@ -607,6 +652,10 @@ pub struct Policy {
     /// Normalized service name -> every KEK fingerprint accepted for it.
     pinned_external_keys: BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>,
     pkcs11: Pkcs11Settings,
+    require_pkcs11_pinned_keys: bool,
+    /// Normalized service name -> every KEK fingerprint accepted for its
+    /// key on the token.
+    pinned_pkcs11_keys: BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>,
     audit_unwrap_success: bool,
 }
 
@@ -776,37 +825,10 @@ impl Policy {
             .as_deref()
             .map(|d| absolute_path("external_secret.dir", d))
             .transpose()?;
-        // Pinned external-secret fingerprints: decoded and checked up front,
-        // with service keys normalized, as for the TPM pins above.
-        let mut pinned_external_keys = BTreeMap::new();
-        for (service, pins) in &raw.external_secret.pinned_keys {
-            let field = format!("external_secret.pinned_keys[\"{service}\"]");
-            let hexes = match pins {
-                PinnedKeys::One(hex) => std::slice::from_ref(hex),
-                PinnedKeys::Several(hexes) => hexes.as_slice(),
-            };
-            if hexes.is_empty() {
-                return Err(Error::Policy(format!(
-                    "hkdfguard policy: {field} is an empty list; remove the entry to unpin the service"
-                )));
-            }
-            let mut fingerprints = Vec::with_capacity(hexes.len());
-            for hex in hexes {
-                let fingerprint = parse_kek_fingerprint(&field, hex)?;
-                if fingerprints.contains(&fingerprint) {
-                    return Err(Error::Policy(format!("hkdfguard policy: {field} lists the same fingerprint more than once")));
-                }
-                fingerprints.push(fingerprint);
-            }
-            if pinned_external_keys
-                .insert(crate::normalize_service(service), fingerprints)
-                .is_some()
-            {
-                return Err(Error::Policy(format!(
-                    "hkdfguard policy: external_secret.pinned_keys lists \"{service}\" more than once (names are compared case-insensitively)"
-                )));
-            }
-        }
+        // Pinned fingerprints: decoded and checked up front, with service
+        // keys normalized, as for the TPM pins above.
+        let pinned_external_keys = parse_pinned_keys("external_secret.pinned_keys", &raw.external_secret.pinned_keys)?;
+        let pinned_pkcs11_keys = parse_pinned_keys("pkcs11.pinned_keys", &raw.pkcs11.pinned_keys)?;
         let pkcs11 = Pkcs11Settings {
             module: raw.pkcs11.module.as_deref().map(|m| absolute_path("pkcs11.module", m)).transpose()?,
             pin_file: raw.pkcs11.pin_file.as_deref().map(|f| absolute_path("pkcs11.pin_file", f)).transpose()?,
@@ -834,6 +856,8 @@ impl Policy {
             require_external_pinned_keys: raw.external_secret.require_pinned_keys,
             pinned_external_keys,
             pkcs11,
+            require_pkcs11_pinned_keys: raw.pkcs11.require_pinned_keys,
+            pinned_pkcs11_keys,
             audit_unwrap_success: raw.audit.unwrap_success,
         })
     }
@@ -887,6 +911,18 @@ impl Policy {
     /// The PKCS#11 settings (`[pkcs11]`).
     pub fn pkcs11(&self) -> &Pkcs11Settings {
         &self.pkcs11
+    }
+
+    /// Whether the PKCS#11 provider treats only pinned services as
+    /// provisioned (`pkcs11.require_pinned_keys`).
+    pub fn require_pkcs11_pinned_keys(&self) -> bool {
+        self.require_pkcs11_pinned_keys
+    }
+
+    /// The KEK fingerprints policy accepts for `service`'s key on the
+    /// token, if it pins any.
+    pub fn pinned_pkcs11_keys(&self, service: &str) -> Option<&[[u8; FINGERPRINT_LEN]]> {
+        self.pinned_pkcs11_keys.get(&crate::normalize_service(service)).map(|v| v.as_slice())
     }
 
     /// The TCTI the TPM provider must use (`tpm.tcti`), if policy sets one.
@@ -1331,6 +1367,43 @@ pub(crate) fn pkcs11_settings() -> Result<Pkcs11Settings> {
         Some(Ok(policy)) => Ok(policy.pkcs11().clone()),
         Some(Err(e)) => Err(e),
         None => Ok(Pkcs11Settings::default()),
+    }
+}
+
+/// The KEK fingerprints policy accepts for `service`'s key on the PKCS#11
+/// token (`pkcs11.pinned_keys`), if any.
+///
+/// The token's own access control is its user PIN, which every service
+/// that uses the token must be able to read. Whoever holds it can delete a
+/// service's key, or delete it and generate another under the same label:
+/// the new key carries every attribute this library checks, having been
+/// generated on the token like the first. A fingerprint recorded when the
+/// key was provisioned, in the root-owned policy, is what tells the two
+/// apart -- and what makes a deleted key an error instead of "no key here",
+/// which would hand the service's next wrap to the next provider in the
+/// policy order.
+///
+/// `Err` when a policy file exists but can't be trusted -- pinning must
+/// fail closed rather than silently degrade to "nothing pinned".
+#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
+pub(crate) fn pinned_pkcs11_keys(service: &str) -> Result<Option<Vec<[u8; FINGERPRINT_LEN]>>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.pinned_pkcs11_keys(service).map(<[_]>::to_vec)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// Whether the PKCS#11 provider only serves services whose key is pinned
+/// (`pkcs11.require_pinned_keys`). No policy file → `false`. A policy file
+/// that exists but is invalid → `true`: a broken policy must never be what
+/// widens the set of keys the provider accepts.
+#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
+pub(crate) fn require_pkcs11_pinned_keys() -> bool {
+    match load() {
+        Some(Ok(policy)) => policy.require_pkcs11_pinned_keys(),
+        Some(Err(_)) => true,
+        None => false,
     }
 }
 
@@ -2116,6 +2189,46 @@ mod tests {
         ] {
             assert!(Policy::from_toml_str(&format!("{base}{bad}")).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    // ---- pkcs11.pinned_keys / pkcs11.require_pinned_keys ----
+
+    #[test]
+    #[serial_test::serial]
+    fn pkcs11_pins_parse_like_external_secret_pins_and_fail_closed() {
+        const PIN: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let base = "[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(base).unwrap();
+        assert!(!policy.require_pkcs11_pinned_keys(), "the allowlist must be opt-in");
+        assert_eq!(policy.pinned_pkcs11_keys("com.company.orders"), None);
+
+        let other = "ff".repeat(FINGERPRINT_LEN);
+        let doc = format!(
+            "{base}[pkcs11]\nrequire_pinned_keys = true\n[pkcs11.pinned_keys]\n\"com.company.Orders\" = \"{PIN}\"\n\
+             \"com.company.billing\" = [\"{PIN}\", \"{other}\"]\n"
+        );
+        let policy = Policy::from_toml_str(&doc).unwrap();
+        assert!(policy.require_pkcs11_pinned_keys());
+        assert_eq!(policy.pinned_pkcs11_keys("COM.COMPANY.ORDERS").expect("pinned, whatever the case").len(), 1);
+        assert_eq!(policy.pinned_pkcs11_keys("com.company.billing").expect("pinned").len(), 2);
+        assert_eq!(policy.pinned_external_keys("com.company.orders"), None, "a PKCS#11 pin is not an external-secret pin");
+
+        for bad in ["\"svc\" = \"nothex\"", "\"svc\" = \"0102\"", "\"svc\" = []", "\"svc\" = 7"] {
+            let doc = format!("{base}[pkcs11.pinned_keys]\n{bad}\n");
+            match Policy::from_toml_str(&doc) {
+                Err(Error::Policy(_)) => {}
+                other => panic!("{bad}: expected a policy error, got {other:?}"),
+            }
+        }
+
+        {
+            let _none = TestPolicy::absent();
+            assert!(!require_pkcs11_pinned_keys());
+            assert_eq!(pinned_pkcs11_keys("com.company.orders").unwrap(), None);
+        }
+        let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\n");
+        assert!(require_pkcs11_pinned_keys(), "a broken policy must fail closed to the allowlist");
+        assert!(pinned_pkcs11_keys("com.company.orders").is_err(), "a broken policy must not report 'nothing pinned'");
     }
 
     // ---- external_secret.pinned_keys / external_secret.require_pinned_keys ----

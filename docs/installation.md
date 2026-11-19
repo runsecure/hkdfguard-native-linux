@@ -227,7 +227,7 @@ exact library file, so the deployed copy can be verified where it sits.
 | Image | Policy |
 |---|---|
 | `ghcr.io/runsecure/hkdfguard-overlay:<version>` | None: the library's defaults. Add your own `/etc/hkdfguard/policy.toml`. |
-| `ghcr.io/runsecure/hkdfguard-overlay:<version>-dev` | A development policy: SoftHSM2 when `/etc/hkdfguard/pkcs11.pin` exists, otherwise **ephemeral keys, lost when the process exits**. Never use it in production. |
+| `ghcr.io/runsecure/hkdfguard-overlay-dev:<version>` | A separate image, so a mistyped tag can never select it. A development policy: SoftHSM2 when `/etc/hkdfguard/pkcs11.pin` exists, otherwise **ephemeral keys, lost when the process exits**. Never use it in production. |
 
 ```dockerfile
 FROM ubuntu:24.04

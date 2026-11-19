@@ -126,6 +126,9 @@ wrong. The library stops rather than quietly using a weaker provider.
 | PIN file refused | Make it `root:<group> 0440` or `root:root 0400`, in directories only root can change up to `/` (never under `/tmp`) |
 | Module refused, or won't load | The module and every directory above it must be root-owned and not group- or other-writable, sticky (`/tmp`) included. Check the path. |
 | No token matches | Check `token_label` and `token_serial` against `pkcs11-tool --list-token-slots` (from OpenSC). Exactly one token must match. |
+| `the PKCS#11 key for this service has fingerprint ..., which is not the one pinned in policy` | The key under the service's label was deleted and generated again since it was pinned; anyone holding the token's PIN can do that. DEKs wrapped under the old key can't be unwrapped with the new one. Find out who replaced it before pinning the new fingerprint. |
+| `policy pins a PKCS#11 key for this service ..., but the token holds none` | The key was deleted, or this isn't the token it was provisioned on (check `token_label` and `token_serial`). If it was retired on purpose, remove the service's pin from `[pkcs11.pinned_keys]`, then run `provision` and pin the new fingerprint. |
+| `pkcs11.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[pkcs11.pinned_keys]`. Its key is now on the token: add the line the message prints, then run `provision` again. |
 | `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. |
 
 **External secret**

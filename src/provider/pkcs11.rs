@@ -95,6 +95,25 @@
 //! its own key rather than leaving two under the label (see
 //! `generate_key`).
 //!
+//! ## What the PIN decides, and what pinning adds
+//!
+//! The token knows one authority for these keys: its user PIN. Every
+//! service that uses the token must be able to read the PIN file, and
+//! whoever holds the PIN can drive the token without this library --
+//! delete a service's key, or delete it and generate another under the
+//! same label, which would pass every check above. So the production
+//! security model's "only root creates or retires a KEK" is this library's
+//! own rule here (`hkdfguard_create_kek` and `retire` refuse anyone else);
+//! the token doesn't enforce it, and services sharing one token are kept
+//! apart by labels alone. No PIN holder can learn a key's value.
+//!
+//! `pkcs11.pinned_keys` is what root can add: the fingerprint of each
+//! service's key, recorded in the policy only root writes. A key with any
+//! other fingerprint is then refused, and so is a pinned service whose key
+//! is gone -- an error, never "no key here", so the provider chain doesn't
+//! hand the service to a weaker provider. `pkcs11.require_pinned_keys`
+//! makes the pins an allowlist (see [`Pins`]).
+//!
 //! `load_kek` locates the key (or generates it, when creation was asked
 //! for) up front and hands back a handle holding its object handle, so
 //! `hkdfguard_create_kek` really creates, `hkdfguard_kek_exists` reports
@@ -793,12 +812,23 @@ impl KekProvider for Pkcs11Provider {
         self.refused.is_some() || self.connected()
     }
 
+    // No module configured: not present, unless policy pins a key for this
+    // service -- which says its KEK is on a token.
+    fn claims_while_absent(&self, service: &str) -> Result<()> {
+        match service_pins(service)? {
+            Pins::OneOf(_) => Err(pinned_but_missing()),
+            Pins::Any | Pins::Unpinned => Ok(()),
+        }
+    }
+
     // Side-effect-free: asks the token whether the service's key is there,
     // without creating anything. A refused provider, or a duplicate or
     // foreign object under the label, is an error -- never read as "no
-    // key", see `provider::kek_exists`.
+    // key", see `provider::kek_exists`. So is a pinned service whose key is
+    // gone, or isn't the pinned one (see `Pins`).
     fn kek_exists(&self, service: &str) -> Result<bool> {
         self.check_not_refused()?;
+        let pins = service_pins(service)?;
         let mut guard = self
             .state
             .lock()
@@ -806,7 +836,17 @@ impl KekProvider for Pkcs11Provider {
         let open = guard
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
-        Ok(find_key(&open.session, service, open)?.is_some())
+        if matches!(pins, Pins::Unpinned) {
+            return Ok(false); // the allowlist is on and this service isn't on it
+        }
+        match find_key(&open.session, service, open)? {
+            Some(key) => {
+                check_pins(&open.session, key, &pins)?;
+                Ok(true)
+            }
+            None if matches!(pins, Pins::OneOf(_)) => Err(pinned_but_missing()),
+            None => Ok(false),
+        }
     }
 
     // Locates the service's key on the token now -- generating it if
@@ -828,8 +868,20 @@ impl KekProvider for Pkcs11Provider {
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
 
+        let pins = service_pins(service)?;
+        if matches!(pins, Pins::Unpinned) && !create_if_missing {
+            return Err(Error::KeyNotProvisioned(
+                "pkcs11.require_pinned_keys is set and policy pins no key for this service",
+            ));
+        }
         let key = match find_key(&open.session, service, open)? {
             Some(key) => key,
+            // A pinned service keeps its KEK here, by the administrator's
+            // own statement, and that key is gone: an error, whether or not
+            // creation was asked for. Declining would send the call on to
+            // the next provider, and a key generated now could never be the
+            // pinned one.
+            None if matches!(pins, Pins::OneOf(_)) => return Err(pinned_but_missing()),
             None if create_if_missing => generate_key(open, service)?, // none exists yet and creation was requested
             None => {
                 return Err(Error::KeyNotProvisioned(
@@ -837,6 +889,13 @@ impl KekProvider for Pkcs11Provider {
                 ))
             }
         };
+        if matches!(pins, Pins::Unpinned) {
+            // Provisioning under the allowlist ends with a root-owned policy
+            // edit, which this process can't make. The key now exists:
+            // report its fingerprint, ready to pin.
+            return Err(Error::Provider(unpinned_service_instructions(service, &open.session, key)));
+        }
+        check_pins(&open.session, key, &pins)?;
         Ok(Box::new(Pkcs11Handle {
             key_id: format!("hkdfguard:{service}").into_bytes(),
             key,
@@ -880,6 +939,101 @@ impl KekProvider for Pkcs11Provider {
         }
         Ok(())
     }
+}
+
+/// What policy accepts as `service`'s key on the token.
+///
+/// The token decides who may use and manage keys by one thing, the user
+/// PIN, and every service using the token reads it. A PIN holder can
+/// delete a service's key, or delete it and generate another under the
+/// same label -- one that passes [`check_protections`], being as
+/// token-generated as the first. Pins are how policy, which only root
+/// writes, says which key is the service's.
+enum Pins {
+    /// No pin, and no allowlist: any key that passes the attribute checks.
+    Any,
+    /// A key with one of these fingerprints, and no other. Its absence is
+    /// an error too, never "no key here".
+    OneOf(Vec<[u8; crate::payload::FINGERPRINT_LEN]>),
+    /// No pin, under `pkcs11.require_pinned_keys`: no key at all.
+    Unpinned,
+}
+
+/// Looks up `service`'s pins. A policy file that exists but is broken
+/// fails closed: the pin lookup errors rather than reporting none.
+fn service_pins(service: &str) -> Result<Pins> {
+    if let Some(fingerprints) = crate::policy::pinned_pkcs11_keys(service)? {
+        return Ok(Pins::OneOf(fingerprints));
+    }
+    if crate::policy::require_pkcs11_pinned_keys() {
+        return Ok(Pins::Unpinned);
+    }
+    Ok(Pins::Any)
+}
+
+/// Refuses `key` unless its fingerprint is one `pins` accepts, computed on
+/// the token with the object about to be used. A mismatch is an error, not
+/// "not provisioned": the key under this service's label isn't the one the
+/// administrator recorded, and the chain must not move on as if nothing
+/// were there.
+fn check_pins(session: &Session, key: ObjectHandle, pins: &Pins) -> Result<()> {
+    let Pins::OneOf(accepted) = pins else {
+        return Ok(());
+    };
+    let fingerprint = crate::crypto::kek_fingerprint(&SessionKey { session, key })?;
+    match pin_mismatch(&fingerprint, accepted) {
+        None => Ok(()),
+        Some(message) => Err(Error::Provider(message)),
+    }
+}
+
+/// Why a key with `fingerprint` isn't one of `accepted`; `None` if it is.
+fn pin_mismatch(fingerprint: &[u8; crate::payload::FINGERPRINT_LEN], accepted: &[[u8; crate::payload::FINGERPRINT_LEN]]) -> Option<String> {
+    if accepted.contains(fingerprint) {
+        return None;
+    }
+    let accepted: Vec<String> = accepted.iter().map(|f| hex(f)).collect();
+    Some(format!(
+        "the PKCS#11 key for this service has fingerprint {}, which is not the one pinned in policy \
+         (pkcs11.pinned_keys: {}): the key on the token was replaced since it was pinned. Pin the new fingerprint \
+         only once you know who generated that key; DEKs wrapped under the old one can't be unwrapped with it",
+        hex(fingerprint),
+        accepted.join(", ")
+    ))
+}
+
+/// The error for a service policy pins a key for, when the token holds
+/// none under its label. Never "not provisioned": see `load_kek`.
+fn pinned_but_missing() -> Error {
+    Error::Provider(
+        "policy pins a PKCS#11 key for this service (pkcs11.pinned_keys), but the token holds none: it was deleted, \
+         or this is not the token it was provisioned on. Refusing rather than using a weaker provider, or generating \
+         a key that could not be the pinned one. If the key is gone for good -- retired, say -- remove the service's \
+         pin from the policy, then provision it again"
+            .into(),
+    )
+}
+
+/// The message `provision` gets for an unpinned service under
+/// `pkcs11.require_pinned_keys`: its key's fingerprint, in the form to
+/// paste into policy. The fingerprint and service name are both public.
+fn unpinned_service_instructions(service: &str, session: &Session, key: ObjectHandle) -> String {
+    match crate::crypto::kek_fingerprint(&SessionKey { session, key }) {
+        Ok(fingerprint) => format!(
+            "pkcs11.require_pinned_keys is set and service \"{service}\" has no pinned key. Its key is on the token, \
+             with fingerprint {fingerprint}; to provision it, add this to the policy file and run provision \
+             again:\n  [pkcs11.pinned_keys]\n  \"{service}\" = \"{fingerprint}\"",
+            fingerprint = hex(&fingerprint)
+        ),
+        Err(e) => format!(
+            "pkcs11.require_pinned_keys is set and this service has no pinned key; computing its key's fingerprint \
+             to report it failed: {e}"
+        ),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // The CKA_LABEL used to identify a service's key on the token.
@@ -1422,6 +1576,52 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn a_pinned_service_is_claimed_even_with_no_module_configured() {
+        // Not layered, as above. A pin says the service's KEK is on a
+        // token: with PKCS#11 not even configured, the chain must stop
+        // here, not hand the service to the next provider.
+        let pinned = "com.company.orders";
+        let fingerprint = "ab".repeat(crate::payload::FINGERPRINT_LEN);
+        let _policy = crate::policy::test_support::TestPolicy::exact(format!(
+            "[selection]\nmode = \"prefer\"\n[pkcs11.pinned_keys]\n\"{pinned}\" = \"{fingerprint}\"\n"
+        ));
+        let provider = Pkcs11Provider::new();
+        assert!(!provider.probe());
+        match provider.claims_while_absent(pinned) {
+            Err(Error::Provider(msg)) => assert!(msg.contains("pkcs11.pinned_keys") && msg.contains("Refusing"), "{msg}"),
+            other => panic!("a pinned service must be claimed, got {other:?}"),
+        }
+        assert!(provider.claims_while_absent("com.company.unpinned").is_ok());
+        assert!(matches!(service_pins(pinned).unwrap(), Pins::OneOf(pins) if pins == vec![[0xab; crate::payload::FINGERPRINT_LEN]]));
+        assert!(matches!(service_pins("com.company.unpinned").unwrap(), Pins::Any));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pins_follow_policy_and_a_broken_policy_fails_closed() {
+        use crate::policy::test_support::TestPolicy;
+        {
+            let _allowlist = TestPolicy::exact("[selection]\nmode = \"prefer\"\n[pkcs11]\nrequire_pinned_keys = true\n");
+            assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Unpinned));
+        }
+        {
+            let _none = TestPolicy::absent();
+            assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Any));
+        }
+        let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\n");
+        assert!(service_pins("com.company.orders").is_err(), "a broken policy must not report 'nothing pinned'");
+    }
+
+    #[test]
+    fn a_key_whose_fingerprint_is_not_pinned_is_named_with_the_pins() {
+        let (pinned, other) = ([0x11u8; crate::payload::FINGERPRINT_LEN], [0x22u8; crate::payload::FINGERPRINT_LEN]);
+        assert_eq!(pin_mismatch(&pinned, &[other, pinned]), None, "any one of the pins is accepted");
+        let msg = pin_mismatch(&other, &[pinned]).expect("a different key is refused");
+        assert!(msg.contains(&hex(&other)) && msg.contains(&hex(&pinned)) && msg.contains("replaced"), "{msg}");
+    }
+
+    #[test]
     fn module_path_must_be_absolute() {
         assert!(validate_module_path(Path::new("libsofthsm2.so")).is_err());
         assert!(validate_module_path(Path::new("./libsofthsm2.so")).is_err());
@@ -1522,6 +1722,90 @@ mod tests {
         assert!(provider.kek_exists(service).unwrap(), "create must leave a key the token reports");
         let loaded = provider.load_kek(service, false).unwrap(); // hkdfguard_wrap_dek's path
         assert_eq!(prf_of(&*created, b"input"), prf_of(&*loaded, b"input"), "both handles must drive the same key");
+
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_pin_refuses_a_replaced_or_deleted_key_and_the_allowlist_gates_provisioning() {
+        use crate::policy::test_support::TestPolicy;
+        let service = "com.hkdfguard.test.pinned";
+        let fingerprint_of = |provider: &Pkcs11Provider| hex(&crate::crypto::kek_fingerprint(&*provider.load_kek(service, false).unwrap()).unwrap());
+        let pin = |fingerprint: &str| TestPolicy::write(&format!("[pkcs11.pinned_keys]\n\"{service}\" = \"{fingerprint}\"\n"));
+
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| destroy_all_for(open, service));
+        drop(provider.load_kek(service, true).unwrap());
+        let original = fingerprint_of(&provider);
+
+        // Pinned to the key that is there: used as before.
+        {
+            let _policy = pin(&original);
+            let provider = Pkcs11Provider::new();
+            assert!(provider.kek_exists(service).unwrap());
+            provider.load_kek(service, false).unwrap();
+        }
+
+        // What any PIN holder can do without this library: delete the key
+        // and generate another under the same label. Every attribute check
+        // passes; only the pin tells them apart.
+        with_open(&provider, |open| destroy_all_for(open, service));
+        drop(provider.load_kek(service, true).unwrap());
+        assert_ne!(fingerprint_of(&provider), original);
+        {
+            let _policy = pin(&original);
+            let provider = Pkcs11Provider::new();
+            for refused in [provider.kek_exists(service).err(), provider.load_kek(service, false).err(), provider.load_kek(service, true).err()] {
+                match refused {
+                    Some(Error::Provider(msg)) => assert!(msg.contains("not the one pinned") && msg.contains(&original), "{msg}"),
+                    other => panic!("a replaced key must be refused, got {other:?}"),
+                }
+            }
+        }
+
+        // Deleted outright: an error, never "no key here" -- and nothing is
+        // generated in its place, even when creation is asked for.
+        with_open(&provider, |open| destroy_all_for(open, service));
+        {
+            let _policy = pin(&original);
+            let provider = Pkcs11Provider::new();
+            for refused in [provider.kek_exists(service).err(), provider.load_kek(service, false).err(), provider.load_kek(service, true).err()] {
+                match refused {
+                    Some(Error::Provider(msg)) => assert!(msg.contains("the token holds none"), "{msg}"),
+                    other => panic!("a pinned service's missing key must be an error, got {other:?}"),
+                }
+            }
+            assert_eq!(with_open(&provider, |open| count_labelled(&open.session, service).unwrap()), 0, "nothing was generated");
+        }
+
+        // The allowlist: provisioning an unpinned service creates its key
+        // and is refused with the fingerprint to pin; until then the
+        // service has no KEK here.
+        {
+            let _policy = TestPolicy::write("[pkcs11]\nrequire_pinned_keys = true\n");
+            let provider = Pkcs11Provider::new();
+            assert!(!provider.kek_exists(service).unwrap());
+            assert!(matches!(provider.load_kek(service, false), Err(Error::KeyNotProvisioned(_))));
+            let message = match provider.load_kek(service, true) {
+                Err(Error::Provider(msg)) => msg,
+                other => panic!("expected pinning instructions, got {:?}", other.map(|_| ())),
+            };
+            assert!(!provider.kek_exists(service).unwrap(), "still unpinned: still no KEK here");
+            // Read straight off the token: under the allowlist no handle is given out.
+            let created = with_open(&provider, |open| {
+                let key = find_key(&open.session, service, open).unwrap().expect("provisioning generated the key");
+                hex(&crate::crypto::kek_fingerprint(&SessionKey { session: &open.session, key }).unwrap())
+            });
+            assert!(message.contains(&format!("\"{service}\" = \"{created}\"")), "{message}");
+
+            let _pinned = pin(&created);
+            let provider = Pkcs11Provider::new();
+            assert!(provider.kek_exists(service).unwrap());
+            provider.load_kek(service, true).expect("pinned: provisioned");
+        }
 
         with_open(&provider, |open| destroy_all_for(open, service));
     }
