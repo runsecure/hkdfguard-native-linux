@@ -222,18 +222,29 @@ harnesses only.
 The one moment the authValue itself crosses the bus is `provision`, inside
 a session salted to the TPM's storage root key. Pinning that key's Name
 with `pinned_session_salt_key_name` stops an attacker who can rewrite bus
-traffic at provisioning time from substituting their own. Pin it on any
-host with a discrete TPM, before provisioning. The Name stays the same
-until the TPM is cleared. From a source checkout on the host, as a user
-in the `tss` group:
+traffic at provisioning time from substituting their own, so `provision`
+refuses to create a TPM key until the Name is pinned. The refusal prints
+the Name this TPM reports, as the line to add to the policy:
 
 ```sh
-cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning \
-    -- --ignored --exact --nocapture
-#   SALT_KEY_NAME=000b...
+sudo hkdfguard provision -sn com.company.orders
+#   ... refusing to provision a TPM key: policy pins no storage root key ...
+#     pinned_session_salt_key_name = "000b..."
 ```
 
-`scripts/native-tpm-test.sh` runs this, and a full check of your TPM, for you.
+Add that line to the `[tpm]` table and run `provision` again. The Name
+stays the same until the TPM is cleared, so it is the same for every
+service on the host; if it was recorded when the host was set up, check
+the printed value against that record. Nothing is created by the refused
+run.
+
+On a TPM with no bus to tamper with (a firmware or virtual TPM),
+`allow_unpinned_provisioning = true` in the `[tpm]` table provisions
+without a pin instead. Each key provisioned that way is recorded as audit
+event 1007. Using a key that already exists never needs the pin.
+
+From a source checkout, `scripts/native-tpm-test.sh` also reports the
+Name, with a full check of your TPM.
 
 **6. Protect the TPM hierarchy (recommended on shared hosts).** Anyone who
 can open the TPM can, with the default empty passwords, *clear* it, which
@@ -666,6 +677,7 @@ permissions so that only the service's own account can do both.
 | `/etc/hkdfguard/policy.toml` | `root:root 0644` | Readable by services; changeable only by root |
 | `/var/lib/hkdfguard/tpm/` | `root:<key-users> 0750` | Only root may add or replace a key; its group is the group of each key file in it |
 | `/var/lib/hkdfguard/tpm/<service>.tpmkey` | `root:<key-users> 0440` (`provision` sets it) | Readable by the services allowed to use TPM keys |
+| `/var/lib/hkdfguard/tpm/.lock` | `root:root 0600` (`provision` creates it) | Empty; held while a key is provisioned or retired. Only root can open it, so no service can hold up either |
 | `/var/lib/hkdfguard/tpm/<service>.tpmauth` | `root:<service-group> 0440`, the group from `tpm.auth_groups`; `root:root 0400` with none (`provision` sets it) | The key's authValue: only that service may read it |
 | `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | Every TPM-using service must read it, and so holds the Owner hierarchy's password |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
@@ -737,7 +749,8 @@ key_dir = "/var/lib/hkdfguard/tpm"                    # one <service>.tpmkey per
 owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"     # default: unset (empty owner password)
 require_pinned_names = false
 session_encryption = "on"                             # on | off (off: test harnesses only)
-pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; pin it before provisioning on a discrete TPM
+pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; provision refuses until it is set, and prints the Name
+allow_unpinned_provisioning = false                   # true: provision without the pin (firmware or virtual TPMs, test harnesses)
 
 [tpm.auth_groups]                                     # default: none (every .tpmauth file root:root 0400)
 "com.company.orders" = "orders"                       # its .tpmauth file root:orders 0440

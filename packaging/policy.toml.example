@@ -123,9 +123,14 @@ mode = "prefer"
 # the service key's authValue: "on" (default) | "off" (test harnesses only).
 #session_encryption = "on"
 # The Name of the TPM's storage root key, which every key file is loaded
-# under and provisioning's session is salted to. Pin it before provisioning
-# on a discrete TPM.
+# under and provisioning's session is salted to. `hkdfguard provision`
+# refuses to create a TPM key until it is set, and prints the Name to put
+# here.
 #pinned_session_salt_key_name = "000b<64 hex chars>"
+# Provision without that pin: for a TPM with no bus to tamper with (a
+# firmware or virtual TPM). Each key provisioned this way is audited
+# (event 1007).
+#allow_unpinned_provisioning = false
 
 [tpm.pinned_names]
 # The TPM Name each service's key must have; any other key is refused.

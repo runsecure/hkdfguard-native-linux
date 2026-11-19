@@ -309,7 +309,7 @@ the host does about logging. The records use facility `authpriv` and tag
 `hkdfguard`, sent straight to `/dev/log`. On systemd hosts they land in the
 journal (`journalctl -t hkdfguard`); elsewhere in `/var/log/secure` or
 `/var/log/auth.log`. These are the Windows build's Event Log events, with the
-same IDs, meanings and severities (1004 and 1006 aside), so one set of alerts covers both:
+same IDs, meanings and severities (1004, 1006 and 1007 aside), so one set of alerts covers both:
 
 | ID | Severity | When |
 |---|---|---|
@@ -320,6 +320,7 @@ same IDs, meanings and severities (1004 and 1006 aside), so one set of alerts co
 | 1004 | warning | A KEK was retired (`hkdfguard retire`): deleted for good, after its fingerprint was confirmed. Names the fingerprint. Every DEK wrapped under it can no longer be unwrapped. |
 | 1005 | warning | A key file was read under the developer security model, which trusts files the calling account owns. Logged once per process; names the file. |
 | 1006 | warning | A provider later in the policy order served a service, because the ones before it were absent or held no key for it; `passed_over` names each and why. Logged once per process for each service. Expected where the policy order lists providers the host doesn't have (trim `preferred_order` to silence it); anywhere else, keys are landing under a weaker provider than intended. |
+| 1007 | warning | A TPM key was provisioned with no storage root key Name pinned, which `tpm.allow_unpinned_provisioning = true` allowed. Harmless on a TPM with no bus; on a discrete TPM, someone rewriting bus traffic at that moment could have learned the key's authValue. |
 | 2000 | warning | `KEK_ACCESS_DENIED`: under the production security model, a non-root caller tried to create a KEK that doesn't exist, or to retire one. |
 | 2002 | error | `KEK_INVALID`. |
 | 2003 | warning | Unwrap rejected a tampered, corrupted, misdirected or unknown-version payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. Or `hkdfguard_open_file` refused a key file someone else could have replaced (`FILE_UNTRUSTED`), or one that isn't a well-formed payload (`FILE_MALFORMED`, `FILE_TOO_SHORT`, `FILE_TOO_LONG`); names the file. |
@@ -537,7 +538,7 @@ prove a TPM has no bus, so every TPM is treated alike.
 ```toml
 [tpm]
 session_encryption = "on"             # "on" (default) | "off" (test harnesses only)
-pinned_session_salt_key_name = "000b<64 hex chars>"   # pin before provisioning on a discrete TPM
+pinned_session_salt_key_name = "000b<64 hex chars>"   # required to provision, unless allow_unpinned_provisioning
 ```
 
 The session is also salted to the SRK, as a second layer: someone who has
@@ -547,7 +548,11 @@ stands alone at one moment: `provision`, whose `TPM2_Create` sends the new
 key's authValue and so can't be protected by it. `TPM2_Create` therefore
 always runs in a salted, encrypting session, whatever `session_encryption`
 says, and `pinned_session_salt_key_name` makes it refuse an SRK whose Name
-isn't the pinned one. The pin is checked against what `TPM2_CreatePrimary`
+isn't the pinned one. With no Name pinned, `provision` creates nothing: it
+fails with the Name the TPM reports, as the policy line to add. Only
+`allow_unpinned_provisioning = true` (for a TPM with no bus, and test
+harnesses) lets it go ahead, and each key created that way is audited
+(event 1007). The pin is checked against what `TPM2_CreatePrimary`
 returned, because that is the public area ESAPI encrypts the salt to. The
 SRK is a *restricted* storage key, so the TPM uses it only for its children
 and to unwrap session salts: someone who can send the TPM commands and
@@ -745,8 +750,8 @@ Name formula, `TPM2_HMAC` against software HMAC-SHA-256, encrypted-session corre
 a C ABI round trip with the KEK on the TPM with session encryption off
 and with both Names pinned, and the CLI-to-C-consumer
 cross-process check. It learns the Names to pin from the TPM itself via
-two operator-helper tests (run them directly to get values for your own
-policy):
+two operator-helper tests (`hkdfguard provision` also prints the storage
+root key's Name when it refuses to provision without the pin):
 
 ```sh
 cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning -- --ignored --nocapture
@@ -1388,7 +1393,8 @@ fail_if_requirement_unmet = true    # accepted for schema parity; the library al
 key_dir = "/var/lib/hkdfguard/tpm"  # absolute path; a <service>.tpmkey and <service>.tpmauth per service, created by provision
 require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
 session_encryption = "on"           # on | off (test harnesses only)  (see "Session parameter encryption")
-pinned_session_salt_key_name = "000b<64 hex>"   # the storage root key's Name; pin before provisioning on a discrete TPM
+pinned_session_salt_key_name = "000b<64 hex>"   # the storage root key's Name; provision refuses until set, and prints it
+allow_unpinned_provisioning = false # true: provision without that pin (a TPM with no bus; test harnesses)
 tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> | mssim:<conf> | swtpm:<conf>
                                     # mssim/swtpm are for testing only: no resource manager, so another client of
                                     # the same simulator can swap a key handle between its Name check and its use

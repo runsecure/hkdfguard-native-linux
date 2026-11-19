@@ -85,6 +85,10 @@ pub(crate) const KEK_RETIRED: u32 = 1004;
 pub(crate) const DEVELOPER_MODEL_KEY_FILE: u32 = 1005;
 // Linux's own: a provider later in the policy order is serving a service.
 pub(crate) const PROVIDER_FALLBACK: u32 = 1006;
+// Linux's own: a TPM key was provisioned with no storage root key Name
+// pinned, as `tpm.allow_unpinned_provisioning` allows.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) const TPM_KEY_PROVISIONED_UNPINNED: u32 = 1007;
 pub(crate) const ACCESS_DENIED: u32 = 2000;
 pub(crate) const KEK_INVALID: u32 = 2002;
 pub(crate) const INTEGRITY_FAILURE: u32 = 2003;
@@ -172,6 +176,23 @@ pub(crate) fn provider_fallback(service: &str, provider: ProviderType, passed_ov
              each service)",
             provider.as_str()
         ),
+    );
+}
+
+/// A TPM key was created for `service` with no storage root key Name
+/// pinned in policy, which `tpm.allow_unpinned_provisioning` allowed. The
+/// new key's authValue went to the TPM encrypted to whatever storage root
+/// key answered: safe on a TPM with no bus, and on one with a bus only if
+/// nobody was rewriting its traffic at that moment.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_key_provisioned_unpinned(service: &str) {
+    emit(
+        Severity::Warning,
+        TPM_KEY_PROVISIONED_UNPINNED,
+        &format!("op={} service={} provider={}", Op::CreateKek.name(), quote(service.as_bytes()), ProviderType::Tpm2.as_str()),
+        "a TPM key was provisioned with no storage root key Name pinned (tpm.allow_unpinned_provisioning = true): on \
+         a discrete TPM, someone able to rewrite bus traffic at that moment could have learned the key's authValue. \
+         Pin tpm.pinned_session_salt_key_name before provisioning on any TPM reached over a bus",
     );
 }
 

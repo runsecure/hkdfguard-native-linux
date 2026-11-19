@@ -143,9 +143,11 @@ require_private_chain() { # require_private_chain <dir> <what to set instead>
 
 # As scripts/native-tpm-test.sh: a complete policy -- $1 top-level, extra
 # [tpm] keys in $2, further tables in $3 -- and making it the one every
-# test executable reads.
+# test executable reads. allow_unpinned_provisioning: the suite provisions
+# before it can learn the storage root key's Name, which the library
+# otherwise refuses; a deployment pins the Name instead.
 policy() { # policy <selection...> [extra [tpm] keys] [more tables]
-    printf 'security_model = "developer"\n%s\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\n' "$1" "$TCTI" "$KEY_DIR"
+    printf 'security_model = "developer"\n%s\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\nallow_unpinned_provisioning = true\n' "$1" "$TCTI" "$KEY_DIR"
     [ -n "${HKDFGUARD_TPM_OWNER_AUTH_FILE:-}" ] && printf 'owner_auth_file = "%s"\n' "$HKDFGUARD_TPM_OWNER_AUTH_FILE"
     printf '%s\n' "${2:-}"
     if [ -n "$SOFTHSM_MODULE" ]; then

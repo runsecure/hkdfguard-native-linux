@@ -52,6 +52,7 @@
 "pinned_keys"
 "pinned_names"
 "pinned_session_salt_key_name"
+"allow_unpinned_provisioning"
 "pinned_tpm_names"
 "pkcs11"
 "pkcs11.module"

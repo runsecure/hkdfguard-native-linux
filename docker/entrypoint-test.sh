@@ -95,6 +95,7 @@ mode = "prefer"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 key_dir = "$HARNESS/tpm-keys"
 
 [pkcs11]
@@ -266,6 +267,7 @@ provider = "tpm2"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 TOML
 chmod 0644 /etc/hkdfguard/policy.toml
 
@@ -328,6 +330,7 @@ mode = "prefer"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 TOML
 for build in release debug; do
     if OUT=$(as_ci target/$build/hkdfguard provision --service-name $UNTRUSTED_SERVICE 2>&1); then
@@ -481,6 +484,7 @@ provider = "tpm2"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 TOML
 OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision on TPM2: $OUT" >&2; exit 1; }
 FP=$(fingerprint_in "$OUT")
@@ -531,6 +535,7 @@ provider = "tpm2"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 key_dir = "$TMP_ROOT/tpm-keys"
 TOML
 expect_sticky_refusal "the TPM key directory" as_ci $CLI provision -sn $STICKY_SERVICE

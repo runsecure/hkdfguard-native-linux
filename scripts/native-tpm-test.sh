@@ -147,9 +147,11 @@ fi
 # provisions and wraps as whoever runs it), $1 (the [selection] table and
 # anything else top-level), this machine's TPM settings plus any extra
 # [tpm] keys in $2, the SoftHSM2 token if there is one, then any further
-# tables in $3.
+# tables in $3. allow_unpinned_provisioning: the suite provisions before it
+# can learn the storage root key's Name, which the library otherwise
+# refuses; a deployment pins the Name instead (see section 5's output).
 policy() { # policy <selection...> [extra [tpm] keys] [more tables]
-    printf 'security_model = "developer"\n%s\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\n%s\n' "$1" "$TCTI" "$KEY_DIR" "${2:-}"
+    printf 'security_model = "developer"\n%s\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\nallow_unpinned_provisioning = true\n%s\n' "$1" "$TCTI" "$KEY_DIR" "${2:-}"
     if [ "$HAVE_SOFTHSM" -eq 1 ]; then
         printf '\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' "$SOFTHSM_MODULE" "$WORK/pkcs11.pin"
     fi
@@ -318,7 +320,7 @@ REQUIRED_PINS="[tpm.pinned_names]
 \"com.company.orders\" = \"$SVC_NAME\""
 note "with this machine's real key directory in place of the scratch one, this is what a"
 note "hardened deployment on THIS machine would install at /etc/hkdfguard/policy.toml:"
-policy "$REQUIRED_SELECTION" "$REQUIRED_TPM_KEYS" "$REQUIRED_PINS" | sed 's/^/     /'
+policy "$REQUIRED_SELECTION" "$REQUIRED_TPM_KEYS" "$REQUIRED_PINS" | grep -v '^allow_unpinned_provisioning' | sed 's/^/     /'
 
 # ---------------------------------------------------------------------
 # 6. C ABI round trip on the TPM, under both policies

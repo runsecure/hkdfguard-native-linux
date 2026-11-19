@@ -72,7 +72,9 @@
 //!
 //! Provisioning is real: `load_kek(service, true)` creates the authValue
 //! file -- always a new value -- and then the key file if there is none,
-//! holding a lock on the key directory throughout, and a service with no key
+//! holding the key directory's lock (see [`KeyDirLock`]) throughout, and
+//! only under a storage root key whose Name policy pins, unless policy
+//! allows otherwise (see [`check_provisioning_pin`]). A service with no key
 //! file has no KEK here ([`Error::KeyNotProvisioned`]), so the provider
 //! chain moves on. A key file without its authValue file is an error.
 //! `retire_kek` deletes both.
@@ -83,7 +85,7 @@ use crate::provider::{Backend, KekHandle, KekProvider, PrfOutput, ProviderType, 
 use crate::secure_file::{FileIdentity, Owner};
 use sha2::{Digest as ShaDigest, Sha256}; // the payload's key_id tag and TPM Names (aliased to avoid clashing with tss-esapi's own `Digest`)
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd; // the key directory's descriptor, for flock
+use std::os::unix::io::AsRawFd; // the key directory lock file's descriptor, for flock
 use std::path::{Path, PathBuf}; // the key directory and key files
 use std::str::FromStr; // brings `TctiNameConf::from_str` into scope
 use std::sync::{Arc, Mutex, OnceLock}; // shared, lock-protected TPM context; `OnceLock` for the per-process conformance verdict
@@ -379,36 +381,104 @@ fn checked_key_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// An exclusive `flock` on the key directory, held while a service's files
-/// are created or deleted, so provisioning and retiring are one step each
-/// as far as every other process doing either is concerned: a provisioner
-/// that finds no key file can be sure no one else is half-way through
-/// writing one, and so that any authValue file there belongs to no key.
-/// Readers don't take it; the files they read only ever appear whole.
-/// Released when dropped (the descriptor closes).
+/// The lock file's name in the key directory. Hidden, like the temporary
+/// files [`write_key_dir_file`] makes: a service name never starts with '.'.
+const LOCK_FILE_NAME: &str = ".lock";
+
+/// How long [`KeyDirLock::acquire`] waits for another provisioner or
+/// retirer to finish before giving up. Each holds the lock for a handful of
+/// TPM commands, so this is far longer than any honest wait.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// An exclusive `flock`, held while a service's files are created or
+/// deleted, so provisioning and retiring are one step each as far as every
+/// other process doing either is concerned: a provisioner that finds no key
+/// file can be sure no one else is half-way through writing one, and so
+/// that any authValue file there belongs to no key. Readers don't take it;
+/// the files they read only ever appear whole. Released when dropped (the
+/// descriptor closes).
+///
+/// The lock is on a file of its own in the key directory, `.lock`, which
+/// only [`key_owner`] can open (mode `0600`) -- not on the directory.
+/// `flock` needs no more than a descriptor opened for reading, and every
+/// service that uses TPM keys can open the directory (`root:<key-users>
+/// 0750`): any one of them could hold a lock on it for as long as it liked,
+/// and root could then neither provision nor retire a key. Nor does the
+/// wait go on for ever: after [`LOCK_WAIT`] it fails, saying so.
 struct KeyDirLock {
-    _dir: std::fs::File,
+    _file: std::fs::File,
 }
 
 impl KeyDirLock {
     fn acquire() -> Result<KeyDirLock> {
+        Self::acquire_within(LOCK_WAIT)
+    }
+
+    fn acquire_within(wait: std::time::Duration) -> Result<KeyDirLock> {
         let dir = checked_key_dir()?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&dir)
-            .map_err(|e| Error::Provider(format!("could not open TPM key directory {} to lock it: {e}", dir.display())))?;
+        let path = dir.join(LOCK_FILE_NAME);
+        let file = open_lock_file(&path)?;
+        let deadline = std::time::Instant::now() + wait;
         loop {
             // SAFETY: `file` is an open descriptor for the life of this call.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(KeyDirLock { _dir: file });
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(KeyDirLock { _file: file });
             }
             let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(Error::Provider(format!("could not lock TPM key directory {}: {e}", dir.display())));
+            match e.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EWOULDBLOCK) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Some(libc::EWOULDBLOCK) => {
+                    return Err(Error::Provider(format!(
+                        "the TPM key directory's lock ({}) is still held after {} seconds, by another process                          provisioning or retiring a key; nothing was changed. Run this again once that process has                          finished",
+                        path.display(),
+                        wait.as_secs()
+                    )));
+                }
+                _ => return Err(Error::Provider(format!("could not lock {}: {e}", path.display()))),
             }
         }
     }
+}
+
+/// Opens the key directory's lock file, creating it if this is the first
+/// lock taken there. The directory is already known to be writable by
+/// nobody but [`key_owner`] (see [`checked_key_dir`]), so whatever is at
+/// the name was put there by them; it is checked all the same, on the
+/// opened descriptor, and given mode `0600` with no ACL -- a default ACL on
+/// the directory would otherwise let whoever it names open the file, and
+/// so hold the lock.
+fn open_lock_file(path: &Path) -> Result<std::fs::File> {
+    use crate::secure_file::PrincipalTrust;
+
+    let fail = |why: String| Error::Provider(format!("TPM key directory lock file {}: {why}", path.display()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true) // `create` needs it; nothing is ever written
+        .create(true)
+        .mode(0o600)
+        // O_NOFOLLOW: never through a symlink. O_NONBLOCK: a FIFO at the
+        // name can't hang the open; the regular-file check then refuses it.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            fail(format!(
+                "could not be opened ({e}). Only the account that may create TPM keys here can take the lock: root,                  under the production security model"
+            ))
+        })?;
+    let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
+    if !meta.file_type().is_file() {
+        return Err(fail("is not a regular file".into()));
+    }
+    if !key_owner()?.trusts_owner(meta.uid()) {
+        return Err(fail(format!("is owned by uid {}, which may not create TPM keys here", meta.uid())));
+    }
+    crate::secure_file::strip_acl(&file).map_err(|e| fail(format!("could not remove its ACL: {e}")))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| fail(format!("could not set its mode to 0600: {e}")))?;
+    Ok(file)
 }
 
 /// Writes `<service><suffix>` into the key directory. `what` names the file
@@ -1325,6 +1395,52 @@ fn create_srk(ctx: &mut Context) -> Result<KeyHandle> {
 /// Logged once: a key was provisioned under an unpinned SRK.
 static UNPINNED_SALT_KEY_WARNED: OnceLock<()> = OnceLock::new();
 
+/// Whether policy pins the SRK's Name (`tpm.pinned_session_salt_key_name`).
+/// `Err` on a policy that exists but can't be trusted.
+fn srk_is_pinned() -> Result<bool> {
+    Ok(crate::policy::pinned_session_salt_key_name()?.is_some())
+}
+
+/// Refuses to provision a service key while policy pins no SRK Name,
+/// unless it says to go ahead (`tpm.allow_unpinned_provisioning`).
+///
+/// `TPM2_Create` is the one command whose session has no secret but its
+/// salt, and the salt is encrypted to the SRK `TPM2_CreatePrimary` returned
+/// (see [`create_service_key`]). Unpinned, that SRK is whatever answered:
+/// someone rewriting a discrete TPM's bus traffic could answer with a key
+/// of their own, read the new key's authValue, and from then on read and
+/// replace every wrapping key `TPM2_HMAC` returns for the service. Nothing
+/// read over the bus can show that a TPM has none, so this isn't left to a
+/// warning. The refusal carries the SRK's Name, as reported now, in the
+/// form to paste into policy.
+///
+/// Called before anything is written for the service, and again by
+/// [`create_service_key`] itself, so no caller can skip it.
+fn check_provisioning_pin(ctx: &mut Context) -> Result<()> {
+    if srk_is_pinned()? || crate::policy::tpm_allow_unpinned_provisioning() {
+        return Ok(());
+    }
+    let (handle, _public, name) = create_srk_unpinned(ctx)?;
+    let _ = ctx.flush_context(handle.into());
+    Err(Error::Provider(unpinned_srk_instructions(name.value())))
+}
+
+/// The message `provision` gets when policy pins no SRK Name: why it was
+/// refused, and the Name this TPM reports, ready to pin. A Name is public.
+fn unpinned_srk_instructions(name: &[u8]) -> String {
+    let name = hex(name);
+    format!(
+        "refusing to provision a TPM key: policy pins no storage root key (tpm.pinned_session_salt_key_name). A new \
+         key's authValue is sent to the TPM encrypted to that key, so on a TPM reached over a bus, someone able to \
+         rewrite bus traffic during provisioning could put their own key in its place and learn the authValue. \
+         Nothing was created. This TPM reports its storage root key's Name as {name}. Add this to the [tpm] table \
+         of the policy file and provision again:\n  pinned_session_salt_key_name = \"{name}\"\nThe Name stays the \
+         same until the TPM is cleared; if it was recorded when the host was set up, check it against that. For a \
+         TPM with no bus to tamper with (a firmware or virtual TPM), allow_unpinned_provisioning = true in the same \
+         table provisions without a pin instead"
+    )
+}
+
 /// Creates a new service key under the SRK, with `auth` as its authValue.
 /// Returns it as a key file's contents; nothing stays loaded.
 ///
@@ -1332,14 +1448,17 @@ static UNPINNED_SALT_KEY_WARNED: OnceLock<()> = OnceLock::new();
 /// encrypting session, whatever `tpm.session_encryption` says: this is the
 /// one time the authValue crosses the bus, and it never does in cleartext.
 /// The salt is the session's only secret here, so this command is as safe
-/// as the SRK it is salted to -- see `tpm.pinned_session_salt_key_name`.
+/// as the SRK it is salted to: with no Name pinned for that
+/// (`tpm.pinned_session_salt_key_name`), nothing is created unless policy
+/// allows it -- see [`check_provisioning_pin`].
 fn create_service_key(ctx: &mut Context, auth: &Auth) -> Result<KeyBlob> {
-    if crate::policy::pinned_session_salt_key_name()?.is_none() {
+    check_provisioning_pin(ctx)?;
+    if !srk_is_pinned()? {
         UNPINNED_SALT_KEY_WARNED.get_or_init(|| {
             log::warn!(
-                "hkdfguard: provisioning a TPM key under an unpinned storage root key; on a discrete TPM, someone \
-                 able to rewrite bus traffic now could learn the key's authValue. Set \
-                 tpm.pinned_session_salt_key_name to rule that out"
+                "hkdfguard: provisioning a TPM key under an unpinned storage root key, as \
+                 tpm.allow_unpinned_provisioning allows; on a discrete TPM, someone able to rewrite bus traffic now \
+                 could learn the key's authValue. Set tpm.pinned_session_salt_key_name to rule that out"
             );
         });
     }
@@ -1427,7 +1546,9 @@ fn load_service_key(
 // specification's one-pass ECDH, and the one classical step left. It
 // stands alone only at `TPM2_Create`, which sends a new key's authValue
 // and so can't be protected by it; `tpm.pinned_session_salt_key_name`
-// closes that against an interposer active at provisioning, and the ECDH
+// closes that against an interposer active at provisioning -- and without
+// it provisioning is refused, unless policy opts out (see
+// `check_provisioning_pin`) -- and the ECDH
 // is the residual against one who records provisioning and later breaks
 // P-256.
 //
@@ -1653,11 +1774,19 @@ impl KekProvider for Tpm2Provider {
                 match read_key_file(service)? {
                     Some(file) => (file, required_auth_file(service)?),
                     None => {
+                        // Before anything is written: no key is created
+                        // under an unpinned SRK unless policy allows it.
+                        with_context(&self.context, check_provisioning_pin)?;
                         // The authValue file first, so the key file never
                         // exists without one.
                         let auth = provision_auth_file(service)?;
                         let blob = with_context(&self.context, |ctx| create_service_key(ctx, &auth))?;
                         write_key_file(service, &blob)?;
+                        if !srk_is_pinned()? {
+                            // Only reachable under the opt-out; the `log`
+                            // warning goes nowhere in a host with no logger.
+                            crate::audit::tpm_key_provisioned_unpinned(service);
+                        }
                         // Re-read rather than trusting `blob`: the file on
                         // disk is the key every later call uses.
                         let file = read_key_file(service)?
@@ -2318,20 +2447,31 @@ mod tests {
         });
     }
 
+    // A non-blocking exclusive `flock` on `path` through an open file
+    // description of its own, as another process's would be: whether it
+    // was granted, and the descriptor holding it.
+    fn try_flock(path: &Path) -> (bool, std::fs::File) {
+        let file = std::fs::File::open(path).unwrap();
+        // SAFETY: `file` is open for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        (rc == 0, file)
+    }
+
     #[test]
     #[serial]
     fn the_key_dir_lock_excludes_every_other_holder_until_dropped() {
         with_key_dir(|dir| {
-            let try_lock = || {
-                let other = std::fs::File::open(dir).unwrap(); // its own open file description, as another process's
-                // SAFETY: `other` is open for the duration of the call.
-                let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                (rc == 0, std::io::Error::last_os_error().raw_os_error())
-            };
+            let lock_file = dir.join(LOCK_FILE_NAME);
             let lock = KeyDirLock::acquire().unwrap();
-            assert_eq!(try_lock(), (false, Some(libc::EWOULDBLOCK)), "held: nobody else gets it");
+            assert!(!try_flock(&lock_file).0, "held: nobody else gets it");
+            // A second provisioner waits, then gives up without changing anything.
+            match KeyDirLock::acquire_within(std::time::Duration::from_millis(120)) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("still held") && msg.contains("nothing was changed"), "{msg}"),
+                other => panic!("expected a timeout, got {:?}", other.map(|_| ())),
+            }
             drop(lock);
-            assert!(try_lock().0, "dropped: free again");
+            assert!(try_flock(&lock_file).0, "dropped: free again");
+            KeyDirLock::acquire().expect("and it can be taken again");
         });
         // A missing key directory: the same instructions as writing into one.
         let dir = crate::secure_file::private_tempdir();
@@ -2341,6 +2481,69 @@ mod tests {
                 other => panic!("expected instructions, got {:?}", other.map(|_| ())),
             }
         });
+    }
+
+    #[test]
+    #[serial]
+    fn a_lock_held_on_the_key_directory_itself_blocks_nothing() {
+        // What any account that can open the directory could do: every
+        // service using TPM keys can, and `flock` asks no more of it.
+        with_key_dir(|dir| {
+            let (granted, _held) = try_flock(dir);
+            assert!(granted);
+            KeyDirLock::acquire_within(std::time::Duration::from_millis(120)).expect("the directory's own lock is not the one taken");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn the_lock_file_is_one_only_its_owner_can_open() {
+        with_key_dir(|dir| {
+            let lock_file = dir.join(LOCK_FILE_NAME);
+            drop(KeyDirLock::acquire().unwrap());
+            let meta = std::fs::symlink_metadata(&lock_file).unwrap();
+            assert!(meta.file_type().is_file());
+            assert_eq!(meta.mode() & 0o7777, 0o600);
+            assert_eq!(meta.len(), 0, "nothing is ever written to it");
+
+            // One left with a broader mode is narrowed before it is locked.
+            std::fs::set_permissions(&lock_file, std::fs::Permissions::from_mode(0o664)).unwrap();
+            drop(KeyDirLock::acquire().unwrap());
+            assert_eq!(std::fs::metadata(&lock_file).unwrap().mode() & 0o7777, 0o600);
+
+            // Anything but a regular file at the name is refused, not
+            // followed or waited on: a symlink, a FIFO, a directory.
+            std::fs::remove_file(&lock_file).unwrap();
+            let elsewhere = dir.join("elsewhere");
+            std::fs::write(&elsewhere, b"").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &lock_file).unwrap();
+            assert!(matches!(KeyDirLock::acquire(), Err(Error::Provider(_))), "a symlink is not followed");
+            std::fs::remove_file(&lock_file).unwrap();
+
+            let c_path = std::ffi::CString::new(lock_file.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `c_path` is a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            match KeyDirLock::acquire() {
+                Err(Error::Provider(msg)) => assert!(msg.contains("not a regular file"), "{msg}"),
+                other => panic!("a FIFO must be refused, got {:?}", other.map(|_| ())),
+            }
+            std::fs::remove_file(&lock_file).unwrap();
+
+            std::fs::create_dir(&lock_file).unwrap();
+            assert!(matches!(KeyDirLock::acquire(), Err(Error::Provider(_))), "a directory is refused");
+        });
+    }
+
+    #[test]
+    fn the_unpinned_srk_refusal_carries_the_name_ready_to_pin() {
+        let name = [vec![0x00, 0x0b], vec![0xa5; 32]].concat();
+        let msg = unpinned_srk_instructions(&name);
+        let name_hex = hex(&name);
+        assert!(msg.contains(&format!("pinned_session_salt_key_name = \"{name_hex}\"")), "{msg}");
+        assert!(msg.contains("Nothing was created") && msg.contains("allow_unpinned_provisioning = true"), "{msg}");
+        // What it prints is what the policy accepts.
+        let doc = format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\npinned_session_salt_key_name = \"{name_hex}\"\n");
+        assert_eq!(crate::policy::Policy::from_toml_str(&doc).unwrap().pinned_session_salt_key_name(), Some(name.as_slice()));
     }
 
     #[test]
@@ -2888,6 +3091,51 @@ mod tests {
             .unwrap();
             assert!(refused, "TPM2_HMAC with the restricted SRK must be refused by the TPM");
             assert!(accepted, "the control: a service key accepts the same input");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn provisioning_under_an_unpinned_srk_is_refused_unless_policy_allows_it() {
+        let name_hex = hex(&srk_name());
+        with_key_dir(|dir| {
+            // Neither pinned nor allowed: refused with the Name to pin, and
+            // nothing written for the service -- no key file, no authValue file.
+            with_policy("[tpm]\nallow_unpinned_provisioning = false\n", || {
+                let tpm = provider();
+                match tpm.load_kek(SERVICE, true) {
+                    Err(Error::Provider(msg)) => {
+                        assert!(msg.contains(&format!("pinned_session_salt_key_name = \"{name_hex}\"")), "{msg}");
+                    }
+                    other => panic!("expected the refusal, got {:?}", other.map(|_| ())),
+                }
+                assert!(!tpm.kek_exists(SERVICE).unwrap());
+                assert!(!key_file_path(dir, SERVICE).exists() && !auth_file_path(dir, SERVICE).exists());
+                // The primitive refuses on its own account too.
+                let auth = Auth::try_from(generate_auth_value().unwrap().to_vec()).unwrap();
+                assert!(matches!(with_tpm_context(|ctx| create_service_key(ctx, &auth)), Err(Error::Provider(_))));
+            });
+
+            // Pinned: provisioned, whatever the opt-out says.
+            with_policy(
+                &format!("[tpm]\nallow_unpinned_provisioning = false\npinned_session_salt_key_name = \"{name_hex}\"\n"),
+                || {
+                    provider().load_kek(SERVICE, true).expect("a pinned SRK provisions");
+                },
+            );
+            assert!(key_file_path(dir, SERVICE).exists());
+            // A key that exists is used with or without a pin: the gate is
+            // on creating one.
+            with_policy("[tpm]\nallow_unpinned_provisioning = false\n", || prf_output(SERVICE, false, b"input")).unwrap();
+
+            // Allowed: provisioned without a pin, and audited.
+            let other = "com.company.unpinned";
+            with_policy("[tpm]\nallow_unpinned_provisioning = true\n", || {
+                provider().load_kek(other, true).expect("the opt-out provisions");
+            });
+            let audited = crate::audit::captured_containing(other);
+            assert!(audited.iter().any(|r| r.contains("event=1007 ")), "{audited:?}");
         });
     }
 

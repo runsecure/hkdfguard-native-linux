@@ -356,6 +356,15 @@ struct TpmPolicy {
     /// learn it. After provisioning the authValue protects every session
     /// on its own (see `crate::provider::tpm2`).
     pinned_session_salt_key_name: Option<String>,
+    /// Let `provision` create a service key while
+    /// `pinned_session_salt_key_name` is unset. Default `false`: with no
+    /// pin, provisioning is refused, with the storage root key's Name to
+    /// pin in the message. `true` is for a TPM with no bus to tamper with
+    /// (a firmware or virtual TPM) and for test harnesses; a key
+    /// provisioned under it is audited (event 1007). Ignored once a Name
+    /// is pinned.
+    #[serde(default)]
+    allow_unpinned_provisioning: bool,
     /// Which TPM to talk to, as a tpm2-tss TCTI string:
     /// `device:/dev/tpmrm0` (the default when unset), `tabrmd:...`,
     /// `mssim:...` or `swtpm:...`. Set here, by root, because it decides
@@ -587,6 +596,7 @@ pub struct Policy {
     pinned_tpm_names: BTreeMap<String, Vec<u8>>,
     tpm_session_encryption: SessionEncryption,
     pinned_session_salt_key_name: Option<Vec<u8>>,
+    tpm_allow_unpinned_provisioning: bool,
     tpm_tcti: Option<String>,
     tpm_key_dir: Option<PathBuf>,
     tpm_owner_auth_file: Option<PathBuf>,
@@ -815,6 +825,7 @@ impl Policy {
             pinned_tpm_names,
             tpm_session_encryption: raw.tpm.session_encryption,
             pinned_session_salt_key_name,
+            tpm_allow_unpinned_provisioning: raw.tpm.allow_unpinned_provisioning,
             tpm_tcti: raw.tpm.tcti,
             tpm_key_dir,
             tpm_owner_auth_file,
@@ -891,6 +902,12 @@ impl Policy {
     /// The administrator-pinned Name of the session salt key, if any.
     pub fn pinned_session_salt_key_name(&self) -> Option<&[u8]> {
         self.pinned_session_salt_key_name.as_deref()
+    }
+
+    /// Whether a TPM key may be provisioned with no storage root key Name
+    /// pinned (`tpm.allow_unpinned_provisioning`).
+    pub fn tpm_allow_unpinned_provisioning(&self) -> bool {
+        self.tpm_allow_unpinned_provisioning
     }
 
     /// The floor on how long each setup call (`hkdfguard_create_kek`,
@@ -1325,6 +1342,18 @@ pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
         Some(Ok(policy)) => Ok(policy.pinned_session_salt_key_name().map(|n| n.to_vec())),
         Some(Err(e)) => Err(e),
         None => Ok(None),
+    }
+}
+
+/// Whether a TPM key may be provisioned with no storage root key Name
+/// pinned (`tpm.allow_unpinned_provisioning`). `false` unless a valid policy
+/// sets it: with no policy file, or one that can't be trusted, provisioning
+/// under an unpinned storage root key is refused.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_allow_unpinned_provisioning() -> bool {
+    match load() {
+        Some(Ok(policy)) => policy.tpm_allow_unpinned_provisioning(),
+        Some(Err(_)) | None => false,
     }
 }
 
@@ -2278,6 +2307,26 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn unpinned_provisioning_is_off_unless_a_valid_policy_allows_it() {
+        let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        assert!(!Policy::from_toml_str(base).unwrap().tpm_allow_unpinned_provisioning(), "unset: refused");
+        let allowed = format!("{base}[tpm]\nallow_unpinned_provisioning = true\n");
+        assert!(Policy::from_toml_str(&allowed).unwrap().tpm_allow_unpinned_provisioning());
+        assert!(Policy::from_toml_str(&format!("{base}[tpm]\nallow_unpinned_provisioning = \"yes\"\n")).is_err(), "a boolean, nothing else");
+
+        // No policy file, and a policy that can't be used: both refuse.
+        let no_policy = TestPolicy::absent();
+        assert!(!tpm_allow_unpinned_provisioning());
+        drop(no_policy);
+        let broken = TestPolicy::exact("[selection]\nmode = \"require\"\n[tpm]\nallow_unpinned_provisioning = true\n");
+        assert!(!tpm_allow_unpinned_provisioning(), "a broken policy must never be what allows it");
+        drop(broken);
+        let _allowed = TestPolicy::exact(&allowed);
+        assert!(tpm_allow_unpinned_provisioning());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn session_encryption_helpers_fail_closed() {
         // No policy: on, nothing pinned.
         let _no_policy = TestPolicy::absent();
@@ -2495,6 +2544,7 @@ mod tests {
         assert!(policy.pinned_tpm_name("com.company.orders").is_none());
         assert_eq!(policy.tpm_session_encryption(), SessionEncryption::On);
         assert!(policy.pinned_session_salt_key_name().is_none());
+        assert!(!policy.tpm_allow_unpinned_provisioning());
         assert!(policy.tpm_tcti().is_none());
         assert!(policy.tpm_key_dir().is_none());
         assert!(policy.tpm_owner_auth_file().is_none());
