@@ -230,6 +230,11 @@ pub const MAX_SECRET_WRAPPED_LEN: usize = MIN_SECRET_WRAPPED_LEN + MAX_KEY_ID_LE
 
 /// The KEK fingerprint and a payload's wrapping key, from one PRF call to
 /// the provider (see the module doc).
+///
+/// The wrapping key comes back in a self-wiping stack buffer. On its way
+/// here it sits in the `Vec` [`KekHandle::prf`] returns, which is wiped
+/// before it is freed (see below); what a provider's own library leaves
+/// behind while computing it is that library's (see each provider's `prf`).
 fn derive_keys(
     handle: &dyn KekHandle,
     label: &[u8],
@@ -238,20 +243,24 @@ fn derive_keys(
 ) -> Result<([u8; FINGERPRINT_LEN], PrfOutput)> {
     let fingerprint_input = fingerprint_block();
     let wrap_input = labeled_wrap_block(label, service, header);
-    let mut outputs = handle.prf(&[&fingerprint_input, &wrap_input])?;
-    let (Some(wrapping_key), Some(fingerprint), None) = (outputs.pop(), outputs.pop(), outputs.pop()) else {
+    let outputs = handle.prf(&[&fingerprint_input, &wrap_input])?;
+    // Copied out, never moved out: `outputs` is a heap `Vec`, and taking an
+    // element by value (`pop`, `into_iter`) leaves its bytes behind in the
+    // buffer, which is then freed unwiped. Left in place, each element is
+    // zeroed where it sits when the `Vec` drops, on every path out of here.
+    let [fingerprint, wrapping_key] = outputs.as_slice() else {
         return Err(Error::Provider("the KEK returned the wrong number of PRF outputs".into()));
     };
-    Ok((*fingerprint, wrapping_key))
+    Ok((**fingerprint, wrapping_key.clone()))
 }
 
 /// This KEK's fingerprint (see the module doc): what every payload it
 /// wraps carries, what `hkdfguard_kek_fingerprint` reports, and what
 /// policy pins for an external secret. Public, so returned unwrapped.
 pub(crate) fn kek_fingerprint(handle: &dyn KekHandle) -> Result<[u8; FINGERPRINT_LEN]> {
-    let mut outputs = handle.prf(&[&fingerprint_block()])?;
-    match (outputs.pop(), outputs.pop()) {
-        (Some(fingerprint), None) => Ok(*fingerprint),
+    let outputs = handle.prf(&[&fingerprint_block()])?;
+    match outputs.as_slice() {
+        [fingerprint] => Ok(**fingerprint),
         _ => Err(Error::Provider("the KEK returned the wrong number of PRF outputs".into())),
     }
 }
@@ -365,7 +374,7 @@ fn seal<const N: usize>(label: &[u8], service: &str, plaintext: &[u8; N]) -> Res
     };
     salt.zeroize(); // already copied into the payload; don't leave a second copy on the stack
 
-    let (fingerprint, mut wrapping_key) = derive_keys(&*handle, label, service, &payload.header_bytes())?; // only the KEK's holder can compute these (already stack-only: see `provider::PrfOutput`)
+    let (fingerprint, mut wrapping_key) = derive_keys(&*handle, label, service, &payload.header_bytes())?; // only the KEK's holder can compute these (self-wiping: see `derive_keys`)
     payload.fingerprint = fingerprint; // identifies *which* KEK this payload is wrapped under, for `unwrap` to check before decrypting
     // Every non-ciphertext byte of the payload, as the AEAD's associated
     // data -- see `Payload::authenticated_bytes`. This is what

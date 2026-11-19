@@ -1639,11 +1639,13 @@ fn tpm_hmac(ctx: &mut Context, session: Option<AuthSession>, key: KeyHandle, inp
         Some(session) => ctx.execute_with_session(Some(session), |ctx| ctx.hmac(key.into(), buffer, HashingAlgorithm::Sha256)),
         None => ctx.execute_with_nullauth_session(|ctx| ctx.hmac(key.into(), buffer, HashingAlgorithm::Sha256)),
     }
-    .map_err(|e| Error::Provider(format!("TPM2_HMAC failed: {e}")))?; // a `Digest` wipes itself on drop
+    .map_err(|e| Error::Provider(format!("TPM2_HMAC failed: {e}")))?; // this `Digest` wipes itself on drop; the copies tss-esapi and libtss2 made on the way to it are theirs, and aren't wiped
     if mac.value().len() != 32 {
         return Err(Error::Provider(format!("TPM2_HMAC returned {} bytes, not an HMAC-SHA-256", mac.value().len())));
     }
-    let mut out = PrfOutput::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
+    // Self-wiping from here on. Returning it moves it, though, and a move
+    // may leave a copy in the stack frame it came from.
+    let mut out = PrfOutput::new([0u8; 32]);
     out.copy_from_slice(mac.value());
     Ok(out)
 }
@@ -1672,7 +1674,7 @@ fn tpm_prf(
     };
     let session = if session_encryption_enabled() { start_encrypted_session(ctx, srk) } else { start_plain_session(ctx) };
     let outputs = session.and_then(|session| {
-        let outputs = inputs.iter().map(|input| tpm_hmac(ctx, Some(session), key, input)).collect();
+        let outputs = crate::provider::collect_outputs(inputs, |input| tpm_hmac(ctx, Some(session), key, input));
         let _ = ctx.flush_context(SessionHandle::from(session).into());
         outputs
     });

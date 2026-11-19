@@ -374,25 +374,37 @@ fn select_token(tokens: &[(String, String)], label: Option<&str>, serial: Option
 }
 
 /// Checks a PKCS#11 module path before it's ever `dlopen`ed: it must be
-/// absolute, and after resolving symlinks, the module file must be owned
-/// by root and not writable by group or others, and so must its directory
-/// and every directory above it, sticky or not (see
-/// [`crate::secure_file::check_dir_chain`]).
+/// absolute; every directory that decides what it names -- each one it
+/// passes through, and each one a symlink along the way lives in, every
+/// one up to `/` -- must be owned by root and not writable by group or
+/// others, sticky or not (see [`crate::secure_file::resolve_trusted`]); and
+/// the module file it resolves to must be owned by root and not writable
+/// by anyone else.
 /// Returns the canonical (symlink-resolved) path -- the one that was
 /// actually checked -- so that's exactly what gets loaded.
 ///
 /// Loading a module runs its code inside this process. Checking only the
 /// file and its immediate directory isn't enough: a non-root user who can
 /// write to any ancestor can rename the module's directory away and put
-/// their own in its place between this check and the `dlopen`. With the
-/// whole chain root-controlled, nothing on the path can change in between.
+/// their own in its place between this check and the `dlopen`. Nor is
+/// checking only where the path ends up: with `module =
+/// "/opt/vendor/current/libhsm.so"` and `/opt/vendor` owned by a deploy
+/// account, that account can point `current` at any root-owned directory
+/// holding a `libhsm.so` -- a software token's, say, whose "HSM" then holds
+/// every KEK in files -- and the file loaded would pass every check made
+/// on it. With every directory on the way root-controlled, nothing about
+/// what the path names can change, before the check or after it.
 fn validate_module_path(path: &Path) -> std::result::Result<PathBuf, String> {
     use crate::secure_file::{check_dir_chain, check_metadata, Owner, FORBID_GROUP_OTHER_WRITE};
 
     if !path.is_absolute() {
         return Err(format!("PKCS#11 module path {path:?} must be absolute"));
     }
-    let canonical = std::fs::canonicalize(path).map_err(|e| format!("PKCS#11 module {path:?}: {e}"))?;
+    // Resolved one component at a time, each directory a lookup happens in
+    // checked first -- the ones symlinks on the way live in included.
+    let canonical = crate::secure_file::resolve_trusted(path, &Owner::Root)
+        .map_err(|e| format!("refusing to load PKCS#11 module {path:?}: {e}"))?
+        .ok_or_else(|| format!("PKCS#11 module {path:?}: no such file"))?;
 
     let file_meta = std::fs::metadata(&canonical).map_err(|e| format!("PKCS#11 module {}: {e}", canonical.display()))?;
     check_metadata(&file_meta, Some(Owner::Root), FORBID_GROUP_OTHER_WRITE)
@@ -765,7 +777,7 @@ impl KekHandle for Pkcs11Handle {
         let open = guard
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?; // session setup failed at construction time
-        inputs.iter().map(|input| token_hmac(&open.session, self.key, input)).collect()
+        crate::provider::collect_outputs(inputs, |input| token_hmac(&open.session, self.key, input))
     }
 }
 
@@ -781,7 +793,10 @@ fn token_hmac(session: &Session, key: ObjectHandle, input: &[u8]) -> Result<PrfO
     if mac.len() != 32 {
         return Err(Error::Provider(format!("PKCS#11 token returned a {}-byte HMAC-SHA-256", mac.len())));
     }
-    let mut out = PrfOutput::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
+    // Self-wiping from here on. Returning it moves it, though, and a move
+    // may leave a copy in the stack frame it came from; and the PKCS#11
+    // module's own buffers are the module's to wipe.
+    let mut out = PrfOutput::new([0u8; 32]);
     out.copy_from_slice(&mac);
     Ok(out)
 }
@@ -799,7 +814,7 @@ impl KekHandle for SessionKey<'_> {
     }
 
     fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
-        inputs.iter().map(|input| token_hmac(self.session, self.key, input)).collect()
+        crate::provider::collect_outputs(inputs, |input| token_hmac(self.session, self.key, input))
     }
 }
 
@@ -1635,6 +1650,29 @@ mod tests {
         let f = pin_file(b"not really a module", 0o755);
         let err = validate_module_path(f.path()).unwrap_err();
         assert!(err.contains("refusing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_module_path_through_a_link_someone_else_could_retarget_is_rejected() {
+        if crate::secure_file::skip_as_root() {
+            return; // as root, the directory the link lives in is root-owned too
+        }
+        // The file the path ends at is one validation accepts (see the next
+        // test): what is refused is the route to it, through a directory
+        // this (non-root) user owns and could repoint at any time.
+        let dir = crate::secure_file::private_tempdir();
+        let system = Path::new("/bin/sh");
+        validate_module_path(system).expect("the control: the target itself passes");
+
+        let file_link = dir.path().join("libhsm.so");
+        std::os::unix::fs::symlink(system, &file_link).unwrap();
+        let dir_link = dir.path().join("current");
+        std::os::unix::fs::symlink(system.parent().unwrap(), &dir_link).unwrap();
+        for through in [file_link, dir_link.join("sh")] {
+            assert_eq!(std::fs::canonicalize(&through).unwrap(), std::fs::canonicalize(system).unwrap(), "it does lead there");
+            let err = validate_module_path(&through).unwrap_err();
+            assert!(err.contains("refusing") && err.contains("not an allowed owner"), "{}: {err}", through.display());
+        }
     }
 
     #[test]

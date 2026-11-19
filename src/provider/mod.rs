@@ -78,16 +78,29 @@ pub(crate) fn random_kek_for_tests() -> [u8; KEK_LEN] {
 #[cfg(any(feature = "external-secret", feature = "ephemeral", feature = "tpm2", test))]
 pub(crate) fn software_prf(key: &[u8; KEK_LEN], inputs: &[&[u8]]) -> Vec<PrfOutput> {
     use hmac::{Hmac, KeyInit, Mac};
-    inputs
-        .iter()
-        .map(|input| {
-            let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
-            mac.update(input);
-            let mut out = PrfOutput::new([0u8; 32]);
-            out.copy_from_slice(&mac.finalize().into_bytes());
-            out
-        })
-        .collect()
+    collect_outputs(inputs, |input| {
+        let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(input);
+        let mut out = PrfOutput::new([0u8; 32]);
+        out.copy_from_slice(&mac.finalize().into_bytes());
+        Ok(out)
+    })
+    .expect("software HMAC cannot fail")
+}
+
+/// One PRF output per input, from `one`, in a `Vec` allocated once at its
+/// final size -- what [`KekHandle::prf`] promises. Collecting an iterator
+/// of `Result`s gives no such guarantee: it can't know the length up
+/// front, so the `Vec` grows as it goes, and each growth frees a buffer
+/// with outputs still in it. Stops at the first error; the outputs so far
+/// are zeroed as the `Vec` drops.
+#[cfg(any(feature = "external-secret", feature = "ephemeral", feature = "tpm2", feature = "pkcs11", test))]
+pub(crate) fn collect_outputs(inputs: &[&[u8]], mut one: impl FnMut(&[u8]) -> Result<PrfOutput>) -> Result<Vec<PrfOutput>> {
+    let mut outputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        outputs.push(one(input)?);
+    }
+    Ok(outputs)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] // cheap to copy/compare/hash; needed for logging, matching, and use as a map-ish key
@@ -165,6 +178,11 @@ pub trait KekHandle {
     /// TPM each session costs a key load. Each input is one SP 800-108
     /// block, at most [`crate::crypto::MAX_PRF_INPUT_LEN`] bytes. Never
     /// exposes the key itself.
+    ///
+    /// The `Vec` is allocated once, at its final size, and never grown: a
+    /// reallocation would free the old buffer with outputs still in it.
+    /// Callers read the outputs in place and let the `Vec` drop, which
+    /// zeroes each one where it sits (see `crypto::derive_keys`).
     fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>>;
 }
 
