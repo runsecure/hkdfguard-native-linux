@@ -1915,7 +1915,9 @@ fn stage_key_file(
 // and checked first (`open_for_shredding`); anything refused there leaves
 // both as they were. Once the rename is done the new key file is in place,
 // so a failure overwriting the old one -- or not being allowed to try -- is
-// returned as a warning, not an error.
+// returned as a warning, not an error. The old file is overwritten before
+// the checks that follow the rename, so none of them failing leaves it
+// intact on the disk.
 fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool) -> Result<Option<String>, String> {
     let StagedKeyFile { file, temp } = staged;
     let fail = |e: String| {
@@ -1960,18 +1962,10 @@ fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool
             Err(e) => return fail(format!("failed to create {shown}: {e}")),
         }
     }
-    // The spelled path must now name the very file staged. Compared by
-    // device and inode: /proc/self/fd still shows the temporary name the
-    // descriptor was opened under, even once that name is gone.
-    let (Ok(staged_meta), Ok(named)) = (file.metadata(), fs::symlink_metadata(&spelled)) else {
-        return Err(format!("could not confirm {shown} was written: it can't be examined"));
-    };
-    if (staged_meta.dev(), staged_meta.ino()) != (named.dev(), named.ino()) {
-        return Err(format!("{shown} was replaced by something else right after it was written; check its contents"));
-    }
-    sync_parent_folder(&spelled).map_err(|e| format!("failed to flush the folder of {shown} to storage: {e}"))?;
-
-    Ok(match old {
+    // The old file first, before anything below can return: the rename has
+    // happened, so whatever else goes wrong it has lost its name, and this
+    // descriptor is the last chance to overwrite it.
+    let old_file_warning = match old {
         None => None,
         Some(OldKeyFile::Shred(old_file, len)) => shred_replaced(old_file, len, path)
             .err()
@@ -1981,7 +1975,29 @@ fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool
              ({e}), so its contents may remain on the disk until those blocks are reused. Run --force as the \
              file's owner (or root) to have it overwritten"
         )),
-    })
+    };
+    // An error from here on still carries what happened to the old file.
+    let after_publish = |e: String| match &old_file_warning {
+        Some(warning) => format!("{e}; {warning}"),
+        None => e,
+    };
+
+    // The spelled path must now name the very file staged. Compared by
+    // device and inode: /proc/self/fd still shows the temporary name the
+    // descriptor was opened under, even once that name is gone.
+    let (Ok(staged_meta), Ok(named)) = (file.metadata(), fs::symlink_metadata(&spelled)) else {
+        return Err(after_publish(format!("could not confirm {shown} was written: it can't be examined")));
+    };
+    if (staged_meta.dev(), staged_meta.ino()) != (named.dev(), named.ino()) {
+        return Err(after_publish(format!(
+            "{shown} was replaced by something else right after it was written; check its contents"
+        )));
+    }
+    sync_parent_folder(&spelled).map_err(|e| {
+        after_publish(format!("{shown} was written, but its folder could not be flushed to storage, so it may not survive a crash: {e}"))
+    })?;
+
+    Ok(old_file_warning)
 }
 
 // fsync on the folder, so the key file's directory entry -- not just its

@@ -189,9 +189,10 @@ with what each code means, is in [docs/usage.md](docs/usage.md#the-c-api).
 creates the `service`'s KEK on the first one that is available.
 `hkdfguard_wrap_dek` walks the same order but only ever *loads*: it uses
 the first provider that already holds a KEK for `service`, and never
-creates one. `hkdfguard_unwrap_dek` always uses the exact provider that
-wrapped the payload (recorded -- and authenticated -- in the
-payload itself, never in `service`). Providers are constructed fresh on
+creates one. `hkdfguard_unwrap_dek` uses the exact provider that
+wrapped the payload (recorded in the payload itself, never in `service`)
+-- and refuses the payload if a provider earlier in the order holds a KEK
+for `service` now (see `selection.allow_unwrap_from_lower_provider`). Providers are constructed fresh on
 every call; no session, login, or device connection is kept open between
 calls. (A PKCS#11 *module* stays loaded and initialized for the life of
 the process -- see "Nothing is cached between calls" under "Design
@@ -1078,8 +1079,11 @@ held to the same standard as the PKCS#11 PIN and the TPM owner password.
   file. Generate one with `head -c 32 /dev/urandom > <file>` or
   `openssl rand -out <file> 32`;
 
-- be **owned by root or by the process's user**, with **no group or other
-  access** — `0400` or `0600`. A root-owned file may also be readable by
+- be **owned by root**, with **no group or other
+  access** — `0400` or `0600`. A file owned by the process's own user is
+  accepted only under the developer security model, or when policy pins
+  the service's key (`external_secret.pinned_keys`): under the production
+  model only root creates a KEK, and a file in the mount is one. A root-owned file may also be readable by
   its group (`root:<group> 0440`), which is how a non-root service reads
   it; never by others, and never by the group of a file the service owns
   itself;
@@ -1090,7 +1094,7 @@ held to the same standard as the PKCS#11 PIN and the TPM owner password.
   only while the resolution stays within the mount directory. A link
   leading anywhere else is refused;
 - sit in a **mount nobody else can write to**: the mount directory and
-  every directory above it must be owned by root or the process's user and
+  every directory above it must be owned as the file must be, and
   not writable by group or others -- sticky or not, so a mount anywhere
   under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however private the
   directories beneath it; so must the directory the resolved file sits in,
@@ -1384,6 +1388,7 @@ minimum_protection = "external"     # ephemeral | software | external | hardware
 mode = "prefer"                     # require | require-level | prefer
 provider = "tpm2"                   # with `require`: exactly this provider (tpm2 | pkcs11 | external-secret | ephemeral)
 level = "hardware"                  # with `require-level`: any provider at this tier or above
+allow_unwrap_from_lower_provider = false  # true: unwrap payloads from a provider below the one holding the service's KEK (while re-wrapping)
 
 [startup_behavior]
 setup_min_delay_ms = 1000           # floor on create_kek/kek_exists latency; 0 disables, max 60000
@@ -1502,11 +1507,21 @@ its default.
   session and login is still opened per call and closed with it. This is
   deliberate: the most secret parts of the system are re-authenticated on
   every use rather than held open.
-- **Unwrap always uses the provider recorded in the payload**, not
-  whichever provider is currently strongest -- and that provider tag is
-  authenticated, so it cannot be steered. If it differs from what policy
-  would pick today, a debug-level migration hint is logged so operators
-  know it's time to re-wrap onto the stronger provider.
+- **Unwrap uses the provider recorded in the payload**, not whichever
+  provider is currently strongest. That tag is authenticated only under
+  the key of the provider it names, so by itself it proves nothing about
+  which provider *should* hold the service's key: whoever holds a weaker
+  allowed provider's key for a service (a sidecar that can write the
+  external-secret mount, say) could make a payload naming that provider.
+  So a payload naming a provider later in the order than one that holds a
+  KEK for the service now is refused (`KEK_FINGERPRINT_MISMATCH`, event
+  2003): every wrap since the service moved up names the earlier
+  provider. Payloads left over from before the move are re-wrapped under
+  `selection.allow_unwrap_from_lower_provider = true`, set for as long as
+  that takes. The check asks the earlier providers whether they hold a
+  key, so such an unwrap costs what a wrap does; an unwrap naming the
+  first provider in the order asks nothing extra. `require`,
+  `minimum_protection` and pinned keys narrow the set further.
 
 ## Security properties
 

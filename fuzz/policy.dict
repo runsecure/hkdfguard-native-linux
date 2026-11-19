@@ -53,6 +53,7 @@
 "pinned_names"
 "pinned_session_salt_key_name"
 "allow_unpinned_provisioning"
+"allow_unwrap_from_lower_provider"
 "pinned_tpm_names"
 "pkcs11"
 "pkcs11.module"

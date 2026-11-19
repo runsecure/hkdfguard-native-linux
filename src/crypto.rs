@@ -444,7 +444,10 @@ fn open<const N: usize>(label: &[u8], service: &str, wrapped: &[u8]) -> Result<Z
         return Err(Error::Malformed("wrapped payload's key_id is longer than any wrap records"));
     }
 
-    let provider = provider::get_by_type(payload.provider_type)?; // must use the exact provider that originally wrapped this DEK
+    // The exact provider that wrapped this DEK -- refused if a provider
+    // earlier in the policy order holds a KEK for the service now (see
+    // `provider::for_unwrap`).
+    let provider = provider::for_unwrap(service, payload.provider_type)?;
     let handle = provider.load_kek(service, false)?; // load (never create) that provider's KEK for this service
 
     // Re-derive the same wrapping key from the same header, and the

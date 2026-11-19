@@ -709,6 +709,14 @@ fn production_trusts_only_key_files_a_deployer_wrote() {
         let wrapped = run_wrap_stdin(&key_path, service, &dek, &[]);
         assert!(wrapped.status.success(), "{}", stderr_of(&wrapped));
         assert_eq!(open_via_library(&key_path).0, status::OK);
+        // The KEK's fingerprint, for the pin production needs below.
+        let fingerprint = {
+            let c_service = std::ffi::CString::new(service).unwrap();
+            let mut fp = [0u8; 32];
+            let mut fp_len = fp.len() as c_int;
+            assert_eq!(hkdfguard::hkdfguard_kek_fingerprint(c_service.as_ptr(), fp.as_mut_ptr(), &mut fp_len), status::OK);
+            fp.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
 
         // ...but under production the same account is just the
         // application: the file it wrote is refused, and the CLI won't
@@ -738,19 +746,38 @@ fn production_trusts_only_key_files_a_deployer_wrote() {
             assert!(!provisioned.status.success(), "creating a KEK needs root under production");
             let stderr = stderr_of(&provisioned);
             assert!(stderr.contains("only root creates or retires a KEK"), "{stderr}");
-            assert!(run_provision(service).status.success(), "verifying an existing KEK needs no role");
-
-            // Unwrapping is the same in both models: the payload itself
-            // still opens, for whoever the provider lets use the KEK.
+            // Nor is a secret this account mounted for itself a KEK: under
+            // production only root creates one, and for external-secret
+            // putting a file in the mount is creating one.
+            let unvouched = run_provision(service);
+            assert!(!unvouched.status.success(), "a secret the application wrote, with nothing from root naming it");
+            let c_service = std::ffi::CString::new(service).unwrap();
             let bytes = fs::read(&key_path).unwrap();
             let mut out = [0u8; 32];
             let mut out_len = out.len() as c_int;
-            let c_service = std::ffi::CString::new(service).unwrap();
-            assert_eq!(
+            assert_ne!(
                 hkdfguard_unwrap_dek(c_service.as_ptr(), bytes.as_ptr(), bytes.len() as c_int, out.as_mut_ptr(), &mut out_len),
-                status::OK
+                status::OK,
+                "and nothing unwraps under it"
             );
-            assert_eq!(out, dek);
+
+            // Root pinning its fingerprint in policy says which key it is,
+            // whoever wrote the file. Verifying a KEK that exists then
+            // needs no role...
+            let pinned = format!("{policy}[external_secret.pinned_keys]\n\"{service}\" = \"{fingerprint}\"\n");
+            with_policy(&pinned, || {
+                assert!(run_provision(service).status.success(), "verifying an existing KEK needs no role");
+
+                // ...and unwrapping is the same in both models: the payload
+                // itself still opens, for whoever the provider lets use the KEK.
+                let mut out = [0u8; 32];
+                let mut out_len = out.len() as c_int;
+                assert_eq!(
+                    hkdfguard_unwrap_dek(c_service.as_ptr(), bytes.as_ptr(), bytes.len() as c_int, out.as_mut_ptr(), &mut out_len),
+                    status::OK
+                );
+                assert_eq!(out, dek);
+            });
         });
     });
 }

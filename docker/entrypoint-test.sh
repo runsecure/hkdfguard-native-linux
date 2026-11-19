@@ -600,7 +600,10 @@ for d in "$RW_MOUNT" "$RW_MOUNT/hkdfguard"; do
     head -c 32 /dev/urandom > "$d/$RO_SERVICE"; chown ci:ci "$d/$RO_SERVICE"; chmod 0400 "$d/$RO_SERVICE"
 done
 for sub in "" /hkdfguard; do
-    printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT$sub" \
+    # The developer model: the KEK is ci's own file, which production
+    # accepts only from root or with its fingerprint pinned. What is under
+    # test here is the directory rule, the same under both models.
+    printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT$sub" \
         > /etc/hkdfguard/policy.toml
     OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1) \
         || { echo "FAIL: the read-only 1777 mount ($RO_MOUNT$sub) was refused: $OUT" >&2; exit 1; }

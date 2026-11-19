@@ -27,7 +27,9 @@
 //! defensive input -- so it is held to the same standard as every other
 //! secret this crate reads from disk:
 //!
-//! - **Owned by root or by this process's user**, with **no group or
+//! - **Owned by root**, or -- under the developer security model, or when
+//!   policy pins the service's key (see "Pinning") -- **by this process's
+//!   user**; with **no group or
 //!   other access** (`0400`/`0600`) -- except that a root-owned file may
 //!   also be group-readable (`root:<group> 0440`), which is what a
 //!   Kubernetes Secret volume becomes when the pod sets `fsGroup`, and how
@@ -37,7 +39,7 @@
 //!   provisioned", so a misconfigured mount can't silently fall through to
 //!   a weaker provider.
 //! - **In a mount nobody else can write to.** The mount directory and
-//!   every directory above it must be owned by root or this process's user
+//!   every directory above it must be owned by the same owners as the file
 //!   and not writable by group or others -- sticky or not, so a mount
 //!   anywhere under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however
 //!   private the directories beneath it (see
@@ -80,6 +82,9 @@
 //! `external_secret.require_pinned_keys`, a service with no pin has no KEK
 //! here, whatever is mounted for it; `provision` then reports the mounted
 //! key's fingerprint and the policy line that would accept it.
+//!
+//! Under the production security model a pin is also what lets a file the
+//! service's own user wrote be accepted at all (see [`secret_owner`]).
 
 use crate::crypto::software_kek_fingerprint; // the fingerprint every payload carries, and policy pins
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
@@ -206,7 +211,7 @@ impl KekProvider for ExternalSecretProvider {
         if matches!(pins, Pins::Unpinned) {
             return Ok(false); // the allowlist is on and this service isn't on it
         }
-        match read_key(dir, service)? {
+        match read_key(dir, service, &pins)? {
             Some(key) => {
                 check_pins(&key, &pins)?;
                 Ok(true)
@@ -244,7 +249,7 @@ impl KekProvider for ExternalSecretProvider {
                 "external_secret.require_pinned_keys is set and policy pins no key for this service",
             ));
         }
-        let key = read_key(dir, service)?.ok_or_else(missing)?; // mount exists, but nothing there for this service
+        let key = read_key(dir, service, &pins)?.ok_or_else(missing)?; // mount exists, but nothing there for this service
         if matches!(pins, Pins::Unpinned) {
             // Provisioning here means a root-owned policy edit, which this
             // process can't make itself. Do the part it can: report the
@@ -263,12 +268,28 @@ impl KekProvider for ExternalSecretProvider {
 /// (escapes the mount, wrong owner, too broad a mode, not a regular file),
 /// unreadable, or not exactly [`KEK_LEN`] bytes is an error, never "not
 /// provisioned".
-fn read_key(mount: &Path, service: &str) -> Result<Option<Zeroizing<[u8; KEK_LEN]>>> {
-    let mut file = match open_secret_within_mount(mount, service) {
+fn read_key(mount: &Path, service: &str, pins: &Pins) -> Result<Option<Zeroizing<[u8; KEK_LEN]>>> {
+    let rejected = |e: std::io::Error| format!("external secret for this service rejected: {e}");
+    // First under the rule every mount must meet, whatever the model:
+    // nobody but root and this process's user could have written here.
+    // That is what decides "nothing provisioned" -- a mount the service's
+    // own user owns, with no file for this service, is exactly that.
+    let mut file = match open_secret_within_mount(mount, service, Owner::RootOrCurrentUser) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::Provider(format!("external secret for this service rejected: {e}"))),
+        Err(e) => return Err(Error::Provider(rejected(e))),
     };
+    // Then, for a file that is there, under the rule of who may have
+    // provisioned it (see `secret_owner`).
+    if secret_owner(pins)? == Owner::Root {
+        file = open_secret_within_mount(mount, service, Owner::Root).map_err(|e| {
+            Error::Provider(format!(
+                "{}. Under the production security model an external secret, its mount and every directory above \
+                 them must be owned by root, unless policy pins the service's key (external_secret.pinned_keys)",
+                rejected(e)
+            ))
+        })?;
+    }
 
     // Raw KEK material read straight off disk into a
     // `SecretBuffer`: one fixed allocation, never grown, zeroed on every
@@ -359,16 +380,32 @@ const MAX_SECRET_FILE_LEN: usize = 4096;
 
 /// What a mounted KEK file must satisfy -- identical to the PKCS#11 PIN
 /// and the TPM owner password, because it is at least as sensitive.
-const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
-    owner: Some(Owner::RootOrCurrentUser),
-    forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
-    follow_symlinks: false, // applied to the already-resolved path; see below
-    allow_group_read_if_root_owned: true, // root:<fsGroup> 0440, as the kubelet writes it for a non-root pod
-};
+fn secret_file_requirements(owner: Owner) -> FileRequirements {
+    FileRequirements {
+        owner: Some(owner),
+        forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
+        follow_symlinks: false, // applied to the already-resolved path; see below
+        allow_group_read_if_root_owned: true, // root:<fsGroup> 0440, as the kubelet writes it for a non-root pod
+    }
+}
+
+/// Who may own `service`'s secret file, its mount, and every directory
+/// above either. Under the developer model: root or this process's user.
+/// Under the production model only root creates a KEK, and for this
+/// provider putting a file in the mount *is* creating one -- so root
+/// alone, unless policy pins the service's key: the pin is root saying
+/// which key this is, and whoever wrote the file can't have chosen
+/// another.
+fn secret_owner(pins: &Pins) -> Result<Owner> {
+    Ok(match (crate::security_model::current()?, pins) {
+        (crate::security_model::SecurityModel::Developer, _) | (_, Pins::OneOf(_)) => Owner::RootOrCurrentUser,
+        (crate::security_model::SecurityModel::Production, Pins::Any | Pins::Unpinned) => Owner::Root,
+    })
+}
 
 /// Resolves `<mount>/<service>` to the real file it names, refuses the
 /// result unless it lies inside the mount, and opens it under
-/// [`SECRET_FILE_REQUIREMENTS`].
+/// [`secret_file_requirements`], with `owner` from [`secret_owner`].
 ///
 /// Symlinks are followed during resolution -- that is what makes a
 /// Kubernetes Secret volume (`<key>` → `..data/<key>` → `..<ts>/<key>`)
@@ -391,7 +428,7 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
 /// Only a missing `<mount>/<service>` is `NotFound`, meaning "nothing
 /// provisioned"; every other failure means "something is there and it is
 /// not acceptable", or "this couldn't be checked".
-fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File> {
+fn open_secret_within_mount(mount: &Path, service: &str, owner: Owner) -> std::io::Result<File> {
     use std::io::{Error as IoError, ErrorKind};
 
     // Only a missing `<mount>/<service>` may come back as `NotFound`; that
@@ -402,12 +439,13 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
         .map_err(|e| IoError::new(ErrorKind::PermissionDenied, format!("secret mount {}: {e}", mount.display())))?;
     // A mount others can write to would let them plant a KEK for a service
     // not provisioned yet -- which `create_kek` would then adopt, leaving
-    // them holding the key to everything wrapped under it. The service's
-    // own uid may own it: that uid can read every KEK here anyway.
-    crate::secure_file::check_dir_chain(&mount_real, Owner::RootOrCurrentUser)?;
+    // them holding the key to everything wrapped under it. Where `owner`
+    // lets the service's own uid own it (see `secret_owner`), that uid can
+    // read every KEK here anyway.
+    crate::secure_file::check_dir_chain(&mount_real, owner)?;
     // Resolved with every directory a lookup happens in checked, including
     // any a symlink on the way lives in: NotFound if nothing is provisioned.
-    let target_real = crate::secure_file::resolve_trusted(&mount.join(service), &Owner::RootOrCurrentUser)?
+    let target_real = crate::secure_file::resolve_trusted(&mount.join(service), &owner)?
         .ok_or_else(|| IoError::new(ErrorKind::NotFound, "no secret file provisioned for this service"))?;
 
     if !target_real.starts_with(&mount_real) {
@@ -420,10 +458,10 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
     // And every directory between the mount and the file (Kubernetes'
     // `..<timestamp>/`), so nothing under the mount can be swapped either.
     if let Some(target_dir) = target_real.parent() {
-        crate::secure_file::check_dir_chain(target_dir, Owner::RootOrCurrentUser)?;
+        crate::secure_file::check_dir_chain(target_dir, owner)?;
     }
 
-    let file = open_checked(&target_real, &SECRET_FILE_REQUIREMENTS).map_err(|e| {
+    let file = open_checked(&target_real, &secret_file_requirements(owner)).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
             IoError::new(ErrorKind::PermissionDenied, "changed to a symlink between resolution and open")
         } else {
@@ -901,6 +939,43 @@ mod tests {
         crate::policy::test_support::TestPolicy::write(&format!(
             "[external_secret]\nrequire_pinned_keys = {require}\n[external_secret.pinned_keys]\n{pins}\n"
         ))
+    }
+
+    #[test]
+    #[serial]
+    fn under_the_production_model_only_root_or_a_pin_vouches_for_a_secret() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // as root every file here is root's own
+        }
+        with_dir(|provider, dir| {
+            // A secret this (non-root) user wrote, in a mount it owns: the
+            // developer model's own, and accepted there.
+            let key = random_key();
+            provision(dir, "com.company.orders", key);
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+
+            // Under the production model only root creates a KEK, and a
+            // file put in the mount is one: refused, loudly, saying why.
+            let _production = crate::policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+            for refused in [provider.kek_exists("com.company.orders").map(|_| ()), provider.load_kek("com.company.orders", false).map(|_| ())] {
+                match refused {
+                    Err(Error::Provider(msg)) => {
+                        assert!(msg.contains("production security model") && msg.contains("pinned_keys"), "{msg}");
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+            // A service with nothing mounted is still just "not provisioned".
+            assert!(!provider.kek_exists("com.company.billing").unwrap());
+
+            // Root's policy pinning the key says which key it is, whoever
+            // wrote the file: accepted -- and no other key is.
+            let _pin = pin_policy(false, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&key)));
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+            provision(dir, "com.company.orders", random_key());
+            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Provider(_))));
+        });
     }
 
     #[test]

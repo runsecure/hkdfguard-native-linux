@@ -543,6 +543,14 @@ struct RawSelection {
     mode: SelectionModeTag,
     provider: Option<ProviderType>,
     level: Option<KeyProtectionLevel>,
+    /// Whether unwrap accepts a payload wrapped under a provider later in
+    /// the order than one that holds a KEK for the service now. Off unless
+    /// set: such a payload is either left over from before the service
+    /// moved to the stronger provider, or made by someone holding only the
+    /// weaker provider's key -- and the two look the same. On for the time
+    /// it takes to re-wrap what is left over.
+    #[serde(default)]
+    allow_unwrap_from_lower_provider: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -633,6 +641,7 @@ pub struct Policy {
     security_model: SecurityModel,
     deployer_groups: Vec<String>,
     selection: SelectionMode,
+    allow_unwrap_from_lower_provider: bool,
     minimum_protection: Option<KeyProtectionLevel>,
     preferred_order: Vec<ProviderType>,
     setup_min_delay: Duration,
@@ -840,6 +849,7 @@ impl Policy {
             security_model: raw.security_model,
             deployer_groups: raw.deployer_groups,
             selection,
+            allow_unwrap_from_lower_provider: raw.selection.allow_unwrap_from_lower_provider,
             minimum_protection,
             preferred_order: raw.preferred_order,
             setup_min_delay: Duration::from_millis(setup_min_delay_ms),
@@ -938,6 +948,13 @@ impl Policy {
     /// The administrator-pinned Name of the session salt key, if any.
     pub fn pinned_session_salt_key_name(&self) -> Option<&[u8]> {
         self.pinned_session_salt_key_name.as_deref()
+    }
+
+    /// Whether unwrap accepts a payload wrapped under a provider later in
+    /// the order than one holding a KEK for the service
+    /// (`selection.allow_unwrap_from_lower_provider`).
+    pub fn allow_unwrap_from_lower_provider(&self) -> bool {
+        self.allow_unwrap_from_lower_provider
     }
 
     /// Whether a TPM key may be provisioned with no storage root key Name
@@ -1426,6 +1443,17 @@ pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
 pub(crate) fn tpm_allow_unpinned_provisioning() -> bool {
     match load() {
         Some(Ok(policy)) => policy.tpm_allow_unpinned_provisioning(),
+        Some(Err(_)) | None => false,
+    }
+}
+
+/// Whether unwrap accepts a payload wrapped under a provider later in the
+/// order than one holding a KEK for the service
+/// (`selection.allow_unwrap_from_lower_provider`). `false` unless a valid
+/// policy says otherwise: a broken policy must never be what allows it.
+pub(crate) fn allow_unwrap_from_lower_provider() -> bool {
+    match load() {
+        Some(Ok(policy)) => policy.allow_unwrap_from_lower_provider(),
         Some(Err(_)) | None => false,
     }
 }
@@ -2395,6 +2423,23 @@ mod tests {
             let doc = format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"{removed}\"\n");
             assert!(Policy::from_toml_str(&doc).is_err(), "{removed} must be rejected");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unwrap_from_a_lower_provider_is_refused_unless_policy_allows_it() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        assert!(!Policy::from_toml_str(base).unwrap().allow_unwrap_from_lower_provider(), "unset: refused");
+        let allowed = format!("{base}allow_unwrap_from_lower_provider = true\n");
+        assert!(Policy::from_toml_str(&allowed).unwrap().allow_unwrap_from_lower_provider());
+        assert!(Policy::from_toml_str(&format!("{base}allow_unwrap_from_lower_provider = \"yes\"\n")).is_err(), "a boolean, nothing else");
+
+        let _none = TestPolicy::absent();
+        assert!(!allow_unwrap_from_lower_provider());
+        let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\nallow_unwrap_from_lower_provider = true\n");
+        assert!(!allow_unwrap_from_lower_provider(), "a broken policy must never be what allows it");
+        let _valid = TestPolicy::write(&allowed);
+        assert!(allow_unwrap_from_lower_provider());
     }
 
     #[test]

@@ -603,6 +603,60 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
     construct_provider(provider_type).ok_or(Error::NoProviderAvailable)
 }
 
+/// The provider to unwrap a payload for `service` with: the one the
+/// payload names ([`get_by_type`]) -- unless a provider earlier in the
+/// policy order holds a KEK for the service now.
+///
+/// The provider byte in a payload is authenticated only under the key of
+/// the provider it names. So whoever holds *any* allowed provider's key
+/// for a service -- a sidecar that can write the external-secret mount,
+/// say -- can make a payload naming that provider which opens, although
+/// the service's KEK is on the TPM and every wrap goes there. A wrap
+/// always uses the first provider in the order that holds a key
+/// ([`select_existing`]), so a payload naming a later one is either left
+/// over from before the service moved up, or that forgery; the two can't
+/// be told apart, and it is refused as [`Error::KekFingerprintMismatch`]:
+/// not wrapped under the KEK the service resolves to now. An administrator
+/// re-wrapping what is left over sets
+/// `selection.allow_unwrap_from_lower_provider` for as long as that takes.
+///
+/// The earlier providers are asked only when the payload doesn't name the
+/// first one, so the usual unwrap constructs nothing extra. One that can't
+/// answer -- present but failing, or absent with this service's key known
+/// to live there -- fails the unwrap with its own error, as it would fail
+/// a wrap ([`walk_chain`]).
+pub fn for_unwrap(service: &str, provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> {
+    let provider = get_by_type(provider_type)?;
+    if crate::policy::allow_unwrap_from_lower_provider() {
+        return Ok(provider);
+    }
+    for earlier in allowed_types()?.into_iter().take_while(|t| *t != provider_type) {
+        let Some(stronger) = construct_provider(earlier) else {
+            continue; // not compiled into this build
+        };
+        let holds_key = if stronger.probe() {
+            stronger.kek_exists(service)
+        } else {
+            stronger.claims_while_absent(service).map(|()| false)
+        };
+        if holds_key.map_err(|e| attribute(earlier, e))? {
+            log::error!(
+                "hkdfguard: refusing a payload wrapped under {}: {} is earlier in the policy order and holds a KEK \
+                 for this service, so nothing wrapped for it since then names {}. If the payload is left over from \
+                 before the service moved to {}, set selection.allow_unwrap_from_lower_provider = true while it is \
+                 re-wrapped; otherwise it was made by someone holding only the {} key",
+                provider_type.as_str(),
+                earlier.as_str(),
+                provider_type.as_str(),
+                earlier.as_str(),
+                provider_type.as_str()
+            );
+            return Err(Error::KekFingerprintMismatch);
+        }
+    }
+    Ok(provider)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*; // bring `ProviderType` etc. into scope
@@ -698,6 +752,48 @@ mod tests {
             let p = get_by_type(ProviderType::Ephemeral).unwrap();
             assert_eq!(p.provider_type(), ProviderType::Ephemeral);
         }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+    fn unwrap_refuses_a_payload_from_a_provider_below_the_one_holding_the_services_key() {
+        use crate::policy::test_support::TestPolicy;
+        const ORDER: &str = "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n";
+        let _policy = TestPolicy::write(ORDER);
+        let mount = crate::secure_file::private_tempdir();
+        let _secret_mount = crate::policy::test_support::secret_mount(mount.path());
+        let dek = [7u8; crate::crypto::DEK_LEN];
+
+        // No external secret yet: the wrap lands on Ephemeral, and opens.
+        create_kek("com.company.orders").unwrap();
+        let below = crate::crypto::wrap("com.company.orders", &dek).unwrap();
+        assert_eq!(*crate::crypto::unwrap("com.company.orders", &below).unwrap(), dek);
+
+        // The service's KEK is now an external secret: every wrap goes
+        // there, so a payload naming Ephemeral is left over -- or made by
+        // someone holding only the Ephemeral key. Refused either way.
+        let secret = mount.path().join("com.company.orders");
+        std::fs::write(&secret, random_kek_for_tests()).unwrap();
+        std::fs::set_permissions(&secret, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
+        assert!(matches!(crate::crypto::unwrap("com.company.orders", &below), Err(Error::KekFingerprintMismatch)));
+        assert!(matches!(for_unwrap("com.company.orders", ProviderType::Ephemeral).map(|_| ()), Err(Error::KekFingerprintMismatch)));
+        // What the service wraps now opens as ever, and another service,
+        // with no key higher up, is untouched.
+        let above = crate::crypto::wrap("com.company.orders", &dek).unwrap();
+        assert_eq!(*crate::crypto::unwrap("com.company.orders", &above).unwrap(), dek);
+        assert!(for_unwrap("com.company.billing", ProviderType::Ephemeral).is_ok());
+
+        // While what is left over is re-wrapped, policy can allow it.
+        {
+            let _allowed = TestPolicy::write(&format!("{ORDER}allow_unwrap_from_lower_provider = true\n"));
+            assert_eq!(*crate::crypto::unwrap("com.company.orders", &below).unwrap(), dek);
+        }
+
+        // A provider higher up that can't answer fails the unwrap with its
+        // own error: it is never read as "holds no key".
+        std::fs::set_permissions(&secret, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644)).unwrap();
+        assert!(matches!(crate::crypto::unwrap("com.company.orders", &below), Err(Error::Provider(_))));
     }
 
     #[test]

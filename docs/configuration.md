@@ -436,15 +436,21 @@ checks the key, so a wrong format is reported when you provision, not
 later.
 
 **File rules.** The file must:
-- be owned by root or by the service's user, with no group or other access
+- be owned by root, with no group or other access
   (`0400` or `0600`), except that a root-owned file may also be readable by
-  its group (`root:<group> 0440`), so a non-root service can read it;
+  its group (`root:<group> 0440`), so a non-root service can read it. A
+  file owned by the service's own user is accepted only under the developer
+  security model, or when `external_secret.pinned_keys` pins the service's
+  key: under the production model only root creates a KEK, and for this
+  provider putting a file in the mount is creating one. The pin is root
+  saying which key it is, whoever wrote the file;
 - be a regular file;
 - resolve to a path inside the mount (symlinks are followed only while they
   stay inside it).
 
-The mount and every directory above it must be owned by root or the
-service's user and not writable by anyone else -- sticky directories such as
+The mount and every directory above it must be owned as the file must be
+(root; or the service's user under the developer model or with a pinned
+key) and not writable by anyone else -- sticky directories such as
 `/tmp` included, so a mount anywhere under `/tmp`, `/var/tmp` or `/dev/shm`
 is refused. A sticky directory on a read-only mount is the one exception:
 a Kubernetes Secret volume, or a memory-backed `emptyDir`, is `1777`, and
@@ -728,7 +734,7 @@ permissions so that only the service's own account can do both.
 | `/var/lib/hkdfguard/tpm/<service>.tpmauth` | `root:<service-group> 0440`, the group from `tpm.auth_groups`; `root:root 0400` with none (`provision` sets it) | The key's authValue: only that service may read it |
 | `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | Every TPM-using service must read it, and so holds the Owner hierarchy's password |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
-| External secret `<dir>/<service>` | root or the service's user, `0400`; or `root:<group> 0440` | Only that service (or the pod's `fsGroup`) |
+| External secret `<dir>/<service>` | root, `0400`; or `root:<group> 0440`; the service's user only under the developer model or with a pinned key | Only that service (or the pod's `fsGroup`) |
 | Wrapped key files (CLI output) | root or a deployer, `:<service-group> 0640` | Only that service can read its wrapped DEK; under the production model, only root's and deployers' are trusted |
 | Folder holding key files | root or a deployer; `root:hkdfguard-deployers 2775` to share it | Nobody untrusted can replace a key file |
 
@@ -780,6 +786,8 @@ preferred_order = ["tpm2", "pkcs11", "external-secret"]
 mode = "prefer"          # prefer | require | require-level
 provider = "tpm2"        # with "require": tpm2 | pkcs11 | external-secret | ephemeral
 level = "hardware"       # with "require-level": ephemeral | software | external | hardware
+allow_unwrap_from_lower_provider = false   # true: unwrap payloads wrapped under a provider later in the order than
+                                           # one holding the service's KEK now. Only while those are re-wrapped.
 
 [key_requirements]
 minimum_protection = "external"   # exclude providers below this level, whatever the mode (default: no minimum)

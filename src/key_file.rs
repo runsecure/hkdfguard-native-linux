@@ -181,8 +181,9 @@ impl KeyFileError {
 ///    metadata, before a byte is read.
 /// 4. The descriptor is confirmed to be the file resolved and checked in
 ///    steps 1-2 ([`secure_file::verify_opened`]): through `/proc` where it
-///    is mounted, and by device and inode where it isn't -- equally
-///    conclusive, so a sandbox without `/proc` loses nothing.
+///    is mounted, and always by device and inode against the resolved path
+///    walked again without following a link -- conclusive on its own, so a
+///    sandbox without `/proc` loses nothing.
 ///
 /// A file whose size alone says it is too long, or is a raw DEK, is then
 /// normally refused without being read (one rewritten between the size

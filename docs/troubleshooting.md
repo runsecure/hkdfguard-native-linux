@@ -62,6 +62,7 @@ back to defaults in that case.
 | `could not create a private session object` (warning) | The PKCS#11 module refuses a private, non-token data object in a read-only session, which the library uses to detect a logout followed at once by a new login | Nothing to fix; on this token only that narrow case goes undetected. The plain logged-out check still applies |
 | `C_Initialize failed: ... (re-initializing the module in a process forked from the one that loaded it)` | A child created with `fork()` must initialize a PKCS#11 module again, and this module refused | Use the module's own guidance for forked processes; or open PKCS#11 only after forking, or `exec` in the child |
 | `TPM key file has no authValue file` | The `<service>.tpmauth` beside the key file is missing | Restore it from the backup taken with the key file. Without one the key can't be used or retired (retire confirms the fingerprint on the TPM, which needs the authValue): delete the `.tpmkey` file by hand and provision again; DEKs wrapped under the old key are lost |
+| `refusing to provision a TPM key: this service has an authValue file (...) but no key file` | A `<service>.tpmauth` with no `<service>.tpmkey`: left by a key file deleted by hand or a retire that couldn't delete it, or the key file is only missing for now (a restore in progress, a directory not mounted). Provisioning never replaces an authValue file, since without it the key file opens nothing | If the key file should be there, put it back and the key works as before. If the key is gone for good, delete the `.tpmauth` file and provision again |
 | `TPM authValue file ... can't be read by this process` | A service's `.tpmauth` file is readable only by root and the service's group from `tpm.auth_groups`; this service runs as an account in neither | Add `"<service>" = "<the service's group>"` under `[tpm.auth_groups]`, and `chgrp <group>` the file (or retire and provision again) |
 | `tpm.auth_groups group "..." ...: an over-broad group can't be a tpm.auth_groups group` (-80) | `tpm.auth_groups` names `users`, `root`, `nogroup` or another group that covers essentially every account | Name a group only the service's accounts are in |
 
@@ -136,7 +137,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 | Symptom | Fix |
 |---|---|
 | `permissions too broad (mode ...)` | The key file must be `0400` or `0600` with no group or other access, or `root:<group> 0440`. On Kubernetes, use `defaultMode: 0400` (never `0444`); a non-root pod also needs `fsGroup`. |
-| `owned by uid ..., which is not an allowed owner` | The key file must be owned by root or by the service's user |
+| `owned by uid ..., which is not an allowed owner` | The key file must be owned by root. One owned by the service's user is accepted under the developer model, or -- as the message says under production -- once `external_secret.pinned_keys` pins the service's key; the mount and every directory above it follow the same rule |
 | `resolves to ..., outside the secret mount` | A symlink points out of the mount. Deliver the file inside it. |
 | `directory ...: writable by group or others (mode ...)` | The mount, or a directory above it or above the resolved file, can be changed by others -- a sticky one (`/tmp`) included. Mount the secrets read-only (as Kubernetes does), or somewhere only root or the service can write, up to `/`. |
 | `external secret is N bytes; it must be exactly 32 raw random bytes ...` | The file must hold exactly 32 raw bytes. Most often it's base64 or hex text (decode it to raw bytes where it is mounted), has a trailing newline (`echo` adds one), or is an old P-256 key in PEM or DER, which is no longer accepted. Generate a new key with `head -c 32 /dev/urandom` or `openssl rand -out <file> 32` and pin its new fingerprint. |
@@ -171,6 +172,14 @@ KEK** than the one the service resolves to now. Something changed the key:
   different token is now selected.
 - **Any provider:** the payload came from another host. A payload only
   ever opens on the host whose KEK wrapped it.
+- **A service that moved to a stronger provider:** the payload names a
+  provider later in the policy order than one that holds a KEK for the
+  service now (the log line says `refusing a payload wrapped under ...`).
+  Every wrap since the move names the stronger provider, so the library
+  can't tell such a payload from one made by someone holding only the
+  weaker provider's key, and refuses it. If it is left over from before
+  the move, set `allow_unwrap_from_lower_provider = true` under
+  `[selection]`, re-wrap it, and remove the setting.
 
 To recover:
 - **The key file or secret was changed:** restore the original from your

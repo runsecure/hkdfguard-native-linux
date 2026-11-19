@@ -80,6 +80,12 @@
 mode = "prefer"
 #provider = "tpm2"           # with "require": tpm2 | pkcs11 | external-secret | ephemeral
 #level = "hardware"          # with "require-level": ephemeral | software | external | hardware
+# Unwrap refuses a payload wrapped under a provider later in the order than
+# one that holds a KEK for the service now: every wrap since the service
+# moved up names the earlier provider, so such a payload is either left
+# over from before, or made by someone holding only the later provider's
+# key. Set true only while the leftovers are re-wrapped.
+#allow_unwrap_from_lower_provider = false
 
 [key_requirements]
 # Exclude every provider below this tier, whatever the mode:

@@ -275,20 +275,62 @@ fn generate_auth_value() -> Result<zeroize::Zeroizing<[u8; AUTH_VALUE_LEN]>> {
     }
 }
 
-/// A fresh authValue for `service`, written to its authValue file, for a
-/// key about to be created. Called only under [`KeyDirLock`], and only when
-/// the service has no key file: any authValue file already there belongs to
-/// no key (one left by a retire that couldn't delete it, or by a key file
-/// deleted by hand), and is replaced rather than reused. A value that has
-/// sat in the directory may have been read by whoever could read it then --
-/// a group the file had before, a backup -- and a new key must not inherit
-/// that exposure.
+/// Writes `value`, the authValue of a key just created on the TPM, to
+/// `service`'s authValue file. Called only under [`KeyDirLock`], for a
+/// service with no key file, after [`refuse_orphaned_auth_file`]. It never
+/// replaces a file: one that appeared since is refused the same way.
 ///
 /// Who may read the file is [`auth_file_readers`].
-fn provision_auth_file(service: &str) -> Result<Auth> {
+fn provision_auth_file(service: &str, value: &[u8; AUTH_VALUE_LEN]) -> Result<Auth> {
     let readers = auth_file_readers(service)?;
-    write_key_dir_file(service, AUTH_FILE_SUFFIX, "TPM authValue", &generate_auth_value()?[..], readers, Publish::Replace)?;
+    write_key_dir_file(service, AUTH_FILE_SUFFIX, "TPM authValue", value, readers, Publish::New)?;
     read_auth_file(service)?.ok_or_else(|| Error::Provider("the TPM authValue file vanished right after it was written".into()))
+}
+
+/// Refuses to provision `service` while it has an authValue file and no key
+/// file. That file may be all that is left of a retired key (a retire that
+/// couldn't delete it, a key file deleted by hand) -- or half of a key
+/// whose key file is only missing for now: a restore in progress, a
+/// directory not fully mounted. The two can't be told apart from here, and
+/// in the second case the authValue is the one thing that can't be made
+/// again: without it the key file, once back, opens nothing. So it is never
+/// overwritten and never deleted for a new key; an administrator says
+/// which case it is by restoring the key file or deleting the authValue
+/// file. Nor is it reused for the new key: a value that has sat in the
+/// directory may have been read by whoever could read it then.
+fn refuse_orphaned_auth_file(service: &str) -> Result<()> {
+    let dir = key_dir()?;
+    let auth = auth_file_path(&dir, service);
+    // Whatever is at the name, readable or not: nothing is written over it.
+    if std::fs::symlink_metadata(&auth).is_err() {
+        return Ok(());
+    }
+    Err(orphaned_auth_file(&auth, &key_file_path(&dir, service)))
+}
+
+fn orphaned_auth_file(auth: &Path, key: &Path) -> Error {
+    Error::Provider(format!(
+        "refusing to provision a TPM key: this service has an authValue file ({}) but no key file ({}), and          provisioning never replaces an authValue file. If the key file is missing by mistake (a restore in          progress, a directory not mounted), put it back: the key then works as before. If the key is gone for          good, delete the authValue file by hand and provision again",
+        auth.display(),
+        key.display()
+    ))
+}
+
+/// Deletes the authValue file this process just wrote for `service`, after
+/// the key file that was to go with it couldn't be written. Best effort:
+/// what is left behind only blocks provisioning, with a message saying so.
+fn remove_new_auth_file(service: &str) {
+    let Ok(dir) = key_dir() else { return };
+    let path = auth_file_path(&dir, service);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            let _ = sync_dir(&dir);
+        }
+        Err(e) => log::warn!(
+            "hkdfguard: the TPM key file could not be written, and the authValue file made for it ({}) could not be              deleted: {e}. Delete it by hand before provisioning again",
+            path.display()
+        ),
+    }
 }
 
 /// Who may read `service`'s authValue file when root writes it: the group
@@ -356,8 +398,10 @@ enum Publish {
     /// Leave it, and discard what was to be written: a key file is never
     /// replaced.
     IfAbsent,
-    /// Replace it, in one step.
-    Replace,
+    /// Fail, leaving it as it is: an authValue file is never replaced
+    /// either, and unlike a key file the one already there is not the one
+    /// to use (see [`refuse_orphaned_auth_file`]).
+    New,
 }
 
 /// The key directory, resolved and checked: it must already exist, set up
@@ -552,14 +596,15 @@ fn write_key_dir_file(service: &str, suffix: &str, what: &str, contents: &[u8], 
                 Err(e) => return Err(fail("create", e)),
             }
         }
-        Publish::Replace => {
-            let replacing = std::fs::symlink_metadata(&target).is_ok();
-            if let Err(e) = std::fs::rename(&temp, &target) {
-                let _ = std::fs::remove_file(&temp);
-                return Err(fail("create", e));
-            }
-            if replacing {
-                log::info!("hkdfguard: replaced a {what} file that belonged to no key file with a new one");
+        Publish::New => {
+            let linked = std::fs::hard_link(&temp, &target);
+            let _ = std::fs::remove_file(&temp);
+            match linked {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(orphaned_auth_file(&target, &dir.join(format!("{service}{KEY_FILE_SUFFIX}"))));
+                }
+                Err(e) => return Err(fail("create", e)),
             }
         }
     }
@@ -1779,11 +1824,26 @@ impl KekProvider for Tpm2Provider {
                         // Before anything is written: no key is created
                         // under an unpinned SRK unless policy allows it.
                         with_context(&self.context, check_provisioning_pin)?;
+                        // Nor while an authValue file with no key file is
+                        // there: it is never replaced.
+                        refuse_orphaned_auth_file(service)?;
+                        // The key is made on the TPM before either file is
+                        // written, so a TPM that refuses leaves the
+                        // directory as it was.
+                        let value = generate_auth_value()?;
+                        let fresh = Auth::try_from(value.to_vec())
+                            .map_err(|e| Error::Provider(format!("the TPM authValue was rejected: {e}")))?;
+                        let blob = with_context(&self.context, |ctx| create_service_key(ctx, &fresh))?;
                         // The authValue file first, so the key file never
                         // exists without one.
-                        let auth = provision_auth_file(service)?;
-                        let blob = with_context(&self.context, |ctx| create_service_key(ctx, &auth))?;
-                        write_key_file(service, &blob)?;
+                        let auth = provision_auth_file(service, &value)?;
+                        if let Err(e) = write_key_file(service, &blob) {
+                            // No key file was written, so the authValue file
+                            // just created belongs to no key: taken back,
+                            // or it would block the next attempt.
+                            remove_new_auth_file(service);
+                            return Err(e);
+                        }
                         if !srk_is_pinned()? {
                             // Only reachable under the opt-out; the `log`
                             // warning goes nowhere in a host with no logger.
@@ -1866,11 +1926,15 @@ impl KekProvider for Tpm2Provider {
         std::fs::remove_file(&path)
             .map_err(|e| Error::Provider(format!("could not delete TPM key file {}: {e}", path.display())))?;
         // The key file is gone, so the key is retired: an authValue file
-        // left behind by a failure here authorizes nothing, and provisioning
-        // the service again replaces it with a new one.
+        // left behind by a failure here authorizes nothing. Provisioning
+        // the service again is refused until it is deleted (see
+        // `refuse_orphaned_auth_file`), so say so.
         let auth_path = auth_file_path(&dir, service);
         if let Err(e) = std::fs::remove_file(&auth_path) {
-            log::warn!("hkdfguard: retired the TPM key, but could not delete its authValue file {}: {e}", auth_path.display());
+            log::warn!(
+                "hkdfguard: retired the TPM key, but could not delete its authValue file {}: {e}. Delete it by hand:                  this service can't be provisioned again while it is there",
+                auth_path.display()
+            );
         }
         sync_dir(&dir).map_err(|e| Error::Provider(format!("could not persist deleting TPM key file {}: {e}", path.display())))
     }
@@ -2398,10 +2462,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn provisioning_an_auth_file_writes_32_fresh_private_bytes_every_time() {
+    fn provisioning_an_auth_file_writes_32_private_bytes_and_never_replaces_one() {
         with_key_dir(|dir| {
             assert!(read_auth_file(SERVICE).unwrap().is_none(), "no file: none provisioned");
-            let first = provision_auth_file(SERVICE).unwrap();
+            refuse_orphaned_auth_file(SERVICE).expect("nothing there to protect");
+            let value = generate_auth_value().unwrap();
+            let first = provision_auth_file(SERVICE, &value).unwrap();
             let path = dir.join("com.company.orders.tpmauth");
             let bytes = std::fs::read(&path).unwrap();
             assert_eq!(bytes.len(), AUTH_VALUE_LEN);
@@ -2416,14 +2482,35 @@ mod tests {
             assert_eq!(first.value(), bytes.as_slice());
             assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "no temporary file left behind");
 
-            // Called again -- only ever for a service with no key file, so
-            // the file there belongs to no key -- it is replaced, never
-            // reused: a value that sat in the directory may have been read.
-            let second = provision_auth_file(SERVICE).unwrap();
-            assert_ne!(second.value(), bytes.as_slice(), "a fresh value");
-            assert_eq!(std::fs::read(&path).unwrap(), second.value(), "the file holds it");
-            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "replaced in place, nothing left behind");
-            assert_ne!(provision_auth_file("com.company.billing").unwrap().value(), second.value(), "one value per service");
+            assert_eq!(first.value(), &value[..]);
+            assert_ne!(generate_auth_value().unwrap()[..], value[..], "a fresh value every time");
+
+            // An authValue file with no key file may be half of a key whose
+            // key file is only missing for now: provisioning is refused
+            // before the TPM is asked for a key, the message names both
+            // files, and the write itself refuses too.
+            for refused in [refuse_orphaned_auth_file(SERVICE), provision_auth_file(SERVICE, &generate_auth_value().unwrap()).map(|_| ())] {
+                match refused {
+                    Err(Error::Provider(msg)) => {
+                        assert!(msg.contains("never replaces an authValue file"), "{msg}");
+                        assert!(msg.contains("com.company.orders.tpmauth") && msg.contains("com.company.orders.tpmkey"), "{msg}");
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "left exactly as it was");
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "no temporary file left behind");
+            // Even one this process couldn't read or use.
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink("/nonexistent", &path).unwrap();
+            assert!(refuse_orphaned_auth_file(SERVICE).is_err(), "whatever is at the name");
+            std::fs::remove_file(&path).unwrap();
+
+            // Taking back the file of a key whose key file couldn't be written.
+            provision_auth_file(SERVICE, &value).unwrap();
+            remove_new_auth_file(SERVICE);
+            assert!(!path.exists());
+            refuse_orphaned_auth_file(SERVICE).expect("so the next attempt isn't blocked");
         });
     }
 
@@ -3260,14 +3347,23 @@ mod tests {
             assert!(!key_path.exists() && !auth_path.exists(), "retiring deletes both");
 
             // An authValue file left with no key file -- a retire that
-            // couldn't delete it, a key file deleted by hand -- is never
-            // what the next key is created with: whoever read it then could
-            // use the new key.
+            // couldn't delete it, a key file deleted by hand, or a key file
+            // that is only missing for now -- is never replaced, and never
+            // what the next key is created with: provisioning is refused
+            // until an administrator deletes it.
             std::fs::write(&auth_path, &saved).unwrap();
             std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            match tpm.load_kek(SERVICE, true) {
+                Err(Error::Provider(msg)) => assert!(msg.contains("never replaces an authValue file"), "{msg}"),
+                other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+            }
+            assert_eq!(std::fs::read(&auth_path).unwrap(), saved, "the orphan is untouched");
+            assert!(!key_path.exists(), "and no key file was written");
+            assert!(!tpm.kek_exists(SERVICE).unwrap(), "still not provisioned");
+            std::fs::remove_file(&auth_path).unwrap();
             let again = fingerprint(&*tpm.load_kek(SERVICE, true).unwrap());
             assert_ne!(again, right, "a new key");
-            assert_ne!(std::fs::read(&auth_path).unwrap(), saved, "under a new authValue, not the orphan");
+            assert_ne!(std::fs::read(&auth_path).unwrap(), saved, "under a new authValue");
             prf_output(SERVICE, false, b"input").unwrap();
             tpm.retire_kek(SERVICE, &again).unwrap();
         });

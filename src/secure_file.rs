@@ -403,10 +403,17 @@ pub fn check_metadata_trusting(meta: &Metadata, trust: &dyn PrincipalTrust) -> i
 /// and checked, two ways: on Linux, by reading its path back from
 /// `<proc>/self/fd/<n>` and checking it is `within` (pass the resolved file
 /// itself to require exactly that file), where `/proc` is mounted; and, in
-/// every case, by comparing the descriptor's device and inode with what
-/// `target_real` names now. Without `/proc` (masked, as in some minimal
-/// containers and sandboxes, or a non-Linux build) the second alone is
-/// just as conclusive. The CLI's own opens use the same check.
+/// every case, by comparing the descriptor's device and inode with the file
+/// `target_real` names now, reached without following a single symlink
+/// ([`stat_without_links`]).
+///
+/// `target_real` is a resolved path, so it had no symlinks in it when it
+/// was resolved. One put in place of a directory on the way since then
+/// would be followed by the open and by a plain `stat` alike, and the two
+/// would agree; walking the path a component at a time, refusing every
+/// link, is what makes the comparison conclusive without `/proc` (masked,
+/// as in some minimal containers and sandboxes, or a non-Linux build). The
+/// CLI's own opens use the same check.
 /// Every failure is `PermissionDenied` -- never `NotFound`, which callers
 /// reserve for "the file isn't there".
 pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: &Path) -> io::Result<()> {
@@ -429,12 +436,62 @@ pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: 
     let _ = (within, proc_root);
 
     let opened = file.metadata().map_err(|e| denied(format!("could not stat the opened file: {e}")))?;
-    let resolved = std::fs::symlink_metadata(target_real)
+    let resolved = stat_without_links(target_real)
         .map_err(|e| denied(format!("{} changed after it was opened: {e}", target_real.display())))?;
     if (opened.dev(), opened.ino()) != (resolved.dev(), resolved.ino()) {
         return Err(denied(format!("{} was replaced between resolution and open", target_real.display())));
     }
     Ok(())
+}
+
+/// The metadata of what the absolute path `path` names, reached from `/`
+/// one component at a time through directory descriptors, each opened with
+/// `O_NOFOLLOW`: a symlink anywhere in the path -- the last component
+/// included -- is an error, never followed. `.` and `..` are refused too:
+/// a resolved path has neither.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn stat_without_links(path: &Path) -> io::Result<Metadata> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::path::Component;
+
+    let refused = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{what} in {}", path.display()));
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(refused("not an absolute path"));
+    }
+    // O_PATH: a handle on the entry itself, needing no read permission and
+    // never blocking (a FIFO, a device) -- only search permission on each
+    // directory, as the open being verified needed too.
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut here = std::fs::OpenOptions::new().read(true).custom_flags(flags).open("/")?;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(refused("a `.` or `..` component"));
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| refused("a NUL byte"))?;
+        // SAFETY: `here` is an open descriptor and `name` a valid
+        // NUL-terminated string, both alive for the call.
+        let fd = unsafe { libc::openat(here.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by openat and is owned by nothing else.
+        here = unsafe { File::from_raw_fd(fd) };
+        // With O_PATH | O_NOFOLLOW a symlink is opened as itself, not
+        // refused: it is refused here.
+        if here.metadata()?.file_type().is_symlink() {
+            return Err(refused("a symbolic link"));
+        }
+    }
+    here.metadata()
+}
+
+/// Elsewhere (and under Miri, which has no `openat`): what the path names
+/// now, its last component not followed.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+fn stat_without_links(path: &Path) -> io::Result<Metadata> {
+    std::fs::symlink_metadata(path)
 }
 
 fn on_read_only_mount(path: &Path) -> bool {
@@ -709,6 +766,7 @@ pub(crate) struct FileIdentity {
 impl FileIdentity {
     /// The identity of the file `path` resolves to, symlinks followed: for
     /// a credential file, where a Kubernetes-style link swap is a change.
+    #[cfg_attr(not(any(feature = "tpm2", test)), allow(dead_code))]
     pub(crate) fn of(path: &Path) -> Option<Self> {
         Some(Self::from_meta(&std::fs::metadata(path).ok()?))
     }
@@ -723,7 +781,7 @@ impl FileIdentity {
 
     /// The identity of the open file `file`: exactly the one read through
     /// it, whatever has happened at its path since.
-    #[cfg_attr(not(any(feature = "pkcs11", test)), allow(dead_code))]
+    #[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
     pub(crate) fn of_file(file: &std::fs::File) -> Option<Self> {
         Some(Self::from_meta(&file.metadata().ok()?))
     }
@@ -994,6 +1052,41 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{name}: {err}");
         }
         std::fs::set_permissions(untrusted.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn verify_opened_without_proc_refuses_a_directory_swapped_for_a_link() {
+        // The resolved path had no links in it. One put in place of a
+        // directory afterwards is followed by the open, and would be by a
+        // plain stat of the path too: the two would agree on the wrong
+        // file. With no /proc to say where the descriptor really is, the
+        // path is walked link-free instead, and the link is refused.
+        let dir = private_tempdir();
+        let d = std::fs::canonicalize(dir.path()).unwrap();
+        let (real, elsewhere) = (d.join("keys"), d.join("elsewhere"));
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(real.join("a.key"), b"real").unwrap();
+        std::fs::write(elsewhere.join("a.key"), b"planted").unwrap();
+        let target = real.join("a.key");
+        let no_proc = d.join("no-proc-here");
+
+        verify_opened(&File::open(&target).unwrap(), &target, &target, &no_proc).expect("the real file, by a real path");
+
+        std::fs::rename(&real, d.join("keys.moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &real).unwrap();
+        let planted = File::open(&target).unwrap(); // follows the link, as the library's open would
+        let err = verify_opened(&planted, &target, &target, &no_proc).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("symbolic link"), "says why: {err}");
+        // A link as the last component is no better.
+        let link = d.join("link.key");
+        std::os::unix::fs::symlink(elsewhere.join("a.key"), &link).unwrap();
+        assert!(verify_opened(&planted, &link, &link, &no_proc).is_err());
+        // Nor a path that isn't a resolved one at all.
+        assert!(verify_opened(&planted, &elsewhere.join("../elsewhere/a.key"), &d, &no_proc).is_err());
+        verify_opened(&planted, &elsewhere.join("a.key"), &d, &no_proc).expect("where it really is");
     }
 
     #[test]
