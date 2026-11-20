@@ -70,6 +70,29 @@ fn creating_an_ephemeral_key_hardens_the_process_and_locks_the_key_away() {
     );
     assert_eq!(dek_len, 32);
 
+    // Hardening is checked on every use of a key, not only when it is made:
+    // a process that has become dumpable again -- here by its own prctl, as
+    // a crash reporter would; the kernel does the same on a change of
+    // credentials -- is made non-dumpable again before the key is used.
+    // SAFETY: PR_SET_DUMPABLE takes the new value and nothing else.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) }, 0);
+    assert_eq!(dumpable(), 1);
+    dek_len = dek.len() as c_int;
+    assert_eq!(
+        hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), wrapped_len, dek.as_mut_ptr(), &mut dek_len),
+        status::OK
+    );
+    assert_eq!(dumpable(), 0, "using an ephemeral key must find the process non-dumpable, or make it so");
+
+    // The key page is not copied into a forked child (`wf`).
+    assert!(
+        flags.iter().any(|f| {
+            let f: Vec<&str> = f.split_whitespace().collect();
+            f.contains(&"dd") && f.contains(&"wf")
+        }),
+        "no mapping is both excluded from core dumps and wiped on fork: {flags:?}"
+    );
+
     // A forked child has none of this process's ephemeral keys -- and must
     // know it. The key page reads as zeroes there (MADV_WIPEONFORK), so a
     // child that still believed it had the key would wrap under an all-zero

@@ -16,16 +16,29 @@
 //! - **The process is hardened before the first key is created** (core
 //!   dumps off, and on Linux non-dumpable, which also stops same-user
 //!   `ptrace` and `/proc/<pid>/mem` -- see `hkdfguard_harden_process`).
-//!   Creating a key fails if that can't be done. It is re-applied on every
-//!   key creation, since the kernel clears the non-dumpable flag when the
-//!   process changes credentials.
+//!   Creating a key fails if that can't be done. **And it is checked again
+//!   on every use of a key:** the kernel clears the non-dumpable flag when
+//!   the process changes credentials, and anything in the process can set
+//!   it back. A process found dumpable again is hardened again before the
+//!   key is used, or the call fails ([`still_hardened`]). That repairs it
+//!   from that call on; it can't undo what was readable in between.
 //! - **The keys live in dedicated pages**, mapped once and never
-//!   moved or freed: locked into RAM where `RLIMIT_MEMLOCK` allows it (so
-//!   they are never written to swap), and excluded from core dumps. Only
-//!   the service-name index lives on the ordinary heap, and service names
-//!   are not secret.
+//!   moved or freed: excluded from core dumps, wiped in a forked child, and
+//!   locked into RAM where `RLIMIT_MEMLOCK` allows it (so they are never
+//!   written to swap). The first two are required: a page that can't be
+//!   given them holds no key (Linux 4.14 or later). Only the service-name
+//!   index lives on the ordinary heap, and service names are not secret.
 //! - **Copies are wiped:** each call's copy of the key zeroes itself on
-//!   drop (see `provider::software_prf` for what HMAC itself leaves).
+//!   drop.
+//!
+//! What that does not cover. While a call runs, the key is also in that
+//! call's own memory -- its handle on the heap, the stack -- which is
+//! ordinary memory: not locked, and copied by `fork()`. And HMAC leaves
+//! values derived from the key (its inner and outer pads) on the stack
+//! when it returns, which nothing wipes (see `provider::software_prf`). So
+//! the pages' protections are the pages': these traces can reach swap, and
+//! a child forked while another thread is inside a call, or before the
+//! stack a call used is overwritten, may hold one.
 //!
 //! Root, or a process with `CAP_SYS_PTRACE`, can still read the key: no
 //! software-only key is protected from them.
@@ -33,19 +46,28 @@
 //! An ephemeral key can only ever be used by the process that created it,
 //! so the `hkdfguard` CLI turns this provider off for itself
 //! ([`refuse_in_this_process`]): a key it created would be gone when it
-//! exits, and nothing it wrapped could ever be unwrapped. Nor does a key
-//! spread to a child: on Linux 4.14 and later the keys' page is marked
-//! `MADV_WIPEONFORK`, so a child created with `fork()` sees zeroes there.
+//! exits, and nothing it wrapped could ever be unwrapped. Nor do the keys'
+//! pages go to a child: they are marked `MADV_WIPEONFORK`, so a child
+//! created with `fork()` sees zeroes there.
 //!
 //! A forked child starts with no ephemeral keys at all. The store's index
 //! is ordinary heap memory, which `fork()` copies, so the child would
 //! otherwise still believe every service has a key -- in a page that now
-//! holds zeroes -- and wrap under an all-zero KEK anyone can reproduce. The
-//! store therefore belongs to the process that filled it
-//! ([`KeyStore::forget_if_forked`]): a child's first call wipes and unmaps
-//! what it inherited, and its services are unprovisioned until it creates
-//! keys of its own, in pages of its own. An all-zero slot is never handed
-//! out as a key either ([`KeyStore::load`]).
+//! holds zeroes -- and wrap under an all-zero KEK anyone can reproduce.
+//! Each page therefore starts with a marker the kernel's wipe erases
+//! ([`KeyPage::intact`]): a store with a page whose marker is gone is a
+//! forked child's ([`KeyStore::forget_if_forked`]), whose first call unmaps
+//! what it inherited, and whose services are unprovisioned until it creates
+//! keys of its own, in pages of its own. The marker, not the process id,
+//! decides: a descendant can be given the id its ancestor had, and a child
+//! that shares this process's memory (`vfork`, `clone(CLONE_VM)`) has
+//! another id but the very same pages, which it must not wipe. An all-zero
+//! slot is never handed out as a key either ([`KeyStore::load`]).
+//!
+//! `fork()` in a process with other threads copies this module's lock in
+//! whatever state it was in: a child forked while another thread was
+//! inside a call can wait on it for ever. As with any library that takes
+//! locks, such a child should `exec`, not call in (see include/hkdfguard.h).
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
 use crate::provider::{KekHandle, KekProvider, PrfOutput, ProviderType, KEK_LEN}; // the traits/types this module implements
@@ -68,10 +90,14 @@ pub fn refuse_in_this_process() {
     REFUSED.store(true, Ordering::SeqCst);
 }
 
-/// One page of anonymous memory holding up to `len / KEY_LEN` keys. Mapped
-/// once and never moved, so no copy of a key is ever left behind by a
-/// reallocation, and unmapped only by a forked child discarding what it
-/// inherited ([`KeyPage::discard`]).
+/// What every key page starts with ([`KeyPage::intact`]). No byte of it is
+/// zero, so no part of it survives the kernel's wipe.
+const PAGE_MARKER: [u8; KEY_LEN] = [0xA5; KEY_LEN];
+
+/// One page of anonymous memory: [`PAGE_MARKER`], then up to
+/// `len / KEY_LEN - 1` keys. Mapped once and never moved, so no copy of a
+/// key is ever left behind by a reallocation, and unmapped only by a forked
+/// child discarding what it inherited ([`KeyPage::discard`]).
 struct KeyPage {
     base: *mut u8,
     len: usize,
@@ -83,7 +109,7 @@ unsafe impl Send for KeyPage {}
 impl KeyPage {
     fn new() -> Result<Self> {
         // SAFETY: sysconf takes only a name constant.
-        let len = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096).max(KEY_LEN);
+        let len = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096).max(2 * KEY_LEN);
         // SAFETY: an anonymous private mapping with no address hint; the
         // result is checked against MAP_FAILED before use.
         let base = unsafe {
@@ -102,36 +128,33 @@ impl KeyPage {
                 std::io::Error::last_os_error()
             )));
         }
-        // Advice and locking only: under Miri, which runs the tests to check
-        // the `unsafe` code here and supports neither, the page is used as
+        // Under Miri, which runs the tests to check the `unsafe` code here
+        // and supports neither advice nor locking, the page is used as
         // mapped.
         #[cfg(all(target_os = "linux", not(miri)))]
         {
-            // SAFETY: `base..base+len` is the mapping just created.
-            if unsafe { libc::madvise(base, len, libc::MADV_DONTDUMP) } != 0 {
-                crate::provider::log_once(
-                    log::Level::Warn,
-                    format!(
-                        "hkdfguard: could not exclude ephemeral key memory from core dumps (madvise: {}); \
-                         core dumps are disabled for the process instead",
-                        std::io::Error::last_os_error()
-                    ),
-                );
-            }
-            // A forked child gets this page zero-filled rather than a copy of
-            // every ephemeral KEK, so a key never spreads to a second process
-            // that may later run less trusted code. Linux 4.14 and later.
-            // SAFETY: as above.
-            if unsafe { libc::madvise(base, len, libc::MADV_WIPEONFORK) } != 0 {
-                crate::provider::log_once(
-                    log::Level::Warn,
-                    format!(
-                        "hkdfguard: could not keep ephemeral key memory out of forked child processes \
-                         (madvise MADV_WIPEONFORK: {}; Linux 4.14 or later is needed); a child forked \
-                         from this process inherits a copy of its ephemeral keys",
-                        std::io::Error::last_os_error()
-                    ),
-                );
+            // Both required: a page that would be written to a core dump,
+            // or copied whole into every forked child -- which may go on to
+            // run less trusted code -- holds no key. Nothing is in it yet,
+            // so it is simply unmapped. MADV_WIPEONFORK is also what makes
+            // a forked child recognisable at all (`intact`).
+            for (advice, name, purpose) in [
+                (libc::MADV_DONTDUMP, "MADV_DONTDUMP", "exclude ephemeral key memory from core dumps"),
+                (
+                    libc::MADV_WIPEONFORK,
+                    "MADV_WIPEONFORK",
+                    "keep ephemeral key memory out of forked child processes (Linux 4.14 or later is needed)",
+                ),
+            ] {
+                // SAFETY: `base..base+len` is the mapping just created.
+                if unsafe { libc::madvise(base, len, advice) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    // SAFETY: the mapping just created, which nothing refers to yet.
+                    unsafe { libc::munmap(base, len) };
+                    return Err(Error::Provider(format!(
+                        "refusing to create an ephemeral key: could not {purpose} (madvise {name}: {e})"
+                    )));
+                }
             }
         }
         // SAFETY: as above.
@@ -145,23 +168,42 @@ impl KeyPage {
                 ),
             );
         }
-        Ok(KeyPage { base: base.cast(), len })
+        let mut page = KeyPage { base: base.cast(), len };
+        *page.block(0) = PAGE_MARKER;
+        Ok(page)
     }
 
+    /// How many keys the page holds: every `KEY_LEN`-byte block but the
+    /// first, the marker's.
     fn slots(&self) -> usize {
-        self.len / KEY_LEN
+        self.len / KEY_LEN - 1
     }
 
+    /// Key slot `i`: the block after the marker's, and on from there.
     fn slot(&mut self, i: usize) -> &mut [u8; KEY_LEN] {
         assert!(i < self.slots());
+        self.block(i + 1)
+    }
+
+    /// The page's `i`th `KEY_LEN`-byte block: the marker (0), then the keys.
+    fn block(&mut self, i: usize) -> &mut [u8; KEY_LEN] {
+        assert!(i < self.len / KEY_LEN);
         // SAFETY: `i` is in range, the page is readable and writable for
         // the life of the process, and `&mut self` (behind the store's
         // mutex) makes this the only reference.
         unsafe { &mut *self.base.add(i * KEY_LEN).cast::<[u8; KEY_LEN]>() }
     }
 
-    /// Wipes the page and unmaps it. Wiped first: where `MADV_WIPEONFORK`
-    /// isn't available, a forked child's copy still holds the parent's keys.
+    /// Whether the page still starts with [`PAGE_MARKER`]: that is, whether
+    /// this process is the one that mapped it, or shares that one's memory.
+    /// In a child made by `fork()` the kernel has replaced the page with
+    /// zeroes (`MADV_WIPEONFORK`), marker included.
+    fn intact(&mut self) -> bool {
+        *self.block(0) == PAGE_MARKER
+    }
+
+    /// Wipes the page and unmaps it. Wiped first: on a platform with no
+    /// `MADV_WIPEONFORK`, a forked child's copy still holds the parent's keys.
     fn discard(self) {
         // SAFETY: `base..base+len` is this page's own mapping, readable and
         // writable, and `self` is consumed, so nothing refers to it afterwards.
@@ -178,7 +220,8 @@ struct KeyStore {
     index: HashMap<String, usize>, // service name -> slot number across `pages`
     pages: Vec<KeyPage>,
     used: usize,
-    /// The process this store's keys belong to: 0 until first used.
+    /// The process that first used this store: 0 until then. Consulted only
+    /// where pages can't be marked `MADV_WIPEONFORK` (see `forget_if_forked`).
     owner: libc::pid_t,
 }
 
@@ -188,10 +231,20 @@ impl KeyStore {
     /// the module docs). Called before every use. The inherited pages are
     /// wiped and unmapped rather than reused: `mlock` is not inherited, so
     /// the child's own keys go into pages mapped, locked and marked afresh.
+    ///
+    /// A forked child is one whose pages the kernel wiped: any page without
+    /// its marker. Only where pages can't be marked for that -- not Linux,
+    /// where this crate is built for development at most -- does the
+    /// process id decide instead.
     fn forget_if_forked(&mut self) {
         // SAFETY: getpid takes no arguments and cannot fail.
         let pid = unsafe { libc::getpid() };
-        if self.owner == pid {
+        let wiped = self.pages.iter_mut().any(|page| !page.intact());
+        let other_process = cfg!(not(target_os = "linux")) && self.owner != pid;
+        if !wiped && !other_process {
+            if self.owner == 0 {
+                self.owner = pid;
+            }
             return;
         }
         if !self.index.is_empty() {
@@ -223,11 +276,12 @@ impl KeyStore {
     fn load(&mut self, service: &str) -> Option<Zeroizing<[u8; KEY_LEN]>> {
         let n = *self.index.get(service)?;
         let key = Zeroizing::new(*self.slot(n));
-        // No generated key is all zeroes: this is a page the kernel wiped
-        // (`MADV_WIPEONFORK`) in a descendant `forget_if_forked` could not
-        // tell from the store's owner -- one given the pid that process had
-        // before it exited. Never a key: HMAC under it is something anyone can compute. Folded
-        // without branching on any one byte of what is otherwise a key.
+        // No generated key is all zeroes: this would be a page the kernel
+        // wiped (`MADV_WIPEONFORK`) that `forget_if_forked` didn't catch.
+        // It checks every page's marker first, so nothing should get here;
+        // kept all the same, since an all-zero key is never a key: HMAC
+        // under it is something anyone can compute. Folded without
+        // branching on any one byte of what is otherwise a key.
         if key.iter().fold(0u8, |acc, b| acc | b) == 0 {
             self.forget();
             return None;
@@ -263,6 +317,41 @@ impl KeyStore {
         self.index.insert(service.to_string(), n);
         Ok(key)
     }
+}
+
+/// Before an existing key is used: the process must still be as
+/// [`KeyStore::create`] left it. Non-dumpable is the part that can be
+/// undone behind this library's back -- the kernel resets the flag when the
+/// process changes credentials, and a crash reporter or any other code in
+/// the process can set it with one `prctl` -- and it is what keeps another
+/// process of the same user out of this one's memory, and its memory out of
+/// a core dump piped to a handler (which `RLIMIT_CORE` does not stop). If
+/// it has been undone, hardening is applied again; if that fails, so does
+/// the call, rather than a key being used in a process anyone running as
+/// the same user can read.
+fn still_hardened() -> Result<()> {
+    if cfg!(any(miri, not(target_os = "linux"))) {
+        return Ok(()); // no dumpable flag to ask about
+    }
+    // SAFETY: PR_GET_DUMPABLE takes no further arguments.
+    if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } == 0 {
+        return Ok(());
+    }
+    if crate::harden_process_impl(0) != crate::status::OK {
+        return Err(Error::Provider(
+            "refusing to use an ephemeral key: the process has become dumpable again since the key was created, \
+             and could not be hardened again (core dumps off, non-dumpable) -- see the message above"
+                .into(),
+        ));
+    }
+    crate::provider::log_once(
+        log::Level::Warn,
+        "hkdfguard: this process had become dumpable again while holding ephemeral KEKs (a change of credentials, \
+         or something in it called prctl(PR_SET_DUMPABLE)), so its memory was readable by other processes of the \
+         same user until now; it has been marked non-dumpable again"
+            .to_string(),
+    );
+    Ok(())
 }
 
 // Holds one HMAC key per service name, entirely in process
@@ -335,6 +424,9 @@ impl KekProvider for EphemeralProvider {
             .lock() // acquire the mutex; blocks if another call is using the store right now
             .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?; // a prior panic while holding the lock would poison it
         keys.forget_if_forked(); // a forked child starts with no keys
+        if keys.index.contains_key(service) {
+            still_hardened()?; // only a process that holds the key: nothing else is hardened by asking
+        }
 
         let key = match keys.load(service) {
             Some(existing) => existing,
@@ -458,8 +550,9 @@ mod tests {
         store.forget_if_forked();
         assert_eq!(*store.load(service).unwrap(), parents_key, "the owning process keeps its keys");
 
-        // What a forked child sees: a store another process filled.
-        store.owner += 1;
+        // What a forked child sees: pages the kernel wiped, under an index
+        // that still lists every service.
+        wipe_as_fork_does(&mut store);
         store.forget_if_forked();
         assert!(store.load(service).is_none(), "a child must not have the parent's key, nor a zeroed one");
         assert!(store.index.is_empty() && store.pages.is_empty() && store.used == 0);
@@ -471,12 +564,76 @@ mod tests {
         assert_eq!(*store.load(service).unwrap(), childs_key, "the child keeps the key it created");
     }
 
+    // What MADV_WIPEONFORK does to a forked child's copy of every page.
+    fn wipe_as_fork_does(store: &mut KeyStore) {
+        for page in &mut store.pages {
+            for i in 0..page.len / KEY_LEN {
+                page.block(i).fill(0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_starts_with_its_marker_and_keeps_its_keys_apart_from_it() {
+        let (mut store, key) = store_with_key("com.company.marker-test");
+        let page = &mut store.pages[0];
+        assert!(page.intact());
+        assert_eq!(*page.block(0), PAGE_MARKER);
+        assert_eq!(*page.slot(0), key, "the first key is after the marker, not over it");
+        assert_eq!(page.slots(), page.len / KEY_LEN - 1);
+        // Filling every slot leaves the marker alone.
+        for i in 0..page.slots() {
+            page.slot(i).fill(0xff);
+        }
+        assert!(page.intact());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_process_id_does_not_decide_who_holds_the_keys() {
+        // Another id with the pages intact: a child that shares this
+        // process's memory (vfork, clone(CLONE_VM)). The keys are as much
+        // its own, and wiping them would take them from the parent too.
+        let service = "com.company.shared-memory-test";
+        let (mut store, key) = store_with_key(service);
+        store.owner += 1;
+        store.forget_if_forked();
+        assert_eq!(*store.load(service).unwrap(), key);
+
+        // The same id with the pages wiped: a forked descendant given the
+        // id its ancestor had. It has no keys.
+        // SAFETY: getpid takes no arguments and cannot fail.
+        store.owner = unsafe { libc::getpid() };
+        wipe_as_fork_does(&mut store);
+        store.forget_if_forked();
+        assert!(store.index.is_empty() && store.pages.is_empty(), "a wiped store is forgotten whatever the id");
+        assert!(store.load(service).is_none());
+    }
+
+    #[test]
+    fn one_wiped_page_among_several_forgets_the_whole_store() {
+        let mut store = KeyStore::default();
+        store.forget_if_forked();
+        let per_page = {
+            store.create("com.company.multi-page-test.0").unwrap();
+            store.pages[0].slots()
+        };
+        for i in 1..=per_page {
+            store.create(&format!("com.company.multi-page-test.{i}")).unwrap();
+        }
+        assert_eq!(store.pages.len(), 2);
+        let last = store.pages.len() - 1;
+        store.pages[last].block(0).fill(0);
+        store.forget_if_forked();
+        assert!(store.index.is_empty() && store.pages.is_empty() && store.used == 0);
+    }
+
     #[test]
     fn a_wiped_slot_is_never_handed_out_as_a_key() {
         let service = "com.company.wiped-page-test";
         let (mut store, _) = store_with_key(service);
         store.create("com.company.wiped-page-test.other").unwrap();
-        // What MADV_WIPEONFORK leaves in a child the pid check missed.
+        // A wiped page `forget_if_forked` was not asked about first.
         for n in 0..store.used {
             store.slot(n).fill(0);
         }

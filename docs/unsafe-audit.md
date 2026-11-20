@@ -114,16 +114,23 @@ The one `unsafe impl` and the only raw-pointer arithmetic.
 
 - **`mmap` result checked against `MAP_FAILED`** before use. The page is
   never unmapped, so a pointer into it can't dangle.
-- **`slot(i)` asserts `i < slots()`** before forming `&mut [u8; 32]` at
+- **`block(i)` asserts `i < len / 32`** before forming `&mut [u8; 32]` at
   `base + i * 32`. The alignment needed is 1, and `&mut self` behind the
-  store's mutex makes it the only reference.
+  store's mutex makes it the only reference. Block 0 holds the page's
+  marker, which `intact()` reads to recognise a page the kernel wiped in a
+  forked child; `slot(i)`, safe code over it, is block `i + 1` and asserts
+  `i < slots()`. (Until 0.9.2 `slot(i)` formed the reference itself.)
 - **`discard` wipes and unmaps a page** (0.9.2, for a forked child that
   inherited its parent's pages). It takes `self` by value, so the borrow
   checker has already ended every `&mut` that `slot()` handed out; the
   zeroing covers exactly `base..base+len`, the mapping `new` created, and
   nothing refers to it after `munmap`.
-- **`MADV_WIPEONFORK` and `getpid`** (0.9.2) take only the mapping's own
-  range, or nothing.
+- **`MADV_DONTDUMP`, `MADV_WIPEONFORK` and `getpid`** (0.9.2) take only
+  the mapping's own range, or nothing. Since 0.9.2 either `madvise`
+  failing unmaps the page -- just mapped, empty, referred to by nothing
+  yet -- and fails the key's creation.
+- **`prctl(PR_GET_DUMPABLE)`** (after 0.9.2, `still_hardened`) takes no
+  pointers.
 - **`unsafe impl Send for KeyPage`.** It holds a raw pointer, but every
   `KeyPage` is reached only through the store's `Mutex`, so it is never
   shared between threads unsynchronised. It is not `Sync`, and nothing

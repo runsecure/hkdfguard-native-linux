@@ -586,9 +586,20 @@ Because the process's memory is the key's only protection, the library
 hardens the process before it creates the first ephemeral key: core dumps
 are disabled and the process is marked non-dumpable, as
 `hkdfguard_harden_process` does, and creating the key fails if that isn't
-possible. Debuggers and crash reporters stop working for that process. The
-keys themselves sit in pages excluded from core dumps and locked into RAM
-where `RLIMIT_MEMLOCK` allows (a warning is logged once if it doesn't).
+possible. Debuggers and crash reporters stop working for that process. It
+is checked again each time a key is used: a process that has become
+dumpable since (the kernel resets the flag when credentials change, and a
+crash reporter may set it) is hardened again first, with a warning, or the
+call fails.
+
+The keys themselves sit in pages excluded from core dumps and wiped in a
+forked child; a kernel that can't do both (before Linux 4.14) can't hold
+an ephemeral key, and creating one fails. The pages are also locked into
+RAM where `RLIMIT_MEMLOCK` allows (a warning is logged once if it
+doesn't). A forked child has none of its parent's keys and creates its
+own. While a call runs, the key is also in that call's ordinary memory,
+which those protections don't cover: a trace of it can reach swap, or a
+child forked at that moment by another thread.
 
 The `hkdfguard` CLI refuses ephemeral keys for `provision` and `wrap`: a
 key it created would be gone when it exits. Wrap DEKs from the application

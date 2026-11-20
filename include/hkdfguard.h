@@ -145,7 +145,15 @@ extern "C" {
  * and after any privilege change (the kernel resets the dumpable flag
  * when credentials change). Root and CAP_SYS_PTRACE are unaffected; that
  * is host configuration. Idempotent. The library applies it itself before
- * creating an ephemeral KEK, whose only protection is process memory.
+ * creating an ephemeral KEK, whose only protection is process memory, and
+ * again before using one if the process has become dumpable since.
+ *
+ * fork(): a child of a process holding ephemeral KEKs has none of them
+ * (their memory is wiped in the child) and creates its own. In a process
+ * with more than one thread, a forked child should exec rather than call
+ * this library: fork copies the library's locks in whatever state another
+ * thread left them, and a call in the child can then wait for ever -- as
+ * with any library that takes locks.
  *
  * Same as hkdfguard_harden_process_with_flags(0).
  *
