@@ -1952,9 +1952,11 @@ fn stage_key_file(
 // and checked first (`open_for_shredding`); anything refused there leaves
 // both as they were. Once the rename is done the new key file is in place,
 // so a failure overwriting the old one -- or not being allowed to try -- is
-// returned as a warning, not an error. The old file is overwritten before
-// the checks that follow the rename, so none of them failing leaves it
-// intact on the disk.
+// returned as a warning, not an error. The folder is flushed before the
+// old file is overwritten, so a crash can't leave `path` naming a file
+// already destroyed; and the old file is overwritten before the checks
+// that follow the rename, so none of them failing leaves it intact on the
+// disk.
 fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool) -> Result<Option<String>, String> {
     let StagedKeyFile { file, temp } = staged;
     let fail = |e: String| {
@@ -1999,7 +2001,15 @@ fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool
             Err(e) => return fail(format!("failed to create {shown}: {e}")),
         }
     }
-    // The old file first, before anything below can return: the rename has
+    // The folder first, so the new name is on storage before the old file's
+    // contents are destroyed. Overwriting flushes the old file each pass,
+    // and not every filesystem commits the rename along with that: after a
+    // power cut the path could otherwise name the old file again, already
+    // overwritten, with the new key file under no name at all. Its result
+    // is reported at the end; nothing may return before the old file has
+    // been dealt with.
+    let folder_synced = sync_parent_folder(&spelled);
+    // Then the old file, before anything below can return: the rename has
     // happened, so whatever else goes wrong it has lost its name, and this
     // descriptor is the last chance to overwrite it.
     let old_file_warning = match old {
@@ -2030,7 +2040,7 @@ fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool
             "{shown} was replaced by something else right after it was written; check its contents"
         )));
     }
-    sync_parent_folder(&spelled).map_err(|e| {
+    folder_synced.map_err(|e| {
         after_publish(format!("{shown} was written, but its folder could not be flushed to storage, so it may not survive a crash: {e}"))
     })?;
 

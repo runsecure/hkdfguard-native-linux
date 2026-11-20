@@ -156,8 +156,9 @@ the service's group from `tpm.auth_groups`, mode `0440` -- or, with no
 entry, `root:root 0400`, which only a service running as root can use. A
 group that covers essentially every account (`users`, `nogroup`, `root`,
 `wheel` and the like) is refused. To change a provisioned service's group,
-`chgrp` its `.tpmauth` file; the library accepts any group on a root-owned
-`0440` file. The library refuses either file, or a directory above it,
+change its entry in `tpm.auth_groups` and `chgrp` its `.tpmauth` file to
+match: a root-owned `.tpmauth` file a group can read is refused unless
+that group is the one `tpm.auth_groups` names for the service. The library refuses either file, or a directory above it,
 that anyone else could write to, so never put the directory under `/tmp`.
 `tpm.key_dir` moves it.
 

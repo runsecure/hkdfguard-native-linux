@@ -23,6 +23,10 @@
 //!   alone, normally without its contents being read into this process. No
 //!   such form can be mistaken for a payload: all are shorter than the
 //!   smallest one.
+//! - **A real file.** Only a regular file is opened, and what is read must
+//!   be as long as the file says it is: a file whose filesystem makes its
+//!   contents up when read (procfs, sysfs) has an owner and a mode, but
+//!   nobody they could vouch for wrote its bytes.
 //! - **Integrity.** The file must be owned by someone the security model
 //!   trusts, and must not be writable by anyone else; otherwise
 //!   [`KeyFileError::Untrusted`]. Under the production model (the
@@ -231,6 +235,19 @@ fn read_with_proc_root(
         None if e.kind() == io::ErrorKind::PermissionDenied => KeyFileError::Untrusted,
         _ => open_error(e),
     };
+    // Only a regular file is opened at all. Opening is not free of effects
+    // for everything else a caller's path might name -- a watchdog device
+    // is armed by it, a serial line raises DTR, a tape rewinds when closed
+    // -- and `/dev` is as trusted a directory chain as any. Every directory
+    // deciding what this name is has just been judged, so nobody the model
+    // doesn't trust can change it between here and the open; and the open
+    // checks the type again, on the descriptor.
+    match std::fs::symlink_metadata(&target_real) {
+        Ok(named) if named.file_type().is_file() => {}
+        Ok(named) if named.file_type().is_symlink() => return Err(KeyFileError::Untrusted), // became one after it was resolved
+        Ok(_) => return Err(KeyFileError::Io),
+        Err(e) => return Err(open_error(e)),
+    }
     let mut file = secure_file::open_checked(&target_real, &req).map_err(untrusted)?;
     let meta = file.metadata().map_err(|_| KeyFileError::Io)?;
     secure_file::check_metadata_trusting(&meta, trust).map_err(untrusted)?;
@@ -243,6 +260,15 @@ fn read_with_proc_root(
     if size > kind.max_len() as u64 {
         return Err(KeyFileError::TooLong);
     }
+    if size == 0 {
+        // What an empty file is -- and all that is said of a file whose
+        // filesystem makes its contents up as they are read (procfs: every
+        // such file reports no size), without reading any: a process's
+        // command line there is a root-owned regular file when the process
+        // is root's, with bytes whoever started it chose, and reading some
+        // of the others consumes what they hold.
+        return Err(KeyFileError::TooShort);
+    }
     // The size can change between the fstat and the read; `check` judges
     // what was actually read, and a file that grew past the limit fails
     // the read itself.
@@ -250,6 +276,14 @@ fn read_with_proc_root(
         io::ErrorKind::InvalidData => KeyFileError::TooLong,
         _ => KeyFileError::Io,
     })?;
+    if contents.as_slice().len() as u64 != size {
+        // Not the bytes its own metadata describes: a file on a filesystem
+        // that generates contents on read (sysfs reports a page, whatever
+        // it holds), where owner and mode say nothing about who chose
+        // them -- or one rewritten in place while it was read, which no
+        // key file is: they are replaced whole, by rename.
+        return Err(KeyFileError::Untrusted);
+    }
     check_kind(contents.as_slice(), kind)?;
     Ok(contents)
 }
@@ -1122,6 +1156,37 @@ mod tests {
     fn directory_is_refused_as_io() {
         let dir = secure_file::private_tempdir();
         assert_eq!(read(dir.path()).err(), Some(KeyFileError::Io));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "reads /proc and /dev, which Miri can't")]
+    fn a_file_whose_filesystem_makes_up_its_contents_is_never_read() {
+        // Root-owned, regular, in root-owned directories nobody else can
+        // write, and not empty when read: everything the trust checks ask
+        // of a key file, for bytes nobody wrote. Each reports no size, and
+        // is refused from that alone.
+        for generated in ["/proc/version", "/proc/cmdline"] {
+            let path = Path::new(generated);
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            if meta.uid() != 0 || meta.len() != 0 || std::fs::read(path).map(|b| b.is_empty()).unwrap_or(true) {
+                continue; // not this host's procfs as expected: nothing to show
+            }
+            match read(path) {
+                Err(KeyFileError::TooShort) => {}
+                // Something above it isn't trusted on this host (a container's /proc).
+                Err(KeyFileError::Untrusted) => {}
+                other => panic!("{generated}: expected a refusal without a read, got {:?}", other.map(|_| ())),
+            }
+        }
+        // A device is not opened, whoever owns it.
+        assert!(matches!(read(Path::new("/dev/null")), Err(KeyFileError::Io | KeyFileError::Untrusted)));
+    }
+
+    #[test]
+    fn an_empty_key_file_is_too_short() {
+        let dir = secure_file::private_tempdir();
+        let path = write(dir.path(), "wrapped.key", &[]);
+        assert_eq!(read(&path).err(), Some(KeyFileError::TooShort));
     }
 
     #[test]
