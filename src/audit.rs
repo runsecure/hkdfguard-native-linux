@@ -49,6 +49,7 @@ pub(crate) enum Op {
     WrapSecret,
     UnwrapSecret,
     OpenFile,
+    OpenSecretFile,
     KekFingerprint,
     RetireKek,
 }
@@ -64,6 +65,7 @@ impl Op {
             Op::WrapSecret => "hkdfguard_wrap_secret",
             Op::UnwrapSecret => "hkdfguard_unwrap_secret",
             Op::OpenFile => "hkdfguard_open_file",
+            Op::OpenSecretFile => "hkdfguard_open_secret_file",
             Op::KekFingerprint => "hkdfguard_kek_fingerprint",
             // Not a C function: the CLI's `retire`, through the library's
             // Rust-only `admin::retire_kek`.
@@ -332,16 +334,11 @@ pub(crate) fn operation_failed(op: Op, service: &str, code: i32) {
 /// an unwrapped DEK, so possibly a plaintext key on disk. Names the file;
 /// none of its contents are logged.
 pub(crate) fn plaintext_key_file(path: &Path) {
-    emit(
+    emit_for_path(
         Severity::Error,
         PLAINTEXT_KEY_FILE,
-        &format!(
-            "op={} result={}({}) path={}",
-            Op::OpenFile.name(),
-            code_name(status::FILE_PLAINTEXT_KEY),
-            status::FILE_PLAINTEXT_KEY,
-            quote(path.as_os_str().as_bytes())
-        ),
+        &format!("op={} result={}({})", Op::OpenFile.name(), code_name(status::FILE_PLAINTEXT_KEY), status::FILE_PLAINTEXT_KEY),
+        path,
         "the file looks like an unwrapped DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), \
          or its base64 or hex), so it may be a plaintext key \
          written to disk by mistake; none of its contents were returned. Treat that key as exposed: find out how \
@@ -349,7 +346,8 @@ pub(crate) fn plaintext_key_file(path: &Path) {
     );
 }
 
-/// hkdfguard_open_file refused `path` for a reason that points at tampering
+/// `op` -- hkdfguard_open_file or hkdfguard_open_secret_file -- refused
+/// `path` for a reason that points at tampering
 /// rather than a setup mistake: `FILE_UNTRUSTED` (someone else could have
 /// replaced it -- an untrusted owner, a writable file or directory, a
 /// symlink in a directory others control, or a swap mid-open) or a file
@@ -358,39 +356,42 @@ pub(crate) fn plaintext_key_file(path: &Path) {
 /// Anything else -- missing, unreadable, not a regular file -- isn't
 /// audited, and `FILE_PLAINTEXT_KEY` has its own event
 /// ([`plaintext_key_file`]). Names the file; none of its contents are logged.
-pub(crate) fn key_file_refused(path: &Path, code: i32) {
+pub(crate) fn key_file_refused(op: Op, path: &Path, code: i32) {
     let meaning = match code {
         status::FILE_UNTRUSTED => {
             "the key file, or a directory deciding what its path names, could have been replaced by someone the \
              security model doesn't trust; it was not read"
         }
         status::FILE_MALFORMED | status::FILE_TOO_SHORT | status::FILE_TOO_LONG => {
-            "the key file is not a well-formed wrapped DEK (truncated, corrupted, or tampered with)"
+            "the key file is not a well-formed wrapped payload (truncated, corrupted, or tampered with)"
         }
         _ => return,
     };
-    emit(
+    emit_for_path(
         Severity::Warning,
         INTEGRITY_FAILURE,
-        &format!("op={} result={}({code}) path={}", Op::OpenFile.name(), code_name(code), quote(path.as_os_str().as_bytes())),
-        &format!("{} refused a key file: {meaning}", Op::OpenFile.name()),
+        &format!("op={} result={}({code})", op.name(), code_name(code)),
+        path,
+        &format!("{} refused a key file: {meaning}", op.name()),
     );
 }
 
-/// hkdfguard_open_file accepted `path` under the developer security model,
+/// `op` -- hkdfguard_open_file or hkdfguard_open_secret_file -- accepted
+/// `path` under the developer security model,
 /// which trusts key files the application's own account owns -- so the
 /// application could have planted it. Written once per process (the first
 /// such file named), as the Windows build's event 1005 is: a reminder that
 /// this host is not running the production model, not a per-read record.
-pub(crate) fn developer_model_key_file(path: &Path) {
+pub(crate) fn developer_model_key_file(op: Op, path: &Path) {
     static WRITTEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if WRITTEN.set(()).is_err() {
         return;
     }
-    emit(
+    emit_for_path(
         Severity::Warning,
         DEVELOPER_MODEL_KEY_FILE,
-        &format!("op={} security_model=developer path={}", Op::OpenFile.name(), quote(path.as_os_str().as_bytes())),
+        &format!("op={} security_model=developer", op.name()),
+        path,
         "a key file was read under the developer security model, which trusts key files owned by the calling \
          account: an application could plant a DEK it knows. Set security_model = \"production\" (or remove it) \
          in /etc/hkdfguard/policy.toml on any host that is not a development machine (logged once per process)",
@@ -414,13 +415,28 @@ pub(crate) fn setup_calls_exceeded(calls: u32, floor_ms: u128) {
 
 // One record: the event's own fields, who called, then the sentence.
 fn emit(severity: Severity, event: u32, fields: &str, message: &str) {
+    emit_record(severity, event, fields, None, message);
+}
+
+// A record that names a file: `path=` comes after who called, not among the
+// event's own fields. The path is the caller's, up to PATH_MAX bytes, and
+// every byte of it can take four here (`quote`); a syslog receiver cuts a
+// record at its own limit (8 KiB by default in rsyslog), and a path placed
+// first could push `uid`, `pid` and `exe` -- who made the call -- off the
+// end of the record it sent.
+fn emit_for_path(severity: Severity, event: u32, fields: &str, path: &Path, message: &str) {
+    emit_record(severity, event, fields, Some(path), message);
+}
+
+fn emit_record(severity: Severity, event: u32, fields: &str, path: Option<&Path>, message: &str) {
     // SAFETY: getuid/geteuid take no arguments and cannot fail.
     let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
     let exe = std::fs::read_link("/proc/self/exe")
         .map(|p| quote(p.as_os_str().as_bytes()))
         .unwrap_or_else(|_| "\"(unknown)\"".to_string());
+    let path = path.map(|p| format!(" path={}", quote(p.as_os_str().as_bytes()))).unwrap_or_default();
     let line = format!(
-        "event={event} {fields} uid={uid} euid={euid} pid={} exe={exe} msg={}",
+        "event={event} {fields} uid={uid} euid={euid} pid={} exe={exe}{path} msg={}",
         std::process::id(),
         quote(message.as_bytes())
     );
@@ -640,10 +656,8 @@ mod tests {
         plaintext_key_file(Path::new("/srv/audit-test/plain\n.key"));
         let record = last_with("audit-test/plain");
         assert!(record.starts_with("<83>"), "{record}");
-        assert!(
-            record.contains("event=2006 op=hkdfguard_open_file result=FILE_PLAINTEXT_KEY(-37) path=\"/srv/audit-test/plain\\x0a.key\""),
-            "{record}"
-        );
+        assert!(record.contains("event=2006 op=hkdfguard_open_file result=FILE_PLAINTEXT_KEY(-37) uid="), "{record}");
+        assert!(record.contains(" path=\"/srv/audit-test/plain\\x0a.key\" msg="), "{record}");
         assert!(!record.contains('\n'));
     }
 
@@ -651,12 +665,12 @@ mod tests {
     fn key_file_refusals_that_point_at_tampering_are_audited_and_setup_mistakes_are_not() {
         for (code, name, says) in [
             (status::FILE_UNTRUSTED, "FILE_UNTRUSTED", "could have been replaced"),
-            (status::FILE_MALFORMED, "FILE_MALFORMED", "not a well-formed wrapped DEK"),
-            (status::FILE_TOO_SHORT, "FILE_TOO_SHORT", "not a well-formed wrapped DEK"),
-            (status::FILE_TOO_LONG, "FILE_TOO_LONG", "not a well-formed wrapped DEK"),
+            (status::FILE_MALFORMED, "FILE_MALFORMED", "not a well-formed wrapped payload"),
+            (status::FILE_TOO_SHORT, "FILE_TOO_SHORT", "not a well-formed wrapped payload"),
+            (status::FILE_TOO_LONG, "FILE_TOO_LONG", "not a well-formed wrapped payload"),
         ] {
             let path = format!("/srv/audit-test/refused-{name}.key");
-            key_file_refused(Path::new(&path), code);
+            key_file_refused(Op::OpenFile, Path::new(&path), code);
             let record = last_with(&path);
             assert!(record.starts_with("<84>"), "a Warning: {record}");
             assert!(record.contains(&format!("event=2003 op=hkdfguard_open_file result={name}({code})")), "{record}");
@@ -664,8 +678,26 @@ mod tests {
         }
         for code in [status::FILE_NOT_FOUND, status::FILE_ACCESS_DENIED, status::FILE_IO, status::FILE_PLAINTEXT_KEY] {
             let path = format!("/srv/audit-test/quiet-{code}.key");
-            key_file_refused(Path::new(&path), code);
+            key_file_refused(Op::OpenFile, Path::new(&path), code);
             assert!(captured_containing(&path).is_empty(), "code {code} is not audited here");
+        }
+        // A wrapped-secret file's refusal names the function that refused it.
+        key_file_refused(Op::OpenSecretFile, Path::new("/srv/audit-test/refused-secret.key"), status::FILE_UNTRUSTED);
+        assert!(last_with("refused-secret.key").contains("event=2003 op=hkdfguard_open_secret_file result=FILE_UNTRUSTED("));
+    }
+
+    #[test]
+    fn a_long_path_cannot_push_the_caller_out_of_its_own_record() {
+        // PATH_MAX bytes that each take four in the record: 16 KiB of path,
+        // past where a syslog receiver cuts a record. Who called is ahead
+        // of it.
+        let path = format!("/srv/audit-test/long-{}", "\n".repeat(4000));
+        key_file_refused(Op::OpenFile, Path::new(&path), status::FILE_UNTRUSTED);
+        let record = last_with("audit-test/long-");
+        let (before, _) = record.split_once(" path=").expect("the record names the file");
+        assert!(before.len() < 512, "{before}");
+        for field in [" uid=", " euid=", " pid=", " exe="] {
+            assert!(before.contains(field), "{field} must come before the path: {before}");
         }
     }
 

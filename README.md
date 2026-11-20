@@ -337,6 +337,10 @@ hkdfguard[4242]: event=1002 op=hkdfguard_wrap_dek result=OK service="com.company
   kek_fingerprint=3f9c... payload_sha256=a01b... uid=990 euid=990 pid=4242 exe="/usr/bin/orders" msg="DEK wrapped"
 ```
 
+A record about a key file names it in a `path` field, after the caller's
+fields: a long path can't push them past the length a syslog receiver cuts
+a record at.
+
 The fields identify the caller (`uid`, `euid`, `pid`, `exe`) and the service
 by name: service names are public identifiers and are never redacted. Wrap
 and unwrap records also carry the KEK's fingerprint and a SHA-256 of the

@@ -201,9 +201,18 @@ jobs:
           # moby/buildkit:<tag>).
           docker buildx create --use --driver docker-container --name overlay \
             --driver-opt image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+          # A released tag is never pushed over. Only the registry saying
+          # the tag isn't there lets the push go ahead: any other failure
+          # of the lookup (an outage, a rate limit, a login that didn't
+          # take) leaves the question open, and is not read as "absent".
           for target in overlay overlay-dev; do
-            if docker buildx imagetools inspect "$image${target#overlay}:$version" >/dev/null 2>&1; then
-              echo "$image${target#overlay}:$version already exists: refusing to push over a released image" >&2
+            ref="$image${target#overlay}:$version"
+            if found=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              echo "$ref already exists: refusing to push over a released image" >&2
+              exit 1
+            elif ! grep -qiE 'not found|manifest unknown|name unknown' <<<"$found"; then
+              echo "could not tell whether $ref already exists; refusing to push:" >&2
+              echo "$found" >&2
               exit 1
             fi
           done

@@ -1,0 +1,28 @@
+# A new RustSec advisory, or a yanked crate, against a Cargo.lock that
+# hasn't changed. build.yml runs cargo deny on every push and pull request,
+# which says nothing about a lockfile nobody has touched since: this runs
+# the same advisory check on the default branch every day, and fails -- so
+# GitHub notifies the repository's watchers -- when one applies.
+name: advisories
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo deny (advisories)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          command-arguments: advisories

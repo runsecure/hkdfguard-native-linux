@@ -82,6 +82,18 @@
 //! the token sets only on a key it generated itself and never exposed --
 //! so an imported or derived key, labelled and tagged to match, is refused
 //! (see `check_protections`).
+//!
+//! Those attributes describe the object as it is now, not everything that
+//! has happened to its value. A copy of a token-generated key
+//! (`C_CopyObject`) keeps all three, whatever the original allowed; on a
+//! token that offers mechanisms deriving one key's bytes into another a
+//! PIN holder can read (`CKM_EXTRACT_KEY_FROM_KEY`, `CKM_XOR_BASE_AND_DATA`
+//! and the like), such a copy, made after the original was put through
+//! them, passes every check here with a value its maker knows. The checks
+//! keep out a key that was imported or left loose; they are not proof that
+//! nobody ever learned it. What ties a service to the key an administrator
+//! provisioned is its fingerprint in `pkcs11.pinned_keys` (below), and an
+//! HSM policy that disables those mechanisms for the user role.
 //! It is `CKA_PRIVATE`, and only private objects are ever looked up, so
 //! nothing made by a session without the PIN is seen at all (see
 //! `labelled_template`).

@@ -130,7 +130,6 @@ pub mod admin {
                 .to_string(),
         })?;
 
-        let _policy = policy::snapshot_for_call();
         let result = gated_setup(|| -> Result<provider::ProviderType, error::Error> {
             if !security_model::may_administer_keks(security_model::current()?) {
                 return Err(error::Error::AccessDenied("under the production security model only root retires a KEK"));
@@ -218,6 +217,12 @@ fn gated_setup<T>(f: impl FnOnce() -> T) -> T {
     // poisons the mutex; that's not a reason to stop gating, so recover
     // the guard rather than propagating the poison.
     let _serialized = SETUP_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // One read of the policy file serves the whole call -- taken here, once
+    // the gate is held, not by the caller before it waited: a call queued
+    // behind others (each held to the floor) would otherwise decide who may
+    // create or retire a KEK from the policy as it was when it arrived,
+    // seconds after an administrator replaced it.
+    let _policy = policy::snapshot_for_call();
     let entered = Instant::now();
     let floor = effective_setup_min_delay();
 
@@ -240,6 +245,24 @@ fn gated_setup<T>(f: impl FnOnce() -> T) -> T {
         }
     }
     result
+}
+
+/// This call's own copy of the caller's wrapped payload, read once.
+///
+/// An unwrap reads the payload to open it and again, after the provider
+/// has answered, for its audit record (the payload's hash, provider and KEK
+/// fingerprint). Read from the caller's buffer both times, another thread
+/// of the caller could change the bytes in between -- a TPM or HSM round
+/// trip is a wide window -- and the record would then describe a payload
+/// that was never unwrapped, and tie back to no wrap record. Public bytes:
+/// an ordinary heap copy.
+///
+/// At most `longest + 1` bytes are copied, `longest` being the longest
+/// payload of this kind a wrap produces: anything longer is refused by its
+/// length alone, as one byte over is, so a caller passing a huge buffer
+/// doesn't have it copied first.
+fn copy_of_payload(wrapped: &[u8], longest: usize) -> Vec<u8> {
+    wrapped[..wrapped.len().min(longest + 1)].to_vec()
 }
 
 /// Wraps a 32-byte Data Encryption Key (DEK) under the persistent
@@ -866,7 +889,6 @@ fn create_kek_impl(service: *const c_char) -> c_int {
         Err(code) => return code,
     };
 
-    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     gated_setup(|| {
         // Asked first, so the audit trail records a KEK being *created*
         // (1000/1001), not every idempotent re-run. If the question itself
@@ -916,7 +938,6 @@ fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
         Err(code) => return code,
     };
 
-    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     gated_setup(|| match provider::kek_exists(&service_str) {
         Ok(found) => {
             // SAFETY: exists is non-null per check above; caller contract
@@ -958,7 +979,6 @@ fn kek_fingerprint_impl(service: *const c_char, out: *mut u8, out_len: *mut c_in
         return status::BUFFER_TOO_SMALL;
     }
 
-    let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     let fingerprint = gated_setup(|| {
         let (_provider, handle) = provider::select_existing(&service_str)?;
         crypto::kek_fingerprint(&*handle)
@@ -1119,6 +1139,8 @@ fn unwrap_impl(
     // guarantees it is readable for that many bytes.
     let wrapped_slice =
         unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) }; // borrow the caller's wrapped-payload bytes
+    let wrapped_copy = copy_of_payload(wrapped_slice, crypto::MAX_WRAPPED_LEN);
+    let wrapped_slice = wrapped_copy.as_slice(); // the caller's buffer is not read again
 
     let _policy = policy::snapshot_for_call(); // one read of the policy file serves the whole call
     let mut dek = match crypto::unwrap(&service_str, wrapped_slice) {
@@ -1135,8 +1157,9 @@ fn unwrap_impl(
     // Unless policy turns it off (audit.unwrap_success = false): who
     // unwrapped, and the same payload hash its wrap record carries. Before
     // the DEK is written: `out` may be the caller's `wrapped` buffer, and
-    // the record must hash the payload, never the DEK written over it.
-    // `wrapped_slice` is not read again after this.
+    // the record must hash the payload, never the DEK written over it --
+    // and the payload that was unwrapped: `wrapped_slice` is this call's
+    // own copy (see `copy_of_payload`).
     if policy::audit_unwrap_success() {
         audit::dek_operation(audit::Op::Unwrap, &service_str, wrapped_slice);
     }
@@ -1303,6 +1326,8 @@ fn unwrap_secret_impl(
     // SAFETY: wrapped is non-null and wrapped_len >= 0; caller contract
     // guarantees it is readable for that many bytes.
     let wrapped_slice = unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) };
+    let wrapped_copy = copy_of_payload(wrapped_slice, crypto::MAX_SECRET_WRAPPED_LEN);
+    let wrapped_slice = wrapped_copy.as_slice(); // the caller's buffer is not read again
 
     let _policy = policy::snapshot_for_call();
     let secret = match crypto::unwrap_secret(&service_str, &name, wrapped_slice) {
@@ -1317,7 +1342,7 @@ fn unwrap_secret_impl(
     };
 
     // Before the secret is written, as in `unwrap_impl`: `out` may be the
-    // caller's `wrapped` buffer. `wrapped_slice` is not read after this.
+    // caller's `wrapped` buffer. `wrapped_slice` is this call's own copy.
     if policy::audit_unwrap_success() {
         audit::secret_operation(audit::Op::UnwrapSecret, &service_str, &name, wrapped_slice);
     }
@@ -1583,9 +1608,9 @@ fn cstr_to_path(ptr: *const c_char) -> Result<std::path::PathBuf, c_int> {
 // The actual logic behind `hkdfguard_open_file`, running inside the
 // `catch_unwind` wrapper above.
 fn open_file_impl(kind: key_file::Kind, path: *const c_char, out: *mut u8, out_len: *mut c_int, capacity: c_int) -> c_int {
-    let function = match kind {
-        key_file::Kind::Dek => "hkdfguard_open_file",
-        key_file::Kind::Secret => "hkdfguard_open_secret_file",
+    let (function, op) = match kind {
+        key_file::Kind::Dek => ("hkdfguard_open_file", audit::Op::OpenFile),
+        key_file::Kind::Secret => ("hkdfguard_open_secret_file", audit::Op::OpenSecretFile),
     };
     if out_len.is_null() {
         return status::INVALID_ARGUMENT; // no declared capacity, so nothing can be safely zeroed
@@ -1637,7 +1662,7 @@ fn open_file_impl(kind: key_file::Kind, path: *const c_char, out: *mut u8, out_l
     let wrapped = match read {
         Ok(contents) => {
             if trust.model() == security_model::SecurityModel::Developer {
-                audit::developer_model_key_file(&path); // once per process
+                audit::developer_model_key_file(op, &path); // once per process
             }
             contents // wiped when it drops at the end of this function
         }
@@ -1662,7 +1687,7 @@ fn open_file_impl(kind: key_file::Kind, path: *const c_char, out: *mut u8, out_l
             if code == status::FILE_PLAINTEXT_KEY {
                 audit::plaintext_key_file(&path);
             } else {
-                audit::key_file_refused(&path, code);
+                audit::key_file_refused(op, &path, code);
             }
             return fail(code);
         }

@@ -391,7 +391,14 @@ the PIN allows -- whatever this library would have refused:
   under a key every PIN holder can use; what the real key wrapped is
   refused. A pin on the service's real key stops this (below).
 
-Nobody can learn a key's value this way: the keys never leave the token.
+None of this reveals the value of a key the library generated: it is not
+extractable, and can't be made so. A key a PIN holder generates is another
+matter where the token offers key-extraction or key-combining derive
+mechanisms (`CKM_EXTRACT_KEY_FROM_KEY`, `CKM_XOR_BASE_AND_DATA`, ...): one
+made loose, read out through them, then copied with the library's
+attributes passes every check above, with a value its maker knows. Pinning
+(below) is what refuses it; disable those mechanisms for the user role
+where the HSM allows.
 
 What to do about it:
 

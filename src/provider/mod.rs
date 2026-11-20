@@ -311,8 +311,8 @@ fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider
 /// The provider types this process is currently allowed to use, in
 /// try-order: the compiled-in list ([`compiled_provider_types`]), filtered
 /// down to and reordered by the administrative policy in `crate::policy`
-/// (`/etc/hkdfguard/policy.toml`, or `HKDFGUARD_POLICY_FILE`) if one is
-/// configured. Pure policy evaluation over types -- no provider is
+/// (`/etc/hkdfguard/policy.toml`; a test build also reads
+/// `HKDFGUARD_POLICY_FILE`) if one is configured. Pure policy evaluation over types -- no provider is
 /// constructed here -- so a policy of e.g. `require: external-secret`
 /// never causes a TPM connection or an HSM login just to be told no.
 /// Every selection/creation/existence-check function below goes through

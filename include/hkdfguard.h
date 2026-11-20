@@ -210,6 +210,14 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * or HKDFGUARD_ERR_KEK_ACCESS_DENIED if there is none. An ephemeral KEK is
  * the exception: it exists only in this process, so this process makes it.
  *
+ * That is a check this library makes on its own callers, in their process:
+ * it keeps an application from provisioning by accident, and is not what
+ * stops an account that means to. What does is the provider's own access
+ * control -- the TPM key directory only root can write, the token's PIN,
+ * the secret mount -- so an account that can read a PKCS#11 PIN file can
+ * create and delete keys on that token with any PKCS#11 tool, whatever this
+ * function answers (see docs/configuration.md, "What the PIN decides").
+ *
  * Audited: creating a KEK, every wrap and unwrap, and the failures an
  * administrator needs to see are written to syslog (facility authpriv,
  * tag hkdfguard) with the Windows build's event IDs - see README.md,
