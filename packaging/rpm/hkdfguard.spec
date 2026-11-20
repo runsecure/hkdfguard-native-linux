@@ -141,26 +141,61 @@ cargo test --locked --offline --all-features
 # differ between EL10, Amazon Linux 2023 and SUSE; rpm's own sysusers
 # support, where it has it, finds them already there. Never removed (see
 # that file for why), so there is no %%postun.
+#
+# A group that can't be created fails the install: the files below are
+# installed for it, and under the production security model the library
+# trusts hkdfguard-deployers by name.
+#
+# A group that is already there is adopted, as it must be on an upgrade --
+# but getent answers from every NSS source, so on a first install "already
+# there" may be a directory (LDAP, sssd) group of the same name, or a local
+# one with members, that nobody meant to hand these roles to. That is said
+# out loud. A group rpm's own sysusers support has just made is local and
+# has no members, and is not remarked on.
 %pre -n %{libpkg}
 for group in hkdfguard hkdfguard-deployers; do
-    getent group "$group" >/dev/null || groupadd -r "$group"
+    if entry=$(getent group "$group"); then
+        if [ "$1" -eq 1 ]; then
+            members=${entry##*:}
+            origin=
+            grep -q "^$group:" /etc/group || origin=" It is not in /etc/group: it comes from a directory service."
+            if [ -n "$origin" ] || [ -n "$members" ]; then
+                echo "hkdfguard: WARNING: group $group already exists and is used as it is.$origin" >&2
+                echo "hkdfguard:   members: ${members:-none listed (primary-group members are not shown)}" >&2
+                case "$group" in
+                    hkdfguard-deployers) echo "hkdfguard:   Under the production security model its members deploy key files the library trusts." >&2 ;;
+                    *) echo "hkdfguard:   Its members can reach the TPM key directory." >&2 ;;
+                esac
+                echo "hkdfguard:   Check that every member is meant to hold that role (getent group $group)." >&2
+            fi
+        fi
+    elif ! groupadd -r "$group"; then
+        echo "hkdfguard: could not create group $group" >&2
+        exit 1
+    fi
 done
-exit 0
 
 # The TPM key directory, root:hkdfguard 0750 -- created here, only if it is
 # missing, rather than installed: rpm reapplies the owner and mode of every
 # file it installs on each upgrade, which would undo an administrator's
 # choice (a narrower group, say) without a word. %%files lists it as
 # %%ghost, so rpm still owns it but never sets its attributes.
+#
+# No trailing `exit 0`: a directory that couldn't be created is reported
+# (rpm prints a failed %%post), not passed over in silence.
 %post -n %{libpkg}
-[ -d %{_sharedstatedir}/hkdfguard/tpm ] || install -d -m 0750 -o root -g hkdfguard %{_sharedstatedir}/hkdfguard/tpm
+if [ ! -d %{_sharedstatedir}/hkdfguard/tpm ]; then
+    install -d -m 0750 -o root -g hkdfguard %{_sharedstatedir}/hkdfguard/tpm || {
+        echo "hkdfguard: could not create %{_sharedstatedir}/hkdfguard/tpm (root:hkdfguard 0750); create it before provisioning a TPM key" >&2
+        exit 1
+    }
+fi
 %if 0%{?suse_version}
 # SUSE policy; Fedora-family glibc runs ldconfig from a file trigger. Here
 # rather than through %%ldconfig_scriptlets, whose own %%post would be a
 # second one.
 %{ldconfig}
 %endif
-exit 0
 
 %if 0%{?suse_version}
 %postun -n %{libpkg} -p %{ldconfig}

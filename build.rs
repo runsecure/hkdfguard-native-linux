@@ -22,7 +22,9 @@
 // in the debug profile; every way a release is made (the packages,
 // scripts/build-release.sh, docker/build-dist.sh, the overlay) builds the
 // release profile, so a RUSTFLAGS that leaked into one of them fails here
-// instead of shipping. Fuzzing is the one exception: `cargo fuzz` builds
+// instead of shipping. That judges the build asked for; the file that
+// ships is checked again, whatever built it, by
+// packaging/check-shipped-binary.sh. Fuzzing is the one exception: `cargo fuzz` builds
 // the release profile with `--cfg fuzzing`, and its harnesses are never
 // shipped.
 

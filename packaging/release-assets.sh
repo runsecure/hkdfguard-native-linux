@@ -68,6 +68,8 @@ for dir in "$artifacts"/binaries-*/; do
     arch=$(basename "$dir"); arch=${arch#binaries-}
     bin="$stage/bin-$arch"
     mkdir -p "$bin/lib" "$bin/bin" "$bin/include"
+    # The last look before these are attested and published.
+    packaging/check-shipped-binary.sh "$dir/libhkdfguard.so" "$dir/libhkdfguard.a" "$dir/hkdfguard"
     # Named as the packages install them: the library under its SONAME
     # (build.rs), not Cargo's libhkdfguard.
     install -m 0644 "$dir/libhkdfguard.so" "$bin/lib/libhkdfguard.so.1"

@@ -711,6 +711,21 @@ Things to know:
   NSS, so LDAP and sssd groups count, and a slow directory slows the call.
   Removing a deployer makes every key file they own untrusted at once:
   redeploy those files first.
+- **Removing a deployer from the group does not end what they can do.** A
+  session they already have open keeps the group in its kernel credentials
+  until it ends, and with it write access to every group-writable folder
+  the deployers share. The library stops trusting files they *own*, so
+  anything they write or replace from then on is refused -- but they can
+  still delete or rename the other deployers' key files there. End their
+  sessions when you remove them (`loginctl terminate-user <name>`, or
+  `pkill -KILL -u <name>`), and check the shared folders afterwards.
+- **The packages use a group that already exists.** `hkdfguard` and
+  `hkdfguard-deployers` are looked up through NSS, at install and by the
+  library, so a directory (LDAP, sssd) group of the same name *is* the
+  deployer group, with whatever members it has. Installing warns when
+  either group is already there from a directory or with members; check
+  `getent group hkdfguard-deployers` before relying on the production
+  model on a directory-joined host.
 - Tools can ask the library the same questions: `hkdfguard_security_model`
   (the model, and whether a key file this process writes would be trusted)
   and `hkdfguard_key_file_principal_trusted("uid:<n>"` or `"gid:<n>")`.

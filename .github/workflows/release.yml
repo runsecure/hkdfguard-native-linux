@@ -194,7 +194,13 @@ jobs:
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hkdfguard-overlay"
           version=${GITHUB_REF_NAME#v}
-          docker buildx create --use --driver docker-container --name overlay
+          # The builder's own image, by digest: it assembles and pushes
+          # what gets signed, so it is pinned like every action here, not
+          # whatever moby/buildkit:buildx-stable-1 is on the day. Bump the
+          # tag and digest together (docker buildx imagetools inspect
+          # moby/buildkit:<tag>).
+          docker buildx create --use --driver docker-container --name overlay \
+            --driver-opt image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
           for target in overlay overlay-dev; do
             if docker buildx imagetools inspect "$image${target#overlay}:$version" >/dev/null 2>&1; then
               echo "$image${target#overlay}:$version already exists: refusing to push over a released image" >&2

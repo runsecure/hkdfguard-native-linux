@@ -93,6 +93,9 @@ example_policy=/usr/share/hkdfguard/policy.toml.example
     || { echo "$example_policy must be installed, root:root 0644" >&2; exit 1; }
 libdir=$(pkg-config --variable=libdir hkdfguard)
 ls -l "$libdir"/libhkdfguard*
+# What the packages installed is what ships (the overlay images take their
+# files from these packages too): none of it may be a test build.
+"$(dirname "$0")"/check-shipped-binary.sh "$libdir"/libhkdfguard.so.1 "$libdir"/libhkdfguard.a "$(command -v hkdfguard)"
 hkdfguard --help
 
 section "external secrets for the test services (root's mount, as a platform's would be)"
