@@ -171,7 +171,7 @@ mode = "prefer"
 # A directory where a rejected PIN is recorded for every process, so a
 # stale PIN file costs the token one login attempt in total, not one per
 # worker or restart. Must exist (root:<service-group> 2770, say; /run is
-# emptied at boot) and not be writable by everyone. Unset: per process.
+# emptied at boot) and closed to all other accounts. Unset: per process.
 #pin_state_dir = "/run/hkdfguard/pkcs11"
 # Choose the token by label and/or serial; exactly one token must match.
 # With neither, exactly one initialized token must be present.

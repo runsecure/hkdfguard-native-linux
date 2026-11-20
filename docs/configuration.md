@@ -341,13 +341,16 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   log in one at a time (`login.lock`), so workers starting together don't
   each try it. The record names the PIN file's version, and stops applying
   when the file changes; deleting it also lets one login retry. The
-  directory must exist, be owned by root or the service's account, and not
-  be writable by everyone; otherwise PKCS#11 is refused. Give write access
-  only to the accounts that read the PIN file: whoever can write there can
-  stop PKCS#11 logins, though nothing more. `/run` is emptied at boot, so
+  directory must exist, be owned by root or the service's account, and
+  give accounts outside its owner and group no access at all (no read,
+  write or search bit for others); otherwise PKCS#11 is refused. Give
+  access only to the accounts that read the PIN file: whoever can write
+  there, or merely open `login.lock` and hold a lock on it, can stop
+  PKCS#11 logins, though nothing more. `/run` is emptied at boot, so
   create the directory from a `tmpfiles.d` entry
   (`d /run/hkdfguard/pkcs11 2770 root <service-group>`) or the unit's
-  `RuntimeDirectory=`. One case is not covered: if the PIN is changed on
+  `RuntimeDirectory=` with `RuntimeDirectoryMode=0750` (systemd's default,
+  `0755`, is refused). One case is not covered: if the PIN is changed on
   the token while several processes are already logged in and working,
   those in the middle of a login at that moment each spend an attempt
   before the first record is written.
@@ -380,7 +383,12 @@ the PIN allows -- whatever this library would have refused:
 - delete it and generate another under the same label. The new key
   passes every check above, being as token-generated as the first;
 - use any other service's key on the same token. Services sharing a token
-  are kept apart by labels only.
+  are kept apart by labels only;
+- generate a key under the label of a service that keeps its KEK somewhere
+  else -- an external secret, say, later in the policy order. The token
+  then holds a key for that service, comes first, and takes its wraps,
+  under a key every PIN holder can use; what the real key wrapped is
+  refused. A pin on the service's real key stops this (below).
 
 Nobody can learn a key's value this way: the keys never leave the token.
 
@@ -399,7 +407,14 @@ What to do about it:
   A key with any other fingerprint is then refused, so a replaced key
   can't be used. A pinned service whose key is gone fails every call,
   instead of being treated as having no key -- which would let the next
-  provider in the policy order serve it. To provision a pinned service
+  provider in the policy order serve it. A pin also says which provider
+  the service's KEK lives in: a service pinned in one provider
+  (`pkcs11.pinned_keys`, `external_secret.pinned_keys`,
+  `tpm.pinned_names`) is never served by PKCS#11, an external secret or
+  an ephemeral key it has no pin for, whatever key turns up there under
+  its name, and a payload naming such a provider is refused
+  (`KEK_FINGERPRINT_MISMATCH`). A service that really keeps keys in two
+  of them -- during a migration -- needs a pin in each. To provision a pinned service
   again (after `retire`, say), remove its pin first, then pin the new
   fingerprint.
 - **`require_pinned_keys = true`** in `[pkcs11]` makes the pins an

@@ -387,6 +387,50 @@ fn reset_warn_once() {
     WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
+/// The provider policy pins `service`'s key in, when `provider_type` is not
+/// one of them: `provider_type` then takes no part in any call for the
+/// service. `None` when nothing is pinned for the service, or
+/// `provider_type` itself holds a pin for it.
+///
+/// A pin -- `pkcs11.pinned_keys`, `external_secret.pinned_keys`,
+/// `tpm.pinned_names` -- is the administrator's statement of where a
+/// service's KEK lives. Without this, the chain would still take the first
+/// provider in the order that holds *a* key for the service, and a key can
+/// appear in a provider the service was never given: whoever can read a
+/// shared token's PIN file can generate one there under any service's
+/// label; a writer of the secret mount can add a file. Every wrap for the
+/// service would then go to that key, which its maker can use, and
+/// [`for_unwrap`] would refuse everything wrapped under the real one.
+/// The pin in the service's own provider can't catch that -- the chain
+/// never gets as far -- so it is caught here, before the other provider is
+/// even constructed.
+///
+/// Only pins in providers the policy allows count: one left behind in a
+/// provider since taken out of the order binds nothing. The TPM is never
+/// passed over: only root writes its key directory, so a TPM key for a
+/// service is one an administrator provisioned.
+fn bound_elsewhere(service: &str, provider_type: ProviderType, allowed: &[ProviderType]) -> Result<Option<ProviderType>> {
+    if provider_type == ProviderType::Tpm2 {
+        return Ok(None);
+    }
+    let mut elsewhere = None;
+    for pinned_in in allowed {
+        let pinned = match pinned_in {
+            ProviderType::Tpm2 => crate::policy::pinned_tpm_name(service)?.is_some(),
+            ProviderType::Pkcs11 => crate::policy::pinned_pkcs11_keys(service)?.is_some(),
+            ProviderType::ExternalSecret => crate::policy::pinned_external_keys(service)?.is_some(),
+            ProviderType::Ephemeral => false, // nothing to pin: its keys end with their process
+        };
+        if pinned && *pinned_in == provider_type {
+            return Ok(None);
+        }
+        if pinned && elsewhere.is_none() {
+            elsewhere = Some(*pinned_in);
+        }
+    }
+    Ok(elsewhere)
+}
+
 /// Shared walk behind [`create_kek`] and [`select_existing`]: for each
 /// policy-allowed type in priority order, constructs that one provider
 /// (see [`construct_provider`]), probes it, and calls
@@ -394,7 +438,9 @@ fn reset_warn_once() {
 /// wins and the walk stops -- providers later in the order are never even
 /// constructed.
 ///
-/// The walk moves on past a provider in exactly two cases: it isn't
+/// A provider is left out of the walk altogether when policy pins this
+/// service's key in another one (see [`bound_elsewhere`]). Otherwise the
+/// walk moves on past a provider in exactly two cases: it isn't
 /// present at all (`probe()` is false -- see [`Backend::Absent`]) and
 /// nothing says this service's key lives there
 /// ([`KekProvider::claims_while_absent`]), or it is
@@ -420,8 +466,17 @@ fn walk_chain(
     // the call, an operator should know a preferred one didn't.
     let mut passed_over: Vec<String> = Vec::new();
     let mut any_present = false;
-    for provider_type in allowed_types()? {
+    let allowed = allowed_types()?;
+    for &provider_type in &allowed {
         // priority order, per the configured policy (or the default compiled-in order)
+        if let Some(home) = bound_elsewhere(service, provider_type, &allowed)? {
+            log::debug!(
+                "hkdfguard: policy pins this service's key in {}; not consulting {}",
+                home.as_str(),
+                provider_type.as_str()
+            );
+            continue;
+        }
         let Some(provider) = construct_provider(provider_type) else {
             continue; // not compiled into this build (policy can name a type the build lacks)
         };
@@ -548,7 +603,11 @@ pub fn select_existing(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn K
 /// first that has the key.
 pub fn kek_exists(service: &str) -> Result<bool> {
     let mut any_present = false;
-    for provider_type in allowed_types()? {
+    let allowed = allowed_types()?;
+    for &provider_type in &allowed {
+        if bound_elsewhere(service, provider_type, &allowed)?.is_some() {
+            continue; // policy pins this service's key in another provider: a key here is not its KEK
+        }
         let Some(provider) = construct_provider(provider_type) else {
             continue;
         };
@@ -623,6 +682,10 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
 /// re-wrapping what is left over sets
 /// `selection.allow_unwrap_from_lower_provider` for as long as that takes.
 ///
+/// A payload naming a provider the service is pinned away from is refused
+/// the same way, whatever the order and that setting, and such a provider
+/// is not asked whether it holds a key: see [`bound_elsewhere`].
+///
 /// The earlier providers are asked only when the payload doesn't name the
 /// first one, so the usual unwrap constructs nothing extra. One that can't
 /// answer -- present but failing, or absent with this service's key known
@@ -630,10 +693,26 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
 /// a wrap ([`walk_chain`]).
 pub fn for_unwrap(service: &str, provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> {
     let provider = get_by_type(provider_type)?;
+    let allowed = allowed_types()?;
+    if let Some(home) = bound_elsewhere(service, provider_type, &allowed)? {
+        log::error!(
+            "hkdfguard: refusing a payload wrapped under {}: policy pins this service's key in {}, so no wrap for it \
+             uses {}. If the service does keep a KEK in {} as well, pin that key too; otherwise the payload was made \
+             by someone who could place a key there",
+            provider_type.as_str(),
+            home.as_str(),
+            provider_type.as_str(),
+            provider_type.as_str()
+        );
+        return Err(Error::KekFingerprintMismatch);
+    }
     if crate::policy::allow_unwrap_from_lower_provider() {
         return Ok(provider);
     }
-    for earlier in allowed_types()?.into_iter().take_while(|t| *t != provider_type) {
+    for earlier in allowed.iter().copied().take_while(|t| *t != provider_type) {
+        if bound_elsewhere(service, earlier, &allowed)?.is_some() {
+            continue; // not this service's provider, whatever key it holds under the name (see `bound_elsewhere`)
+        }
         let Some(stronger) = construct_provider(earlier) else {
             continue; // not compiled into this build
         };
@@ -797,6 +876,54 @@ mod tests {
         // own error: it is never read as "holds no key".
         std::fs::set_permissions(&secret, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644)).unwrap();
         assert!(matches!(crate::crypto::unwrap("com.company.orders", &below), Err(Error::Provider(_))));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+    fn a_pin_binds_a_service_to_its_provider_whatever_comes_earlier_in_the_order() {
+        // Ephemeral is ahead of external-secret, and any process may create
+        // an Ephemeral key: the stand-in for a provider someone other than
+        // the administrator can place a key in (a shared PKCS#11 token).
+        const ORDER: &str = "preferred_order = [\"ephemeral\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n";
+        let service = "com.company.pinnedhome";
+        let mount = crate::secure_file::private_tempdir();
+        let _secret_mount = crate::policy::test_support::secret_mount(mount.path());
+        let key = random_kek_for_tests();
+        let secret = mount.path().join(service);
+        std::fs::write(&secret, key).unwrap();
+        std::fs::set_permissions(&secret, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
+        let dek = [9u8; crate::crypto::DEK_LEN];
+
+        // Unpinned: the first provider holding a key wins, as ever. A key
+        // planted on Ephemeral takes the service's wraps.
+        let planted = {
+            let _unpinned = write_policy(ORDER);
+            let (provider, _) = create_kek(service).unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+            crate::crypto::wrap(service, &dek).unwrap()
+        };
+
+        // Pinned to its external secret: the planted key is never used, for
+        // a wrap, an existence check, or a creation...
+        let fingerprint: String = crate::crypto::software_kek_fingerprint(&key).iter().map(|b| format!("{b:02x}")).collect();
+        let _pinned = write_policy(&format!("{ORDER}[external_secret.pinned_keys]\n\"{service}\" = \"{fingerprint}\"\n"));
+        for (provider, _) in [select_existing(service).unwrap(), create_kek(service).unwrap()] {
+            assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
+        }
+        assert!(kek_exists(service).unwrap());
+        let genuine = crate::crypto::wrap(service, &dek).unwrap();
+        assert_eq!(crate::payload::Payload::from_bytes(&genuine).unwrap().provider_type, ProviderType::ExternalSecret);
+        // ...what the real key wrapped still opens, though a provider
+        // earlier in the order holds a key under the service's name...
+        assert_eq!(*crate::crypto::unwrap(service, &genuine).unwrap(), dek);
+        // ...and what the planted key wrapped does not.
+        assert!(matches!(crate::crypto::unwrap(service, &planted), Err(Error::KekFingerprintMismatch)));
+        assert!(matches!(for_unwrap(service, ProviderType::Ephemeral).map(|_| ()), Err(Error::KekFingerprintMismatch)));
+
+        // A service with no pin is untouched.
+        let (provider, _) = create_kek("com.company.nopin").unwrap();
+        assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
     }
 
     #[test]

@@ -554,9 +554,11 @@ fn set_pin_confirmed(confirmed: Option<(PathBuf, Option<FileIdentity>)>) {
 }
 
 /// Checks `pkcs11.pin_state_dir`: a real directory (not a link to one),
-/// owned by root or this account, that not everyone can write. In a
-/// world-writable one, any local account could forge a rejection or hold
-/// the login lock.
+/// owned by root or this account, that accounts outside its owner and
+/// group can't reach at all. Writing there forges a rejection; holding the
+/// login lock takes less -- `flock` needs only a descriptor, so anyone who
+/// can search the directory and open the lock file to read can stop every
+/// first login (see [`SharedLoginLock`]).
 fn check_pin_state_dir(dir: &Path) -> std::result::Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let fail = |why: String| format!("pkcs11.pin_state_dir {}: {why}", dir.display());
@@ -571,9 +573,10 @@ fn check_pin_state_dir(dir: &Path) -> std::result::Result<(), String> {
     if meta.uid() != 0 && meta.uid() != euid {
         return Err(fail(format!("is owned by uid {}, not by root or this account", meta.uid())));
     }
-    if meta.mode() & 0o002 != 0 {
+    if meta.mode() & 0o007 != 0 {
         return Err(fail(format!(
-            "is writable by everyone (mode {:o}), so any account could stop PKCS#11 logins",
+            "is open to every account (mode {:o}), so any of them could stop PKCS#11 logins. Give it to the group \
+             of the accounts that read the PIN file and nobody else: root:<service-group>, mode 2770",
             meta.mode() & 0o7777
         )));
     }
@@ -1802,20 +1805,21 @@ mod tests {
     }
 
     #[test]
-    fn the_pin_state_dir_must_be_a_directory_not_everyone_can_write() {
+    fn the_pin_state_dir_must_be_a_directory_closed_to_other_accounts() {
         let base = crate::secure_file::private_tempdir();
         let dir = base.path().join("state");
         assert!(check_pin_state_dir(&dir).unwrap_err().contains("Create it"), "a missing one says what to do");
 
         std::fs::create_dir(&dir).unwrap();
-        for mode in [0o700, 0o770, 0o2770, 0o755] {
+        for mode in [0o700, 0o770, 0o2770, 0o750] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
             check_pin_state_dir(&dir).unwrap_or_else(|e| panic!("mode {mode:o} must pass: {e}"));
         }
-        for mode in [0o777, 0o1777, 0o702] {
+        // Search or read alone is enough to hold the login lock.
+        for mode in [0o777, 0o1777, 0o702, 0o755, 0o751, 0o774] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
             let err = check_pin_state_dir(&dir).unwrap_err();
-            assert!(err.contains("writable by everyone"), "mode {mode:o}: {err}");
+            assert!(err.contains("open to every account"), "mode {mode:o}: {err}");
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 

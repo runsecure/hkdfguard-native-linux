@@ -133,7 +133,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `pkcs11.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[pkcs11.pinned_keys]`. Its key is now on the token: add the line the message prints, then run `provision` again. |
 | `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. Other processes still try once each unless `pkcs11.pin_state_dir` is set. |
 | `PKCS#11 login disabled: the token rejected the PIN in ... for another process` | Another process recorded a rejected PIN in `pkcs11.pin_state_dir`. Correct the PIN file; any change to it re-enables login. If the PIN was right and the token was at fault, delete `pin-rejected` in that directory. |
-| `pkcs11.pin_state_dir ...: is writable by everyone`, or `No such file or directory` | Create the directory (`root:<service-group> 2770`), or remove the setting. Under `/run` it must be re-created at boot (`tmpfiles.d`, or the unit's `RuntimeDirectory=`). |
+| `pkcs11.pin_state_dir ...: is open to every account`, or `No such file or directory` | Create the directory (`root:<service-group> 2770`) with no access for other accounts, or remove the setting. Under `/run` it must be re-created at boot (`tmpfiles.d`, or the unit's `RuntimeDirectory=` with `RuntimeDirectoryMode=0750`). |
 | `PKCS#11 login lock ... still held after 30 seconds` | Another process has been in its first login for that long, usually a hung module or unreachable HSM. The call can be retried; find the stuck process if it repeats. |
 
 **External secret**
