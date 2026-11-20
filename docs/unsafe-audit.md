@@ -153,8 +153,8 @@ The one `unsafe impl` and the only raw-pointer arithmetic.
 ### Calls with no preconditions
 
 `geteuid`, `getuid`, `getegid`, `getpid` and `sysconf` take no pointers
-and can't fail. 32 of the crate's 113 `unsafe` blocks (86 at 0.9.1) are
-only these. (`getpid` is how the ephemeral store and the PKCS#11 module
+and can't fail. 35 of the 121 `unsafe` blocks under `src/` (86 at 0.9.1)
+are only these. (`getpid` is how the ephemeral store and the PKCS#11 module
 registry notice they are in a forked child.)
 
 ### Tests only
@@ -177,7 +177,7 @@ it were run again; the others are as 0.9.1 left them.
 | Module | Under Miri | Notes |
 |---|---|---|
 | C ABI (`ffi_tests`) | 65 passed (0.9.2) | 4 ignored under Miri: 3 assert wall-clock speed, 1 needs the passwd database. About 20 minutes. Includes the secret functions and their in-place unwrap |
-| `provider::ephemeral` | 10 passed (0.9.2) | Includes the `mmap` pages, `slot()`, and the forked-child store's `discard` |
+| `provider::ephemeral` | 13 passed (after 0.9.2) | Run again on 2026-11-20 (nightly `6905905bb 2026-11-19`) after the page marker and `block()` were added. Includes the `mmap` pages, `block()` and `slot()`, the marker check, and the forked-child store's `discard` |
 | `key_file` | 46 passed (0.9.2) | 3 ignored: 2 need the passwd database, 1 makes a FIFO. About 80 minutes |
 | `secure_file` | 25 passed (0.9.2) | 3 ignored: 1 makes a FIFO, 2 set a real ACL |
 | `security_model` | 8 passed (0.9.2) | 4 ignored: they need the passwd or group database. First run under Miri in 0.9.2 |
@@ -211,7 +211,9 @@ that ships has them:
 - `secure_file::open_checked` opens without `O_NONBLOCK | O_NOCTTY`,
   which Miri doesn't support. Neither changes how a regular file opens.
 - `harden_process_impl` runs `harden_steps` with no system calls.
-- The ephemeral key page skips `madvise` and `mlock`, which are advice.
+- The ephemeral key page skips `madvise` and `mlock`, which Miri can't
+  call, and `still_hardened` skips its `prctl` check. In a real build a
+  failed `madvise` fails the key's creation.
 - `security_model`'s lookups report no such user or group.
 - `on_read_only_mount` reports no read-only mount, the answer for every
   test directory.
