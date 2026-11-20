@@ -86,11 +86,16 @@
 //! nothing made by a session without the PIN is seen at all (see
 //! `labelled_template`).
 //!
-//! A wrong PIN is tried once: after the token rejects it, this process
-//! attempts no further login with that PIN file until the file changes,
-//! and a token that reports its user PIN locked or on its final attempt is
-//! refused before any login -- so this library never locks the HSM user
-//! out (see [`PIN_LATCHES`]). Two processes generating a service's key at
+//! A wrong PIN is tried once per process: after the token rejects it, this
+//! process attempts no further login with that PIN file until the file
+//! changes, and a token that reports its user PIN locked or on its final
+//! attempt is refused before any login (see [`PIN_LATCHES`]). That bounds
+//! one process, not a host: every worker of a prefork server, and every
+//! start of a service in a restart loop, is a new process with one attempt
+//! to spend, and not every token reports its final attempt. With
+//! `pkcs11.pin_state_dir` set, the rejection is recorded for all of them,
+//! and a wrong PIN then costs one attempt in total (see
+//! `SHARED_LATCH_FILE`). Two processes generating a service's key at
 //! the same moment is detected after the fact, and the later one discards
 //! its own key rather than leaving two under the label (see
 //! `generate_key`).
@@ -447,8 +452,10 @@ use crate::secure_file::FileIdentity;
 /// seconds. After one rejection this process attempts no further login
 /// with that file until the file changes -- an operator corrected it -- or
 /// the process restarts. The token's own flags are checked before each
-/// login as well (see `open_session`), so a token already on its final
-/// attempt is never pushed over by this library.
+/// login as well (see `open_session`), so a token that reports itself on
+/// its final attempt is never pushed over by this library. This list is
+/// one process's: what carries a rejection to the others is the record in
+/// `pkcs11.pin_state_dir` (see `SHARED_LATCH_FILE`).
 static PIN_LATCHES: Mutex<Vec<(PathBuf, Option<FileIdentity>, String)>> = Mutex::new(Vec::new());
 
 /// Serializes the PIN-state check, `C_Login` and the latching of its
@@ -500,6 +507,216 @@ fn latch_pin_login(pin_file: &Path, identity: Option<FileIdentity>, reason: Stri
     let mut latches = PIN_LATCHES.lock().unwrap_or_else(PoisonError::into_inner);
     latches.retain(|(path, _, _)| path != pin_file);
     latches.push((pin_file.to_path_buf(), identity, reason));
+}
+
+// ---------------------------------------------------------------------
+// The rejected-PIN record shared between processes.
+// ---------------------------------------------------------------------
+//
+// `PIN_LATCHES` is one process's memory. Prefork workers each have their
+// own, and a service in a restart loop starts with an empty one every
+// time: with a stale PIN file, each worker and each restart spends one of
+// the token's attempts, and a handful of those lock it. When policy names
+// a `pkcs11.pin_state_dir`, a rejection is also written there, and every
+// process reads it before logging in. The record names the PIN file's
+// version (`FileIdentity`), so it stops applying the moment the file
+// changes, as the in-process latch does.
+//
+// The directory decides who is believed. Whoever can write it can stop
+// PKCS#11 logins (a forged record, a held lock) but nothing more: the
+// record holds no secret and is never a reason to log in. It is meant to
+// be writable by exactly the accounts that read the PIN file, each of
+// which could lock the token outright with the PIN it holds.
+
+/// The rejection record's name in `pkcs11.pin_state_dir`.
+const SHARED_LATCH_FILE: &str = "pin-rejected";
+/// The file processes lock around a login whose PIN they haven't yet seen
+/// accepted (see [`SharedLoginLock`]).
+const SHARED_LOGIN_LOCK_FILE: &str = "login.lock";
+const SHARED_LATCH_HEADER: &str = "hkdfguard-pin-rejected 1";
+/// More than any record this code writes; bounds the read.
+const MAX_SHARED_LATCH_LEN: u64 = 1024;
+/// How long a first login waits for another process's first login.
+const SHARED_LOGIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The PIN-file version this process has seen the token accept. A login
+/// with it needs no cross-process lock: only a PIN nobody has vouched for
+/// can cost an attempt in every process at once.
+static PIN_CONFIRMED: Mutex<Option<(PathBuf, Option<FileIdentity>)>> = Mutex::new(None);
+
+fn pin_confirmed(pin_file: &Path, identity: Option<FileIdentity>) -> bool {
+    let confirmed = PIN_CONFIRMED.lock().unwrap_or_else(PoisonError::into_inner);
+    matches!(&*confirmed, Some((path, id)) if path == pin_file && *id == identity)
+}
+
+fn set_pin_confirmed(confirmed: Option<(PathBuf, Option<FileIdentity>)>) {
+    *PIN_CONFIRMED.lock().unwrap_or_else(PoisonError::into_inner) = confirmed;
+}
+
+/// Checks `pkcs11.pin_state_dir`: a real directory (not a link to one),
+/// owned by root or this account, that not everyone can write. In a
+/// world-writable one, any local account could forge a rejection or hold
+/// the login lock.
+fn check_pin_state_dir(dir: &Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let fail = |why: String| format!("pkcs11.pin_state_dir {}: {why}", dir.display());
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        fail(format!("{e}. Create it, writable by the accounts that read the PIN file and by nobody else, or remove the setting"))
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(fail("is not a directory".into()));
+    }
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(fail(format!("is owned by uid {}, not by root or this account", meta.uid())));
+    }
+    if meta.mode() & 0o002 != 0 {
+        return Err(fail(format!(
+            "is writable by everyone (mode {:o}), so any account could stop PKCS#11 logins",
+            meta.mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+fn shared_latch_text(identity: FileIdentity, reason: &str) -> String {
+    let reason: String = reason.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(400).collect();
+    format!(
+        "{SHARED_LATCH_HEADER}\n{} {} {} {} {}\n{reason}\n",
+        identity.dev, identity.ino, identity.len, identity.mtime.0, identity.mtime.1
+    )
+}
+
+/// The PIN-file version a record names and why its PIN was rejected, or
+/// `None` for anything that isn't a whole record this code wrote. The
+/// reason is shown to an operator, so only printable ASCII survives.
+fn parse_shared_latch(text: &str) -> Option<(FileIdentity, String)> {
+    let mut lines = text.lines();
+    if lines.next()? != SHARED_LATCH_HEADER {
+        return None;
+    }
+    let mut fields = lines.next()?.split(' ');
+    let identity = FileIdentity {
+        dev: fields.next()?.parse().ok()?,
+        ino: fields.next()?.parse().ok()?,
+        len: fields.next()?.parse().ok()?,
+        mtime: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    let reason = lines.next()?.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(400).collect();
+    Some((identity, reason))
+}
+
+/// Why another process's login with this very version of the PIN file was
+/// rejected, if `dir` holds a record saying so. A record for any other
+/// version -- the file has changed since -- says nothing, and neither does
+/// one that can't be read or parsed: this only ever withholds a login.
+fn read_shared_latch(dir: &Path, current: Option<FileIdentity>) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let current = current?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(dir.join(SHARED_LATCH_FILE))
+        .ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_SHARED_LATCH_LEN).read_to_string(&mut text).ok()?;
+    let (rejected, reason) = parse_shared_latch(&text)?;
+    (rejected == current).then_some(reason)
+}
+
+/// Records for every process using `dir` that the token rejected the PIN
+/// in the file version `identity`. Written whole under another name and
+/// renamed into place, so a reader sees the old record or the new one.
+/// Best effort: if it can't be written, this process's own latch still
+/// holds, and the warning says other processes will each try once.
+fn write_shared_latch(dir: &Path, identity: Option<FileIdentity>, reason: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Some(identity) = identity else { return };
+    let temp = dir.join(format!(".{SHARED_LATCH_FILE}.{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp); // a leftover of an earlier process with this pid
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
+        .and_then(|mut file| {
+            // Readable by the other accounts sharing the directory,
+            // whatever this process's umask: it holds nothing secret.
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            file.write_all(shared_latch_text(identity, reason).as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, dir.join(SHARED_LATCH_FILE)));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        log::warn!(
+            "hkdfguard: the rejected PKCS#11 PIN could not be recorded in pkcs11.pin_state_dir {} ({e}); other \
+             processes will each spend one login attempt finding out for themselves",
+            dir.display()
+        );
+    }
+}
+
+/// Held by a process while it logs in with a PIN-file version it hasn't
+/// yet seen accepted, so that processes starting together -- prefork
+/// workers -- learn of a wrong PIN from the first of them, not one attempt
+/// each. An exclusive `flock` on a file in `pkcs11.pin_state_dir`,
+/// released when dropped, or when its holder dies.
+struct SharedLoginLock {
+    _file: std::fs::File,
+}
+
+impl SharedLoginLock {
+    fn acquire(dir: &Path, wait: std::time::Duration) -> std::result::Result<SharedLoginLock, String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let path = dir.join(SHARED_LOGIN_LOCK_FILE);
+        let fail = |why: String| format!("PKCS#11 login lock {}: {why}", path.display());
+        // Read-only is all `flock` needs, so an account that shares the
+        // directory but not this file's owner can still take the lock.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .mode(0o644)
+            .open(&path)
+            .map_err(|e| fail(format!("could not be opened ({e})")))?;
+        let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
+        if !meta.file_type().is_file() {
+            return Err(fail("is not a regular file".into()));
+        }
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o644)); // ours if we just made it; else already set
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            // SAFETY: `file` is an open descriptor for the life of this call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(SharedLoginLock { _file: file });
+            }
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EWOULDBLOCK) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Some(libc::EWOULDBLOCK) => {
+                    return Err(fail(format!(
+                        "still held after {} seconds by another process's first login; no login was attempted",
+                        wait.as_secs()
+                    )))
+                }
+                _ => return Err(fail(format!("could not be locked: {e}"))),
+            }
+        }
+    }
 }
 
 
@@ -625,6 +842,24 @@ fn open_session() -> Backend<OpenSession> {
     if let Some(reason) = pin_login_blocked(&pin_path, pin_identity) {
         return login_disabled(reason);
     }
+    // The same, as other processes saw it: see `SHARED_LATCH_FILE`.
+    let state_dir = settings.pin_state_dir.clone();
+    let shared_login_disabled = |dir: &Path, reason: String| {
+        Backend::Refused(format!(
+            "PKCS#11 login disabled: the token rejected the PIN in {} for another process ({reason}). Correct the \
+             PIN file (any change to it re-enables login); if the PIN is right and the token was at fault, delete {}",
+            pin_path.display(),
+            dir.join(SHARED_LATCH_FILE).display()
+        ))
+    };
+    if let Some(dir) = &state_dir {
+        if let Err(reason) = check_pin_state_dir(dir) {
+            return Backend::Refused(reason);
+        }
+        if let Some(reason) = read_shared_latch(dir, pin_identity) {
+            return shared_login_disabled(dir, reason);
+        }
+    }
 
     let checked = match validate_module_path(&module) {
         Ok(checked) => checked,
@@ -672,6 +907,22 @@ fn open_session() -> Backend<OpenSession> {
     if let Some(reason) = pin_login_blocked(&pin_path, pin_identity) {
         return login_disabled(reason);
     }
+    // And one process at a time, until this process has seen the token
+    // accept this PIN: see `SharedLoginLock`. The record is re-read under
+    // the lock, for the same reason the latch was under the gate.
+    let shared_lock = match &state_dir {
+        Some(dir) if !pin_confirmed(&pin_path, pin_identity) => {
+            let lock = match SharedLoginLock::acquire(dir, SHARED_LOGIN_LOCK_WAIT) {
+                Ok(lock) => lock,
+                Err(reason) => return Backend::Refused(reason),
+            };
+            if let Some(reason) = read_shared_latch(dir, pin_identity) {
+                return shared_login_disabled(dir, reason);
+            }
+            Some(lock)
+        }
+        _ => None,
+    };
 
     // The token reports the user PIN's state. Read it before spending an
     // attempt: a token that is locked, or down to its last try, is refused
@@ -714,13 +965,19 @@ fn open_session() -> Backend<OpenSession> {
     // other call out mid-operation; closing the last session ends the
     // login instead.
     match session.login(UserType::User, Some(&pin)) {
-        Ok(()) | Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
+        Ok(()) => set_pin_confirmed(Some((pin_path.clone(), pin_identity))),
+        // Says nothing about this PIN: another call's login is in effect.
+        Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
         // The token rejected the configured PIN. One attempt was spent
         // finding that out; none more will be, from this process, until the
         // PIN file changes.
         Err(CryptokiError::Pkcs11(rv, _)) if pin_rejection(rv).is_some() => {
             let reason = pin_rejection(rv).unwrap_or_default();
             latch_pin_login(&pin_path, pin_identity, reason.clone());
+            set_pin_confirmed(None);
+            if let Some(dir) = &state_dir {
+                write_shared_latch(dir, pin_identity, &reason);
+            }
             return Backend::Refused(format!(
                 "C_Login failed: {reason}; no further login will be attempted by this process until the PIN file {} \
                  changes, so the token's remaining attempts are not spent",
@@ -730,6 +987,7 @@ fn open_session() -> Backend<OpenSession> {
         Err(e) => return refuse("C_Login failed", &e),
     }
     drop(pin); // AuthPin zeroizes its storage on drop; don't keep the PIN around for the session's lifetime
+    drop(shared_lock); // the verdict is in: other processes' first logins may go ahead
 
     // Straight after the login, before any search it is to vouch for. A
     // token that can't hold one (a module that refuses session objects in
@@ -1474,6 +1732,131 @@ mod tests {
         let v2 = Some(FileIdentity { mtime: (11, 0), ..first }); // the operator rewrote the file
         assert!(pin_login_blocked(path, v2).is_none(), "a changed file clears the latch, so one login can try it");
         assert!(pin_login_blocked(path, v1).is_none(), "and it stays cleared");
+    }
+
+    #[test]
+    fn a_rejection_recorded_in_the_state_dir_reaches_other_processes_until_the_pin_file_changes() {
+        // What a second process does is exactly these calls, with nothing
+        // in its own `PIN_LATCHES`.
+        let dir = crate::secure_file::private_tempdir();
+        let first = FileIdentity { dev: 7, ino: 42, len: 5, mtime: (-3, 999_999_999) };
+        assert!(read_shared_latch(dir.path(), Some(first)).is_none(), "no record yet");
+
+        write_shared_latch(dir.path(), Some(first), "the token rejected the configured PIN (PinIncorrect)");
+        assert_eq!(
+            read_shared_latch(dir.path(), Some(first)).as_deref(),
+            Some("the token rejected the configured PIN (PinIncorrect)")
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from(SHARED_LATCH_FILE)], "no temporary file is left behind");
+        let mode = std::fs::metadata(dir.path().join(SHARED_LATCH_FILE)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "readable by the other accounts sharing the directory, whatever the umask");
+
+        let rewritten = FileIdentity { mtime: (11, 0), ..first }; // the operator corrected the file
+        assert!(read_shared_latch(dir.path(), Some(rewritten)).is_none(), "a changed PIN file is not blocked");
+        assert!(read_shared_latch(dir.path(), None).is_none(), "nor is a file whose version is unknown");
+
+        // A later rejection of the corrected file replaces the record.
+        write_shared_latch(dir.path(), Some(rewritten), "again");
+        assert_eq!(read_shared_latch(dir.path(), Some(rewritten)).as_deref(), Some("again"));
+        assert!(read_shared_latch(dir.path(), Some(first)).is_none());
+    }
+
+    #[test]
+    fn only_a_whole_record_blocks_a_login() {
+        let id = FileIdentity { dev: 1, ino: 2, len: 3, mtime: (4, 5) };
+        let good = shared_latch_text(id, "why");
+        assert_eq!(parse_shared_latch(&good), Some((id, "why".to_string())));
+
+        for bad in [
+            "",
+            "garbage",
+            "hkdfguard-pin-rejected 2\n1 2 3 4 5\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 3 4\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 3 4 5 6\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 x 4 5\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 3 4 5\n", // cut off before the reason: not written whole
+        ] {
+            assert_eq!(parse_shared_latch(bad), None, "{bad:?}");
+        }
+
+        // The reason reaches an operator's log: nothing but printable ASCII, on one line.
+        let (_, reason) = parse_shared_latch("hkdfguard-pin-rejected 1\n1 2 3 4 5\nline\x1b[2Jone\u{e9}\n").unwrap();
+        assert_eq!(reason, "line[2Jone");
+        assert!(!shared_latch_text(id, "two\nlines").trim_end().ends_with("lines\n"));
+        assert_eq!(parse_shared_latch(&shared_latch_text(id, "two\nlines")).unwrap().1, "twolines");
+
+        // Whatever else is at the name -- a link, a directory, junk -- blocks nothing.
+        let dir = crate::secure_file::private_tempdir();
+        let record = dir.path().join(SHARED_LATCH_FILE);
+        std::fs::write(&record, "junk").unwrap();
+        assert!(read_shared_latch(dir.path(), Some(id)).is_none());
+        std::fs::remove_file(&record).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, &good).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+        assert!(read_shared_latch(dir.path(), Some(id)).is_none(), "a link is not followed");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert!(read_shared_latch(dir.path(), Some(id)).is_none());
+    }
+
+    #[test]
+    fn the_pin_state_dir_must_be_a_directory_not_everyone_can_write() {
+        let base = crate::secure_file::private_tempdir();
+        let dir = base.path().join("state");
+        assert!(check_pin_state_dir(&dir).unwrap_err().contains("Create it"), "a missing one says what to do");
+
+        std::fs::create_dir(&dir).unwrap();
+        for mode in [0o700, 0o770, 0o2770, 0o755] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            check_pin_state_dir(&dir).unwrap_or_else(|e| panic!("mode {mode:o} must pass: {e}"));
+        }
+        for mode in [0o777, 0o1777, 0o702] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = check_pin_state_dir(&dir).unwrap_err();
+            assert!(err.contains("writable by everyone"), "mode {mode:o}: {err}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(check_pin_state_dir(&link).unwrap_err().contains("not a directory"), "a link to one is refused");
+        let file = base.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(check_pin_state_dir(&file).unwrap_err().contains("not a directory"));
+    }
+
+    #[test]
+    fn first_logins_take_turns_across_processes() {
+        // Two open file descriptions, as two processes have.
+        let dir = crate::secure_file::private_tempdir();
+        let none = std::time::Duration::ZERO;
+        let held = SharedLoginLock::acquire(dir.path(), none).expect("free: taken at once");
+        let err = SharedLoginLock::acquire(dir.path(), none).err().expect("held: the second must not get it");
+        assert!(err.contains("no login was attempted"), "{err}");
+        drop(held);
+        SharedLoginLock::acquire(dir.path(), none).expect("released when its holder is done");
+
+        // A FIFO at the name can't hang the open, and is refused.
+        let fifo_dir = crate::secure_file::private_tempdir();
+        let fifo = std::ffi::CString::new(fifo_dir.path().join(SHARED_LOGIN_LOCK_FILE).to_str().unwrap()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(SharedLoginLock::acquire(fifo_dir.path(), none).err().unwrap().contains("not a regular file"));
+    }
+
+    #[test]
+    fn a_confirmed_pin_is_one_file_version() {
+        let path = Path::new("/nonexistent/hkdfguard-confirmed-test/pkcs11.pin");
+        let v1 = Some(FileIdentity { dev: 1, ino: 2, len: 5, mtime: (10, 0) });
+        let v2 = Some(FileIdentity { dev: 1, ino: 3, len: 5, mtime: (10, 0) });
+        set_pin_confirmed(Some((path.to_path_buf(), v1)));
+        assert!(pin_confirmed(path, v1));
+        assert!(!pin_confirmed(path, v2), "a rewritten file has not been confirmed");
+        assert!(!pin_confirmed(Path::new("/nonexistent/other.pin"), v1));
+        set_pin_confirmed(None);
+        assert!(!pin_confirmed(path, v1));
     }
 
     #[test]

@@ -134,8 +134,11 @@ With `--force`, the existing key file is left as it was.
 
 `retire` permanently deletes the service's KEK, and with it every DEK
 wrapped under it. It deletes nothing unless the KEK's fingerprint is the
-one given. Only PKCS#11 keys can be retired; a TPM key isn't stored
-anywhere, so there's nothing to delete. See "Retiring a KEK" in the README.
+one given. TPM and PKCS#11 keys can be retired. For a TPM key, `retire`
+deletes the service's key file and then its authValue file: the TPM keeps
+no copy, so a backup of both files is the only thing that could still load
+the key. An external secret belongs to the platform that mounted it and is
+removed there. See "Retiring a KEK" in the README.
 
 The CLI hardens itself before touching key material (no core dumps, no
 debugger attachment) and refuses to run if it can't. It also tries to lock

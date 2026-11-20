@@ -117,6 +117,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `the TPM key directory's lock ... is still held after 30 seconds` | Another `provision` or `retire` is running, or one is stuck. Nothing was changed. Run it again once that process has finished. |
 | A pinned Name mismatch | The service's key file holds a different key than the pinned one: it was replaced, or the service was retired and provisioned again. Restore the original key file from your backup, or re-learn the pin only once you're sure which key is right: see [Fingerprint mismatch](#fingerprint-mismatch--16). |
 | A failed owner authorization | `owner_auth_file` and the TPM's owner password disagree. Set both in the same change. |
+| `TPM owner authorization file ... holds N bytes; at least 16 are required` | The owner password is short enough to guess offline from recorded bus traffic. Write 32 random bytes to the file and set them as the password: `tpm2_changeauth -c o -p <current> file:<path>`. |
 | `could not open the configured TCTI` | The `tcti` the policy names can't be opened. Check the path, or that `tpm2-abrmd` is running for `tabrmd:`. |
 | `TPM_RC_LOCKOUT` | The TPM is in dictionary-attack lockout, often from another program's failed authorizations. Wait for the lockout interval, or reset it with the lockout password. |
 
@@ -130,7 +131,10 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `the PKCS#11 key for this service has fingerprint ..., which is not the one pinned in policy` | The key under the service's label was deleted and generated again since it was pinned; anyone holding the token's PIN can do that. DEKs wrapped under the old key can't be unwrapped with the new one. Find out who replaced it before pinning the new fingerprint. |
 | `policy pins a PKCS#11 key for this service ..., but the token holds none` | The key was deleted, or this isn't the token it was provisioned on (check `token_label` and `token_serial`). If it was retired on purpose, remove the service's pin from `[pkcs11.pinned_keys]`, then run `provision` and pin the new fingerprint. |
 | `pkcs11.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[pkcs11.pinned_keys]`. Its key is now on the token: add the line the message prints, then run `provision` again. |
-| `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. |
+| `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. Other processes still try once each unless `pkcs11.pin_state_dir` is set. |
+| `PKCS#11 login disabled: the token rejected the PIN in ... for another process` | Another process recorded a rejected PIN in `pkcs11.pin_state_dir`. Correct the PIN file; any change to it re-enables login. If the PIN was right and the token was at fault, delete `pin-rejected` in that directory. |
+| `pkcs11.pin_state_dir ...: is writable by everyone`, or `No such file or directory` | Create the directory (`root:<service-group> 2770`), or remove the setting. Under `/run` it must be re-created at boot (`tmpfiles.d`, or the unit's `RuntimeDirectory=`). |
+| `PKCS#11 login lock ... still held after 30 seconds` | Another process has been in its first login for that long, usually a hung module or unreachable HSM. The call can be retried; find the stuck process if it repeats. |
 
 **External secret**
 

@@ -1544,16 +1544,46 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
         )
     })?;
     if exists == 1 {
-        println!("KEK already provisioned for service \"{service_name}\"; verified, nothing to do");
-        println!(
-            "fingerprint: {} -- confirm it matches the one recorded when this service was provisioned",
-            hex(&fingerprint)
-        );
+        report(
+            "the KEK was verified",
+            &format!(
+                "KEK already provisioned for service \"{service_name}\"; verified, nothing to do\n\
+                 fingerprint: {} -- confirm it matches the one recorded when this service was provisioned",
+                hex(&fingerprint)
+            ),
+        )
     } else {
-        println!("KEK provisioned for service \"{service_name}\"");
-        println!("fingerprint: {} -- record this; retire requires it", hex(&fingerprint));
+        report(
+            "the KEK was provisioned",
+            &format!(
+                "KEK provisioned for service \"{service_name}\"\nfingerprint: {} -- record this; retire requires it",
+                hex(&fingerprint)
+            ),
+        )
     }
-    Ok(())
+}
+
+// Writes `text` and a newline to standard output and flushes it. Used in
+// place of `println!`, which panics -- exit status 101 and a Rust panic
+// message -- when the write fails: a reader that closed its end of the
+// pipe, a full disk behind a redirect.
+fn write_stdout(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()
+}
+
+// Prints what a command did, once it has done it. If standard output
+// can't be written, the same lines go to standard error -- a new KEK's
+// fingerprint is printed nowhere else -- and the command fails, saying
+// that `done` happened all the same.
+fn report(done: &str, text: &str) -> Result<(), String> {
+    write_stdout(text).map_err(|e| {
+        eprintln!("{text}");
+        format!("{done}, but the lines above could not be written to standard output: {e}")
+    })
 }
 
 // The fingerprint of the KEK `service` resolves to now, through the C ABI;
@@ -1580,15 +1610,15 @@ fn read_kek_fingerprint(service: &CString) -> Result<[u8; FINGERPRINT_LEN], c_in
 fn run_retire(mut service_name: String, fingerprint: [u8; FINGERPRINT_LEN]) -> Result<(), String> {
     let service_c = prepare_service(&mut service_name)?;
     match admin::retire_kek(&service_name, &fingerprint) {
-        Ok(provider) => {
-            println!(
-                "retired KEK for service \"{service_name}\" (fingerprint {}, provider {})",
+        Ok(provider) => report(
+            "the KEK was retired",
+            &format!(
+                "retired KEK for service \"{service_name}\" (fingerprint {}, provider {})\n\
+                 every payload wrapped under it is now permanently unrecoverable",
                 hex(&fingerprint),
                 provider.as_str()
-            );
-            println!("every payload wrapped under it is now permanently unrecoverable");
-            Ok(())
-        }
+            ),
+        ),
         Err(e) if e.status == status::KEK_NOT_FOUND => {
             Err(format!("no KEK exists for service \"{service_name}\"; nothing to retire"))
         }
@@ -1745,13 +1775,15 @@ fn run_wrap(
     let used_fingerprint =
         confirm_fingerprint(&wrapped, expected_fingerprint, &service_name, "hkdfguard_wrap_dek", "the DEK")?;
     let access = write_key_file(&target, &wrapped)?;
-    println!(
-        "wrapped key written to {} ({} bytes, {access}, service \"{service_name}\")",
-        target.shown,
-        wrapped.len()
-    );
-    println!("{}", fingerprint_line(&used_fingerprint, expected_fingerprint.is_some()));
-    Ok(())
+    report(
+        "the wrapped key was written",
+        &format!(
+            "wrapped key written to {} ({} bytes, {access}, service \"{service_name}\")\n{}",
+            target.shown,
+            wrapped.len(),
+            fingerprint_line(&used_fingerprint, expected_fingerprint.is_some())
+        ),
+    )
 }
 
 // `protect`: `wrap`, for a secret (a password) bound to a secret name,
@@ -1789,12 +1821,14 @@ fn run_protect(
     match target {
         Some(target) => {
             let access = write_key_file(&target, &wrapped)?;
-            println!(
-                "protected secret written to {} ({} bytes, {access}, service \"{service_name}\", secret \"{secret_name}\")",
-                target.shown,
-                wrapped.len()
-            );
-            println!("{fingerprint}");
+            report(
+                "the protected secret was written",
+                &format!(
+                    "protected secret written to {} ({} bytes, {access}, service \"{service_name}\", secret \"{secret_name}\")\n{fingerprint}",
+                    target.shown,
+                    wrapped.len()
+                ),
+            )
         }
         None => {
             // stdout carries the payload alone, so it can be captured as
@@ -1802,7 +1836,10 @@ fn run_protect(
             let mut text = [0u8; INITIAL_SECRET_WRAPPED_CAPACITY.div_ceil(3) * 4];
             // `wrap_secret` never returns more than INITIAL_SECRET_WRAPPED_CAPACITY bytes.
             let encoded = Base64::encode(&wrapped, &mut text).expect("`text` holds the base64 of the largest payload");
-            println!("{encoded}");
+            // The payload is this command's whole product: if it can't
+            // be written, nothing was produced.
+            write_stdout(encoded)
+                .map_err(|e| format!("could not write the protected secret to standard output: {e}; nothing was stored"))?;
             eprintln!(
                 "protected secret printed as base64 ({} bytes wrapped, service \"{service_name}\", secret \"{secret_name}\"). \
                  Store it where only root or a deployer can write: anyone who can replace it, and can wrap under \
@@ -1810,9 +1847,9 @@ fn run_protect(
                 wrapped.len()
             );
             eprintln!("{fingerprint}");
+            Ok(())
         }
     }
-    Ok(())
 }
 
 // Removes the file this run created -- but only if `path` still names

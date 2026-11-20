@@ -260,7 +260,9 @@ tpm2_clearcontrol -C l -P "$LOCKOUT_PW" s
 Optionally, also set an **owner** password and name a file holding it in
 `tpm.owner_auth_file`. Then the storage root key every key file is loaded
 under can't be re-created without that password either. It changes no
-existing key. But other
+existing key. The file must hold at least 16 random bytes (the README's
+steps write 32): a recorded use of the password lets guesses be tested
+offline, so a passphrase is not enough, and a shorter file is refused. But other
 software on the host that uses the owner hierarchy with an empty password
 (for example `systemd-cryptenroll --tpm2-device`) stops working until it is
 given the password. Every service using TPM keys must be able to read the
@@ -317,8 +319,38 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   token must match. With neither set, exactly one initialized token must be
   present.
 - **A rejected PIN stops further logins** from that process until the PIN
-  file changes, so a wrong PIN can't run the token's retry counter down to a
-  lockout.
+  file changes, so one process can't run the token's retry counter down to
+  a lockout. That is per process: each worker of a prefork server, and each
+  start of a service in a restart loop, spends one attempt of its own on a
+  stale PIN file, and a token that allows three is locked by three of them.
+  Set `pin_state_dir` to close that:
+
+  ```toml
+  [pkcs11]
+  pin_state_dir = "/run/hkdfguard/pkcs11"
+  ```
+
+  ```sh
+  install -d -m 0755 /run/hkdfguard
+  install -d -m 2770 -o root -g <service-group> /run/hkdfguard/pkcs11   # the group that reads the PIN file
+  ```
+
+  A rejection is then recorded there (`pin-rejected`), and every process
+  using this policy reads it before logging in, so a wrong PIN costs one
+  attempt in total. Processes that haven't yet seen the PIN accepted also
+  log in one at a time (`login.lock`), so workers starting together don't
+  each try it. The record names the PIN file's version, and stops applying
+  when the file changes; deleting it also lets one login retry. The
+  directory must exist, be owned by root or the service's account, and not
+  be writable by everyone; otherwise PKCS#11 is refused. Give write access
+  only to the accounts that read the PIN file: whoever can write there can
+  stop PKCS#11 logins, though nothing more. `/run` is emptied at boot, so
+  create the directory from a `tmpfiles.d` entry
+  (`d /run/hkdfguard/pkcs11 2770 root <service-group>`) or the unit's
+  `RuntimeDirectory=`. One case is not covered: if the PIN is changed on
+  the token while several processes are already logged in and working,
+  those in the middle of a login at that moment each spend an attempt
+  before the first record is written.
 
 `provision` generates one secret key on the token (`CKO_SECRET_KEY`,
 `CKK_GENERIC_SECRET`, 32 bytes, with `CKM_GENERIC_SECRET_KEY_GEN`),
@@ -838,6 +870,7 @@ require_pinned_keys = false       # true: only services in pinned_keys have a KE
 [pkcs11]
 module = "/usr/lib/vendor/libvendor-pkcs11.so"   # default: unset (PKCS#11 not used)
 pin_file = "/etc/hkdfguard/pkcs11.pin"
+pin_state_dir = "/run/hkdfguard/pkcs11"          # default: unset (a rejected PIN is remembered per process only)
 token_label = "hkdfguard-prod"                   # 1 to 32 bytes
 token_serial = "0123456789abcdef"                # 1 to 16 bytes
 require_pinned_keys = false                      # true: only the services below have a key on the token

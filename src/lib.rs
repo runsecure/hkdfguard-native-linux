@@ -1649,7 +1649,13 @@ fn open_file_impl(kind: key_file::Kind, path: *const c_char, out: *mut u8, out_l
                 }
                 _ => "",
             };
-            log::error!("hkdfguard: {function} refused key file {}: {}{hint}", path.display(), e.describe());
+            // The path is the caller's, so it is escaped as the audit
+            // record's is: a newline in it must not start a second line.
+            log::error!(
+                "hkdfguard: {function} refused key file {}: {}{hint}",
+                audit::quote(path.as_os_str().as_encoded_bytes()),
+                e.describe()
+            );
             let code = e.status_code();
             // Audited: a possible key exposure (event 2006), and a file
             // that could have been replaced or isn't a payload (2003).

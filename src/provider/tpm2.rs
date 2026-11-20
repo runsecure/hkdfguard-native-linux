@@ -675,6 +675,21 @@ fn resolve_tcti() -> Result<TctiNameConf> {
 /// `TPM2B_AUTH` (a digest of the largest hash the TPM supports).
 const MAX_OWNER_AUTH_LEN: usize = 64;
 
+/// Shortest Owner-hierarchy authorization value accepted from
+/// `tpm.owner_auth_file`.
+///
+/// The password never crosses the bus, but what does is enough to test a
+/// guess against: the Owner-authorized `TPM2_CreatePrimary` runs in an
+/// unsalted, unbound HMAC session (the storage root key that would salt
+/// one is the key being created), whose HMAC key is the password alone.
+/// Whoever records one such command -- its bytes, both nonces and its HMAC
+/// are all in the clear -- can try passwords against it offline, as fast as
+/// they can hash and with no dictionary-attack counter in the way. So the
+/// value has to be one that can't be guessed: random bytes, not a
+/// passphrase. Length is the only part of that this code can check, and
+/// 16 random bytes is already out of reach; the documented setup writes 32.
+const MIN_OWNER_AUTH_LEN: usize = 16;
+
 /// Reads the Owner-hierarchy authorization value from `path`
 /// (`tpm.owner_auth_file`). Held to the same standard as the policy file's
 /// other secrets -- root-owned, `0400` or `root:<service-group> 0440`, not
@@ -682,7 +697,8 @@ const MAX_OWNER_AUTH_LEN: usize = 64;
 /// trimming, so it matches exactly what `tpm2_changeauth -c o file:<path>`
 /// set. Every failure, a missing file included, is an error: the policy
 /// says the owner has this password, so trying with none would fail anyway
-/// and hide why.
+/// and hide why. A value shorter than [`MIN_OWNER_AUTH_LEN`] is refused
+/// before it is ever used to authorize a command.
 fn read_owner_auth(path: &std::path::Path) -> Result<tss_esapi::structures::Auth> {
     use crate::secure_file::{
         check_location, config_owner, open_checked, FileRequirements, SecretBuffer, FORBID_GROUP_OTHER_ACCESS,
@@ -700,6 +716,17 @@ fn read_owner_auth(path: &std::path::Path) -> Result<tss_esapi::structures::Auth
         .map_err(|e| Error::Provider(format!("TPM owner authorization file {}: {e}", path.display())))?;
     if raw.as_slice().is_empty() {
         return Err(Error::Provider(format!("TPM owner authorization file {} is empty", path.display())));
+    }
+    if raw.as_slice().len() < MIN_OWNER_AUTH_LEN {
+        let len = raw.as_slice().len();
+        raw.wipe();
+        return Err(Error::Provider(format!(
+            "TPM owner authorization file {} holds {len} bytes; at least {MIN_OWNER_AUTH_LEN} are required. Each use of \
+             the Owner password puts an HMAC keyed by it alone on the TPM's bus, which anyone recording the bus can \
+             test guesses against offline, so it must be random bytes, not a passphrase. Write 32 random bytes to \
+             the file and set them as the Owner password (tpm2_changeauth -c o -p <current> file:<path>)",
+            path.display()
+        )));
     }
     // `Auth` keeps its bytes in a `Zeroizing<Vec<u8>>`; `raw` wipes itself on drop.
     let auth = tss_esapi::structures::Auth::try_from(raw.as_slice().to_vec())
@@ -990,8 +1017,10 @@ fn open_context() -> Backend<Context> {
     // (self-test and SRK) is under the Owner hierarchy and authorizes
     // through `execute_with_nullauth_session`, an HMAC session that keys
     // its HMAC with whatever authValue the context holds for the handle --
-    // so the password authorizes without ever crossing the bus. It is not
-    // an input to the SRK's derivation, so setting it changes no KEK.
+    // so the password authorizes without ever crossing the bus. That HMAC
+    // is keyed by the password alone, though, so a recorded command lets
+    // guesses be tested offline: see `MIN_OWNER_AUTH_LEN`. It is not an
+    // input to the SRK's derivation, so setting it changes no KEK.
     let owner_auth_file = match crate::policy::tpm_owner_auth_file() {
         Ok(file) => file,
         Err(e) => return Backend::Refused(e.to_string()),
@@ -2075,6 +2104,33 @@ mod tests {
 
     #[test]
     #[serial]
+    fn an_owner_password_short_enough_to_guess_offline_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::secure_file::private_tempdir();
+        let owner_auth = dir.path().join("owner.auth");
+        let write = |bytes: &[u8]| {
+            std::fs::write(&owner_auth, bytes).unwrap();
+            std::fs::set_permissions(&owner_auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+
+        write(b"correct horse"); // 13 bytes: a passphrase, not a random value
+        match read_owner_auth(&owner_auth) {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("at least 16"), "says what is required: {msg}");
+                assert!(!msg.contains("correct horse"), "and never the value: {msg}");
+            }
+            Err(other) => panic!("expected a Provider error, got {other:?}"),
+            Ok(_) => panic!("a 13-byte owner password must be refused"),
+        }
+
+        write(&[0x5a; MIN_OWNER_AUTH_LEN]);
+        assert!(read_owner_auth(&owner_auth).is_ok(), "the shortest accepted length");
+        write(&[0x5a; MAX_OWNER_AUTH_LEN]);
+        assert!(read_owner_auth(&owner_auth).is_ok(), "the longest");
+    }
+
+    #[test]
+    #[serial]
     fn an_owner_password_under_a_sticky_ancestor_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         let chmod = |p: &std::path::Path, mode: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -2086,7 +2142,7 @@ mod tests {
         std::fs::create_dir(&private).unwrap();
         chmod(&private, 0o700);
         let owner_auth = private.join("owner.auth");
-        std::fs::write(&owner_auth, b"secret").unwrap();
+        std::fs::write(&owner_auth, [0x5a; 32]).unwrap();
         chmod(&owner_auth, 0o600);
         assert!(read_owner_auth(&owner_auth).is_ok(), "a private chain is fine");
 

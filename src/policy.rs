@@ -268,6 +268,11 @@ struct Pkcs11Policy {
     module: Option<String>,
     /// Absolute path of the user-PIN file (default /etc/hkdfguard/pkcs11.pin).
     pin_file: Option<String>,
+    /// Absolute path of a directory where a rejected PIN is recorded for
+    /// every process using this policy, not only the one that saw the
+    /// rejection (see `pkcs11::PIN_LATCHES`). Default: none, and each
+    /// process then finds out for itself, at one login attempt each.
+    pin_state_dir: Option<String>,
     /// Select the token by its CKA label (`CK_TOKEN_INFO.label`), and/or
     /// its serial number. Slot numbers aren't stable across reboots or
     /// hot-plugging; these are. Exactly one token must match.
@@ -293,6 +298,7 @@ struct Pkcs11Policy {
 pub struct Pkcs11Settings {
     pub module: Option<PathBuf>,
     pub pin_file: Option<PathBuf>,
+    pub pin_state_dir: Option<PathBuf>,
     pub token_label: Option<String>,
     pub token_serial: Option<String>,
 }
@@ -841,6 +847,7 @@ impl Policy {
         let pkcs11 = Pkcs11Settings {
             module: raw.pkcs11.module.as_deref().map(|m| absolute_path("pkcs11.module", m)).transpose()?,
             pin_file: raw.pkcs11.pin_file.as_deref().map(|f| absolute_path("pkcs11.pin_file", f)).transpose()?,
+            pin_state_dir: raw.pkcs11.pin_state_dir.as_deref().map(|d| absolute_path("pkcs11.pin_state_dir", d)).transpose()?,
             token_label: raw.pkcs11.token_label.as_deref().map(|l| token_field("pkcs11.token_label", l, 32)).transpose()?,
             token_serial: raw.pkcs11.token_serial.as_deref().map(|n| token_field("pkcs11.token_serial", n, 16)).transpose()?,
         };
@@ -2191,6 +2198,7 @@ mod tests {
         let doc = format!(
             "{base}[external_secret]\ndir = \"/srv/secrets/hkdfguard\"\n\
              [pkcs11]\nmodule = \"/usr/lib/vendor/libhsm.so\"\npin_file = \"/etc/hkdfguard/hsm.pin\"\n\
+             pin_state_dir = \"/run/hkdfguard/pkcs11\"\n\
              token_label = \"prod-kek\"\ntoken_serial = \"0123456789abcdef\"\n"
         );
         let policy = Policy::from_toml_str(&doc).unwrap();
@@ -2200,6 +2208,7 @@ mod tests {
             &Pkcs11Settings {
                 module: Some(PathBuf::from("/usr/lib/vendor/libhsm.so")),
                 pin_file: Some(PathBuf::from("/etc/hkdfguard/hsm.pin")),
+                pin_state_dir: Some(PathBuf::from("/run/hkdfguard/pkcs11")),
                 token_label: Some("prod-kek".into()),
                 token_serial: Some("0123456789abcdef".into()),
             }
@@ -2209,6 +2218,7 @@ mod tests {
             "[external_secret]\ndir = \"relative/dir\"\n",
             "[pkcs11]\nmodule = \"libsofthsm2.so\"\n",
             "[pkcs11]\npin_file = \"pkcs11.pin\"\n",
+            "[pkcs11]\npin_state_dir = \"run/pkcs11\"\n",
             "[pkcs11]\ntoken_label = \"\"\n",
             "[pkcs11]\ntoken_label = \"this label is far too long for a pkcs11 token\"\n",
             "[pkcs11]\ntoken_serial = \"0123456789abcdef0\"\n",

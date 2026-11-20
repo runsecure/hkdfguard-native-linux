@@ -58,6 +58,8 @@
 "pkcs11"
 "pkcs11.module"
 "pkcs11.pin_file"
+"pkcs11.pin_state_dir"
+"pin_state_dir"
 "pkcs11.token_label"
 "pkcs11.token_serial"
 "policy.toml"

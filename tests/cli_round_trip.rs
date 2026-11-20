@@ -869,6 +869,49 @@ fn cli_protect_to_stdout_prints_only_the_payload_and_takes_base64_input() {
     });
 }
 
+// /dev/full accepts the open and fails every write: a full disk behind a
+// redirect. `println!` would panic there (exit status 101).
+#[test]
+#[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
+fn cli_reports_an_unwritable_stdout_instead_of_panicking() {
+    let Ok(full) = fs::OpenOptions::new().write(true).open("/dev/full") else {
+        eprintln!("skipping: no /dev/full here");
+        return;
+    };
+    with_provisioned_external_secret("com.example.fullstdout", || {
+        // `provision`: the work is done, so its report -- the fingerprint
+        // included, which is printed nowhere else -- goes to stderr instead.
+        let output = cli()
+            .args(["provision", "--service-name", "com.example.fullstdout"])
+            .stdout(full.try_clone().unwrap())
+            .output()
+            .expect("failed to run hkdfguard provision");
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "an ordinary failure, not a panic: {stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(stderr.contains("fingerprint: "), "the report is not lost: {stderr}");
+        assert!(stderr.contains("could not be written to standard output"), "{stderr}");
+
+        // `protect --stdout`: the payload is the product, so nothing was produced.
+        let mut child = cli()
+            .arg("protect")
+            .args(["-sn", "com.example.fullstdout", "-sid", "vault.password", "--secret-stdin", "--stdout"])
+            .stdin(Stdio::piped())
+            .stdout(full.try_clone().unwrap())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn hkdfguard protect");
+        child.stdin.as_mut().unwrap().write_all(b"hunter2").unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(stderr.contains("could not write the protected secret to standard output"), "{stderr}");
+    });
+}
+
 // `protect` with `input` on stdin, after `pre_exec` has run in the child --
 // for resource limits that make one step of the run fail.
 fn run_protect_stdin_in(service: &str, name: &str, input: &[u8], extra_args: &[&str], pre_exec: fn() -> std::io::Result<()>) -> Output {

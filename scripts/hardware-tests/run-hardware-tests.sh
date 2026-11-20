@@ -36,7 +36,8 @@
 # Environment (read by this script; the library reads none of them):
 #   HKDFGUARD_TCTI                 override the TCTI (default /dev/tpmrm0, else /dev/tpm0)
 #   HKDFGUARD_TPM_OWNER_AUTH_FILE  a private file holding the Owner hierarchy's password,
-#                                  if it has one (tpm.owner_auth_file in every test policy)
+#                                  if it has one (tpm.owner_auth_file in every test policy);
+#                                  at least 16 bytes, or the library refuses it
 #   HKDFGUARD_HARDWARE_TEST_STATE  where `reboot capture` saves its state (default
 #                                  ${XDG_STATE_HOME:-~/.local/state}/hkdfguard-hardware-tests)
 #   HKDFGUARD_TEST_TMPDIR          where the temp dir goes (default $XDG_RUNTIME_DIR, else

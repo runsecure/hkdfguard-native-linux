@@ -117,6 +117,7 @@ mode = "prefer"
 
 # File holding the Owner hierarchy's password, if you set one. Unset: an
 # empty password. Root-owned, mode 0400 (or 0440 with the services' group).
+# At least 16 random bytes (not a passphrase); a shorter file is refused.
 # Every service using TPM keys must read it, and so holds the password.
 #owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 
@@ -167,6 +168,11 @@ mode = "prefer"
 #module = "/usr/lib/vendor/libhsm-pkcs11.so"
 # User PIN file: root-owned, mode 0400 (or 0440 with the service's group).
 #pin_file = "/etc/hkdfguard/pkcs11.pin"
+# A directory where a rejected PIN is recorded for every process, so a
+# stale PIN file costs the token one login attempt in total, not one per
+# worker or restart. Must exist (root:<service-group> 2770, say; /run is
+# emptied at boot) and not be writable by everyone. Unset: per process.
+#pin_state_dir = "/run/hkdfguard/pkcs11"
 # Choose the token by label and/or serial; exactly one token must match.
 # With neither, exactly one initialized token must be present.
 #token_label = "hkdfguard-prod"

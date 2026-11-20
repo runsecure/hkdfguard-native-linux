@@ -357,9 +357,9 @@ static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new())
 /// Logs `message` at warn level the first time this process sees it, and
 /// never again. For events that are worth an operator's attention but
 /// would repeat on every call -- a fallback, a migration hint -- so the
-/// log shows each distinct one once instead of flooding. Bounded by the
-/// number of distinct messages: provider combinations, and the services a
-/// process uses where a message names one.
+/// log shows each distinct one once instead of flooding. The list of
+/// messages seen is bounded: at `audit::ONCE_LIST_LIMIT` it starts over,
+/// so a message can then be logged once more.
 fn warn_once(message: String) {
     log_once(log::Level::Warn, message);
 }
@@ -373,6 +373,9 @@ pub(crate) fn log_once(level: log::Level, message: String) {
     let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !warned.contains(&message) {
         log::log!(level, "{message}");
+        if warned.len() >= crate::audit::ONCE_LIST_LIMIT {
+            warned.clear(); // bounded: see `ONCE_LIST_LIMIT`
+        }
         warned.push(message);
     }
 }

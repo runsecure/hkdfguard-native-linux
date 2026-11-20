@@ -122,6 +122,13 @@ pub(crate) enum Creation {
     Unconfirmed,
 }
 
+/// Most entries a "once per process" list keeps -- here and for
+/// `provider::log_once`. Entries can carry a caller's service name, so a
+/// list without a limit grows for as long as a caller invents names. At
+/// the limit the list is emptied rather than closed: nothing is ever left
+/// unlogged, and a message repeats at most once per this many others.
+pub(crate) const ONCE_LIST_LIMIT: usize = 256;
+
 /// A KEK was created (not merely found) -- or, `Unconfirmed`, may have
 /// been. `preferred` is the policy's first choice of provider: created
 /// anywhere else, the event is 1001 (Warning), the counterpart of the
@@ -153,7 +160,11 @@ pub(crate) fn kek_created(service: &str, provider: ProviderType, preferred: Opti
 /// `provider` served a call for `service` although providers earlier in the
 /// policy order were tried first; `passed_over` names each and why (not
 /// present, or no key for the service). Written once per process for each
-/// distinct combination: it marks a state, not a call. Expected where the
+/// distinct combination: it marks a state, not a call. The list of
+/// combinations already written is bounded (see [`ONCE_LIST_LIMIT`]): a
+/// caller can make up service names without end, and each must cost neither
+/// memory for good nor a dropped event, so a full list starts over and a
+/// combination can then be written again. Expected where the
 /// policy lists providers this host doesn't have; anywhere else it is the
 /// one sign that keys are landing under a weaker provider than intended.
 pub(crate) fn provider_fallback(service: &str, provider: ProviderType, passed_over: &str) {
@@ -163,6 +174,9 @@ pub(crate) fn provider_fallback(service: &str, provider: ProviderType, passed_ov
         let mut written = WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if written.contains(&fields) {
             return;
+        }
+        if written.len() >= ONCE_LIST_LIMIT {
+            written.clear();
         }
         written.push(fields.clone());
     }
@@ -488,7 +502,7 @@ fn hex(bytes: &[u8]) -> String {
 // kept; everything else -- quotes, backslashes, control characters
 // (newlines included, so no value can forge a second record), and any
 // non-ASCII or non-UTF-8 byte of a path -- is written as \xNN.
-fn quote(bytes: &[u8]) -> String {
+pub(crate) fn quote(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
     for &b in bytes {

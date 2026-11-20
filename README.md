@@ -608,6 +608,13 @@ tpm2_changeauth -c o file:/etc/hkdfguard/tpm.owner-auth   # bytes used verbatim,
 owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 ```
 
+The file must hold at least 16 bytes, and they must be random, as above,
+not a passphrase. The password itself never crosses the TPM's bus, but
+each use puts an HMAC keyed by it alone there, and anyone who records one
+(an interposer on a discrete TPM's bus) can test guesses against it
+offline, with no dictionary-attack limit in the way. A shorter file is
+refused.
+
 Set the policy entry in the same change as the password: with a password
 and no entry (or the reverse), every TPM call is refused. Each process
 tries a rejected password once, then sends nothing Owner-authorized again
@@ -1298,7 +1305,7 @@ What can be retired depends on the provider:
 | Provider | `retire` |
 |---|---|
 | PKCS#11 | Deletes the service's HMAC secret key from the token. |
-| TPM | Deletes the service's key file. The TPM keeps no copy, so the KEK is gone -- unless a copy of the key file survives (a backup), which still loads on this TPM: destroy those too. |
+| TPM | Deletes the service's key file, then its authValue file. The TPM keeps no copy, so the KEK is gone -- unless copies of both files survive (a backup), which still load on this TPM: destroy those too. |
 | External secret | Refused: the KEK is the mounted secret. Remove it where it is managed (the Kubernetes Secret, Vault entry, systemd credential). |
 | Ephemeral | Refused: an ephemeral KEK ends with its process. |
 
@@ -1425,6 +1432,8 @@ unwrap_success = true               # false: no audit record (1003) for a succes
 [pkcs11]
 module = "/usr/lib/vendor/libhsm-pkcs11.so"   # PKCS#11 is used only when this is set (no default search); root-owned
 pin_file = "/etc/hkdfguard/pkcs11.pin"        # root-owned 0400, or 0440 with the service's group; this is the default
+pin_state_dir = "/run/hkdfguard/pkcs11"       # optional: a rejected PIN is recorded here for every process, so a stale
+                                    # PIN file costs one login attempt in total, not one per worker or restart
 token_label = "hkdfguard-prod"      # choose the token by label and/or serial; exactly one must match.
 token_serial = "0123456789abcdef"   # with neither, exactly one initialized token must be present
 require_pinned_keys = false         # true: only services in pinned_keys have a key on the token
