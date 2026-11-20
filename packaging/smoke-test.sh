@@ -7,9 +7,11 @@
 # SONAME, libhkdfguard.so.1, and the CLI's provision/wrap output
 # unwrapped through the installed library.
 #
-# There is no TPM or PKCS#11 module in the container, so with no policy
-# file the external-secret provider serves every call, as it does in
-# docker/entrypoint-test.sh.
+# There is no TPM or PKCS#11 module in the container, so under the example
+# policy the external-secret provider serves every call, once the test
+# services' keys are pinned in it: the packages install no policy, the
+# library refuses every call without one, and the production model serves
+# only pinned services.
 #
 # Usage (as root, in the clean container; packaging/build-packages.sh
 # runs it):
@@ -105,6 +107,36 @@ for service in com.company.orders com.company.cli; do
     head -c 32 /dev/urandom > "/run/secrets/hkdfguard/$service"
 done
 
+section "no policy file: every call is refused, saying one is required"
+if out=$(hkdfguard provision -sn com.company.cli 2>&1); then
+    echo "provision succeeded with no policy file: $out" >&2
+    exit 1
+fi
+grep -q 'a policy file is required' <<< "$out" \
+    || { echo "with no policy file, provision failed for another reason: $out" >&2; exit 1; }
+echo "refused: a policy file is required"
+
+section "example policy, copied into place"
+# The documented way to start a policy. Unedited, it must load (a policy
+# the library rejects would fail every call) -- and, being a production
+# policy, serve no service whose key it doesn't pin: provision refuses
+# each, printing the fingerprint of the key mounted for it.
+install -m 0644 -o root -g root "$example_policy" /etc/hkdfguard/policy.toml
+grep -q '^\[external_secret\.pinned_keys\]$' /etc/hkdfguard/policy.toml \
+    || { echo "the example policy has no [external_secret.pinned_keys] table to add pins to" >&2; exit 1; }
+for service in com.company.orders com.company.cli; do
+    if out=$(hkdfguard provision -sn "$service" 2>&1); then
+        echo "the unedited example policy served $service, which it pins no key for: $out" >&2
+        exit 1
+    fi
+    grep -q 'has no pinned key' <<< "$out" \
+        || { echo "unexpected refusal of unpinned $service: $out" >&2; exit 1; }
+    fingerprint=$(grep -o '[0-9a-f]\{64\}' <<< "$out" | head -n 1)
+    [ ${#fingerprint} -eq 64 ] || { echo "the refusal printed no fingerprint to pin: $out" >&2; exit 1; }
+    sed -i "/^\[external_secret\.pinned_keys\]\$/a \"$service\" = \"$fingerprint\"" /etc/hkdfguard/policy.toml
+    echo "pinned $service to $fingerprint"
+done
+
 section "dynamic link via pkg-config"
 # shellcheck disable=SC2046 # pkg-config output is a list of flags
 cc -o "$work/wrap_unwrap" "$examples/wrap_unwrap.c" $(pkg-config --cflags --libs hkdfguard)
@@ -154,12 +186,6 @@ hkdfguard provision -sn com.company.cli
 base64 -w0 < "$work/dek.bin" | hkdfguard wrap -kf "$work/wrapped.key" -sn com.company.cli --dek-stdin
 "$work/cli_unwrap_check" "$work/wrapped.key" com.company.cli "$work/dek.bin"
 
-section "example policy, copied into place unedited"
-# The documented way to start a policy. Unedited, it must load (a policy
-# the library rejects would fail every call) and change nothing.
-install -m 0644 -o root -g root "$example_policy" /etc/hkdfguard/policy.toml
-"$work/wrap_unwrap"
-"$work/cli_unwrap_check" "$work/wrapped.key" com.company.cli "$work/dek.bin"
 rm /etc/hkdfguard/policy.toml
 
 section "SMOKE TEST PASSED"

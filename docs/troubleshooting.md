@@ -36,12 +36,15 @@ fixing the policy or a file, just try again. Nothing needs restarting.
 
 ## Every call fails: the policy is refused (-9)
 
-`HKDFGUARD_ERR_POLICY_INVALID` means the policy file exists but can't be
-trusted or parsed, and then **every** call fails. The library never falls
-back to defaults in that case.
+`HKDFGUARD_ERR_POLICY_INVALID` means the policy file is missing, or can't
+be trusted or parsed, and then **every** call fails. The library never
+falls back to defaults.
 
 | Message contains | Cause | Fix |
 |---|---|---|
+| `does not exist, and a policy file is required` | There is no `/etc/hkdfguard/policy.toml`: it was never installed, or the volume or ConfigMap that carries it isn't mounted in this container | Install one (`sudo install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example /etc/hkdfguard/policy.toml`), or fix the mount. The shortest valid policy is `[selection]` / `mode = "prefer"` |
+| `it is on a FUSE filesystem served by uid ...` | The file (policy, secret, PIN, key file) is on a FUSE mount that a non-root user's process serves, which can report any owner, mode and contents | Put the file on a filesystem root controls. A FUSE mount made by root (`user_id=0` in `/proc/self/mountinfo`) and virtiofs are accepted |
+| `it is on a FUSE filesystem, and who serves it could not be read` | As above, and `/proc` isn't mounted, so the library can't tell who serves the mount | Mount `/proc`, or move the file off FUSE |
 | `refusing to trust its location (directory ...: writable by group or others (mode 775) ...)` | `/etc/hkdfguard` or a directory above it can be changed by non-root users | `sudo chmod go-w <directory>`; every directory up to `/` must be root-owned and not group- or other-writable |
 | `... (mode 1777; sticky, like /tmp, which is not enough) ...` | The file (policy, secret, PIN, module, key file) is somewhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory, even inside a private directory there | Move it to a directory only root (or, where allowed, the service) can write, all the way up to `/`. Sticky directories are never trusted; only a sticky directory on a read-only mount, such as a Kubernetes Secret volume, is exempt |
 | `... (mode 777) ...` on a read-only Kubernetes volume | A plain `configMap:` volume or a disk-backed `emptyDir` is `0777` and not sticky, so being mounted read-only doesn't exempt it | Mount the ConfigMap through a `projected:` volume (`1777`); for an `emptyDir`, use `medium: Memory` or mount a private subdirectory |
@@ -130,7 +133,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 | No token matches | Check `token_label` and `token_serial` against `pkcs11-tool --list-token-slots` (from OpenSC). Exactly one token must match. |
 | `the PKCS#11 key for this service has fingerprint ..., which is not the one pinned in policy` | The key under the service's label was deleted and generated again since it was pinned; anyone holding the token's PIN can do that. DEKs wrapped under the old key can't be unwrapped with the new one. Find out who replaced it before pinning the new fingerprint. |
 | `policy pins a PKCS#11 key for this service ..., but the token holds none` | The key was deleted, or this isn't the token it was provisioned on (check `token_label` and `token_serial`). If it was retired on purpose, remove the service's pin from `[pkcs11.pinned_keys]`, then run `provision` and pin the new fingerprint. |
-| `pkcs11.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[pkcs11.pinned_keys]`. Its key is now on the token: add the line the message prints, then run `provision` again. |
+| `pkcs11.require_pinned_keys is on and service ... has no pinned key` | The service isn't in `[pkcs11.pinned_keys]`, and the allowlist is on: the default under the production security model. Its key is now on the token: add the line the message prints, then run `provision` again. |
 | `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. Other processes still try once each unless `pkcs11.pin_state_dir` is set. |
 | `PKCS#11 login disabled: the token rejected the PIN in ... for another process` | Another process recorded a rejected PIN in `pkcs11.pin_state_dir`. Correct the PIN file; any change to it re-enables login. If the PIN was right and the token was at fault, delete `pin-rejected` in that directory. |
 | `pkcs11.pin_state_dir ...: is open to every account`, or `No such file or directory` | Create the directory (`root:<service-group> 2770`) with no access for other accounts, or remove the setting. Under `/run` it must be re-created at boot (`tmpfiles.d`, or the unit's `RuntimeDirectory=` with `RuntimeDirectoryMode=0750`). |
@@ -147,7 +150,7 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `external secret is N bytes; it must be exactly 32 raw random bytes ...` | The file must hold exactly 32 raw bytes. Most often it's base64 or hex text (decode it to raw bytes where it is mounted), has a trailing newline (`echo` adds one), or is an old P-256 key in PEM or DER, which is no longer accepted. Generate a new key with `head -c 32 /dev/urandom` or `openssl rand -out <file> 32` and pin its new fingerprint. |
 | `external secret is all zero bytes` | The file was filled from `/dev/zero` or truncated and extended. Provision 32 random bytes. |
 | `the external secret for this service has fingerprint ..., which is not the one pinned in policy` | The mounted key isn't the one `external_secret.pinned_keys` names. Either something else wrote the mount (check every container that mounts the volume read-write), or the key was rotated without adding its fingerprint first. Pin the new fingerprint only once you've confirmed where the key came from. |
-| `external_secret.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[external_secret.pinned_keys]`. Compare the printed fingerprint with the one you computed when generating the key, then add the line. |
+| `external_secret.require_pinned_keys is on and service ... has no pinned key` | The service isn't in `[external_secret.pinned_keys]`, and the allowlist is on: the default under the production security model. Compare the printed fingerprint with the one you computed when generating the key, then add the line. |
 | A configured `external_secret.dir` is missing | The mount isn't there yet (a volume not attached, a sidecar not ready). Fix the mount; the library won't use another provider in the meantime. |
 
 ## No KEK for the service (-17)

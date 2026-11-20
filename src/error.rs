@@ -44,7 +44,7 @@ pub mod status {
     // valid UTF-8 is one more way for it to be invalid, reported as
     // INVALID_SERVICE_NAME below -- see that constant's comment.
     pub const INVALID_SERVICE_NAME: i32 = -8; // `service` is null, empty, not valid UTF-8, over MAX_SERVICE_LEN bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." -- one code for every way the service identifier itself can be wrong
-    pub const POLICY_INVALID: i32 = -9; // the policy file can't be trusted or used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or its directory, or it requires a provider this build lacks
+    pub const POLICY_INVALID: i32 = -9; // the policy file can't be trusted or used: missing (one is required), unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or its directory, or it requires a provider this build lacks
 
     // ---- Wrapped payload ----
     pub const PAYLOAD_MALFORMED: i32 = -10; // wrapped payload is structurally invalid: truncated, trailing bytes, an unknown provider type, or a field length no wrap produces

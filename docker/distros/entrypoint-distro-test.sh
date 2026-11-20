@@ -160,15 +160,23 @@ run_c() { as_ci env LD_LIBRARY_PATH=target/release "$@"; }
 mkdir -p /etc/hkdfguard
 
 section "ephemeral is never chosen unless policy names it"
-# No policy file at all: TPM2 is not built, PKCS#11 has no module and no
-# secret is mounted, so nothing is available -- and the library must say
-# so rather than fall back to a key that dies with the process.
+# No policy file at all: every call is refused.
 rm -f /etc/hkdfguard/policy.toml
 if OUT=$(run_c target/c/wrap_unwrap 2>&1); then
-    fail "with no policy, a KEK was created (ephemeral fallback?): $OUT"
+    fail "with no policy file, a KEK was created: $OUT"
 fi
-grep -q 'create_kek failed' <<<"$OUT" || fail "unexpected failure without a policy: $OUT"
-echo "no policy: no provider available, no silent ephemeral fallback."
+grep -q 'create_kek failed: -9' <<<"$OUT" || fail "expected HKDFGUARD_ERR_POLICY_INVALID (-9) without a policy file: $OUT"
+echo "no policy file: refused (-9)."
+# A policy that names no provider: TPM2 is not built, PKCS#11 has no module
+# and no secret is mounted, so nothing is available -- and the library
+# must say so rather than fall back to a key that dies with the process.
+printf '[selection]\nmode = "prefer"\n' > /etc/hkdfguard/policy.toml
+chmod 0644 /etc/hkdfguard/policy.toml
+if OUT=$(run_c target/c/wrap_unwrap 2>&1); then
+    fail "under a policy naming no provider, a KEK was created (ephemeral fallback?): $OUT"
+fi
+grep -q 'create_kek failed' <<<"$OUT" || fail "unexpected failure under a policy naming no provider: $OUT"
+echo "a policy naming no provider: none available, no silent ephemeral fallback."
 
 section "ephemeral via /etc/hkdfguard/policy.toml (release .so)"
 cat > /etc/hkdfguard/policy.toml <<'TOML'

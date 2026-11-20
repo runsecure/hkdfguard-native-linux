@@ -5,7 +5,8 @@
 # ldconfig has run: the library must load from its multiarch directory as
 # copied.
 #
-#   consumer-test.sh plain  the overlay target: no policy, external-secret KEKs
+#   consumer-test.sh plain  the overlay target: no policy shipped; the consumer
+#                           writes one, pinning its external-secret KEKs
 #   consumer-test.sh dev    the overlay-dev target: ephemeral without a PIN
 #                           file, then SoftHSM2 once one exists
 #
@@ -31,8 +32,8 @@ for f in "$libdir/libhkdfguard.so.1" /usr/bin/hkdfguard; do
     [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }
 done
 case "$mode" in
-    # Not even /etc/hkdfguard: with no policy directory the library still
-    # runs on its defaults.
+    # Not even /etc/hkdfguard: the policy is the consumer image's to
+    # write, and until it does the library refuses every call.
     plain) [ ! -e /etc/hkdfguard ] || { echo "the overlay target must not create /etc/hkdfguard" >&2; exit 1; } ;;
     dev)   [ "$(stat -c '%U:%G %a' /etc/hkdfguard)" = "root:root 755" ] \
                || { echo "/etc/hkdfguard must be root:root 0755" >&2; exit 1; }
@@ -80,11 +81,32 @@ cli_round_trip() { # cli_round_trip <service> <expected provider byte>
 }
 
 if [ "$mode" = plain ]; then
-    section "no policy: external-secret KEKs from /run/secrets/hkdfguard"
+    section "no policy file: every call is refused, saying one is required"
+    if out=$(hkdfguard provision -sn com.company.cli 2>&1); then
+        echo "provision succeeded with no policy file: $out" >&2
+        exit 1
+    fi
+    grep -q 'a policy file is required' <<< "$out" \
+        || { echo "with no policy file, provision failed for another reason: $out" >&2; exit 1; }
+    echo "refused: a policy file is required"
+
+    section "the consumer's policy: external-secret KEKs from /run/secrets/hkdfguard, pinned"
     install -d -m 0755 /run/secrets/hkdfguard
+    install -d -m 0755 /etc/hkdfguard
+    printf '[selection]\nmode = "prefer"\n\n[external_secret.pinned_keys]\n' > /etc/hkdfguard/policy.toml
+    chmod 0644 /etc/hkdfguard/policy.toml
     for service in com.company.orders com.company.cli; do
         install -m 0600 /dev/null "/run/secrets/hkdfguard/$service"
         head -c 32 /dev/urandom > "/run/secrets/hkdfguard/$service"
+        # Production serves only pinned services: provision refuses, and
+        # prints the mounted key's fingerprint to pin.
+        if out=$(hkdfguard provision -sn "$service" 2>&1); then
+            echo "$service was served with no key pinned for it: $out" >&2
+            exit 1
+        fi
+        fingerprint=$(grep -o '[0-9a-f]\{64\}' <<< "$out" | head -n 1)
+        [ ${#fingerprint} -eq 64 ] || { echo "the refusal printed no fingerprint to pin: $out" >&2; exit 1; }
+        printf '"%s" = "%s"\n' "$service" "$fingerprint" >> /etc/hkdfguard/policy.toml
     done
     "$work/wrap_unwrap"
     cli_round_trip com.company.cli 3

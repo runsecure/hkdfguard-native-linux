@@ -25,9 +25,9 @@ There are four providers, from strongest to weakest:
 | External secret | `external-secret` | `external` | A root-owned file delivered by your platform (Kubernetes, Vault, systemd credentials, ...) |
 | Ephemeral | `ephemeral` | `ephemeral` | Process memory only; **lost when the process exits** |
 
-With **no policy file**, the library tries `tpm2`, then `pkcs11`, then
-`external-secret`, and uses the first one that is set up on the host. It
-never uses `ephemeral` unless a policy names it.
+Unless the policy says otherwise, the library tries `tpm2`, then `pkcs11`,
+then `external-secret`, and uses the first one that is set up on the host.
+It never uses `ephemeral` unless the policy names it.
 
 The library only moves on to the next provider when one is **absent**: not
 on this host or not set up, or holding no key for the service. A provider
@@ -54,8 +54,25 @@ sudo install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example \
     /etc/hkdfguard/policy.toml
 ```
 
-Copied unedited, it behaves exactly like having no policy: every setting is
+**The file is required.** With no `/etc/hkdfguard/policy.toml`, every call
+fails with `HKDFGUARD_ERR_POLICY_INVALID` (-9). A policy that never arrived
+(a volume that didn't mount, a ConfigMap that wasn't projected, an image
+built without it) looks the same as one that was deleted, and the defaults
+have no pins and name no provider, so the library refuses to fall back to
+them. The shortest valid policy is the defaults, spelled out:
+
+```toml
+[selection]
+mode = "prefer"
+```
+
+Copied unedited, the example is exactly that: every other setting is
 commented out at its default. Uncomment and change only what you need.
+Under the production security model (the default), the PKCS#11 and
+external-secret providers serve only services whose key is pinned in the
+policy, so a service kept in either needs its pin before it works (see
+[PKCS#11](#pkcs11-hsm-or-smart-card) and
+[External secret](#external-secret-file)).
 
 **The file must be trustworthy, or every call fails.**
 
@@ -85,10 +102,17 @@ commented out at its default. Uncomment and change only what you need.
   refused like the mode's write bits, and, on a secret, one that gives
   anyone but root read access. With an ACL, `ls -l` shows its mask in the
   group bits, not who it names: check with `getfacl`.
-- Only a *missing* file means "no policy". A file that exists but is wrongly
-  owned, too broadly writable, unreadable or malformed makes every
-  operation fail, rather than falling back to the defaults. Deleting or
-  breaking the policy can never switch it off.
+- It must not be on a FUSE filesystem served by anyone but root. On a FUSE
+  mount the owner, mode and contents of a file are whatever the process
+  serving it reports, and `fusermount` lets any user serve one. The
+  library reads who serves the mount (`user_id=` in
+  `/proc/self/mountinfo`) and requires root; virtiofs, which only root can
+  mount, passes. This applies to every file the library reads. For key
+  files under the developer security model, a mount served by the
+  process's own user passes too.
+- A file that is missing, wrongly owned, too broadly writable, unreadable
+  or malformed makes every operation fail, rather than falling back to the
+  defaults. Deleting or breaking the policy can never switch it off.
 
 **Two TOML rules catch people out.**
 
@@ -217,7 +241,9 @@ motherboard bus. It is always encrypted, and its response authenticated,
 under keys derived from the service key's authValue. Nobody without the
 authValue file can read a wrapping key off the bus or replace one. That
 needs no trusted public key, and a quantum computer doesn't help against
-it. `session_encryption = "off"` turns the encryption off, for test
+it. The cipher is AES-256-CFB where the TPM has it and AES-128-CFB where
+it doesn't (a warning is logged once when the TPM refuses AES-256).
+`session_encryption = "off"` turns the encryption off, for test
 harnesses only.
 
 The one moment the authValue itself crosses the bus is `provision`, inside
@@ -425,10 +451,14 @@ What to do about it:
   of them -- during a migration -- needs a pin in each. To provision a pinned service
   again (after `retire`, say), remove its pin first, then pin the new
   fingerprint.
-- **`require_pinned_keys = true`** in `[pkcs11]` makes the pins an
-  allowlist: a service with no pin has no KEK on the token. `provision`
-  then generates the key and fails with the line to add to the policy;
-  run it again once the pin is in place.
+- **`require_pinned_keys`** in `[pkcs11]` makes the pins an allowlist: a
+  service with no pin has no KEK on the token. `provision` then generates
+  the key and fails with the line to add to the policy; run it again once
+  the pin is in place. It is **on unless you turn it off** under the
+  production security model, and off unless you turn it on under the
+  developer one. Without it, an unpinned service is served with whatever
+  key the token holds under its label, and one whose key has gone missing
+  is handed to the next provider in the order.
 
 Pinning detects a deleted or replaced key; it cannot prevent one. Where
 the HSM can make a key undeletable for the user role, do that as well.
@@ -543,9 +573,12 @@ require_pinned_keys = true           # a service with no pin has no KEK here
 ```
 
 A key whose fingerprint isn't pinned for its service is refused, as an
-error, so the library never moves on to another provider. Without
-`require_pinned_keys`, services you haven't pinned work as before. Service
-names must be quoted, as in `[tpm.pinned_names]`.
+error, so the library never moves on to another provider.
+`require_pinned_keys` is on unless you turn it off under the production
+security model, and off unless you turn it on under the developer one.
+With `require_pinned_keys = false`, services you haven't pinned are served
+with whatever key is mounted for them. Service names must be quoted, as in
+`[tpm.pinned_names]`.
 
 The fingerprint is one HMAC-SHA-256 output of the key over a fixed
 input, `HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)`
@@ -646,6 +679,9 @@ level = "hardware"                   # tpm2 or pkcs11, in the default order
 [pkcs11]
 module = "/usr/lib/vendor/libvendor-pkcs11.so"
 token_label = "hkdfguard-prod"
+
+[pkcs11.pinned_keys]                 # on the HSM hosts, only these services have a key
+"com.company.orders" = "<64 hex chars>"
 ```
 
 **Containers: external secrets only.** For pods or containers that receive
@@ -668,6 +704,7 @@ require_pinned_keys = true
 overlay image. Never use it in production:
 
 ```toml
+security_model = "developer"         # anyone provisions; no pins needed
 preferred_order = ["pkcs11", "ephemeral"]
 
 [selection]
@@ -691,8 +728,8 @@ deployer_groups = ["payments-deployers"] # optional; besides hkdfguard-deployers
 ```
 
 Both keys go above the first `[table]`. Production applies when they are
-absent, and when there is no policy file at all: a host is a production
-install unless an administrator says otherwise. Any other value of
+absent: a host is a production install unless an administrator says
+otherwise. Any other value of
 `security_model` (`"development"` included) makes the policy invalid, and
 every call fails with `HKDFGUARD_ERR_POLICY_INVALID` (-9).
 
@@ -896,7 +933,7 @@ allow_unpinned_provisioning = false                   # true: provision without 
 
 [external_secret]
 dir = "/run/secrets/hkdfguard"    # default: the first existing conventional mount
-require_pinned_keys = false       # true: only services in pinned_keys have a KEK here
+require_pinned_keys = true        # only services in pinned_keys have a KEK here; default: true under production, false under developer
 
 [external_secret.pinned_keys]
 "com.company.orders" = "<64 hex chars>"           # or a list of them, while rotating
@@ -907,7 +944,7 @@ pin_file = "/etc/hkdfguard/pkcs11.pin"
 pin_state_dir = "/run/hkdfguard/pkcs11"          # default: unset (a rejected PIN is remembered per process only)
 token_label = "hkdfguard-prod"                   # 1 to 32 bytes
 token_serial = "0123456789abcdef"                # 1 to 16 bytes
-require_pinned_keys = false                      # true: only the services below have a key on the token
+require_pinned_keys = true                       # only the services below have a key on the token; default: true under production, false under developer
 
 [pkcs11.pinned_keys]                             # default: none
 "com.company.orders" = "<64 hex chars>"          # the fingerprint provision prints; or a list of them

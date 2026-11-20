@@ -353,7 +353,7 @@ fn run_wrap_dek_file(key_path: &Path, service: &str, dek_file: &Path) -> Output 
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_refuses_a_shared_key_folder_up_front() {
-    // Under the production model (no policy file) an ordinary account is
+    // Under the production model (the default) an ordinary account is
     // refused before any of this is reached: these are the developer
     // model's checks.
     with_policy("[selection]\nmode = \"prefer\"\n", cli_refuses_a_shared_key_folder_up_front_under_the_developer_model);
@@ -404,7 +404,7 @@ fn cli_refuses_a_shared_key_folder_up_front_under_the_developer_model() {
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_checks_the_key_folder_mode_not_its_owner() {
-    // Under the production model (no policy file) an ordinary account is
+    // Under the production model (the default) an ordinary account is
     // refused before any of this is reached: these are the developer
     // model's checks.
     with_policy("[selection]\nmode = \"prefer\"\n", cli_checks_the_key_folder_mode_not_its_owner_under_the_developer_model);
@@ -446,7 +446,7 @@ fn cli_checks_the_key_folder_mode_not_its_owner_under_the_developer_model() {
 #[serial]
 #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_refuses_to_read_the_dek_from_a_terminal() {
-    // Under the production model (no policy file) an ordinary account is
+    // Under the production model (the default) an ordinary account is
     // refused before any of this is reached: these are the developer
     // model's checks.
     with_policy("[selection]\nmode = \"prefer\"\n", cli_refuses_to_read_the_dek_from_a_terminal_under_the_developer_model);

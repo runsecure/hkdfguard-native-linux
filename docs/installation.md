@@ -173,8 +173,10 @@ ls -l /usr/share/hkdfguard/policy.toml.example
 
 The packages create an empty TPM key directory, `/var/lib/hkdfguard/tpm`
 (`root:hkdfguard 0750`), and install no policy or PIN file: those are
-per-host decisions. With no policy the library uses its defaults, described
-in [configuration.md](configuration.md).
+per-host decisions. The library needs a policy: until
+`/etc/hkdfguard/policy.toml` exists, every call fails with
+`HKDFGUARD_ERR_POLICY_INVALID` (-9). Start from the example, as
+[configuration.md](configuration.md) describes.
 
 ## Standalone tarball
 

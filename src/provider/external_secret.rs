@@ -79,7 +79,8 @@
 //! a service, the key's fingerprint (see [`crate::crypto::kek_fingerprint`])
 //! must be one of the pinned values, or
 //! the key is refused -- an error, never "not provisioned". With
-//! `external_secret.require_pinned_keys`, a service with no pin has no KEK
+//! `external_secret.require_pinned_keys` (on unless policy turns it off
+//! under the production security model), a service with no pin has no KEK
 //! here, whatever is mounted for it; `provision` then reports the mounted
 //! key's fingerprint and the policy line that would accept it.
 //!
@@ -246,7 +247,7 @@ impl KekProvider for ExternalSecretProvider {
 
         if matches!(pins, Pins::Unpinned) && !create_if_missing {
             return Err(Error::KeyNotProvisioned(
-                "external_secret.require_pinned_keys is set and policy pins no key for this service",
+                "external_secret.require_pinned_keys is on and policy pins no key for this service",
             ));
         }
         let key = read_key(dir, service, &pins)?.ok_or_else(missing)?; // mount exists, but nothing there for this service
@@ -362,7 +363,7 @@ fn pinned_but_missing() -> Error {
 fn unpinned_service_instructions(service: &str, key: &[u8; KEK_LEN]) -> String {
     let fingerprint = hex(&software_kek_fingerprint(key));
     format!(
-        "external_secret.require_pinned_keys is set and service \"{service}\" has no pinned key. The key \
+        "external_secret.require_pinned_keys is on and service \"{service}\" has no pinned key. The key \
          mounted for it has fingerprint {fingerprint}. If that is the key you generated, add this to the \
          policy file and run provision again:\n  [external_secret.pinned_keys]\n  \"{service}\" = \"{fingerprint}\""
     )
@@ -923,7 +924,7 @@ mod tests {
 
         // Only no mount configured, and none of the conventional ones
         // present, means "not here".
-        let _policy = TestPolicy::absent();
+        let _policy = TestPolicy::minimal();
         if !CANDIDATE_MOUNTS.iter().any(|m| Path::new(m).is_dir()) {
             assert_eq!(resolve_dir(), Backend::Absent);
         }
@@ -957,7 +958,11 @@ mod tests {
 
             // Under the production model only root creates a KEK, and a
             // file put in the mount is one: refused, loudly, saying why.
-            let _production = crate::policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+            // (The allowlist, on by default there, is switched off: it
+            // would decline the unpinned service before its file was read.)
+            let _production = crate::policy::test_support::TestPolicy::write(
+                "security_model = \"production\"\n[external_secret]\nrequire_pinned_keys = false\n",
+            );
             for refused in [provider.kek_exists("com.company.orders").map(|_| ()), provider.load_kek("com.company.orders", false).map(|_| ())] {
                 match refused {
                     Err(Error::Provider(msg)) => {
@@ -1096,6 +1101,35 @@ mod tests {
 
     #[test]
     #[serial]
+    fn production_serves_only_pinned_services_unless_policy_says_otherwise() {
+        with_dir(|provider, dir| {
+            let key = random_key();
+            provision(dir, "com.company.orders", key);
+
+            // Nothing said about the allowlist: under production it is on,
+            // and a mounted but unpinned key is no KEK.
+            let production = crate::policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+            assert!(!provider.kek_exists("com.company.orders").unwrap());
+            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::KeyNotProvisioned(_))));
+
+            // Pinned, it is the service's KEK.
+            {
+                let _pin = crate::policy::test_support::TestPolicy::write(&format!(
+                    "[external_secret.pinned_keys]\n\"com.company.orders\" = \"{}\"\n",
+                    fingerprint_hex(&key)
+                ));
+                assert!(provider.kek_exists("com.company.orders").unwrap());
+                provider.load_kek("com.company.orders", false).unwrap();
+            }
+            drop(production);
+
+            // The developer model leaves the allowlist off unless asked.
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+        });
+    }
+
+    #[test]
+    #[serial]
     fn the_fingerprint_is_the_documented_hmac() {
         // What the documented OpenSSL command computes from the secret file:
         //   printf '\0\0\0\001hkdfguard-kek-fingerprint-v1\0\0\0\001\0' |
@@ -1135,6 +1169,7 @@ mod tests {
             assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
         });
 
+        let _policy = crate::policy::test_support::TestPolicy::minimal();
         let provider = ExternalSecretProvider::new();
         assert!(!provider.probe());
     }

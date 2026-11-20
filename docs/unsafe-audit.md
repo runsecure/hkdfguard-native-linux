@@ -71,7 +71,7 @@ before anything is written to `out`.
 ### System calls with out-parameters
 
 `getgrnam_r`, `getgrgid_r`, `getpwuid_r` and `getpwnam_r`
-(`src/security_model.rs`, `src/bin/hkdfguard.rs`), and `statvfs`
+(`src/security_model.rs`, `src/bin/hkdfguard.rs`), and `statvfs` and `fstatfs`
 (`src/secure_file.rs`).
 
 - **Out-parameters are zeroed structs.** All-zero is valid for these:
@@ -153,7 +153,7 @@ The one `unsafe impl` and the only raw-pointer arithmetic.
 ### Calls with no preconditions
 
 `geteuid`, `getuid`, `getegid`, `getpid` and `sysconf` take no pointers
-and can't fail. 35 of the 121 `unsafe` blocks under `src/` (86 at 0.9.1)
+and can't fail. 35 of the 123 `unsafe` blocks under `src/` (86 at 0.9.1)
 are only these. (`getpid` is how the ephemeral store and the PKCS#11 module
 registry notice they are in a forked child.)
 
@@ -196,7 +196,7 @@ tests that look this user up through NSS, which Miri can't, now skip
 under it like the other passwd-dependent tests.
 
 **What Miri can't reach.** It interprets Rust, so calls into C are
-outside it: the NSS lookups, `statvfs`, the xattr calls, `flock`,
+outside it: the NSS lookups, `statvfs`, `fstatfs`, the xattr calls, `flock`,
 `prctl`, `setrlimit`, `madvise`, `mlock`, `mkfifo`, `fork`, Unix
 sockets, and the TPM and PKCS#11 libraries. For
 those, the review above is the check. Beyond what is listed above (the
@@ -215,6 +215,9 @@ that ships has them:
   call, and `still_hardened` skips its `prctl` check. In a real build a
   failed `madvise` fails the key's creation.
 - `security_model`'s lookups report no such user or group.
+- `check_filesystem` skips `fstatfs` and passes every file: no test file
+  is on a FUSE mount except in the one test that looks for one, which
+  Miri doesn't build.
 - `on_read_only_mount` reports no read-only mount, the answer for every
   test directory.
 - `acl_grants_of_file` and `acl_grants_of_path` report no ACL, and

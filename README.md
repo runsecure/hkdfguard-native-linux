@@ -252,19 +252,22 @@ directory above it -- sticky directories like `/tmp` included; only a
 sticky directory on a read-only mount (a Kubernetes Secret or projected
 volume) is exempt, and POSIX ACL entries count as the mode bits do. The service's own user is deliberately not accepted: any
 process running as that user could otherwise rewrite the policy, or
-delete it to switch policy off. Only a *missing* file in a trusted
-directory means "no policy"; a file that exists but is unreadable, too
-broadly writable, wrongly owned, or malformed -- or one in a directory
-someone untrusted could change -- makes every operation fail closed with
-`HKDFGUARD_ERR_POLICY_INVALID` (`-9`).
+delete it to switch policy off. The file is **required**: one that is
+missing, unreadable, too broadly writable, wrongly owned, or malformed --
+or one in a directory someone untrusted could change, or on a FUSE mount a
+non-root user serves -- makes every operation fail closed with
+`HKDFGUARD_ERR_POLICY_INVALID` (`-9`). A policy that never arrived (an
+unmounted volume, an image built without it) is thereby an error, not a
+silent return to defaults; the defaults themselves are the two lines
+`[selection]` / `mode = "prefer"`.
 (Only test builds -- see "Testing against scratch configuration" -- also accept the process's own user.)
 
 ### Security model
 
 The policy's top-level `security_model` decides who may do what, as the
 Windows build's `SecurityModel` policy value and the macOS build's
-production mode do. **Production is the default**: with no policy file, or
-one that doesn't set it, this is a production install.
+production mode do. **Production is the default**: under a policy that
+doesn't set it, this is a production install.
 
 | Role | Production | May |
 |---|---|---|
@@ -545,6 +548,12 @@ prove a TPM has no bus, so every TPM is treated alike.
 session_encryption = "on"             # "on" (default) | "off" (test harnesses only)
 pinned_session_salt_key_name = "000b<64 hex chars>"   # required to provision, unless allow_unpinned_provisioning
 ```
+
+The session cipher is AES-256-CFB where the TPM implements it, and
+AES-128-CFB (the only size the PC Client profile requires) where it
+doesn't; the fallback is logged once. An interposer can force the
+fallback by refusing the AES-256 request, but nothing lower: there is no
+fallback to an unencrypted session.
 
 The session is also salted to the SRK, as a second layer: someone who has
 read a `.tpmauth` file but can't man-in-the-middle the SRK still sees
@@ -874,17 +883,21 @@ tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
 only ever loaded at run time, from the policy file. The packages install
 no policy file or PIN, and an empty TPM key directory
 (`/var/lib/hkdfguard/tpm`, `root:hkdfguard 0750`): those are per-host decisions
-(see "Configuration"), and with no policy file the library uses its
-defaults. To write one, start from the annotated example:
+(see "Configuration"). The library needs a policy file: until one exists,
+every call fails with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`). To write one,
+start from the annotated example:
 
 ```sh
 install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example \
     /etc/hkdfguard/policy.toml
 ```
 
-Copied unedited, it behaves exactly like no policy file: every setting in
-it is commented out at its default, and a unit test
-(`shipped_example_policy_behaves_like_no_policy`) keeps it that way. It is
+Copied unedited, it is the defaults: every setting in it is commented out
+at its default, and a unit test
+(`shipped_example_policy_is_the_defaults`) keeps it that way. Under the
+production model those defaults serve only pinned services from PKCS#11
+and external secrets, so add each service's pin (`provision` prints the
+line). It is
 installed under `/usr/share`, not `/usr/share/doc`, so it survives
 container base images that drop documentation.
 
@@ -1389,7 +1402,7 @@ nested tables, which is also rejected.
 preferred_order = ["tpm2", "pkcs11", "external-secret"]
                                     # with `prefer`: try in this order; omitted providers are excluded.
                                     # This is also the ONLY way Ephemeral is ever used: it must be named here
-                                    # (or be the `require` provider). With no policy file at all, the order is
+                                    # (or be the `require` provider). Omitted altogether, the order is
                                     # tpm2, pkcs11, external-secret -- and never ephemeral.
 
 [key_requirements]
@@ -1425,7 +1438,8 @@ owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"  # unset: empty owner password
 [external_secret]
 dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, the only place looked
                                     # (default: first existing of the four conventional mounts)
-require_pinned_keys = false         # true: only services in pinned_keys have a KEK here (provisioning allowlist)
+require_pinned_keys = true          # only services in pinned_keys have a KEK here (provisioning allowlist);
+                                    # default: true under the production model, false under developer
 
 [external_secret.pinned_keys]       # per-service expected KEK fingerprint (or a list, while rotating); refuse any other key
 "com.company.orders" = "<64 hex>"
@@ -1440,7 +1454,8 @@ pin_state_dir = "/run/hkdfguard/pkcs11"       # optional: a rejected PIN is reco
                                     # PIN file costs one login attempt in total, not one per worker or restart
 token_label = "hkdfguard-prod"      # choose the token by label and/or serial; exactly one must match.
 token_serial = "0123456789abcdef"   # with neither, exactly one initialized token must be present
-require_pinned_keys = false         # true: only services in pinned_keys have a key on the token
+require_pinned_keys = true          # only services in pinned_keys have a key on the token;
+                                    # default: true under the production model, false under developer
 
 [pkcs11.pinned_keys]                # the fingerprint each service's key must have (provision prints it), or a list.
 "com.company.orders" = "<64 hex>"   # any PIN holder can delete or regenerate a key on the token: a pin makes a
@@ -1462,12 +1477,11 @@ Secret or projected volume) is exempt. A plain ConfigMap volume is `0777`,
 not sticky, and is refused: mount a ConfigMap through a `projected:`
 volume instead.
 
-Only a *missing* file means "no policy"; a present but
-unreadable, too-broadly-writable, or malformed file makes every operation
-fail closed with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`) -- and resolves
+A missing, unreadable, too-broadly-writable, or malformed file makes
+every operation fail closed with `HKDFGUARD_ERR_POLICY_INVALID` (`-9`) -- and resolves
 each hardening knob to its strictest setting
-(`session_encryption = "on"`, the pinned-names allowlist on) rather than
-its default.
+(`session_encryption = "on"`, the pinned-names and pinned-keys allowlists
+on) rather than its default.
 
 ## Design decisions worth knowing
 

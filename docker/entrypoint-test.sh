@@ -125,11 +125,22 @@ test_cargo test --features pkcs11 --lib provider::pkcs11
 unset HKDFGUARD_POLICY_FILE TPM2TOOLS_TCTI
 
 section "C ABI round trip via examples/wrap_unwrap.c (default providers)"
-# With no policy file, Ephemeral is never used, so the example needs a
-# real KEK: provision an external secret for its service, as a
-# deployment platform would, in a standard secret mount.
+# Under a policy that names no provider, Ephemeral is never used, so the
+# example needs a real KEK: provision an external secret for its service,
+# as a deployment platform would, in a standard secret mount.
 # The mount is root's, as a platform's would be; the KEK file belongs to
-# the service user, owner-only, as the provider requires.
+# the service user, owner-only, as the provider requires -- under the
+# developer model, which is what trusts a service user's own file. A
+# policy there must be: without one every call is refused.
+mkdir -p /etc/hkdfguard
+if OUT=$(as_ci target/debug/hkdfguard provision --service-name com.company.orders 2>&1); then
+    echo "FAIL: provision succeeded with no policy file: $OUT" >&2; exit 1
+fi
+grep -q 'a policy file is required' <<<"$OUT" \
+    || { echo "FAIL: with no policy file, provision failed for another reason: $OUT" >&2; exit 1; }
+echo "no policy file: refused, saying one is required."
+printf 'security_model = "developer"\n[selection]\nmode = "prefer"\n' > /etc/hkdfguard/policy.toml
+chmod 0644 /etc/hkdfguard/policy.toml
 SECRET_MOUNT=/run/secrets/hkdfguard
 mkdir -p "$SECRET_MOUNT"
 ci_file "$SECRET_MOUNT/com.company.orders"; head -c 32 /dev/urandom > "$SECRET_MOUNT/com.company.orders"
@@ -235,7 +246,7 @@ rm -rf "$TMP_DEK"
 echo "a --dek-file under /tmp: wrap refuses to read it."
 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
-rm -rf "$SECRET_MOUNT"
+rm -rf "$SECRET_MOUNT" /etc/hkdfguard
 
 section "builds that ship take configuration only from /etc/hkdfguard/policy.toml"
 # Release builds, and plain debug builds -- anything not made with

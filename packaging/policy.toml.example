@@ -6,9 +6,17 @@
 #       /etc/hkdfguard/policy.toml
 # then edit /etc/hkdfguard/policy.toml.
 #
-# As shipped -- every setting below commented out -- this file behaves
-# exactly like having no policy file at all: providers are tried in the
-# order tpm2, pkcs11, external-secret, and ephemeral is never used. Each
+# The library needs a policy file: with none at /etc/hkdfguard/policy.toml
+# every call fails (HKDFGUARD_ERR_POLICY_INVALID), so that a file that
+# never arrived -- an unmounted volume, an image built without it -- is an
+# error and not a silent return to defaults.
+#
+# As shipped -- every setting below commented out -- this file is the
+# defaults: the production security model, providers tried in the order
+# tpm2, pkcs11, external-secret, and ephemeral never used. Under the
+# production model the PKCS#11 and external-secret providers serve only
+# the services whose keys are pinned below (`require_pinned_keys`), so a
+# service kept in either needs its pin added before it works. Each
 # commented line shows its default, or a placeholder where there is none;
 # uncomment and change only what you need. See "Policy file reference" in
 # the README (/usr/share/doc/libhkdfguard1/README.md on Debian and Ubuntu)
@@ -22,16 +30,14 @@
 # volume) is exempt; mount a ConfigMap through a projected volume, as a
 # plain ConfigMap volume (0777, not sticky) is refused.
 # POSIX ACL entries count as the mode bits do.
-# A file that exists
-# but is wrongly owned, too broadly writable or malformed makes every
-# operation fail closed; only a missing file means "no policy". Unknown
+# A file that is missing, wrongly owned, too broadly writable or malformed
+# makes every operation fail closed. Unknown
 # keys are rejected, so a typo fails loudly rather than being ignored.
 #
 # The library re-reads this file on every call: changes take effect
 # without restarting the service.
 
-# The security model: "production" (the default, with or without this
-# file) or "developer". Any other value -- "development" included -- makes
+# The security model: "production" (the default) or "developer". Any other value -- "development" included -- makes
 # the policy invalid. Production splits the duties:
 #   security admin    root: `hkdfguard provision` and `retire`. The library
 #                     creates a KEK that doesn't exist yet only for root;
@@ -160,6 +166,18 @@ mode = "prefer"
 #   /var/run/secrets/hkdfguard, /run/secrets/hkdfguard,
 #   /vault/secrets/hkdfguard, /mnt/secrets-store/hkdfguard
 #dir = "/run/secrets/hkdfguard"
+# Serve only the services pinned below; `provision` then prints the line
+# to add for a new one. Unset: true under the production security model,
+# false under the developer one.
+#require_pinned_keys = true
+
+[external_secret.pinned_keys]
+# The fingerprint each service's mounted key must have (`provision` prints
+# it), or a list of them while a key is rotated. The mount's own checks
+# say who could have written a key file, not which key it holds; with a
+# pin, any other key is refused and a missing one is an error, not "no key
+# here". Quote the service names.
+#"com.company.orders" = "<64 hex chars>"
 
 [pkcs11]
 # PKCS#11 is used only when `module` is set: there is no default module.
@@ -178,8 +196,9 @@ mode = "prefer"
 #token_label = "hkdfguard-prod"
 #token_serial = "0123456789abcdef"
 # Serve only the services pinned below; `provision` then prints the line
-# to add for a new one.
-#require_pinned_keys = false
+# to add for a new one. Unset: true under the production security model,
+# false under the developer one.
+#require_pinned_keys = true
 
 [pkcs11.pinned_keys]
 # The fingerprint each service's key on the token must have (`provision`

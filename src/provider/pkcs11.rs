@@ -129,7 +129,8 @@
 //! other fingerprint is then refused, and so is a pinned service whose key
 //! is gone -- an error, never "no key here", so the provider chain doesn't
 //! hand the service to a weaker provider. `pkcs11.require_pinned_keys`
-//! makes the pins an allowlist (see [`Pins`]).
+//! makes the pins an allowlist (see [`Pins`]); it is on unless policy
+//! turns it off under the production security model.
 //!
 //! `load_kek` locates the key (or generates it, when creation was asked
 //! for) up front and hands back a handle holding its object handle, so
@@ -1159,7 +1160,7 @@ impl KekProvider for Pkcs11Provider {
         let pins = service_pins(service)?;
         if matches!(pins, Pins::Unpinned) && !create_if_missing {
             return Err(Error::KeyNotProvisioned(
-                "pkcs11.require_pinned_keys is set and policy pins no key for this service",
+                "pkcs11.require_pinned_keys is on and policy pins no key for this service",
             ));
         }
         let key = match find_key(&open.session, service, open)? {
@@ -1308,13 +1309,13 @@ fn pinned_but_missing() -> Error {
 fn unpinned_service_instructions(service: &str, session: &Session, key: ObjectHandle) -> String {
     match crate::crypto::kek_fingerprint(&SessionKey { session, key }) {
         Ok(fingerprint) => format!(
-            "pkcs11.require_pinned_keys is set and service \"{service}\" has no pinned key. Its key is on the token, \
+            "pkcs11.require_pinned_keys is on and service \"{service}\" has no pinned key. Its key is on the token, \
              with fingerprint {fingerprint}; to provision it, add this to the policy file and run provision \
              again:\n  [pkcs11.pinned_keys]\n  \"{service}\" = \"{fingerprint}\"",
             fingerprint = hex(&fingerprint)
         ),
         Err(e) => format!(
-            "pkcs11.require_pinned_keys is set and this service has no pinned key; computing its key's fingerprint \
+            "pkcs11.require_pinned_keys is on and this service has no pinned key; computing its key's fingerprint \
              to report it failed: {e}"
         ),
     }
@@ -2008,7 +2009,8 @@ mod tests {
         }
         assert!(provider.claims_while_absent("com.company.unpinned").is_ok());
         assert!(matches!(service_pins(pinned).unwrap(), Pins::OneOf(pins) if pins == vec![[0xab; crate::payload::FINGERPRINT_LEN]]));
-        assert!(matches!(service_pins("com.company.unpinned").unwrap(), Pins::Any));
+        // Production, with nothing said about the allowlist: it is on.
+        assert!(matches!(service_pins("com.company.unpinned").unwrap(), Pins::Unpinned));
     }
 
     #[test]
@@ -2020,8 +2022,17 @@ mod tests {
             assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Unpinned));
         }
         {
-            let _none = TestPolicy::absent();
+            // Production, where nothing set means the allowlist is on.
+            let _default = TestPolicy::minimal();
+            assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Unpinned));
+        }
+        {
+            let _off = TestPolicy::exact("[selection]\nmode = \"prefer\"\n[pkcs11]\nrequire_pinned_keys = false\n");
             assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Any));
+        }
+        {
+            let _none = TestPolicy::absent();
+            assert!(service_pins("com.company.orders").is_err(), "a missing policy must not report 'nothing pinned'");
         }
         let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\n");
         assert!(service_pins("com.company.orders").is_err(), "a broken policy must not report 'nothing pinned'");

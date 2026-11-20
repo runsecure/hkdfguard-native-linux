@@ -72,8 +72,9 @@ Provides:       group(hkdfguard)
 %description -n %{libpkg} %{common_description}
 
 Provider selection is controlled by the root-owned policy file
-/etc/hkdfguard/policy.toml, which this package does not create; an
-annotated example is installed as /usr/share/hkdfguard/policy.toml.example.
+/etc/hkdfguard/policy.toml, which this package does not create and the
+library requires: every call fails until it exists. An annotated example
+is installed as /usr/share/hkdfguard/policy.toml.example.
 Unless the policy says otherwise the production security model applies:
 only root creates KEKs, and only key files written by root or by a member
 of the hkdfguard-deployers group, which this package creates, are trusted.

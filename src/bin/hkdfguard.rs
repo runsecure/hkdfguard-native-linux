@@ -993,7 +993,7 @@ fn describe_status(code: c_int) -> String {
         status::INTERNAL_ERROR => "an internal error occurred in the hkdfguard library".to_string(),
         status::INVALID_SERVICE_NAME => "the service name is missing, empty, too long, or contains an invalid character".to_string(),
         status::POLICY_INVALID => {
-            "the hkdfguard policy file is invalid or can't be trusted (see the library's log for why)".to_string()
+            "the hkdfguard policy file is missing, invalid or can't be trusted (see the library's log for why)".to_string()
         }
         status::PAYLOAD_MALFORMED => "the wrapped payload is malformed".to_string(),
         status::PAYLOAD_AUTH_FAILED => {
@@ -3071,7 +3071,7 @@ mod tests {
         let output = ProtectOutput::KeyFile { key_file_path: existing.to_str().unwrap().into(), force: false, group: None };
         let err = run_protect("svc".into(), "vault.password".into(), source(), false, output, None).unwrap_err();
         // An existing file without --force -- or, in a build that reads the
-        // host's real policy (a package build: no policy, so production,
+        // host's real policy (a package build: no policy file, or production,
         // run by an account that is neither root nor a deployer), the
         // security-model check just before it.
         assert!(

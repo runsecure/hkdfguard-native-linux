@@ -4,7 +4,7 @@
 # them first with DISTROS=ubuntu24.04 packaging/build-packages.sh -- then
 # copies each into a clean Ubuntu 24.04 consumer image and runs
 # packaging/overlay/consumer-test.sh there:
-#   overlay      no policy; external-secret KEKs
+#   overlay      no policy shipped; the test writes one, pinning external-secret KEKs
 #   overlay-dev  the dev policy; ephemeral, then SoftHSM2 with a PIN file
 #
 # Leaves hkdfguard-overlay:local and hkdfguard-overlay-dev:local loaded in

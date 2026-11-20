@@ -321,8 +321,7 @@ fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider
 ///
 /// Ephemeral is **excluded** unless a policy explicitly names it (as the
 /// sole provider under `require`, or by name in `preferred_order`) -- see
-/// `crate::policy::Policy::ephemeral_explicitly_listed`. With no policy
-/// file at all, nothing can be named, so it's always excluded then too.
+/// `crate::policy::Policy::ephemeral_explicitly_listed`.
 /// Its keys live only in process memory, so every DEK wrapped under one is
 /// permanently lost on restart; silently falling back to it -- because a
 /// secret mount wasn't there yet at startup, or a TPM failed its
@@ -330,14 +329,9 @@ fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider
 /// data loss.
 fn allowed_types() -> Result<Vec<ProviderType>> {
     let compiled = compiled_provider_types();
-    let Some(policy) = crate::policy::load() else {
-        return Ok(compiled
-            .into_iter()
-            .filter(|t| *t != ProviderType::Ephemeral)
-            .collect()); // no policy configured: default order, minus Ephemeral (named-only)
-    };
-    let policy = policy?; // a configured-but-malformed/self-contradictory policy fails every operation, on purpose (fail closed)
-    policy.allowed_providers(&compiled)
+    // A missing, malformed or self-contradictory policy fails every
+    // operation, on purpose (fail closed).
+    crate::policy::load()?.allowed_providers(&compiled)
 }
 
 /// The policy's first choice of provider (the head of the allowed chain),
@@ -744,11 +738,12 @@ mod tests {
     use super::*; // bring `ProviderType` etc. into scope
     use serial_test::serial;
 
-    // Points HKDFGUARD_POLICY_FILE somewhere guaranteed not to exist, so
-    // tests that don't care about policy behavior aren't accidentally
-    // affected by a real /etc/hkdfguard/policy.toml on the test host.
-    fn clear_policy_env() {
-        let _no_policy = crate::policy::test_support::TestPolicy::absent();
+    // The shortest valid policy, for tests that don't care about policy
+    // behavior: nothing from the harness's policy, and nothing set. In
+    // force while the returned guard lives.
+    #[must_use]
+    fn default_policy() -> crate::policy::test_support::TestPolicy {
+        crate::policy::test_support::TestPolicy::minimal()
     }
 
     // Stand-in for `.unwrap_err()`: the `Ok` type here is
@@ -815,7 +810,7 @@ mod tests {
     #[test]
     #[serial]
     fn get_by_type_finds_compiled_providers() {
-        clear_policy_env();
+        let _policy = default_policy();
         #[cfg(feature = "external-secret")]
         {
             let p = get_by_type(ProviderType::ExternalSecret).unwrap();
@@ -958,16 +953,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn create_kek_does_not_fall_back_to_ephemeral_without_a_policy() {
+    fn create_kek_does_not_fall_back_to_ephemeral_unless_policy_names_it() {
         #[cfg(feature = "ephemeral")]
         {
-            clear_policy_env(); // no policy file at all
+            let _policy = default_policy(); // a policy that names nothing
 
             // External secret unreachable, so on a host with no hardware
             // provider Ephemeral is the only thing left -- and it must
             // NOT be used: a transient outage must not silently become a
             // key that's lost on restart. The subject here is the
-            // *no-policy default*, so the policy deliberately isn't
+            // *default order*, so the policy deliberately isn't
             // pinned; see `assert_never_ephemeral` for why the outcome is
             // asserted as an invariant rather than one fixed result.
 
@@ -1087,7 +1082,7 @@ mod tests {
         #[cfg(feature = "pkcs11")]
         {
             // Nothing from the harness: no PKCS#11 module or PIN file.
-            let _isolated = crate::policy::test_support::TestPolicy::absent();
+            let _isolated = crate::policy::test_support::TestPolicy::minimal();
             // PKCS#11 is compiled in but not reachable here (the policy
             // names no module), and the policy
             // requires exactly it -- so there must be no fallback to
@@ -1108,7 +1103,7 @@ mod tests {
         #[cfg(all(feature = "pkcs11", feature = "external-secret"))]
         {
             // Nothing from the harness: no PKCS#11 module or PIN file.
-            let _isolated = crate::policy::test_support::TestPolicy::absent();
+            let _isolated = crate::policy::test_support::TestPolicy::minimal();
             let ext_dir = crate::secure_file::private_tempdir();
             let _secret_mount = crate::policy::test_support::secret_mount(ext_dir.path());
 
@@ -1335,7 +1330,7 @@ mod tests {
             // is an outage, not "this service isn't provisioned yet":
             // KEK_NOT_FOUND would go unaudited and send the caller off to
             // hkdfguard_create_kek, and kek_exists answering 0 would too.
-            let _isolated = crate::policy::test_support::TestPolicy::absent();
+            let _isolated = crate::policy::test_support::TestPolicy::minimal();
             let _policy = write_policy("[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n");
             if external_secret::ExternalSecretProvider::new().probe() {
                 eprintln!("skipping: this host has a conventional secret mount");

@@ -27,6 +27,12 @@
 //!   be as long as the file says it is: a file whose filesystem makes its
 //!   contents up when read (procfs, sysfs) has an owner and a mode, but
 //!   nobody they could vouch for wrote its bytes.
+//! - **A filesystem that vouches for it.** Owner, mode and contents are
+//!   what the file's filesystem reports. On a FUSE mount that is whatever
+//!   the process serving it says, and any user can serve one: so whoever
+//!   serves it must be someone the security model trusts as an owner, or
+//!   the file is [`KeyFileError::Untrusted`]
+//!   (see [`secure_file::check_filesystem`]).
 //! - **Integrity.** The file must be owned by someone the security model
 //!   trusts, and must not be writable by anyone else; otherwise
 //!   [`KeyFileError::Untrusted`]. Under the production model (the
@@ -252,6 +258,7 @@ fn read_with_proc_root(
     let meta = file.metadata().map_err(|_| KeyFileError::Io)?;
     secure_file::check_metadata_trusting(&meta, trust).map_err(untrusted)?;
     secure_file::check_acl_trusting(&file, trust).map_err(untrusted)?;
+    secure_file::check_filesystem(&file, trust, proc_root).map_err(untrusted)?;
     secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::Untrusted)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
     if kind == Kind::Dek && size == DEK_LEN as u64 {

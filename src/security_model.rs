@@ -67,14 +67,10 @@ pub const DEPLOYERS_GROUP: &str = "hkdfguard-deployers";
 /// (Everyone, Users, Authenticated Users, ...).
 pub const OVER_BROAD_GROUPS: &[&str] = &["root", "users", "nogroup", "nobody", "wheel", "sudo", "adm", "staff"];
 
-/// The model the policy sets: Production with no policy file, the policy's
-/// error if it can't be used.
+/// The model the policy sets (Production unless it says otherwise), or the
+/// policy's error if it is missing or can't be used.
 pub(crate) fn current() -> Result<SecurityModel> {
-    match policy::load() {
-        None => Ok(SecurityModel::Production),
-        Some(Ok(p)) => Ok(p.security_model()),
-        Some(Err(e)) => Err(e),
-    }
+    policy::load().map(|p| p.security_model())
 }
 
 /// Whether this process may create a KEK that doesn't exist yet, or retire
@@ -110,11 +106,8 @@ impl Trust {
     /// `deployer_groups` entry doesn't name a group, names an over-broad
     /// one, or can't be looked up (nor can `hkdfguard-deployers`).
     pub(crate) fn current() -> Result<Trust> {
-        let (model, extra) = match policy::load() {
-            None => (SecurityModel::Production, Vec::new()),
-            Some(Ok(p)) => (p.security_model(), p.deployer_groups().to_vec()),
-            Some(Err(e)) => return Err(e),
-        };
+        let policy = policy::load()?;
+        let (model, extra) = (policy.security_model(), policy.deployer_groups().to_vec());
         // SAFETY: geteuid takes no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
         let mut deployers = Vec::new();
@@ -426,9 +419,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn production_is_the_default_with_no_policy_file_or_none_set() {
+    fn production_is_the_default_and_a_missing_policy_is_no_model_at_all() {
         let _none = TestPolicy::absent();
-        assert_eq!(current().unwrap(), SecurityModel::Production);
+        assert!(matches!(current(), Err(Error::Policy(_))));
+        assert!(matches!(Trust::current(), Err(Error::Policy(_))));
         drop(_none);
         let _unset = TestPolicy::exact("[selection]\nmode = \"prefer\"\n");
         assert_eq!(current().unwrap(), SecurityModel::Production);

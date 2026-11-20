@@ -92,7 +92,7 @@ extern "C" {
 #define HKDFGUARD_ERR_INVALID_SERVICE_NAME (-8) /* service is null, empty, not valid UTF-8, over 128 bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." */
 
 /* Policy */
-#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or of any directory above it (writable by group/others, sticky /tmp-style included), or it requires a provider this build lacks */
+#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: missing (one is required), unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or of any directory above it (writable by group/others, sticky /tmp-style included), or it requires a provider this build lacks */
 
 /* Wrapped payload */
 #define HKDFGUARD_ERR_PAYLOAD_MALFORMED (-10)   /* structurally invalid: truncated, trailing bytes, unknown provider type, or a field length no wrap produces */
@@ -116,7 +116,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_LONG (-36)       /* key file is longer than a wrapped DEK, or than its own header declares */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), or its base64 or hex): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-38)      /* key file is the right length but not a well-formed wrapped DEK */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust, or writable by someone else (sticky, /tmp-style, included): someone else could have replaced it */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust, or writable by someone else (sticky, /tmp-style, included), or the file is on a FUSE filesystem served by someone it doesn't trust: someone else could have replaced it */
 /* -40..-63 reserved for future common codes. */
 
 /* Windows-specific (-64..-79). Not returned on Linux. */
@@ -498,10 +498,13 @@ int hkdfguard_unwrap_secret(
  *
  *     security_model = "production"   # or "developer"
  *
- * in /etc/hkdfguard/policy.toml. Absent -- or no policy file at all --
- * means HKDFGUARD_SECURITY_MODEL_PRODUCTION: this is a production install
+ * in /etc/hkdfguard/policy.toml. A policy that doesn't set it means
+ * HKDFGUARD_SECURITY_MODEL_PRODUCTION: this is a production install
  * unless an administrator says otherwise. Any other value makes the policy
- * invalid, and every call fails with HKDFGUARD_ERR_POLICY_INVALID. It
+ * invalid, and every call fails with HKDFGUARD_ERR_POLICY_INVALID -- as
+ * every call does when there is no policy file at all: one is required,
+ * so that a file that never arrived (an unmounted volume, an image built
+ * without it) is an error and not a silent return to defaults. It
  * decides:
  *
  *   Who may create or retire a KEK. Production: root (see

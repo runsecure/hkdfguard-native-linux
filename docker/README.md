@@ -121,8 +121,8 @@ then, as `ci`:
    tests against the token.
 3. Builds the release library and CLI, then checks them against a
    root-owned `/etc/hkdfguard/policy.toml`, as a deployment installs it:
-   - with no policy, no provider is available: ephemeral is never a
-     silent fallback;
+   - with no policy file, every call is refused; with one that names no
+     provider, none is available: ephemeral is never a silent fallback;
    - with `provider = "ephemeral"`, `examples/wrap_unwrap.c` round-trips,
      and [`distros/ephemeral_cross_process.c`](distros/ephemeral_cross_process.c)
      shows a payload wrapped by one process cannot be unwrapped by the

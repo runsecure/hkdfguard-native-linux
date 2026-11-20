@@ -106,7 +106,7 @@ The policy's top-level
 .B security_model
 setting is
 .B production
-(the default, also with no policy file) or
+(the default) or
 .BR developer .
 Production splits the duties: root, the security admin, runs
 .B provision
@@ -294,7 +294,7 @@ Invalid command line.
 .TP
 .I /etc/hkdfguard/policy.toml
 Administrative policy: which providers may be used, and their
-configuration. Optional. When present it must be owned by root and not
+configuration. Required: without it every call fails. It must be owned by root and not
 writable by group or others, and so must every directory above it up to
 .IR / ,
 sticky ones such as

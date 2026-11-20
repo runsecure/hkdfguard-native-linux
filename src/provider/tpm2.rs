@@ -1719,18 +1719,64 @@ fn session_encryption_enabled() -> bool {
     crate::policy::tpm_session_encryption() == crate::policy::SessionEncryption::On
 }
 
+/// Set once this process's TPM has refused AES-256 as a session cipher, so
+/// later sessions ask for AES-128 straight away instead of paying for a
+/// refusal each time. One TPM per process: policy names it.
+static AES_256_SESSIONS_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the TPM refused `TPM2_StartAuthSession`'s symmetric parameter
+/// itself -- the algorithm (`TPM_RC_SYMMETRIC`), its key size
+/// (`TPM_RC_KEY_SIZE`) or its mode (`TPM_RC_MODE`) -- as opposed to failing
+/// for some other reason, which a smaller key would not cure.
+fn is_cipher_refusal(e: &tss_esapi::Error) -> bool {
+    use tss_esapi::constants::Tss2ResponseCodeKind;
+    matches!(
+        e,
+        tss_esapi::Error::Tss2Error(rc)
+            if matches!(rc.kind(), Some(Tss2ResponseCodeKind::Symmetric | Tss2ResponseCodeKind::KeySize | Tss2ResponseCodeKind::Mode))
+    )
+}
+
 /// Starts a salted HMAC session, salted to `srk`, with response and
-/// command parameter encryption (AES-128-CFB). The caller flushes it.
+/// command parameter encryption. The caller flushes it.
+///
+/// The cipher is AES-256-CFB where the TPM has it, and AES-128-CFB where
+/// it doesn't: AES-128 is the only size the PC Client profile requires,
+/// and some TPMs implement no other. The session key behind either is 256
+/// bits of KDFa output, keyed by the service key's authValue and the salt
+/// (see the section comment), so the larger cipher uses what is already
+/// there. An interposer on the bus can answer the AES-256 request with a
+/// refusal and so bring the session down to AES-128 -- which is where
+/// every session was before this -- but no lower: there is no fallback to
+/// an unencrypted session.
 fn start_encrypted_session(ctx: &mut Context, srk: KeyHandle) -> Result<AuthSession> {
-    let session = ctx
-        .start_auth_session(
+    use std::sync::atomic::Ordering;
+    let mut start = |cipher: SymmetricDefinition| {
+        ctx.start_auth_session(
             Some(srk), // salted: the session key depends on a secret only this TPM can unwrap
             None,      // never bound: see the section comment
             None,
             SessionType::Hmac,
-            SymmetricDefinition::AES_128_CFB,
+            cipher,
             HashingAlgorithm::Sha256,
         )
+    };
+    let started = if AES_256_SESSIONS_REFUSED.load(Ordering::Relaxed) {
+        start(SymmetricDefinition::AES_128_CFB)
+    } else {
+        match start(SymmetricDefinition::AES_256_CFB) {
+            Err(e) if is_cipher_refusal(&e) => {
+                AES_256_SESSIONS_REFUSED.store(true, Ordering::Relaxed);
+                crate::provider::log_once(
+                    log::Level::Warn,
+                    format!("hkdfguard: the TPM refused AES-256 for session encryption ({e}); using AES-128, the size every TPM has"),
+                );
+                start(SymmetricDefinition::AES_128_CFB)
+            }
+            other => other,
+        }
+    };
+    let session = started
         .map_err(|e| Error::Provider(format!("TPM2_StartAuthSession failed: {e}")))?
         .ok_or_else(|| Error::Provider("TPM2_StartAuthSession returned no session".into()))?;
 
@@ -2102,6 +2148,25 @@ mod tests {
     }
 
     #[test]
+    fn only_a_refusal_of_the_cipher_itself_brings_a_session_down_to_aes_128() {
+        let rc = |code: u32| tss_esapi::Error::Tss2Error(tss_esapi::constants::Tss2ResponseCode::from(code));
+        // Format one, parameter 4 (StartAuthSession's `symmetric`):
+        // TPM_RC_SYMMETRIC, TPM_RC_KEY_SIZE, TPM_RC_MODE.
+        for refusal in [0x4D6, 0x4C7, 0x4C9] {
+            assert!(is_cipher_refusal(&rc(refusal)), "{refusal:#x}");
+        }
+        // Anything else is the session failing, at any key size: a bad
+        // salt key handle (TPM_RC_VALUE, handle 1), no session slots
+        // (TPM_RC_SESSION_MEMORY), a wrong password, a locked-out TPM.
+        for other in [0x184, 0x903] {
+            assert!(!is_cipher_refusal(&rc(other)), "{other:#x}");
+        }
+        assert!(!is_cipher_refusal(&auth_fail()));
+        assert!(!is_cipher_refusal(&lockout()));
+        assert!(!is_cipher_refusal(&tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)));
+    }
+
+    #[test]
     #[serial]
     fn a_rejected_owner_password_is_never_tried_again_until_the_file_changes() {
         reset_owner_auth();
@@ -2151,7 +2216,7 @@ mod tests {
     #[serial]
     fn a_rotation_after_confirmation_latches_at_the_failing_command() {
         reset_owner_auth();
-        let _no_policy = TestPolicy::absent(); // so `note_owner_auth_failure` reads "no owner_auth_file"
+        let _no_policy = TestPolicy::minimal(); // so `note_owner_auth_failure` reads "no owner_auth_file"
         confirm_owner_auth(None, || Ok(())).unwrap();
         note_owner_auth_failure(&lockout()); // not an auth rejection: ignored
         confirm_owner_auth(None, || panic!("still confirmed")).unwrap();
@@ -2512,8 +2577,8 @@ mod tests {
         let real = hex(&computed_name(&public).unwrap());
         let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
 
-        let _no_policy = TestPolicy::absent();
-        assert!(pin_allows(SERVICE, &public).unwrap(), "with no policy, any key file is usable");
+        let _no_policy = TestPolicy::minimal();
+        assert!(pin_allows(SERVICE, &public).unwrap(), "with nothing set, any key file is usable");
         drop(_no_policy);
 
         let allowlist = format!("{base}[tpm]\nrequire_pinned_names = true\n");
@@ -2551,7 +2616,7 @@ mod tests {
     #[test]
     #[serial]
     fn tcti_defaults_to_the_kernel_resource_manager() {
-        let _no_policy = TestPolicy::absent();
+        let _no_policy = TestPolicy::minimal();
         assert_eq!(tcti_of(resolve_tcti()), tcti_of(TctiNameConf::from_str(DEFAULT_TCTI).map_err(|e| Error::Provider(e.to_string()))));
     }
 
@@ -2569,7 +2634,7 @@ mod tests {
         // Whoever chooses the TPM chooses which TPM loads the key files,
         // so the tpm2-tools variables are ignored in every build -- this
         // test binary included.
-        let _no_policy = TestPolicy::absent();
+        let _no_policy = TestPolicy::minimal();
         let saved: Vec<_> = ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"].iter().map(|n| (*n, std::env::var_os(n))).collect();
         for (name, _) in &saved {
             std::env::set_var(name, "swtpm:host=127.0.0.1,port=7777");

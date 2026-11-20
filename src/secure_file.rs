@@ -129,6 +129,11 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
     opts.read(true).custom_flags(flags);
     let file = opts.open(path)?;
     let meta = file.metadata()?;
+    // A caller naming no owner judges the file under its own rule, this
+    // included (`key_file` does, under the security model's).
+    if let Some(owner) = req.owner {
+        check_filesystem(&file, &owner, Path::new("/proc"))?;
+    }
     let mut forbidden = req.forbidden_mode_bits;
     if req.allow_group_read_if_root_owned && meta.uid() == 0 {
         forbidden &= !GROUP_READ;
@@ -492,6 +497,131 @@ fn stat_without_links(path: &Path) -> io::Result<Metadata> {
 #[cfg(not(all(target_os = "linux", not(miri))))]
 fn stat_without_links(path: &Path) -> io::Result<Metadata> {
     std::fs::symlink_metadata(path)
+}
+
+/// `statfs`'s `f_type` for every FUSE filesystem: `fuse`, `fuseblk`, and
+/// virtiofs, which is FUSE with the host as its server.
+#[cfg(target_os = "linux")]
+const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+
+/// Refuses a file on a filesystem whose server -- the process that answers
+/// every `stat` and `read` of it -- is someone `trust` doesn't accept as an
+/// owner.
+///
+/// Every other check here reads what the filesystem reports: owner, mode,
+/// ACL, contents. On a FUSE mount all of that is whatever its server
+/// chooses to say, and `fusermount` lets any user be one: a file there can
+/// be "owned by root, mode 0600" and hold bytes its mounter picked. (The
+/// kernel hides such a mount from other users unless it was mounted with
+/// `allow_other`, which `/etc/fuse.conf` can permit; root sees it either
+/// way.) So the server is held to the rule an owner is: `user_id=` in the
+/// mount's options is the uid `/dev/fuse` was opened by, and it must be one
+/// `trust` accepts -- root for configuration and, under the production
+/// model, for key files. A root-mounted FUSE filesystem (a CSI driver's, an
+/// NTFS volume's) passes, and so does virtiofs, whose server is the
+/// hypervisor: only root can mount one.
+///
+/// The mount is found in `<proc>/self/mountinfo` by the file's device
+/// number, and only for a file `fstatfs` says is on FUSE: every other file
+/// passes without `/proc` being read. A FUSE file whose mount can't be
+/// found there -- no `/proc`, or a descriptor from a mount this process
+/// can't see -- is refused.
+///
+/// What this does not cover: a disk image someone crafted and had mounted
+/// (a removable drive, a loop device). Its filesystem is an ordinary one,
+/// served by the kernel, and it says what its author wrote into it. Such a
+/// mount is root's doing, and where key files are looked for is too.
+///
+/// Every refusal is `PermissionDenied` with no `raw_os_error`, as
+/// [`open_checked`]'s own checks are.
+pub fn check_filesystem(file: &File, trust: &dyn PrincipalTrust, proc_root: &Path) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        use std::os::unix::io::AsRawFd;
+        let denied = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, what);
+        // SAFETY: an all-zero `statfs` is a valid out-parameter (plain integers).
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` is an open descriptor for the length of the call;
+        // `st` is a properly sized out-parameter that fstatfs fully
+        // initializes on success, and is read only then.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+            return Err(denied(format!("could not tell which filesystem it is on: {}", io::Error::last_os_error())));
+        }
+        #[allow(clippy::unnecessary_cast)] // `f_type`'s width and sign differ by target
+        if st.f_type as u64 != FUSE_SUPER_MAGIC {
+            return Ok(());
+        }
+        let dev = file.metadata().map_err(|e| denied(format!("could not stat the opened file: {e}")))?.dev();
+        let mounts = std::fs::read_to_string(proc_root.join("self/mountinfo")).map_err(|e| {
+            denied(format!(
+                "it is on a FUSE filesystem, and who serves it could not be read from {}/self/mountinfo: {e}",
+                proc_root.display()
+            ))
+        })?;
+        match fuse_server(&mounts, dev) {
+            Some(FuseServer::Hypervisor) => Ok(()),
+            Some(FuseServer::Uid(uid)) if trust.trusts_owner(uid) => Ok(()),
+            Some(FuseServer::Uid(uid)) => Err(denied(format!(
+                "it is on a FUSE filesystem served by uid {uid}, which is not an allowed owner: its contents and its \
+                 reported owner and mode are whatever that user's process says they are"
+            ))),
+            None => Err(denied("it is on a FUSE filesystem whose mount, and so whose server, could not be identified".into())),
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    {
+        // Elsewhere there is no FUSE to ask about; and Miri, which runs
+        // the tests to check `unsafe` code, can't call fstatfs.
+        let _ = (file, trust, proc_root);
+        Ok(())
+    }
+}
+
+/// Who answers for a FUSE filesystem.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum FuseServer {
+    /// virtiofs: the virtual machine's host.
+    Hypervisor,
+    /// The user whose process opened `/dev/fuse` for the mount.
+    Uid(u32),
+}
+
+/// The server of the FUSE filesystem with device number `dev`, from the
+/// text of a `mountinfo` file; `None` if no mount of that device is listed,
+/// or the one listed is no FUSE mount or names no server.
+///
+/// A line is `id parent major:minor root mountpoint options [tags...] -
+/// fstype source superoptions`. The kernel writes spaces inside a field as
+/// `\040`, so fields split on spaces, and the lone `-` is found after the
+/// six fixed fields, where no path can be mistaken for it. Every mount of
+/// one filesystem shares its device number, type and super options, so the
+/// first line that matches is as good as any.
+#[cfg(target_os = "linux")]
+fn fuse_server(mountinfo: &str, dev: u64) -> Option<FuseServer> {
+    // The kernel's encoding of a device number, as glibc's major()/minor().
+    let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff);
+    let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0xff);
+    let wanted = format!("{major}:{minor}");
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.get(2) != Some(&wanted.as_str()) {
+            continue;
+        }
+        let separator = fields.iter().skip(6).position(|f| *f == "-")? + 6;
+        let fstype = *fields.get(separator + 1)?;
+        if fstype == "virtiofs" {
+            return Some(FuseServer::Hypervisor);
+        }
+        let kind = fstype.split('.').next()?; // "fuse.sshfs": the subtype is the server's to choose
+        if kind != "fuse" && kind != "fuseblk" {
+            return None;
+        }
+        let options = fields.get(separator + 3)?;
+        let uid = options.split(',').find_map(|o| o.strip_prefix("user_id="))?;
+        return uid.parse().ok().map(FuseServer::Uid);
+    }
+    None
 }
 
 fn on_read_only_mount(path: &Path) -> bool {
@@ -1198,6 +1328,96 @@ mod tests {
             assert!(err.to_string().contains("sticky"), "says why: {err}");
         }
         chmod(base.path(), 0o700);
+    }
+
+    // Device numbers as the kernel encodes them: major 0 for every
+    // anonymous (FUSE, tmpfs) device.
+    fn dev(major: u64, minor: u64) -> u64 {
+        ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_server_of_a_fuse_mount_is_read_from_its_own_mountinfo_line() {
+        let mounts = "\
+36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+1012 866 0:60 /by-app/x /run/flatpak/doc rw,nosuid,nodev,relatime master:677 - fuse.portal portal rw,user_id=1000,group_id=1000
+1154 1153 8:33 / /media/u/My\\040Passport rw,nosuid,nodev,relatime master:941 - fuseblk /dev/sdc1 rw,user_id=0,group_id=0,allow_other
+77 60 0:71 / /run/kata/shared rw,relatime - virtiofs kataShared rw
+78 60 0:72 / /home/u/remote rw,nosuid,nodev,relatime shared:9 master:3 - fuse.sshfs host:/ rw,user_id=1001,group_id=1001
+79 60 0:300 / /mnt/big rw - fuse src rw,user_id=7,group_id=7
+80 60 0:73 / /mnt/-\\040- rw - fuse - rw,user_id=8,group_id=8
+81 60 0:74 / /mnt/odd rw - fuse src rw,group_id=9
+82 60 0:75 / /mnt/odd2 rw - fuse src rw,user_id=root
+";
+        assert_eq!(fuse_server(mounts, dev(0, 60)), Some(FuseServer::Uid(1000)));
+        assert_eq!(fuse_server(mounts, dev(8, 33)), Some(FuseServer::Uid(0)), "an escaped space in the mount point");
+        assert_eq!(fuse_server(mounts, dev(0, 71)), Some(FuseServer::Hypervisor));
+        assert_eq!(fuse_server(mounts, dev(0, 72)), Some(FuseServer::Uid(1001)), "two optional fields before the separator");
+        assert_eq!(fuse_server(mounts, dev(0, 300)), Some(FuseServer::Uid(7)), "a minor above 255");
+        assert_eq!(fuse_server(mounts, dev(0, 73)), Some(FuseServer::Uid(8)), "a source that is itself `-`");
+        // Nothing that isn't plainly a FUSE mount naming its server.
+        assert_eq!(fuse_server(mounts, dev(98, 0)), None, "not a FUSE filesystem");
+        assert_eq!(fuse_server(mounts, dev(0, 74)), None, "no user_id");
+        assert_eq!(fuse_server(mounts, dev(0, 75)), None, "a user_id that is no number");
+        assert_eq!(fuse_server(mounts, dev(0, 99)), None, "no such mount");
+        assert_eq!(fuse_server("", dev(0, 60)), None);
+        // A mount point can't pose as another mount's line: the device is
+        // matched in its own field only.
+        assert_eq!(fuse_server("5 4 0:1 / /mnt/0:60 rw - fuse x rw,user_id=0\n", dev(0, 60)), None);
+    }
+
+    #[test]
+    fn a_file_on_an_ordinary_filesystem_passes_without_proc() {
+        // Not FUSE, so nobody's word but the kernel's: `/proc` isn't
+        // consulted, and needn't exist.
+        let f = temp_file_with(b"contents", 0o600);
+        let file = File::open(f.path()).unwrap();
+        check_filesystem(&file, &Owner::Root, Path::new("/nonexistent-hkdfguard-proc")).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn a_file_on_a_fuse_mount_is_judged_by_who_serves_it() {
+        // Whatever FUSE mount this host has that this user can read a
+        // file on (a desktop's document portal, an sshfs or NTFS mount);
+        // none on a build machine, and then there is nothing to check.
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mount_points = mounts.lines().filter_map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let separator = fields.iter().skip(6).position(|f| *f == "-")? + 6;
+            fields.get(separator + 1)?.starts_with("fuse").then(|| fields[4].replace("\\040", " "))
+        });
+        for mount_point in mount_points {
+            let Some(file) = std::fs::read_dir(&mount_point)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .find_map(|e| File::open(e.path()).ok())
+            else {
+                continue;
+            };
+            let server = fuse_server(&mounts, file.metadata().unwrap().dev()).expect("a FUSE mount names its server");
+            let FuseServer::Uid(uid) = server else { continue };
+            struct Only(u32);
+            impl PrincipalTrust for Only {
+                fn trusts_owner(&self, uid: u32) -> bool {
+                    uid == self.0
+                }
+                fn trusts_group_writer(&self, _gid: u32) -> bool {
+                    false
+                }
+            }
+            check_filesystem(&file, &Only(uid), Path::new("/proc")).expect("served by a trusted user");
+            let err = check_filesystem(&file, &Only(uid.wrapping_add(1)), Path::new("/proc")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.raw_os_error().is_none() && err.to_string().contains("FUSE"), "{err}");
+            let err = check_filesystem(&file, &Only(uid), Path::new("/nonexistent-hkdfguard-proc")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "without /proc nobody can be shown to serve it");
+            return;
+        }
+        eprintln!("skipping: no readable file on a FUSE mount on this host");
     }
 
     #[test]

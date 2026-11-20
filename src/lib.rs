@@ -2163,7 +2163,7 @@ mod ffi_tests {
 
     #[test]
     fn ffi_secret_arguments_are_checked_before_any_provider() {
-        // No KEK, no policy: each of these is refused on its arguments alone.
+        // No KEK, no policy file: each of these is refused on its arguments alone.
         let service = CString::new("com.company.nokek").unwrap();
         let name = CString::new("vault.password").unwrap();
         let unterminated = [b'a'; crypto::SECRET_NAME_MAX_LEN + 8]; // no NUL anywhere: the bounded scan must stop
@@ -3604,7 +3604,7 @@ mod ffi_tests {
         let _policy = crate::policy::test_support::TestPolicy::write(
             "preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[audit]\nunwrap_success = 0\n",
         );
-        assert!(matches!(crate::policy::load(), Some(Err(_))));
+        assert!(crate::policy::load().is_err());
         assert!(crate::policy::audit_unwrap_success(), "a broken policy keeps unwrap auditing on");
     }
 
@@ -3644,13 +3644,13 @@ mod ffi_tests {
     #[serial]
     #[cfg_attr(miri, ignore = "needs the passwd database, which Miri can't reach")]
     fn security_model_reports_production_by_default_and_developer_when_set() {
-        let _none = policy::test_support::TestPolicy::absent();
+        let _none = policy::test_support::TestPolicy::minimal();
         // Production trusts root and deployers, and with no deployer_groups
         // the only deployers are hkdfguard-deployers' members -- which the
         // account running this may be (docker/Dockerfile's `ci` is).
         let production_trusted =
             (euid() == 0 || security_model::Trust::this_user_is_packaged_deployer_for_tests()) as c_int;
-        assert_eq!(security_model_now(), (status::OK, 0, production_trusted), "no policy file: production");
+        assert_eq!(security_model_now(), (status::OK, 0, production_trusted), "nothing set: production");
         drop(_none);
         let _dev = developer_policy();
         assert_eq!(security_model_now(), (status::OK, 1, 1), "developer: this account's files are trusted");
@@ -3710,10 +3710,10 @@ mod ffi_tests {
         if euid() != 0 {
             let bytes = sample_wrapped_bytes();
             let (_dir, path) = key_file_with(&bytes);
-            let _none = policy::test_support::TestPolicy::absent();
+            let _none = policy::test_support::TestPolicy::minimal();
             if crate::security_model::Trust::current().is_ok_and(|t| !t.may_write_key_files()) {
                 let (rc, out, _) = open_file(&path, crypto::MAX_WRAPPED_LEN);
-                assert_eq!(rc, status::FILE_UNTRUSTED, "no policy file: production, and this account is no deployer");
+                assert_eq!(rc, status::FILE_UNTRUSTED, "nothing set: production, and this account is no deployer");
                 assert!(out.iter().all(|&b| b == 0));
             }
             drop(_none);

@@ -164,7 +164,7 @@ use_policy() {
     ( umask 077; policy "$@" > "$WORK/policy.toml" )
     export HKDFGUARD_POLICY_FILE="$WORK/policy.toml"
 }
-# Selects as having no policy file would: the default order, no Ephemeral.
+# The built-in selection: the default order, no Ephemeral.
 use_base_policy() { use_policy $'[selection]\nmode = "prefer"'; }
 
 # Runs one #[ignore]d operator-helper test and extracts a KEY=value line.
