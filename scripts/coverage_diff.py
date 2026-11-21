@@ -6,16 +6,37 @@ import os
 import re
 import sys
 
-lcov_path, root = sys.argv[1], sys.argv[2]
+root = os.path.realpath(sys.argv[2])
+
+
+def inside_root(path):
+    """`path` (relative ones taken from the repository root) with symlinks
+    and `..` resolved, or None if that leaves the repository. Every file
+    this script opens goes through here: the names come from the command
+    line and from the diff on stdin, and none of them has any business
+    outside the checkout."""
+    resolved = os.path.realpath(os.path.join(root, path))
+    if os.path.commonpath([root, resolved]) != root:
+        return None
+    return resolved
+
+
+lcov_path = inside_root(sys.argv[1])
+if lcov_path is None:
+    sys.exit(f"coverage_diff: {sys.argv[1]} is outside {root}")
 
 # Exemptions: `path<TAB>source line, stripped<TAB>why`, '#' comments. Lines
 # a test runs but whose process can't record a profile.
 exempt = {}
-if len(sys.argv) > 3 and os.path.exists(sys.argv[3]):
-    for raw in open(sys.argv[3]):
-        if raw.strip() and not raw.startswith("#"):
-            path, text, why = raw.rstrip("\n").split("\t", 2)
-            exempt[(path, text)] = why
+exempt_path = inside_root(sys.argv[3]) if len(sys.argv) > 3 else None
+if len(sys.argv) > 3 and exempt_path is None:
+    sys.exit(f"coverage_diff: {sys.argv[3]} is outside {root}")
+if exempt_path and os.path.exists(exempt_path):
+    with open(exempt_path) as f:
+        for raw in f:
+            if raw.strip() and not raw.startswith("#"):
+                path, text, why = raw.rstrip("\n").split("\t", 2)
+                exempt[(path, text)] = why
 
 # lcov: per source file, line -> max hit count (a line can appear once per
 # object; it is covered if any object ran it).
@@ -47,8 +68,12 @@ missed = []
 exempted = []
 for path in sorted(added):
     file_hits = hits.get(path, {})
+    src_path = inside_root(path)
+    if src_path is None:
+        continue  # a diff naming a file outside the repository: not ours to read
     try:
-        src = open(os.path.join(root, path)).read().splitlines()
+        with open(src_path) as f:
+            src = f.read().splitlines()
     except OSError:
         continue
     for n in sorted(added[path]):
