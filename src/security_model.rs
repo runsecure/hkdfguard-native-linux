@@ -67,14 +67,10 @@ pub const DEPLOYERS_GROUP: &str = "hkdfguard-deployers";
 /// (Everyone, Users, Authenticated Users, ...).
 pub const OVER_BROAD_GROUPS: &[&str] = &["root", "users", "nogroup", "nobody", "wheel", "sudo", "adm", "staff"];
 
-/// The model the policy sets: Production with no policy file, the policy's
-/// error if it can't be used.
+/// The model the policy sets (Production unless it says otherwise), or the
+/// policy's error if it is missing or can't be used.
 pub(crate) fn current() -> Result<SecurityModel> {
-    match policy::load() {
-        None => Ok(SecurityModel::Production),
-        Some(Ok(p)) => Ok(p.security_model()),
-        Some(Err(e)) => Err(e),
-    }
+    policy::load().map(|p| p.security_model())
 }
 
 /// Whether this process may create a KEK that doesn't exist yet, or retire
@@ -110,11 +106,8 @@ impl Trust {
     /// `deployer_groups` entry doesn't name a group, names an over-broad
     /// one, or can't be looked up (nor can `hkdfguard-deployers`).
     pub(crate) fn current() -> Result<Trust> {
-        let (model, extra) = match policy::load() {
-            None => (SecurityModel::Production, Vec::new()),
-            Some(Ok(p)) => (p.security_model(), p.deployer_groups().to_vec()),
-            Some(Err(e)) => return Err(e),
-        };
+        let policy = policy::load()?;
+        let (model, extra) = (policy.security_model(), policy.deployer_groups().to_vec());
         // SAFETY: geteuid takes no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
         let mut deployers = Vec::new();
@@ -214,9 +207,67 @@ impl PrincipalTrust for Trust {
 // would trust every account's key files. Fails closed: if a listed group
 // can't be looked up, whether it is this gid can't be ruled out.
 fn vetted(name: &str, group: Group) -> Result<DeployerGroup> {
-    let refuse = |why: String| Err(Error::GroupInvalid(format!("deployer group \"{name}\" (gid {}): {why}", group.gid)));
+    vetted_as("deployer group", name, group)
+}
+
+/// The gid of `name`, a group meant to cover one service's accounts -- a
+/// TPM authValue file's (`tpm.auth_groups`). Refused, as a deployer group
+/// is, when it is over-broad, missing, or can't be looked up: a file only
+/// one service should read must not become readable by essentially every
+/// account through a typo or a default group.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn service_group_gid(name: &str) -> Result<libc::gid_t> {
+    let group = lookup_group(name)
+        .map_err(|e| Error::GroupInvalid(format!("tpm.auth_groups: could not look up group \"{name}\": {e}")))?
+        .ok_or_else(|| Error::GroupInvalid(format!("tpm.auth_groups: \"{name}\" does not name a group on this host")))?;
+    Ok(vetted_as("tpm.auth_groups group", name, group)?.gid)
+}
+
+/// The over-broad group `gid` is, if it is one: the overflow gid, or the
+/// gid of any name in [`OVER_BROAD_GROUPS`] but `root`. For a secret that
+/// arrives readable by its group, where gid 0 is ordinary -- a root-owned
+/// file's own default group, and the group OpenShift runs every container
+/// user in -- and the others would each open it to accounts well beyond
+/// one service.
+///
+/// The answer for a gid is kept for the life of the process: this is asked
+/// on every wrap and unwrap, and each name is a lookup that may leave the
+/// host. A lookup that fails is an error, and is not kept.
+#[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
+pub(crate) fn over_broad_reader_group(gid: libc::gid_t) -> std::io::Result<Option<&'static str>> {
+    static KNOWN: std::sync::Mutex<Vec<(libc::gid_t, Option<&'static str>)>> = std::sync::Mutex::new(Vec::new());
+    if gid == 0 {
+        return Ok(None);
+    }
+    if gid == 65534 {
+        return Ok(Some("nogroup"));
+    }
+    let known = |gid| {
+        let known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        known.iter().find(|(g, _)| *g == gid).map(|(_, verdict)| *verdict)
+    };
+    if let Some(verdict) = known(gid) {
+        return Ok(verdict);
+    }
+    let mut verdict = None;
+    for broad in OVER_BROAD_GROUPS.iter().copied().filter(|name| *name != "root") {
+        if lookup_group(broad)?.is_some_and(|g| g.gid == gid) {
+            verdict = Some(broad);
+            break;
+        }
+    }
+    let mut all = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if all.len() < 64 && !all.iter().any(|(g, _)| *g == gid) {
+        all.push((gid, verdict));
+    }
+    Ok(verdict)
+}
+
+// `role` names what the group is for, in the refusal.
+fn vetted_as(role: &str, name: &str, group: Group) -> Result<DeployerGroup> {
+    let refuse = |why: String| Err(Error::GroupInvalid(format!("{role} \"{name}\" (gid {}): {why}", group.gid)));
     if group.gid == 0 || group.gid == 65534 || OVER_BROAD_GROUPS.contains(&group.name.as_str()) {
-        return refuse("an over-broad group can't be a deployer group".to_string());
+        return refuse(format!("an over-broad group can't be a {role}"));
     }
     for broad in OVER_BROAD_GROUPS {
         match lookup_group(broad) {
@@ -372,6 +423,51 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "looks groups up through NSS, which Miri can't")]
+    fn a_service_group_must_exist_and_not_be_over_broad() {
+        match service_group_gid("hkdfguard-test-no-such-group") {
+            Err(Error::GroupInvalid(msg)) => assert!(msg.contains("does not name a group"), "{msg}"),
+            other => panic!("expected GroupInvalid, got {other:?}"),
+        }
+        if lookup_group("root").ok().flatten().is_some() {
+            match service_group_gid("root") {
+                Err(Error::GroupInvalid(msg)) => assert!(msg.contains("over-broad") && msg.contains("tpm.auth_groups"), "{msg}"),
+                other => panic!("expected GroupInvalid, got {other:?}"),
+            }
+        }
+        // This process's own primary group, unless that is itself over-broad.
+        let (_, _, gid) = me();
+        // SAFETY: getgrgid returns null or a pointer to a static entry, read at once.
+        let name = unsafe {
+            let entry = libc::getgrgid(gid);
+            (!entry.is_null()).then(|| std::ffi::CStr::from_ptr((*entry).gr_name).to_string_lossy().into_owned())
+        };
+        match name {
+            Some(name) if gid != 0 && gid != 65534 && !OVER_BROAD_GROUPS.contains(&name.as_str()) => {
+                assert_eq!(service_group_gid(&name).unwrap(), gid)
+            }
+            _ => eprintln!("skipping the positive case: this process's primary group is over-broad or unnamed"),
+        }
+    }
+
+    #[test]
+    fn a_reader_group_is_over_broad_by_gid_except_root_s() {
+        assert_eq!(over_broad_reader_group(0).unwrap(), None, "root's own group is ordinary for a root-owned file");
+        assert_eq!(over_broad_reader_group(65534).unwrap(), Some("nogroup"));
+        for broad in OVER_BROAD_GROUPS.iter().copied().filter(|g| *g != "root") {
+            if let Ok(Some(group)) = lookup_group(broad) {
+                if group.gid != 0 && group.gid != 65534 {
+                    // By gid: whichever of the names sharing it is found first.
+                    assert!(over_broad_reader_group(group.gid).unwrap().is_some(), "{broad}");
+                    assert!(over_broad_reader_group(group.gid).unwrap().is_some(), "{broad}, remembered");
+                }
+            }
+        }
+        // A gid no group has, as a Kubernetes fsGroup usually is.
+        assert_eq!(over_broad_reader_group(0x7fff_fff1).unwrap(), None);
+    }
+
+    #[test]
     fn the_c_values_are_the_windows_build_s() {
         assert_eq!(SecurityModel::Production.c_value(), 0);
         assert_eq!(SecurityModel::Developer.c_value(), 1);
@@ -380,9 +476,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn production_is_the_default_with_no_policy_file_or_none_set() {
+    fn production_is_the_default_and_a_missing_policy_is_no_model_at_all() {
         let _none = TestPolicy::absent();
-        assert_eq!(current().unwrap(), SecurityModel::Production);
+        assert!(matches!(current(), Err(Error::Policy(_))));
+        assert!(matches!(Trust::current(), Err(Error::Policy(_))));
         drop(_none);
         let _unset = TestPolicy::exact("[selection]\nmode = \"prefer\"\n");
         assert_eq!(current().unwrap(), SecurityModel::Production);
@@ -399,6 +496,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(miri, ignore = "looks this user up through NSS, which Miri can't")]
     fn developer_trusts_root_and_this_user_and_no_group() {
         let _dev = TestPolicy::write("security_model = \"developer\"\n");
         let trust = Trust::current().unwrap();
@@ -413,6 +511,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "looks this user up through NSS, which Miri can't")]
     fn production_trusts_root_and_deployers_only() {
         let (uid, name, gid) = me();
         if uid == 0 {
@@ -472,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "looks this user up through NSS, which Miri can't")]
     fn this_user_and_its_primary_group_resolve() {
         let (_, name, _) = me();
         assert!(!name.is_empty());

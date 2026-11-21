@@ -5,7 +5,8 @@
 # Each scenario is a Job whose pod mounts a Secret
 # holding a KEK (32 random bytes, made and fingerprinted on this machine
 # with the OpenSSL commands docs/configuration.md gives) and a ConfigMap
-# holding the policy at /etc/hkdfguard, and runs docker/k8s/pod-test.sh:
+# holding the policy at /etc/hkdfguard (in a projected volume: see
+# policy_volume in keys.sh), and runs docker/k8s/pod-test.sh:
 # provision, wrap a DEK, and unwrap it in a separate process through the
 # library.
 #
@@ -66,8 +67,9 @@ put_policy() {
 
 # start_job <name> <runAsUser> <fsGroup or -> <defaultMode, decimal> <mode> <mount>
 start_job() {
-    local fsgroup=""
+    local fsgroup="" policy_kind=""
     [ "$3" != - ] && fsgroup="fsGroup: $3"
+    [[ "$1" = "policy-in-configmap-volume" ]] && policy_kind=configmap
     kubectl apply -f - >/dev/null <<YAML
 apiVersion: batch/v1
 kind: Job
@@ -100,7 +102,7 @@ spec:
           secret:
             secretName: $1
             defaultMode: $4
-        - $(policy_volume "$1-policy")
+        - $(policy_volume "$1-policy" $policy_kind)
 YAML
 }
 
@@ -128,6 +130,10 @@ kubectl create namespace "$NS" >/dev/null
 #        other -- pin a different key: the delivered one must be refused
 #        none  -- require_pinned_keys with no pin for the service
 #        off   -- no pinning
+#   policy-in-configmap-volume mounts its policy through a plain configMap:
+#   volume rather than a projected one (see policy_volume in keys.sh): the
+#   volume's root is 0777, not sticky, so the policy is refused although
+#   the mount is read-only.
 SCENARIOS="
 root-0400|0|-|256|once|-|-|match|works|-
 nonroot-0400|10001|-|256|once|-|-|match|refused|-
@@ -142,6 +148,7 @@ pin-mismatch|10001|10001|256|once|-|-|other|refused|not the one pinned in policy
 pin-missing|10001|10001|256|once|-|-|none|refused|has no pinned key
 dir-docs-example|10001|10001|256|once|/run/secrets/hkdfguard|/run/secrets/hkdfguard|match|works|-
 dir-elsewhere|10001|10001|256|once|-|/srv/hkdfguard|match|refused|is not a directory
+policy-in-configmap-volume|0|-|256|once|-|-|match|refused|(mode 777)
 "
 
 failures=0

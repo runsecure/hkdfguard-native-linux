@@ -8,6 +8,9 @@ libhkdfguard.so.1 libhkdfguard1 #MINVER#
  hkdfguard_kek_fingerprint@Base 0.9.1
  hkdfguard_key_file_principal_trusted@Base 0.9.1
  hkdfguard_open_file@Base 0.9.1
+ hkdfguard_open_secret_file@Base 0.9.2
  hkdfguard_security_model@Base 0.9.1
  hkdfguard_unwrap_dek@Base 0.9.1
+ hkdfguard_unwrap_secret@Base 0.9.2
  hkdfguard_wrap_dek@Base 0.9.1
+ hkdfguard_wrap_secret@Base 0.9.2

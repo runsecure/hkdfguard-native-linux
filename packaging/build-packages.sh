@@ -81,6 +81,7 @@ for distro in $DISTROS; do
             -v "$(pwd)/$out_dir:/packages:ro" \
             -v "$(pwd)/examples:/examples:ro" \
             -v "$(pwd)/packaging/smoke-test.sh:/smoke-test.sh:ro" \
+            -v "$(pwd)/packaging/check-shipped-binary.sh:/check-shipped-binary.sh:ro" \
             "$base_image" bash /smoke-test.sh /packages /examples
     done
 done

@@ -73,7 +73,7 @@ services:
         tpm2_startup -c -T "$$TPM2TOOLS_TCTI"
         H=$$(mktemp -d /work/harness.XXXXXX)
         ( umask 077; mkdir "$$H/tpm-keys" )
-        printf '[selection]\nmode = "prefer"\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\n' \
+        printf '[selection]\nmode = "prefer"\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\nallow_unpinned_provisioning = true\n' \
           "$$TPM2TOOLS_TCTI" "$$H/tpm-keys" > "$$H/policy.toml"
         chmod 0644 "$$H/policy.toml"
         HKDFGUARD_POLICY_FILE="$$H/policy.toml" RUSTFLAGS="--cfg hkdfguard_test_paths" CARGO_TARGET_DIR=target/test-paths \

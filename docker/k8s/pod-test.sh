@@ -5,7 +5,7 @@
 # the deployment flow against it: provision, wrap a fresh DEK, and unwrap it
 # in a separate process through the shared library. Prints one `RESULT:`
 # line for the runner to compare with what the scenario expects. The
-# runner supplies the policy (a ConfigMap at /etc/hkdfguard) and, in MOUNT,
+# runner supplies the policy (a ConfigMap, projected, at /etc/hkdfguard) and, in MOUNT,
 # where it mounted the secret.
 #
 # MODE=rotate additionally waits for the secret to be rotated (the runner

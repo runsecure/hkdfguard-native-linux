@@ -21,7 +21,7 @@
 %global linked_licenses Apache-2.0 AND BSD-3-Clause AND ISC AND MIT AND (Apache-2.0 OR MIT) AND (MIT OR Unlicense)
 
 Name:           hkdfguard
-Version:        0.9.1
+Version:        0.9.2
 Release:        1%{?dist}
 Summary:        DEK wrapping under a TPM2, PKCS#11 or external-secret KEK (CLI)
 License:        MPL-2.0 AND %{linked_licenses}
@@ -63,6 +63,8 @@ License:        MPL-2.0 AND %{linked_licenses}
 # distributions, shadow on SUSE.
 Requires(pre):  /usr/bin/getent
 Requires(pre):  /usr/sbin/groupadd
+# %%post creates the TPM key directory when it is missing.
+Requires(post): /usr/bin/install
 # The group %%pre creates. SUSE's rpm turns the TPM key directory's
 # %%attr group into a Requires on group(hkdfguard), so say who provides it.
 Provides:       group(hkdfguard)
@@ -70,8 +72,9 @@ Provides:       group(hkdfguard)
 %description -n %{libpkg} %{common_description}
 
 Provider selection is controlled by the root-owned policy file
-/etc/hkdfguard/policy.toml, which this package does not create; an
-annotated example is installed as /usr/share/hkdfguard/policy.toml.example.
+/etc/hkdfguard/policy.toml, which this package does not create and the
+library requires: every call fails until it exists. An annotated example
+is installed as /usr/share/hkdfguard/policy.toml.example.
 Unless the policy says otherwise the production security model applies:
 only root creates KEKs, and only key files written by root or by a member
 of the hkdfguard-deployers group, which this package creates, are trusted.
@@ -112,7 +115,7 @@ This package contains the static library.
 export CARGO_PROFILE_RELEASE_STRIP=false
 export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 cargo build --locked --offline --release --all-features
-python3 packaging/third-party-licenses.py target/THIRD-PARTY-LICENSES.txt
+python3 packaging/third-party-licenses.py > target/THIRD-PARTY-LICENSES.txt
 
 %install
 # The library goes in under its SONAME (see build.rs), not Cargo's name.
@@ -139,15 +142,64 @@ cargo test --locked --offline --all-features
 # differ between EL10, Amazon Linux 2023 and SUSE; rpm's own sysusers
 # support, where it has it, finds them already there. Never removed (see
 # that file for why), so there is no %%postun.
+#
+# A group that can't be created fails the install: the files below are
+# installed for it, and under the production security model the library
+# trusts hkdfguard-deployers by name.
+#
+# A group that is already there is adopted, as it must be on an upgrade --
+# but getent answers from every NSS source, so on a first install "already
+# there" may be a directory (LDAP, sssd) group of the same name, or a local
+# one with members, that nobody meant to hand these roles to. That is said
+# out loud. A group rpm's own sysusers support has just made is local and
+# has no members, and is not remarked on.
 %pre -n %{libpkg}
 for group in hkdfguard hkdfguard-deployers; do
-    getent group "$group" >/dev/null || groupadd -r "$group"
+    if entry=$(getent group "$group"); then
+        if [ "$1" -eq 1 ]; then
+            members=${entry##*:}
+            origin=
+            grep -q "^$group:" /etc/group || origin=" It is not in /etc/group: it comes from a directory service."
+            if [ -n "$origin" ] || [ -n "$members" ]; then
+                echo "hkdfguard: WARNING: group $group already exists and is used as it is.$origin" >&2
+                echo "hkdfguard:   members: ${members:-none listed (primary-group members are not shown)}" >&2
+                case "$group" in
+                    hkdfguard-deployers) echo "hkdfguard:   Under the production security model its members deploy key files the library trusts." >&2 ;;
+                    *) echo "hkdfguard:   Its members can reach the TPM key directory." >&2 ;;
+                esac
+                echo "hkdfguard:   Check that every member is meant to hold that role (getent group $group)." >&2
+            fi
+        fi
+    elif ! groupadd -r "$group"; then
+        echo "hkdfguard: could not create group $group" >&2
+        exit 1
+    fi
 done
-exit 0
+
+# The TPM key directory, root:hkdfguard 0750 -- created here, only if it is
+# missing, rather than installed: rpm reapplies the owner and mode of every
+# file it installs on each upgrade, which would undo an administrator's
+# choice (a narrower group, say) without a word. %%files lists it as
+# %%ghost, so rpm still owns it but never sets its attributes.
+#
+# No trailing `exit 0`: a directory that couldn't be created is reported
+# (rpm prints a failed %%post), not passed over in silence.
+%post -n %{libpkg}
+if [ ! -d %{_sharedstatedir}/hkdfguard/tpm ]; then
+    install -d -m 0750 -o root -g hkdfguard %{_sharedstatedir}/hkdfguard/tpm || {
+        echo "hkdfguard: could not create %{_sharedstatedir}/hkdfguard/tpm (root:hkdfguard 0750); create it before provisioning a TPM key" >&2
+        exit 1
+    }
+fi
+%if 0%{?suse_version}
+# SUSE policy; Fedora-family glibc runs ldconfig from a file trigger. Here
+# rather than through %%ldconfig_scriptlets, whose own %%post would be a
+# second one.
+%{ldconfig}
+%endif
 
 %if 0%{?suse_version}
-# SUSE policy; Fedora-family glibc runs ldconfig from a file trigger.
-%ldconfig_scriptlets -n %{libpkg}
+%postun -n %{libpkg} -p %{ldconfig}
 %endif
 
 %files
@@ -160,11 +212,12 @@ exit 0
 %doc README.md
 %{_libdir}/libhkdfguard.so.1
 %dir %{_sysconfdir}/hkdfguard
-# The TPM key directory: its group decides who may use TPM keys (each key
-# file takes it). %%pre creates the group before this lands. Left in place,
-# key files and all, on erase.
+# The TPM key directory: its group decides who may reach the key files
+# (each key file takes it). %%ghost: %%post creates it, and rpm never resets
+# its owner or mode on upgrade (see %%post). Left in place, key files and
+# all, on erase.
 %dir %attr(0755,root,root) %{_sharedstatedir}/hkdfguard
-%dir %attr(0750,root,hkdfguard) %{_sharedstatedir}/hkdfguard/tpm
+%ghost %dir %attr(0750,root,hkdfguard) %{_sharedstatedir}/hkdfguard/tpm
 %dir %{_datadir}/hkdfguard
 %{_datadir}/hkdfguard/policy.toml.example
 %{_prefix}/lib/sysusers.d/hkdfguard.conf
@@ -178,6 +231,32 @@ exit 0
 %{_libdir}/libhkdfguard.a
 
 %changelog
+* Tue Nov 17 2026 runsecure <torin@torinblair.com> - 0.9.2-1
+- Secrets: hkdfguard_wrap_secret, hkdfguard_unwrap_secret and
+  hkdfguard_open_secret_file wrap a password (1 to 256 bytes) bound to a
+  secret name; the CLI's new `protect` command writes one. The
+  plaintext-key check also catches a DEK followed by CRLF. A forked child
+  of a process holding ephemeral keys no longer wraps under the all-zero
+  key it inherits. A provider that has gone missing while holding a
+  service's KEK fails the call instead of handing it to a weaker
+  provider; audit event 1006 records fallbacks. A PKCS#11 logout during a
+  call is seen even when followed by a new login, and a forked child
+  initializes the PKCS#11 module again for itself. TPM authValue files are
+  root:<group> 0440 for the group in the new tpm.auth_groups policy table,
+  else root:root 0400, never the key directory's group; provisioning always
+  creates a new authValue. With no policy-allowed provider present, wrap,
+  kek_exists and kek_fingerprint return PROVIDER_UNAVAILABLE (audited)
+  instead of KEK_NOT_FOUND or a 0 answer. PKCS#11 keys must also be
+  CKA_LOCAL and neither modifiable nor copyable to be used; every
+  PIN-class login failure latches. wrap --force warns when it can't
+  overwrite the file it replaces. Unwrap refuses over-long payloads before
+  parsing them. The build refuses the release profile with
+  --cfg hkdfguard_test_paths. The TPM key directory is created by %post
+  and never reset on upgrade. File trust checks judge POSIX ACL entries
+  too. Only a sticky directory on a read-only mount is exempt from the
+  write-bit checks, so a plain ConfigMap volume (0777) is refused: mount
+  a policy ConfigMap through a projected volume.
+
 * Thu Oct 29 2026 runsecure <torin@torinblair.com> - 0.9.1-1
 - Pre-release 0.9.1: post-quantum HMAC wrapping (payload format 1); TPM keys
   carry a per-service authValue (<service>.tpmauth) that keys session

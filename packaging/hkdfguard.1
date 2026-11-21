@@ -1,8 +1,8 @@
 .\" Keep in step with print_usage() and the header comment in
 .\" src/bin/hkdfguard.rs.
-.TH HKDFGUARD 1 2026-10-02 "hkdfguard" "User Commands"
+.TH HKDFGUARD 1 2026-11-17 "hkdfguard 0.9.2" "User Commands"
 .SH NAME
-hkdfguard \- provision a service's HKDFGuard KEK and wrap DEKs under it
+hkdfguard \- provision a service's HKDFGuard KEK, and wrap DEKs and secrets under it
 .SH SYNOPSIS
 .B hkdfguard provision
 .BR \-\-service\-name | \-sn
@@ -15,9 +15,27 @@ hkdfguard \- provision a service's HKDFGuard KEK and wrap DEKs under it
 .I name
 .RB ( \-\-dek\-stdin " | " \-\-dek\-file
 .IR path )
+.RB [ \-\-group | \-g
+.IR group ]
 .RB [ \-\-fingerprint | \-fp
 .IR hex ]
 .RB [ \-\-force | \-f ]
+.PP
+.B hkdfguard protect
+.BR \-\-service\-name | \-sn
+.I name
+.BR \-\-secret\-name | \-sid
+.I name
+.RB ( \-\-secret\-stdin " | " \-\-secret\-file
+.IR path )
+.RB [ \-\-base64 ]
+.RB [ \-\-fingerprint | \-fp
+.IR hex ]
+.RB ( \-\-key\-file\-path | \-kf
+.I path
+.RB [ \-\-group | \-g
+.IR group ]
+.RB [ \-\-force | \-f "] | " \-\-stdout )
 .PP
 .B hkdfguard retire
 .BR \-\-service\-name | \-sn
@@ -44,30 +62,60 @@ needs root; for an existing one, anyone may run it to verify the KEK.
 Wraps a 32-byte Data Encryption Key (DEK) under the service's existing
 KEK and writes the wrapped payload to
 .IR \-\-key\-file\-path ,
-mode 0600, and prints the fingerprint of the KEK it wrapped under. It
+mode 0600 (0640 with
+.BR \-\-group ),
+and prints the fingerprint of the KEK it wrapped under. It
 never creates a KEK: if none has been provisioned, it fails and says to run
 .BR provision .
 Under the production security model it needs root or a deployer, and
 refuses anyone else before reading the DEK.
 .TP
+.B protect
+.B wrap
+for a secret: a password or other credential of 1 to 256 bytes, wrapped
+under the service's existing KEK and bound to
+.IR \-\-secret\-name ,
+which must be given again to unwrap it. A payload wrapped for one secret
+name does not unwrap under another. Every secret is padded to the same
+length, so the payload does not reveal how long the secret is.
+.IP
+With
+.IR \-\-key\-file\-path ,
+the payload is written to a key file exactly as
+.B wrap
+writes one, for an application to read with
+.BR hkdfguard_open_secret_file (),
+and under the production security model it needs root or a deployer.
+With
+.BR \-\-stdout ,
+it is printed as base64 instead, for the caller to store; nothing on disk
+is checked then, and whoever stores it must keep it writable only by root
+or a deployer: anyone who can replace the payload, and can wrap under the
+service's KEK, can substitute a secret they know.
+.TP
 .B retire
 Permanently deletes the service's KEK, only if its fingerprint is the one
-given; every DEK wrapped under it can no longer be unwrapped. PKCS#11
-only: a TPM KEK is re-derived on demand and not stored, so there is
-nothing to delete. Under the production security model it needs root.
+given; every DEK and secret wrapped under it can no longer be unwrapped.
+TPM2 and PKCS#11 only: an external secret belongs to the platform that
+mounts it, and an ephemeral KEK ends with its process. For a TPM KEK it
+deletes the service's key file and authValue file; a backup of both would
+still load on the same TPM. Under the production security model it needs
+root.
 .SH SECURITY MODEL
 The policy's top-level
 .B security_model
 setting is
 .B production
-(the default, also with no policy file) or
+(the default) or
 .BR developer .
 Production splits the duties: root, the security admin, runs
 .B provision
 and
 .BR retire ;
 root or a deployer, the deployment admin, runs
-.BR wrap ;
+.B wrap
+and
+.BR "protect \-\-key\-file\-path" ;
 the application only unwraps. A deployer is a direct member of the group
 .B hkdfguard\-deployers
 (the packages create it) or of a group listed in the policy's
@@ -76,7 +124,7 @@ The library trusts only key files owned by root or a deployer, in folders
 owned by root or a deployer and group-writable only through a deployer
 group; any other is refused with
 .BR HKDFGUARD_ERR_FILE_UNTRUSTED .
-Under developer, anyone who can reach the provider may do all three, and
+Under developer, anyone who can reach the provider may do all of these, and
 key files owned by the reading account are trusted. Wrapping and
 unwrapping themselves are the same under both.
 .SH OPTIONS
@@ -88,6 +136,8 @@ digits and dots; it must not start with a dot or contain "..".
 .BR \-\-key\-file\-path ", " \-kf " \fIpath\fR"
 Where
 .B wrap
+or
+.B protect
 writes the wrapped payload. Its folder must be a real folder (no
 symbolic link anywhere above the file), and neither that folder nor any
 folder above it up to
@@ -99,15 +149,15 @@ and
 .I /dev/shm
 included. The library refuses to read a key file under such a folder
 .RB ( HKDFGUARD_ERR_FILE_UNTRUSTED ),
-so
-.B wrap
-refuses to write one there, before the DEK is read. Under the developer
-security model only the folders' modes are checked, not who owns them;
-under production each folder must also be owned by root or a deployer,
-and may be group-writable only through a deployer group.
+so neither command writes one there, and both refuse before reading the
+DEK or secret. Under the developer security model only the folders' modes
+are checked, not who owns them; under production each folder must also be
+owned by root or a deployer, and may be group-writable only through a
+deployer group.
 .TP
 .B \-\-dek\-stdin
-Read the DEK, base64 of exactly 32 bytes, from standard input.
+Read the DEK, base64 of exactly 32 bytes, from standard input. Refused
+when standard input is a terminal, where the DEK would be echoed.
 .TP
 .BI \-\-dek\-file " path"
 Read the DEK, base64 of exactly 32 bytes, from a file. The file must be a
@@ -118,7 +168,70 @@ above it up to
 must be a real folder owned by root or the invoking user and not writable
 by group or others \(em sticky folders such as
 .I /tmp
-included, unless on a read-only mount.
+included, unless sticky and on a read-only mount. No POSIX ACL entry
+may give anyone else access to the file, or write access to a folder.
+.TP
+.BR \-\-secret\-name ", " \-sid " \fIname\fR"
+For
+.BR protect :
+the name the secret is bound to, such as
+.B vault.password
+or
+.BR ssl.certificate .
+1 to 64 bytes of lowercase ASCII letters, digits,
+.BR . ,
+.B _
+and
+.BR \- ;
+no uppercase, so two spellings that look alike can't name different keys.
+The application gives the same name to unwrap it.
+.TP
+.B \-\-secret\-stdin
+For
+.BR protect :
+read the secret from standard input. Refused when standard input is a
+terminal.
+.TP
+.BI \-\-secret\-file " path"
+For
+.BR protect :
+read the secret from a file, held to the same rules as
+.BR \-\-dek\-file .
+.TP
+.B \-\-base64
+For
+.BR protect :
+the input is base64 of the secret rather than the secret itself. Needed
+for a binary secret, or one that ends in a newline.
+.TP
+.B \-\-stdout
+For
+.BR protect :
+print the wrapped secret as base64 on standard output instead of writing a
+key file. Give exactly one of
+.B \-\-stdout
+and
+.BR \-\-key\-file\-path .
+.TP
+.BR \-\-group ", " \-g " \fIgroup\fR"
+Give the key file to
+.I group
+(a name or a numeric gid), mode 0640: its owner may read and write it, and
+the group's members may read it. Without it the key file is mode 0600,
+readable by its owner only. A group that covers essentially every account
+or the host's administrators \(em
+.BR root ,
+.BR users ,
+.BR nogroup ,
+.BR nobody ,
+.BR wheel ,
+.BR sudo ,
+.BR adm ,
+.BR staff ,
+gid 0 or gid 65534 \(em is refused. With
+.BR protect ,
+only with
+.BR \-\-key\-file\-path .
 .TP
 .BR \-\-force ", " \-f
 Replace an existing
@@ -126,15 +239,22 @@ Replace an existing
 The new payload is written to a temporary file in the same folder first,
 then renamed over the old file in one step, so a failed wrap or write
 never touches it. The replaced file is then overwritten; that cannot
-guarantee erasure on copy-on-write filesystems or flash storage.
+guarantee erasure on copy-on-write filesystems or flash storage. A file
+this account may not write to is replaced without being overwritten, and
+a warning says so. With
+.BR protect ,
+only with
+.BR \-\-key\-file\-path .
 .TP
 .BR \-\-fingerprint ", " \-fp " \fIhex\fR"
 The KEK's fingerprint as
 .B provision
 printed it, 64 hex characters. For
-.BR wrap ,
-optional: nothing is written unless the DEK was wrapped under that KEK,
-and with
+.B wrap
+and
+.BR protect ,
+optional: nothing is written unless the payload was wrapped under that
+KEK, and with
 .B \-\-force
 the existing file is left as it was. For
 .BR retire ,
@@ -143,11 +263,12 @@ required: nothing is deleted unless it matches.
 .BR \-\-help ", " \-h
 Print usage and exit.
 .PP
-The DEK is never accepted as a command-line argument or from an
-environment variable: other processes of the same user can read both
-through
+Neither the DEK nor a secret is ever accepted as a command-line argument
+or from an environment variable: other processes of the same user can
+read both through
 .IR /proc .
-A single trailing newline on the DEK input is ignored.
+A single trailing newline (LF or CRLF) on the DEK or secret input is
+ignored.
 .PP
 Each option may be given once, and an option's value may not start with
 .BR \- :
@@ -173,7 +294,7 @@ Invalid command line.
 .TP
 .I /etc/hkdfguard/policy.toml
 Administrative policy: which providers may be used, and their
-configuration. Optional. When present it must be owned by root and not
+configuration. Required: without it every call fails. It must be owned by root and not
 writable by group or others, and so must every directory above it up to
 .IR / ,
 sticky ones such as
@@ -184,7 +305,9 @@ reads is trusted anywhere under
 .I /var/tmp
 or
 .IR /dev/shm ;
-only a read-only mount is exempt.
+only a sticky directory on a read-only mount (a Kubernetes Secret or
+projected volume) is exempt. POSIX ACL entries
+are held to the same rules as the mode bits.
 .TP
 .I /usr/share/hkdfguard/policy.toml.example
 Annotated example policy, every setting commented out at its default.
@@ -192,8 +315,18 @@ Copy it to
 .I /etc/hkdfguard/policy.toml
 to start one.
 .TP
-.I /etc/hkdfguard/tpm.derivation\-secret
-Per-host secret mixed into TPM-derived KEKs.
+.I /var/lib/hkdfguard/tpm/
+Default TPM key directory (the policy's
+.BR tpm.key_dir ).
+Each TPM-backed service has a
+.IB service .tpmkey
+file, its key as only this TPM can load it, and a
+.IB service .tpmauth
+file, the authValue that authorizes the key. The key file takes the
+directory's group; the authValue file the service's own group from the
+policy's
+.BR tpm.auth_groups ,
+or root alone. Back up both together.
 .TP
 .I /etc/hkdfguard/pkcs11.pin
 Default PKCS#11 user PIN file.
@@ -211,12 +344,16 @@ printf '%s' "$DEK_B64" | sudo hkdfguard wrap \e
     \-kf /var/lib/app/key.bin \-sn com.company.orders \-\-dek\-stdin \-g app
 hkdfguard wrap \-kf /var/lib/app/key.bin \e
     \-sn com.company.orders \-\-dek\-file "$CREDENTIALS_DIRECTORY/dek"
+printf '%s' "$PASS" | sudo hkdfguard protect \-sn com.company.orders \e
+    \-sid ssl.certificate \-\-secret\-stdin \-kf /var/lib/app/cert.pass \-g app
+hkdfguard protect \-sn com.company.orders \-sid vault.password \e
+    \-\-secret\-file /run/secrets/vault \-\-stdout
 hkdfguard retire \-sn com.company.orders \-fp <fingerprint from provision>
 .fi
 .PP
 .B printf
-is a shell builtin, so the DEK never appears in a process's argument
-list; an external
+is a shell builtin, so neither the DEK nor the secret ever appears in a
+process's argument list; an external
 .B echo
 would put it there.
 .SH SEE ALSO

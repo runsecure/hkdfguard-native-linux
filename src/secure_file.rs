@@ -129,11 +129,28 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
     opts.read(true).custom_flags(flags);
     let file = opts.open(path)?;
     let meta = file.metadata()?;
+    // A caller naming no owner judges the file under its own rule, this
+    // included (`key_file` does, under the security model's).
+    if let Some(owner) = req.owner {
+        check_filesystem(&file, &owner, Path::new("/proc"))?;
+    }
     let mut forbidden = req.forbidden_mode_bits;
     if req.allow_group_read_if_root_owned && meta.uid() == 0 {
         forbidden &= !GROUP_READ;
     }
     check_metadata(&meta, req.owner, forbidden)?;
+    // The same rules for anyone a POSIX ACL names: write only for an owner
+    // `req` accepts (root alone when it names none), and read for nobody
+    // but root where group read is forbidden. The root-owned group-read
+    // allowance is for the file's own group, not for named entries.
+    let forbid_write = req.forbidden_mode_bits & GROUP_WRITE != 0;
+    let forbid_read = req.forbidden_mode_bits & GROUP_READ != 0;
+    if forbid_write || forbid_read {
+        let writers = req.owner.unwrap_or(Owner::Root);
+        if let Some(problem) = acl_problem(&acl_grants_of_file(&file)?, &writers, forbid_write, forbid_read) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, problem));
+        }
+    }
     Ok(file)
 }
 
@@ -149,9 +166,13 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
 /// would rest on the owner checks of everything beneath -- one mistake there
 /// is enough.)
 ///
-/// The one exception: write bits are ignored on a read-only mount. A
-/// Kubernetes Secret or ConfigMap volume is `1777` but mounted read-only,
-/// so nobody can write to it.
+/// The one exception: write bits are ignored on a **sticky** directory on a
+/// read-only mount. A Kubernetes Secret or projected volume's root is
+/// `1777` but mounted read-only, so nothing in this container can write to
+/// it, and the sticky bit stops anyone writing the volume elsewhere from
+/// renaming or deleting entries they don't own. A directory that isn't
+/// sticky -- a ConfigMap or `emptyDir` volume's `0777` root -- is refused
+/// even read-only: a ConfigMap belongs in a `projected:` volume instead.
 ///
 /// Applied, through [`check_location`] or directly, to every file this
 /// crate reads: key files (`key_file::read`, behind `hkdfguard_open_file`),
@@ -172,7 +193,8 @@ pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
 /// must be one `trust` accepts, and a directory writable through its group
 /// passes only if `trust` accepts that group as a writer (a deployer group,
 /// for a key file under the production model). Writable by others never
-/// passes, sticky or not -- the read-only-mount exception aside.
+/// passes, sticky or not -- the sticky-and-read-only exception aside -- and
+/// neither does a POSIX ACL entry giving write to anyone else.
 pub fn check_dir_chain_trusting(dir: &Path, trust: &dyn PrincipalTrust) -> io::Result<()> {
     match first_untrusted_dir(dir, trust) {
         None => Ok(()),
@@ -185,6 +207,7 @@ pub fn check_dir_chain_trusting(dir: &Path, trust: &dyn PrincipalTrust) -> io::R
                     let sticky = if mode & STICKY != 0 { "; sticky, like /tmp, which is not enough" } else { "" };
                     format!("writable by group or others (mode {mode:o}{sticky}), so entries could be created or replaced in it")
                 }
+                DirProblem::Acl(problem) => format!("{problem}, so entries could be created or replaced in it"),
             };
             Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display())))
         }
@@ -202,15 +225,20 @@ pub enum DirProblem {
     Owner(u32),
     /// Someone `trust` doesn't accept can write to it: these are its
     /// permission bits (`0o7777`), sticky bit included. Never reported for
-    /// a read-only mount, which nobody can write to.
+    /// a sticky directory on a read-only mount, which nobody here can write
+    /// to.
     Writable { mode: u32 },
+    /// A POSIX ACL entry gives write access to someone `trust` doesn't
+    /// accept; says whom.
+    Acl(String),
 }
 
 /// Whether one directory is trustworthy under `trust`: a directory, owned
 /// by someone `trust` accepts, and writable by nobody else -- through its
 /// group only if `trust` accepts that group, by others never, sticky or
-/// not, unless it is on a read-only mount. The one rule every directory
-/// check in this crate, and the CLI's, applies.
+/// not, nor through a POSIX ACL entry -- unless it is sticky and on a
+/// read-only mount.
+/// The one rule every directory check in this crate, and the CLI's, applies.
 pub fn judge_dir(dir: &Path, trust: &dyn PrincipalTrust) -> Result<(), DirProblem> {
     let meta = std::fs::metadata(dir).map_err(|e| DirProblem::Unexaminable(e.to_string()))?;
     if !meta.is_dir() {
@@ -219,8 +247,20 @@ pub fn judge_dir(dir: &Path, trust: &dyn PrincipalTrust) -> Result<(), DirProble
     if !trust.trusts_owner(meta.uid()) {
         return Err(DirProblem::Owner(meta.uid()));
     }
-    if untrusted_write_bits(&meta, trust) != 0 && !on_read_only_mount(dir) {
+    // Sticky as well as read-only: a read-only mount says nothing about who
+    // writes the volume elsewhere (a sidecar's read-write mount, the node),
+    // and in a directory that isn't sticky any of them could rename or
+    // delete what is in it. A Kubernetes Secret or projected volume's root
+    // is sticky; a ConfigMap or emptyDir volume's is not.
+    let exempt = || meta.mode() & STICKY != 0 && on_read_only_mount(dir);
+    if untrusted_write_bits(&meta, trust) != 0 && !exempt() {
         return Err(DirProblem::Writable { mode: meta.mode() & 0o7777 });
+    }
+    let grants = acl_grants_of_path(dir).map_err(|e| DirProblem::Unexaminable(e.to_string()))?;
+    if let Some(problem) = acl_problem(&grants, trust, true, false) {
+        if !exempt() {
+            return Err(DirProblem::Acl(problem));
+        }
     }
     Ok(())
 }
@@ -368,10 +408,17 @@ pub fn check_metadata_trusting(meta: &Metadata, trust: &dyn PrincipalTrust) -> i
 /// and checked, two ways: on Linux, by reading its path back from
 /// `<proc>/self/fd/<n>` and checking it is `within` (pass the resolved file
 /// itself to require exactly that file), where `/proc` is mounted; and, in
-/// every case, by comparing the descriptor's device and inode with what
-/// `target_real` names now. Without `/proc` (masked, as in some minimal
-/// containers and sandboxes, or a non-Linux build) the second alone is
-/// just as conclusive. The CLI's own opens use the same check.
+/// every case, by comparing the descriptor's device and inode with the file
+/// `target_real` names now, reached without following a single symlink
+/// ([`stat_without_links`]).
+///
+/// `target_real` is a resolved path, so it had no symlinks in it when it
+/// was resolved. One put in place of a directory on the way since then
+/// would be followed by the open and by a plain `stat` alike, and the two
+/// would agree; walking the path a component at a time, refusing every
+/// link, is what makes the comparison conclusive without `/proc` (masked,
+/// as in some minimal containers and sandboxes, or a non-Linux build). The
+/// CLI's own opens use the same check.
 /// Every failure is `PermissionDenied` -- never `NotFound`, which callers
 /// reserve for "the file isn't there".
 pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: &Path) -> io::Result<()> {
@@ -394,12 +441,187 @@ pub fn verify_opened(file: &File, target_real: &Path, within: &Path, proc_root: 
     let _ = (within, proc_root);
 
     let opened = file.metadata().map_err(|e| denied(format!("could not stat the opened file: {e}")))?;
-    let resolved = std::fs::symlink_metadata(target_real)
+    let resolved = stat_without_links(target_real)
         .map_err(|e| denied(format!("{} changed after it was opened: {e}", target_real.display())))?;
     if (opened.dev(), opened.ino()) != (resolved.dev(), resolved.ino()) {
         return Err(denied(format!("{} was replaced between resolution and open", target_real.display())));
     }
     Ok(())
+}
+
+/// The metadata of what the absolute path `path` names, reached from `/`
+/// one component at a time through directory descriptors, each opened with
+/// `O_NOFOLLOW`: a symlink anywhere in the path -- the last component
+/// included -- is an error, never followed. `.` and `..` are refused too:
+/// a resolved path has neither.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn stat_without_links(path: &Path) -> io::Result<Metadata> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::path::Component;
+
+    let refused = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{what} in {}", path.display()));
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(refused("not an absolute path"));
+    }
+    // O_PATH: a handle on the entry itself, needing no read permission and
+    // never blocking (a FIFO, a device) -- only search permission on each
+    // directory, as the open being verified needed too.
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut here = std::fs::OpenOptions::new().read(true).custom_flags(flags).open("/")?;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(refused("a `.` or `..` component"));
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| refused("a NUL byte"))?;
+        // SAFETY: `here` is an open descriptor and `name` a valid
+        // NUL-terminated string, both alive for the call.
+        let fd = unsafe { libc::openat(here.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by openat and is owned by nothing else.
+        here = unsafe { File::from_raw_fd(fd) };
+        // With O_PATH | O_NOFOLLOW a symlink is opened as itself, not
+        // refused: it is refused here.
+        if here.metadata()?.file_type().is_symlink() {
+            return Err(refused("a symbolic link"));
+        }
+    }
+    here.metadata()
+}
+
+/// Elsewhere (and under Miri, which has no `openat`): what the path names
+/// now, its last component not followed.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+fn stat_without_links(path: &Path) -> io::Result<Metadata> {
+    std::fs::symlink_metadata(path)
+}
+
+/// `statfs`'s `f_type` for every FUSE filesystem: `fuse`, `fuseblk`, and
+/// virtiofs, which is FUSE with the host as its server.
+#[cfg(target_os = "linux")]
+const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+
+/// Refuses a file on a filesystem whose server -- the process that answers
+/// every `stat` and `read` of it -- is someone `trust` doesn't accept as an
+/// owner.
+///
+/// Every other check here reads what the filesystem reports: owner, mode,
+/// ACL, contents. On a FUSE mount all of that is whatever its server
+/// chooses to say, and `fusermount` lets any user be one: a file there can
+/// be "owned by root, mode 0600" and hold bytes its mounter picked. (The
+/// kernel hides such a mount from other users unless it was mounted with
+/// `allow_other`, which `/etc/fuse.conf` can permit; root sees it either
+/// way.) So the server is held to the rule an owner is: `user_id=` in the
+/// mount's options is the uid `/dev/fuse` was opened by, and it must be one
+/// `trust` accepts -- root for configuration and, under the production
+/// model, for key files. A root-mounted FUSE filesystem (a CSI driver's, an
+/// NTFS volume's) passes, and so does virtiofs, whose server is the
+/// hypervisor: only root can mount one.
+///
+/// The mount is found in `<proc>/self/mountinfo` by the file's device
+/// number, and only for a file `fstatfs` says is on FUSE: every other file
+/// passes without `/proc` being read. A FUSE file whose mount can't be
+/// found there -- no `/proc`, or a descriptor from a mount this process
+/// can't see -- is refused.
+///
+/// What this does not cover: a disk image someone crafted and had mounted
+/// (a removable drive, a loop device). Its filesystem is an ordinary one,
+/// served by the kernel, and it says what its author wrote into it. Such a
+/// mount is root's doing, and where key files are looked for is too.
+///
+/// Every refusal is `PermissionDenied` with no `raw_os_error`, as
+/// [`open_checked`]'s own checks are.
+pub fn check_filesystem(file: &File, trust: &dyn PrincipalTrust, proc_root: &Path) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        use std::os::unix::io::AsRawFd;
+        let denied = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, what);
+        // SAFETY: an all-zero `statfs` is a valid out-parameter (plain integers).
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` is an open descriptor for the length of the call;
+        // `st` is a properly sized out-parameter that fstatfs fully
+        // initializes on success, and is read only then.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+            return Err(denied(format!("could not tell which filesystem it is on: {}", io::Error::last_os_error())));
+        }
+        #[allow(clippy::unnecessary_cast)] // `f_type`'s width and sign differ by target
+        if st.f_type as u64 != FUSE_SUPER_MAGIC {
+            return Ok(());
+        }
+        let dev = file.metadata().map_err(|e| denied(format!("could not stat the opened file: {e}")))?.dev();
+        let mounts = std::fs::read_to_string(proc_root.join("self/mountinfo")).map_err(|e| {
+            denied(format!(
+                "it is on a FUSE filesystem, and who serves it could not be read from {}/self/mountinfo: {e}",
+                proc_root.display()
+            ))
+        })?;
+        match fuse_server(&mounts, dev) {
+            Some(FuseServer::Hypervisor) => Ok(()),
+            Some(FuseServer::Uid(uid)) if trust.trusts_owner(uid) => Ok(()),
+            Some(FuseServer::Uid(uid)) => Err(denied(format!(
+                "it is on a FUSE filesystem served by uid {uid}, which is not an allowed owner: its contents and its \
+                 reported owner and mode are whatever that user's process says they are"
+            ))),
+            None => Err(denied("it is on a FUSE filesystem whose mount, and so whose server, could not be identified".into())),
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    {
+        // Elsewhere there is no FUSE to ask about; and Miri, which runs
+        // the tests to check `unsafe` code, can't call fstatfs.
+        let _ = (file, trust, proc_root);
+        Ok(())
+    }
+}
+
+/// Who answers for a FUSE filesystem.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum FuseServer {
+    /// virtiofs: the virtual machine's host.
+    Hypervisor,
+    /// The user whose process opened `/dev/fuse` for the mount.
+    Uid(u32),
+}
+
+/// The server of the FUSE filesystem with device number `dev`, from the
+/// text of a `mountinfo` file; `None` if no mount of that device is listed,
+/// or the one listed is no FUSE mount or names no server.
+///
+/// A line is `id parent major:minor root mountpoint options [tags...] -
+/// fstype source superoptions`. The kernel writes spaces inside a field as
+/// `\040`, so fields split on spaces, and the lone `-` is found after the
+/// six fixed fields, where no path can be mistaken for it. Every mount of
+/// one filesystem shares its device number, type and super options, so the
+/// first line that matches is as good as any.
+#[cfg(target_os = "linux")]
+fn fuse_server(mountinfo: &str, dev: u64) -> Option<FuseServer> {
+    // The kernel's encoding of a device number, as glibc's major()/minor().
+    let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff);
+    let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0xff);
+    let wanted = format!("{major}:{minor}");
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.get(2) != Some(&wanted.as_str()) {
+            continue;
+        }
+        let separator = fields.iter().skip(6).position(|f| *f == "-")? + 6;
+        let fstype = *fields.get(separator + 1)?;
+        if fstype == "virtiofs" {
+            return Some(FuseServer::Hypervisor);
+        }
+        let kind = fstype.split('.').next()?; // "fuse.sshfs": the subtype is the server's to choose
+        if kind != "fuse" && kind != "fuseblk" {
+            return None;
+        }
+        let options = fields.get(separator + 3)?;
+        let uid = options.split(',').find_map(|o| o.strip_prefix("user_id="))?;
+        return uid.parse().ok().map(FuseServer::Uid);
+    }
+    None
 }
 
 fn on_read_only_mount(path: &Path) -> bool {
@@ -421,6 +643,188 @@ fn on_read_only_mount(path: &Path) -> bool {
         return false;
     }
     st.f_flag & libc::ST_RDONLY != 0
+}
+
+// ---------------------------------------------------------------------
+// POSIX ACLs.
+//
+// Owner and mode bits are not the whole story: a POSIX access ACL can name
+// further users and groups, each with its own permissions. With such an
+// entry the mode's group bits are the ACL's *mask*, an upper bound on every
+// named entry -- so `root:svc 0440` can carry `user:mallory:r--` and still
+// look like a file only `svc` reads. Every check here that judges who may
+// read or write a file or directory also judges its named ACL entries.
+// ---------------------------------------------------------------------
+
+/// Whom a named POSIX ACL entry is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclWho {
+    User(u32),
+    Group(u32),
+}
+
+/// A named entry of a POSIX access ACL: someone the owner, group and other
+/// bits don't describe. `perm` is what the entry can actually do -- its
+/// permission bits (read 4, write 2, execute 1) masked by the ACL's mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AclGrant {
+    pub who: AclWho,
+    pub perm: u32,
+}
+
+const ACL_ACCESS_XATTR: &std::ffi::CStr = c"system.posix_acl_access";
+const ACL_XATTR_VERSION: u32 = 2;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP: u16 = 0x08;
+const ACL_MASK: u16 = 0x10;
+const ACL_READ: u32 = 4;
+const ACL_WRITE: u32 = 2;
+
+/// The named entries of the POSIX access ACL in `xattr` (the kernel's
+/// `system.posix_acl_access` format: a version, then 8-byte entries).
+/// Anything malformed is an error: an ACL that can't be read can't be
+/// judged, so it is refused rather than ignored.
+fn parse_acl(xattr: &[u8]) -> io::Result<Vec<AclGrant>> {
+    let bad = |why: &str| io::Error::new(io::ErrorKind::PermissionDenied, format!("unreadable POSIX ACL: {why}"));
+    let (header, entries) = xattr.split_at_checked(4).ok_or_else(|| bad("too short"))?;
+    if u32::from_le_bytes(header.try_into().unwrap()) != ACL_XATTR_VERSION {
+        return Err(bad("unknown version"));
+    }
+    let (entries, rest) = entries.as_chunks::<8>();
+    if !rest.is_empty() {
+        return Err(bad("truncated entry"));
+    }
+    let entries: Vec<(u16, u32, u32)> = entries
+        .iter()
+        .map(|e| {
+            let tag = u16::from_le_bytes([e[0], e[1]]);
+            let perm = u32::from(u16::from_le_bytes([e[2], e[3]]));
+            let id = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+            (tag, perm, id)
+        })
+        .collect();
+    // No mask entry with named entries present isn't a valid ACL; judge
+    // their own permissions, unmasked, rather than guess.
+    let mask = entries.iter().find(|(tag, _, _)| *tag == ACL_MASK).map_or(0o7, |(_, perm, _)| *perm);
+    Ok(entries
+        .iter()
+        .filter_map(|&(tag, perm, id)| match tag {
+            ACL_USER => Some(AclGrant { who: AclWho::User(id), perm: perm & mask }),
+            ACL_GROUP => Some(AclGrant { who: AclWho::Group(id), perm: perm & mask }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Reads an extended attribute through `get` (`getxattr` or `fgetxattr`,
+/// given the buffer and its size). `None` when there is none, or the
+/// filesystem has no extended attributes at all.
+fn read_xattr(get: impl Fn(*mut libc::c_void, usize) -> isize) -> io::Result<Option<Vec<u8>>> {
+    loop {
+        let size = get(std::ptr::null_mut(), 0);
+        if size < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        let mut buf = vec![0u8; size as usize];
+        let got = get(buf.as_mut_ptr().cast(), buf.len());
+        if got >= 0 {
+            buf.truncate(got as usize);
+            return Ok(Some(buf));
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ERANGE) => continue, // it grew between the two calls
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => return Ok(None),
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+/// The named entries of the open file's access ACL; none when it has no
+/// ACL beyond its mode bits. Every failure is `PermissionDenied`: an ACL
+/// that couldn't be read couldn't be judged.
+pub fn acl_grants_of_file(file: &File) -> io::Result<Vec<AclGrant>> {
+    use std::os::unix::io::AsRawFd;
+    // Miri can't call fgetxattr: under it no file has an ACL, as no test file does.
+    if cfg!(miri) {
+        return Ok(Vec::new());
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is open for the life of `file`; the buffer pointer and
+    // size come from `read_xattr`, which passes a live buffer of that size.
+    let raw = read_xattr(|buf, size| unsafe { libc::fgetxattr(fd, ACL_ACCESS_XATTR.as_ptr(), buf, size) })
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("could not read its POSIX ACL: {e}")))?;
+    raw.map_or(Ok(Vec::new()), |raw| parse_acl(&raw))
+}
+
+/// [`acl_grants_of_file`] for what `path` names, symlinks followed.
+pub fn acl_grants_of_path(path: &Path) -> io::Result<Vec<AclGrant>> {
+    use std::os::unix::ffi::OsStrExt;
+    if cfg!(miri) {
+        return Ok(Vec::new());
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "path contains a NUL byte"))?;
+    // SAFETY: `c_path` is NUL-terminated and outlives the call; the buffer
+    // pointer and size come from `read_xattr`.
+    let raw = read_xattr(|buf, size| unsafe { libc::getxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), buf, size) })
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, format!("could not read its POSIX ACL: {e}")))?;
+    raw.map_or(Ok(Vec::new()), |raw| parse_acl(&raw))
+}
+
+/// Why `grants` give access `trust` doesn't allow, if they do: with
+/// `forbid_write`, write to a named user it doesn't trust as an owner, or a
+/// named group it doesn't trust as a writer -- the same rule the mode's
+/// group and other write bits are held to -- and with `forbid_read`, read
+/// to anyone but root.
+pub fn acl_problem(grants: &[AclGrant], trust: &dyn PrincipalTrust, forbid_write: bool, forbid_read: bool) -> Option<String> {
+    grants.iter().find_map(|g| {
+        let (kind, id, trusted_writer) = match g.who {
+            AclWho::User(uid) => ("user", uid, trust.trusts_owner(uid)),
+            AclWho::Group(gid) => ("group", gid, trust.trusts_group_writer(gid)),
+        };
+        if forbid_write && g.perm & ACL_WRITE != 0 && !trusted_writer {
+            return Some(format!("a POSIX ACL entry gives {kind} {id} write access"));
+        }
+        if forbid_read && g.perm & ACL_READ != 0 && g.who != AclWho::User(0) {
+            return Some(format!("a POSIX ACL entry gives {kind} {id} read access"));
+        }
+        None
+    })
+}
+
+/// Refuses an open file whose ACL gives write access to someone `trust`
+/// doesn't accept -- see [`acl_problem`]. `PermissionDenied`, with no
+/// `raw_os_error`, like every other trust refusal here.
+pub fn check_acl_trusting(file: &File, trust: &dyn PrincipalTrust) -> io::Result<()> {
+    match acl_problem(&acl_grants_of_file(file)?, trust, true, false) {
+        Some(problem) => Err(io::Error::new(io::ErrorKind::PermissionDenied, problem)),
+        None => Ok(()),
+    }
+}
+
+/// Removes any access ACL from a file this process just created, so it has
+/// exactly the owner, group and mode it is then given. A directory's
+/// default ACL is copied onto every file created in it; a key directory
+/// carrying one would otherwise make each new key or authValue file
+/// readable by whoever it names. No ACL, or no ACL support, is success.
+pub fn strip_acl(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    if cfg!(miri) {
+        return Ok(());
+    }
+    // SAFETY: a valid open descriptor and a NUL-terminated name.
+    if unsafe { libc::fremovexattr(file.as_raw_fd(), ACL_ACCESS_XATTR.as_ptr()) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(()),
+        _ => Err(e),
+    }
 }
 
 /// Checks that nobody `owner` doesn't cover can delete, rename, or replace
@@ -492,6 +896,7 @@ pub(crate) struct FileIdentity {
 impl FileIdentity {
     /// The identity of the file `path` resolves to, symlinks followed: for
     /// a credential file, where a Kubernetes-style link swap is a change.
+    #[cfg_attr(not(any(feature = "tpm2", test)), allow(dead_code))]
     pub(crate) fn of(path: &Path) -> Option<Self> {
         Some(Self::from_meta(&std::fs::metadata(path).ok()?))
     }
@@ -504,9 +909,60 @@ impl FileIdentity {
         Some(Self::from_meta(&std::fs::symlink_metadata(path).ok()?))
     }
 
+    /// The identity of the open file `file`: exactly the one read through
+    /// it, whatever has happened at its path since.
+    #[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11")), allow(dead_code))]
+    pub(crate) fn of_file(file: &std::fs::File) -> Option<Self> {
+        Some(Self::from_meta(&file.metadata().ok()?))
+    }
+
     fn from_meta(m: &Metadata) -> Self {
         FileIdentity { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()) }
     }
+}
+
+/// Overwrites the regular file at `path` with zeros, in place and synced,
+/// before it is deleted: for a secret this library wrote and is now
+/// retiring. Every name the file has (a hard link left by an interrupted
+/// write, say) then holds zeros too.
+///
+/// Best effort against what the storage does underneath: a journal, a
+/// snapshot, a copy-on-write filesystem or a flash translation layer may
+/// keep the old blocks, and no call here can reach those. It does mean the
+/// value is no longer in the file's own blocks on a filesystem that writes
+/// in place, nor readable through a link or an open descriptor.
+///
+/// `path` is not followed if it is a symlink, and only a regular file is
+/// written to. The file is made owner-writable first (these files are
+/// created read-only), which its owner and root may do.
+#[cfg_attr(not(any(feature = "tpm2", test)), allow(dead_code))]
+pub(crate) fn zero_regular_file(path: &Path) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let no_follow = if cfg!(miri) { libc::O_NOFOLLOW } else { libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY };
+    let not_regular = || io::Error::new(io::ErrorKind::InvalidData, "not a regular file");
+    // Read-only first: a descriptor to check, and to change the mode
+    // through, so nothing is done to whatever a name is swapped for.
+    let handle = OpenOptions::new().read(true).custom_flags(no_follow).open(path)?;
+    let meta = handle.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(not_regular());
+    }
+    handle.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let mut file = OpenOptions::new().write(true).custom_flags(no_follow).open(path)?;
+    let opened = file.metadata()?;
+    if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file was replaced while it was being overwritten"));
+    }
+    let zeros = [0u8; 4096];
+    let mut left = opened.len();
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    file.sync_all()
 }
 
 /// A byte buffer for secret file contents that is guaranteed to be zeroed
@@ -773,6 +1229,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
+    fn verify_opened_without_proc_refuses_a_directory_swapped_for_a_link() {
+        // The resolved path had no links in it. One put in place of a
+        // directory afterwards is followed by the open, and would be by a
+        // plain stat of the path too: the two would agree on the wrong
+        // file. With no /proc to say where the descriptor really is, the
+        // path is walked link-free instead, and the link is refused.
+        let dir = private_tempdir();
+        let d = std::fs::canonicalize(dir.path()).unwrap();
+        let (real, elsewhere) = (d.join("keys"), d.join("elsewhere"));
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(real.join("a.key"), b"real").unwrap();
+        std::fs::write(elsewhere.join("a.key"), b"planted").unwrap();
+        let target = real.join("a.key");
+        let no_proc = d.join("no-proc-here");
+
+        verify_opened(&File::open(&target).unwrap(), &target, &target, &no_proc).expect("the real file, by a real path");
+
+        std::fs::rename(&real, d.join("keys.moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &real).unwrap();
+        let planted = File::open(&target).unwrap(); // follows the link, as the library's open would
+        let err = verify_opened(&planted, &target, &target, &no_proc).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("symbolic link"), "says why: {err}");
+        // A link as the last component is no better.
+        let link = d.join("link.key");
+        std::os::unix::fs::symlink(elsewhere.join("a.key"), &link).unwrap();
+        assert!(verify_opened(&planted, &link, &link, &no_proc).is_err());
+        // Nor a path that isn't a resolved one at all.
+        assert!(verify_opened(&planted, &elsewhere.join("../elsewhere/a.key"), &d, &no_proc).is_err());
+        verify_opened(&planted, &elsewhere.join("a.key"), &d, &no_proc).expect("where it really is");
+    }
+
+    #[test]
     fn verify_opened_with_the_file_as_its_own_boundary_requires_that_exact_file() {
         // How hkdfguard_open_file uses it: `within` is the resolved file
         // itself, so even a sibling in the same directory is a mismatch --
@@ -811,8 +1302,9 @@ mod tests {
         let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let shared = dir.ancestors().skip(1).any(|d| {
-            std::fs::metadata(d).map(|m| m.mode() & FORBID_GROUP_OTHER_WRITE != 0).unwrap_or(false)
-                && !on_read_only_mount(d)
+            std::fs::metadata(d)
+                .map(|m| m.mode() & FORBID_GROUP_OTHER_WRITE != 0 && !(m.mode() & STICKY != 0 && on_read_only_mount(d)))
+                .unwrap_or(false)
         });
         if !shared {
             eprintln!("skipping: {} has no group/other-writable ancestor", dir.display());
@@ -880,6 +1372,129 @@ mod tests {
             assert!(err.to_string().contains("sticky"), "says why: {err}");
         }
         chmod(base.path(), 0o700);
+    }
+
+    // Device numbers as the kernel encodes them: major 0 for every
+    // anonymous (FUSE, tmpfs) device.
+    fn dev(major: u64, minor: u64) -> u64 {
+        ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_server_of_a_fuse_mount_is_read_from_its_own_mountinfo_line() {
+        let mounts = "\
+36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+1012 866 0:60 /by-app/x /run/flatpak/doc rw,nosuid,nodev,relatime master:677 - fuse.portal portal rw,user_id=1000,group_id=1000
+1154 1153 8:33 / /media/u/My\\040Passport rw,nosuid,nodev,relatime master:941 - fuseblk /dev/sdc1 rw,user_id=0,group_id=0,allow_other
+77 60 0:71 / /run/kata/shared rw,relatime - virtiofs kataShared rw
+78 60 0:72 / /home/u/remote rw,nosuid,nodev,relatime shared:9 master:3 - fuse.sshfs host:/ rw,user_id=1001,group_id=1001
+79 60 0:300 / /mnt/big rw - fuse src rw,user_id=7,group_id=7
+80 60 0:73 / /mnt/-\\040- rw - fuse - rw,user_id=8,group_id=8
+81 60 0:74 / /mnt/odd rw - fuse src rw,group_id=9
+82 60 0:75 / /mnt/odd2 rw - fuse src rw,user_id=root
+";
+        assert_eq!(fuse_server(mounts, dev(0, 60)), Some(FuseServer::Uid(1000)));
+        assert_eq!(fuse_server(mounts, dev(8, 33)), Some(FuseServer::Uid(0)), "an escaped space in the mount point");
+        assert_eq!(fuse_server(mounts, dev(0, 71)), Some(FuseServer::Hypervisor));
+        assert_eq!(fuse_server(mounts, dev(0, 72)), Some(FuseServer::Uid(1001)), "two optional fields before the separator");
+        assert_eq!(fuse_server(mounts, dev(0, 300)), Some(FuseServer::Uid(7)), "a minor above 255");
+        assert_eq!(fuse_server(mounts, dev(0, 73)), Some(FuseServer::Uid(8)), "a source that is itself `-`");
+        // Nothing that isn't plainly a FUSE mount naming its server.
+        assert_eq!(fuse_server(mounts, dev(98, 0)), None, "not a FUSE filesystem");
+        assert_eq!(fuse_server(mounts, dev(0, 74)), None, "no user_id");
+        assert_eq!(fuse_server(mounts, dev(0, 75)), None, "a user_id that is no number");
+        assert_eq!(fuse_server(mounts, dev(0, 99)), None, "no such mount");
+        assert_eq!(fuse_server("", dev(0, 60)), None);
+        // A mount point can't pose as another mount's line: the device is
+        // matched in its own field only.
+        assert_eq!(fuse_server("5 4 0:1 / /mnt/0:60 rw - fuse x rw,user_id=0\n", dev(0, 60)), None);
+    }
+
+    #[test]
+    fn a_file_on_an_ordinary_filesystem_passes_without_proc() {
+        // Not FUSE, so nobody's word but the kernel's: `/proc` isn't
+        // consulted, and needn't exist.
+        let f = temp_file_with(b"contents", 0o600);
+        let file = File::open(f.path()).unwrap();
+        check_filesystem(&file, &Owner::Root, Path::new("/nonexistent-hkdfguard-proc")).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn a_file_on_a_fuse_mount_is_judged_by_who_serves_it() {
+        // Whatever FUSE mount this host has that this user can read a
+        // file on (a desktop's document portal, an sshfs or NTFS mount);
+        // none on a build machine, and then there is nothing to check.
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mount_points = mounts.lines().filter_map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let separator = fields.iter().skip(6).position(|f| *f == "-")? + 6;
+            fields.get(separator + 1)?.starts_with("fuse").then(|| fields[4].replace("\\040", " "))
+        });
+        for mount_point in mount_points {
+            let Some(file) = std::fs::read_dir(&mount_point)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .find_map(|e| File::open(e.path()).ok())
+            else {
+                continue;
+            };
+            let server = fuse_server(&mounts, file.metadata().unwrap().dev()).expect("a FUSE mount names its server");
+            let FuseServer::Uid(uid) = server else { continue };
+            struct Only(u32);
+            impl PrincipalTrust for Only {
+                fn trusts_owner(&self, uid: u32) -> bool {
+                    uid == self.0
+                }
+                fn trusts_group_writer(&self, _gid: u32) -> bool {
+                    false
+                }
+            }
+            check_filesystem(&file, &Only(uid), Path::new("/proc")).expect("served by a trusted user");
+            let err = check_filesystem(&file, &Only(uid.wrapping_add(1)), Path::new("/proc")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.raw_os_error().is_none() && err.to_string().contains("FUSE"), "{err}");
+            let err = check_filesystem(&file, &Only(uid), Path::new("/nonexistent-hkdfguard-proc")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "without /proc nobody can be shown to serve it");
+            return;
+        }
+        eprintln!("skipping: no readable file on a FUSE mount on this host");
+    }
+
+    #[test]
+    fn zeroing_a_file_overwrites_every_link_to_it_and_nothing_else() {
+        let dir = private_tempdir();
+        let secret = dir.path().join("svc.tpmauth");
+        std::fs::write(&secret, [0xA5u8; 32]).unwrap();
+        chmod(&secret, 0o400); // as these files are created
+        let link = dir.path().join(".svc.tpmauth.0123456789abcdef");
+        std::fs::hard_link(&secret, &link).unwrap();
+
+        zero_regular_file(&secret).unwrap();
+        assert_eq!(std::fs::read(&secret).unwrap(), [0u8; 32], "same length, all zeros");
+        assert_eq!(std::fs::read(&link).unwrap(), [0u8; 32], "a second name for the file holds zeros too");
+
+        // Longer than one buffer, and an empty file.
+        let long = dir.path().join("long");
+        std::fs::write(&long, vec![0x5Au8; 10_000]).unwrap();
+        zero_regular_file(&long).unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), vec![0u8; 10_000]);
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        zero_regular_file(&empty).unwrap();
+
+        // Never through a symlink, never a directory, and a missing file says so.
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"keep me").unwrap();
+        let symlink = dir.path().join("link");
+        std::os::unix::fs::symlink(&other, &symlink).unwrap();
+        assert!(zero_regular_file(&symlink).is_err());
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+        assert!(zero_regular_file(dir.path()).is_err());
+        assert_eq!(zero_regular_file(&dir.path().join("absent")).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -981,5 +1596,156 @@ mod tests {
         let no_follow = FileRequirements { follow_symlinks: false, ..OWNER_ONLY };
         let err = open_checked(&link, &no_follow).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    // ---- POSIX ACLs ----
+
+    // An access ACL in the kernel's xattr format, from (tag, perm, id).
+    fn acl_xattr(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut out = ACL_XATTR_VERSION.to_le_bytes().to_vec();
+        for &(tag, perm, id) in entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&perm.to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out
+    }
+    const USER_OBJ: u16 = 0x01;
+    const GROUP_OBJ: u16 = 0x04;
+    const OTHER: u16 = 0x20;
+    const UNDEF: u32 = u32::MAX;
+
+    // Owner rw, a named user and a named group each rw, the given mask.
+    fn acl_with_mask(mask: u16) -> Vec<u8> {
+        acl_xattr(&[
+            (USER_OBJ, 6, UNDEF),
+            (ACL_USER, 6, 54321),
+            (GROUP_OBJ, 4, UNDEF),
+            (ACL_GROUP, 6, 54322),
+            (ACL_MASK, mask, UNDEF),
+            (OTHER, 0, UNDEF),
+        ])
+    }
+
+    #[test]
+    fn named_acl_entries_are_masked_and_malformed_acls_refused() {
+        let grants = parse_acl(&acl_with_mask(4)).unwrap();
+        assert_eq!(
+            grants,
+            vec![AclGrant { who: AclWho::User(54321), perm: 4 }, AclGrant { who: AclWho::Group(54322), perm: 4 }],
+            "the mask caps each named entry"
+        );
+        assert!(parse_acl(&acl_with_mask(0)).unwrap().iter().all(|g| g.perm == 0), "a zero mask leaves them nothing");
+        let base_only = acl_xattr(&[(USER_OBJ, 6, UNDEF), (GROUP_OBJ, 4, UNDEF), (OTHER, 0, UNDEF)]);
+        assert!(parse_acl(&base_only).unwrap().is_empty(), "no named entries");
+        for bad in [vec![2u8, 0], vec![3, 0, 0, 0], { let mut v = acl_with_mask(6); v.pop(); v }] {
+            assert_eq!(parse_acl(&bad).unwrap_err().kind(), io::ErrorKind::PermissionDenied, "{bad:?}");
+        }
+    }
+
+    // A trust rule for the tests: these owners and these writer groups.
+    struct Trusting {
+        owners: Vec<u32>,
+        writer_groups: Vec<u32>,
+    }
+    impl PrincipalTrust for Trusting {
+        fn trusts_owner(&self, uid: u32) -> bool {
+            self.owners.contains(&uid)
+        }
+        fn trusts_group_writer(&self, gid: u32) -> bool {
+            self.writer_groups.contains(&gid)
+        }
+    }
+
+    #[test]
+    fn acl_entries_are_judged_as_owners_and_group_writers_are() {
+        let rw = |who| AclGrant { who, perm: 6 };
+        let r = |who| AclGrant { who, perm: 4 };
+        let trust = Trusting { owners: vec![0, 54321], writer_groups: vec![54322] };
+        assert_eq!(acl_problem(&[rw(AclWho::User(54321)), rw(AclWho::Group(54322))], &trust, true, false), None, "both trusted");
+        let problem = acl_problem(&[rw(AclWho::User(1002))], &trust, true, false).unwrap();
+        assert!(problem.contains("user 1002 write access"), "{problem}");
+        let problem = acl_problem(&[rw(AclWho::Group(2003))], &trust, true, false).unwrap();
+        assert!(problem.contains("group 2003 write access"), "{problem}");
+        assert_eq!(acl_problem(&[rw(AclWho::User(1002))], &trust, false, false), None, "write not forbidden");
+
+        // Read, where it is forbidden: nobody but root, trusted writer or not.
+        assert_eq!(acl_problem(&[r(AclWho::User(54321))], &trust, true, false), None);
+        let problem = acl_problem(&[r(AclWho::User(54321))], &trust, true, true).unwrap();
+        assert!(problem.contains("user 54321 read access"), "{problem}");
+        assert!(acl_problem(&[r(AclWho::Group(54322))], &trust, true, true).is_some());
+        assert_eq!(acl_problem(&[r(AclWho::User(0))], &trust, true, true), None, "root reads anything anyway");
+    }
+
+    // Sets `xattr` as `path`'s access ACL; false where the filesystem has
+    // no ACL support, so the test can say it skipped.
+    fn set_acl(path: &Path, xattr: &[u8]) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and name, and a live buffer of that length.
+        let rc = unsafe { libc::setxattr(c.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), xattr.as_ptr().cast(), xattr.len(), 0) };
+        if rc == 0 {
+            return true;
+        }
+        let e = io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTSUP), "setting an ACL failed: {e}");
+        false
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sets an extended attribute, which Miri can't")]
+    fn a_real_acl_is_read_back_and_strip_acl_removes_it() {
+        let f = temp_file_with(b"x", 0o600);
+        if !set_acl(f.path(), &acl_with_mask(6)) {
+            eprintln!("skipping: this filesystem has no POSIX ACLs");
+            return;
+        }
+        let file = File::open(f.path()).unwrap();
+        assert_eq!(
+            acl_grants_of_file(&file).unwrap(),
+            vec![AclGrant { who: AclWho::User(54321), perm: 6 }, AclGrant { who: AclWho::Group(54322), perm: 6 }]
+        );
+        assert_eq!(acl_grants_of_path(f.path()).unwrap(), acl_grants_of_file(&file).unwrap(), "by path, the same");
+
+        // With an ACL the mode's group bits are its mask: rw here.
+        assert_eq!(std::fs::metadata(f.path()).unwrap().mode() & 0o070, 0o060);
+        let me = Owner::RootOrCurrentUser;
+        let problem = check_acl_trusting(&file, &me).unwrap_err().to_string();
+        assert!(problem.contains("user 54321 write access"), "{problem}");
+
+        let writable = OpenOptions::new().write(true).open(f.path()).unwrap();
+        strip_acl(&writable).unwrap();
+        assert!(acl_grants_of_file(&file).unwrap().is_empty(), "removed");
+        strip_acl(&writable).unwrap(); // and removing none is fine
+        check_acl_trusting(&file, &me).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sets an extended attribute, which Miri can't")]
+    fn a_directory_writable_through_a_trusted_group_but_also_a_named_user_is_refused() {
+        // The case the mode bits can't show: group write is accepted for a
+        // trusted (deployer) group, and with an ACL that same group-class
+        // write is the mask -- which lets a named user write too.
+        let dir = private_tempdir();
+        let d = std::fs::canonicalize(dir.path()).unwrap();
+        // SAFETY: getuid/getgid take no arguments and cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let trust = Trusting { owners: vec![0, uid], writer_groups: vec![gid] };
+        chmod(&d, 0o770);
+        judge_dir(&d, &trust).expect("group write through a trusted group is fine");
+
+        let acl = acl_xattr(&[(USER_OBJ, 7, UNDEF), (ACL_USER, 7, 65534), (GROUP_OBJ, 7, UNDEF), (ACL_MASK, 7, UNDEF), (OTHER, 0, UNDEF)]);
+        if !set_acl(&d, &acl) {
+            eprintln!("skipping: this filesystem has no POSIX ACLs");
+            return;
+        }
+        assert_eq!(std::fs::metadata(&d).unwrap().mode() & 0o777, 0o770, "the mode alone looks the same");
+        match judge_dir(&d, &trust) {
+            Err(DirProblem::Acl(problem)) => assert!(problem.contains("user 65534 write access"), "{problem}"),
+            other => panic!("expected the ACL to be refused, got {other:?}"),
+        }
+        let err = check_dir_chain_trusting(&d, &trust).unwrap_err().to_string();
+        assert!(err.contains("POSIX ACL entry gives user 65534 write access"), "{err}");
+        chmod(&d, 0o700);
     }
 }

@@ -40,9 +40,14 @@
 //!   environment can point the module at a token they run, and `C_Login`
 //!   then hands it the root-only PIN; the token's label and serial are its
 //!   own claims, so they can't tell. Set the module's configuration in a
-//!   root-owned file the service's environment can't override. **A
-//!   directory on a read-only mount passes whatever its mode**, as
-//!   everywhere in this crate: a read-only mount's mode bits don't say who
+//!   root-owned file the service's environment can't override. Some
+//!   modules read the calling user's home directory as well, with nothing
+//!   set (SoftHSM2's `~/.config/softhsm2/softhsm2.conf`; the p11-kit
+//!   proxy's `~/.config/pkcs11/modules/`, which names further modules to
+//!   load): a service account that can write its own home can be
+//!   redirected the same way. **A
+//!   sticky directory on a read-only mount passes whatever its write
+//!   bits**, as everywhere in this crate: a read-only mount's mode bits don't say who
 //!   can write the same directory through another, writable mount of it
 //!   (a read-only bind mount of a host directory, say). For code that is
 //!   loaded and run, keep the module's directories root-owned and
@@ -77,22 +82,60 @@
 //! bytes, as it is.
 //!
 //! A key found under a service's label is used only if it still carries
-//! those protections, including `CKA_ALWAYS_SENSITIVE` and
-//! `CKA_NEVER_EXTRACTABLE`, which the token sets only on a key generated
-//! on it and never exposed -- so an imported key with a known value,
-//! labelled and tagged to match, is refused (see `check_protections`).
+//! those protections -- not modifiable or copyable included -- and
+//! `CKA_ALWAYS_SENSITIVE`, `CKA_NEVER_EXTRACTABLE` and `CKA_LOCAL`, which
+//! the token sets only on a key it generated itself and never exposed --
+//! so an imported or derived key, labelled and tagged to match, is refused
+//! (see `check_protections`).
+//!
+//! Those attributes describe the object as it is now, not everything that
+//! has happened to its value. A copy of a token-generated key
+//! (`C_CopyObject`) keeps all three, whatever the original allowed; on a
+//! token that offers mechanisms deriving one key's bytes into another a
+//! PIN holder can read (`CKM_EXTRACT_KEY_FROM_KEY`, `CKM_XOR_BASE_AND_DATA`
+//! and the like), such a copy, made after the original was put through
+//! them, passes every check here with a value its maker knows. The checks
+//! keep out a key that was imported or left loose; they are not proof that
+//! nobody ever learned it. What ties a service to the key an administrator
+//! provisioned is its fingerprint in `pkcs11.pinned_keys` (below), and an
+//! HSM policy that disables those mechanisms for the user role.
 //! It is `CKA_PRIVATE`, and only private objects are ever looked up, so
 //! nothing made by a session without the PIN is seen at all (see
 //! `labelled_template`).
 //!
-//! A wrong PIN is tried once: after the token rejects it, this process
-//! attempts no further login with that PIN file until the file changes,
-//! and a token that reports its user PIN locked or on its final attempt is
-//! refused before any login -- so this library never locks the HSM user
-//! out (see [`PIN_LATCHES`]). Two processes generating a service's key at
+//! A wrong PIN is tried once per process: after the token rejects it, this
+//! process attempts no further login with that PIN file until the file
+//! changes, and a token that reports its user PIN locked or on its final
+//! attempt is refused before any login (see [`PIN_LATCHES`]). That bounds
+//! one process, not a host: every worker of a prefork server, and every
+//! start of a service in a restart loop, is a new process with one attempt
+//! to spend, and not every token reports its final attempt. With
+//! `pkcs11.pin_state_dir` set, the rejection is recorded for all of them,
+//! and a wrong PIN then costs one attempt in total (see
+//! `SHARED_LATCH_FILE`). Two processes generating a service's key at
 //! the same moment is detected after the fact, and the later one discards
 //! its own key rather than leaving two under the label (see
 //! `generate_key`).
+//!
+//! ## What the PIN decides, and what pinning adds
+//!
+//! The token knows one authority for these keys: its user PIN. Every
+//! service that uses the token must be able to read the PIN file, and
+//! whoever holds the PIN can drive the token without this library --
+//! delete a service's key, or delete it and generate another under the
+//! same label, which would pass every check above. So the production
+//! security model's "only root creates or retires a KEK" is this library's
+//! own rule here (`hkdfguard_create_kek` and `retire` refuse anyone else);
+//! the token doesn't enforce it, and services sharing one token are kept
+//! apart by labels alone. No PIN holder can learn a key's value.
+//!
+//! `pkcs11.pinned_keys` is what root can add: the fingerprint of each
+//! service's key, recorded in the policy only root writes. A key with any
+//! other fingerprint is then refused, and so is a pinned service whose key
+//! is gone -- an error, never "no key here", so the provider chain doesn't
+//! hand the service to a weaker provider. `pkcs11.require_pinned_keys`
+//! makes the pins an allowlist (see [`Pins`]); it is on unless policy
+//! turns it off under the production security model.
 //!
 //! `load_kek` locates the key (or generates it, when creation was asked
 //! for) up front and hands back a handle holding its object handle, so
@@ -106,7 +149,9 @@
 //! A provider is constructed per C ABI call and dropped with it, and so is
 //! its session and login. The module itself is different: `C_Initialize`
 //! and `C_Finalize` are process-wide, so the module is loaded and
-//! initialized once per process and never finalized (see [`MODULES`]).
+//! initialized once per process and never finalized (see [`MODULES`]); a
+//! child created with `fork()` initializes it again for itself, as
+//! PKCS#11 asks.
 //! Finalizing per call, while another thread's call is inside the module,
 //! is undefined behavior and in practice fails both calls. Because a login
 //! is per application per token, overlapping calls share one logged-in
@@ -125,7 +170,7 @@ use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11}; // loads the
 use cryptoki::error::{Error as CryptokiError, RvError}; // to recognize the two return codes that mean "already done" rather than failure
 use cryptoki::mechanism::Mechanism; // the mechanism enum (GenericSecretKeyGen, Sha256Hmac, ...)
 use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle}; // PKCS#11 object attributes/handles
-use cryptoki::session::{Session, UserType}; // an open session against a slot/token, and the login role
+use cryptoki::session::{Session, SessionState, UserType}; // an open session against a slot/token, its login state, and the login role
 use cryptoki::slot::Slot; // identifies a PKCS#11 slot
 use cryptoki::types::AuthPin; // wraps a PIN for login
 
@@ -141,6 +186,60 @@ struct OpenSession {
     session: Session,
     pkcs11: Pkcs11,
     slot: Slot,
+    /// Proof the login hasn't ended since this call logged in; `None` on a
+    /// token that can't hold one (see [`LoginWitness`]).
+    witness: Option<LoginWitness>,
+}
+
+/// A private session object, created right after this call's login, that
+/// shows whether the process has been logged out of the token since.
+///
+/// A login is the application's, not a session's, so something else in the
+/// process using the same module -- the host application, another library
+/// -- can call `C_Logout` underneath a call, and `C_Login` again. While it
+/// is logged out the token hides every private object, so a search for a
+/// service's key comes back empty. Checking the session state after the
+/// search catches a logout that is still in effect, but not one followed
+/// by a new login before the check. This does: `C_Logout` destroys every
+/// private session object the application has, and a later login doesn't
+/// bring them back. So if this object is still there, with the random value
+/// it was created with, the login was never interrupted, and an empty search
+/// really means no key.
+///
+/// It is a `CKO_DATA` object, `CKA_TOKEN` false, so it never reaches the
+/// token's storage and goes away when the session closes.
+struct LoginWitness {
+    handle: ObjectHandle,
+    value: [u8; 16],
+}
+
+impl LoginWitness {
+    /// `Err` saying why if it couldn't create one.
+    fn create(session: &Session) -> std::result::Result<LoginWitness, String> {
+        let mut value = [0u8; 16];
+        // A random value, so an object that happens to reuse the handle
+        // after a logout can't pass for this one. Not a secret.
+        getrandom::fill(&mut value).map_err(|e| format!("no random value for it: {e}"))?;
+        let handle = session
+            .create_object(&[
+                Attribute::Class(ObjectClass::DATA),
+                Attribute::Token(false),
+                Attribute::Private(true),
+                Attribute::Label(b"hkdfguard login witness".to_vec()),
+                Attribute::Value(value.to_vec()),
+            ])
+            .map_err(|e| e.to_string())?;
+        Ok(LoginWitness { handle, value })
+    }
+
+    /// Whether the object is still there with its value: no logout has
+    /// happened since it was created.
+    fn intact(&self, session: &Session) -> bool {
+        matches!(
+            session.get_attributes(self.handle, &[AttributeType::Value]).as_deref(),
+            Ok([Attribute::Value(v)]) if v.as_slice() == self.value
+        )
+    }
 }
 
 /// Every PKCS#11 module this process has loaded and initialized, by
@@ -157,33 +256,73 @@ struct OpenSession {
 /// authority: sessions and logins are still opened per call and closed
 /// when the call's provider drops (see [`OpenSession`]), and a login lasts
 /// only while the process has a session open on the token.
-static MODULES: Mutex<Vec<(PathBuf, Pkcs11)>> = Mutex::new(Vec::new());
+///
+/// Each entry also records the process that initialized it. PKCS#11 asks a
+/// child created with `fork()` to call `C_Initialize` itself before using
+/// a module it inherited: the parent's sessions, logins and (for a network
+/// HSM) connections are not the child's, and most modules refuse every
+/// call from a child that hasn't, with `CKR_CRYPTOKI_NOT_INITIALIZED`. So
+/// an entry from another pid is initialized again before it is handed out
+/// -- once per process, like the first time. Forking is supported from a
+/// process with one thread, as POSIX only lets a child of a multithreaded
+/// process call async-signal-safe functions until it `exec`s; a lock some
+/// other thread held at the fork would stay held in the child.
+static MODULES: Mutex<Vec<Module>> = Mutex::new(Vec::new());
+
+struct Module {
+    path: PathBuf,
+    pkcs11: Pkcs11,
+    /// The process that last ran `C_Initialize` on it (or found it already
+    /// initialized).
+    initialized_by: libc::pid_t,
+}
+
+fn this_process() -> libc::pid_t {
+    // SAFETY: getpid takes no arguments and cannot fail.
+    unsafe { libc::getpid() }
+}
+
+// `C_Initialize`, telling the module it may be called from several OS
+// threads. "Already initialized" is success: something else in this
+// process (the host application, another library) initialized the module,
+// or the module is not fork-aware and still counts the parent's
+// initialization. It is usable as it is, and must never be finalized by
+// code that did not initialize it -- which keeping it in the registry
+// guarantees.
+fn initialize_module(pkcs11: &Pkcs11, checked: &Path) -> std::result::Result<(), String> {
+    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
+        Ok(()) => Ok(()),
+        Err(CryptokiError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {
+            log::debug!("hkdfguard: PKCS#11 module {} was already initialized in this process", checked.display());
+            Ok(())
+        }
+        Err(e) => Err(format!("C_Initialize failed: {e}")),
+    }
+}
 
 // The initialized context for the module at `checked` (a canonical path
 // that has passed `validate_module_path`), loading and initializing it the
-// first time it is asked for. Serialized by the registry lock, so two
-// first-time callers cannot both try to initialize.
+// first time this process asks for it. Serialized by the registry lock, so
+// two first-time callers cannot both try to initialize.
 fn load_module(checked: &Path) -> std::result::Result<Pkcs11, String> {
     let mut modules = MODULES.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((_, pkcs11)) = modules.iter().find(|(path, _)| path == checked) {
-        return Ok(pkcs11.clone()); // a clone shares the one underlying library handle
+    let pid = this_process();
+    if let Some(module) = modules.iter_mut().find(|m| m.path == checked) {
+        if module.initialized_by != pid {
+            // Inherited from the process this one was forked from. A
+            // failure leaves the entry as it was, so the next call tries
+            // again.
+            initialize_module(&module.pkcs11, checked)
+                .map_err(|e| format!("{e} (re-initializing the module in a process forked from the one that loaded it)"))?;
+            module.initialized_by = pid;
+        }
+        return Ok(module.pkcs11.clone()); // a clone shares the one underlying library handle
     }
     let pkcs11 = Pkcs11::new(checked).map_err(|e| format!("could not load module {}: {e}", checked.display()))?;
-    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
-        // telling the module we may call it from multiple OS threads
-        Ok(()) => {}
-        // Something else in this process (the host application, another
-        // library) initialized this module already. It is usable as it is,
-        // and must never be finalized by code that did not initialize it --
-        // which keeping it in the registry guarantees.
-        Err(CryptokiError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {
-            log::debug!("hkdfguard: PKCS#11 module {} was already initialized in this process", checked.display());
-        }
-        // `pkcs11` drops here, which unloads the module without calling
-        // C_Finalize (cryptoki finalizes only when asked to explicitly).
-        Err(e) => return Err(format!("C_Initialize failed: {e}")),
-    }
-    modules.push((checked.to_path_buf(), pkcs11.clone()));
+    // On failure `pkcs11` drops, which unloads the module without calling
+    // C_Finalize (cryptoki finalizes only when asked to explicitly).
+    initialize_module(&pkcs11, checked)?;
+    modules.push(Module { path: checked.to_path_buf(), pkcs11: pkcs11.clone(), initialized_by: pid });
     Ok(pkcs11)
 }
 
@@ -258,29 +397,48 @@ fn select_token(tokens: &[(String, String)], label: Option<&str>, serial: Option
 }
 
 /// Checks a PKCS#11 module path before it's ever `dlopen`ed: it must be
-/// absolute, and after resolving symlinks, the module file must be owned
-/// by root and not writable by group or others, and so must its directory
-/// and every directory above it, sticky or not (see
-/// [`crate::secure_file::check_dir_chain`]).
+/// absolute; every directory that decides what it names -- each one it
+/// passes through, and each one a symlink along the way lives in, every
+/// one up to `/` -- must be owned by root and not writable by group or
+/// others, sticky or not (see [`crate::secure_file::resolve_trusted`]); and
+/// the module file it resolves to must be owned by root and not writable
+/// by anyone else.
 /// Returns the canonical (symlink-resolved) path -- the one that was
 /// actually checked -- so that's exactly what gets loaded.
 ///
 /// Loading a module runs its code inside this process. Checking only the
 /// file and its immediate directory isn't enough: a non-root user who can
 /// write to any ancestor can rename the module's directory away and put
-/// their own in its place between this check and the `dlopen`. With the
-/// whole chain root-controlled, nothing on the path can change in between.
+/// their own in its place between this check and the `dlopen`. Nor is
+/// checking only where the path ends up: with `module =
+/// "/opt/vendor/current/libhsm.so"` and `/opt/vendor` owned by a deploy
+/// account, that account can point `current` at any root-owned directory
+/// holding a `libhsm.so` -- a software token's, say, whose "HSM" then holds
+/// every KEK in files -- and the file loaded would pass every check made
+/// on it. With every directory on the way root-controlled, nothing about
+/// what the path names can change, before the check or after it.
 fn validate_module_path(path: &Path) -> std::result::Result<PathBuf, String> {
     use crate::secure_file::{check_dir_chain, check_metadata, Owner, FORBID_GROUP_OTHER_WRITE};
 
     if !path.is_absolute() {
         return Err(format!("PKCS#11 module path {path:?} must be absolute"));
     }
-    let canonical = std::fs::canonicalize(path).map_err(|e| format!("PKCS#11 module {path:?}: {e}"))?;
+    // Resolved one component at a time, each directory a lookup happens in
+    // checked first -- the ones symlinks on the way live in included.
+    let canonical = crate::secure_file::resolve_trusted(path, &Owner::Root)
+        .map_err(|e| format!("refusing to load PKCS#11 module {path:?}: {e}"))?
+        .ok_or_else(|| format!("PKCS#11 module {path:?}: no such file"))?;
 
     let file_meta = std::fs::metadata(&canonical).map_err(|e| format!("PKCS#11 module {}: {e}", canonical.display()))?;
     check_metadata(&file_meta, Some(Owner::Root), FORBID_GROUP_OTHER_WRITE)
         .map_err(|e| format!("refusing to load PKCS#11 module {}: {e}", canonical.display()))?;
+    // Code this process will run: nobody but root may be able to rewrite
+    // it, through a POSIX ACL entry either.
+    let grants = crate::secure_file::acl_grants_of_path(&canonical)
+        .map_err(|e| format!("refusing to load PKCS#11 module {}: {e}", canonical.display()))?;
+    if let Some(problem) = crate::secure_file::acl_problem(&grants, &Owner::Root, true, false) {
+        return Err(format!("refusing to load PKCS#11 module {}: {problem}", canonical.display()));
+    }
 
     let parent = canonical
         .parent()
@@ -312,8 +470,10 @@ use crate::secure_file::FileIdentity;
 /// seconds. After one rejection this process attempts no further login
 /// with that file until the file changes -- an operator corrected it -- or
 /// the process restarts. The token's own flags are checked before each
-/// login as well (see `open_session`), so a token already on its final
-/// attempt is never pushed over by this library.
+/// login as well (see `open_session`), so a token that reports itself on
+/// its final attempt is never pushed over by this library. This list is
+/// one process's: what carries a rejection to the others is the record in
+/// `pkcs11.pin_state_dir` (see `SHARED_LATCH_FILE`).
 static PIN_LATCHES: Mutex<Vec<(PathBuf, Option<FileIdentity>, String)>> = Mutex::new(Vec::new());
 
 /// Serializes the PIN-state check, `C_Login` and the latching of its
@@ -337,6 +497,27 @@ fn pin_login_blocked(pin_file: &Path, current: Option<FileIdentity>) -> Option<S
     Some(latches[i].2.clone())
 }
 
+/// Why `C_Login` failing with `rv` means the configured PIN was rejected --
+/// wrong, malformed, the wrong length, expired, or locked -- or `None` for a
+/// failure that says nothing about the PIN. Every PIN-class answer latches
+/// (see [`PIN_LATCHES`]), not only `CKR_PIN_INCORRECT`: tokens differ in
+/// which of them count against the user's attempts, many never set the
+/// final-try flag `open_session` checks first, and the same PIN tried again
+/// can't get a different answer.
+fn pin_rejection(rv: RvError) -> Option<String> {
+    match rv {
+        RvError::PinExpired => Some(
+            "the token reports the configured PIN expired (CKR_PIN_EXPIRED): change it with the vendor's tools, then \
+             write the new one to the PIN file"
+                .to_string(),
+        ),
+        RvError::PinIncorrect | RvError::PinInvalid | RvError::PinLenRange | RvError::PinLocked => {
+            Some(format!("the token rejected the configured PIN ({rv:?})"))
+        }
+        _ => None,
+    }
+}
+
 /// Records that the token rejected the PIN read from `pin_file` (which had
 /// identity `identity` at the time), so no further login is attempted with
 /// it -- see [`PIN_LATCHES`].
@@ -344,6 +525,219 @@ fn latch_pin_login(pin_file: &Path, identity: Option<FileIdentity>, reason: Stri
     let mut latches = PIN_LATCHES.lock().unwrap_or_else(PoisonError::into_inner);
     latches.retain(|(path, _, _)| path != pin_file);
     latches.push((pin_file.to_path_buf(), identity, reason));
+}
+
+// ---------------------------------------------------------------------
+// The rejected-PIN record shared between processes.
+// ---------------------------------------------------------------------
+//
+// `PIN_LATCHES` is one process's memory. Prefork workers each have their
+// own, and a service in a restart loop starts with an empty one every
+// time: with a stale PIN file, each worker and each restart spends one of
+// the token's attempts, and a handful of those lock it. When policy names
+// a `pkcs11.pin_state_dir`, a rejection is also written there, and every
+// process reads it before logging in. The record names the PIN file's
+// version (`FileIdentity`), so it stops applying the moment the file
+// changes, as the in-process latch does.
+//
+// The directory decides who is believed. Whoever can write it can stop
+// PKCS#11 logins (a forged record, a held lock) but nothing more: the
+// record holds no secret and is never a reason to log in. It is meant to
+// be writable by exactly the accounts that read the PIN file, each of
+// which could lock the token outright with the PIN it holds.
+
+/// The rejection record's name in `pkcs11.pin_state_dir`.
+const SHARED_LATCH_FILE: &str = "pin-rejected";
+/// The file processes lock around a login whose PIN they haven't yet seen
+/// accepted (see [`SharedLoginLock`]).
+const SHARED_LOGIN_LOCK_FILE: &str = "login.lock";
+const SHARED_LATCH_HEADER: &str = "hkdfguard-pin-rejected 1";
+/// More than any record this code writes; bounds the read.
+const MAX_SHARED_LATCH_LEN: u64 = 1024;
+/// How long a first login waits for another process's first login.
+const SHARED_LOGIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The PIN-file version this process has seen the token accept. A login
+/// with it needs no cross-process lock: only a PIN nobody has vouched for
+/// can cost an attempt in every process at once.
+static PIN_CONFIRMED: Mutex<Option<(PathBuf, Option<FileIdentity>)>> = Mutex::new(None);
+
+fn pin_confirmed(pin_file: &Path, identity: Option<FileIdentity>) -> bool {
+    let confirmed = PIN_CONFIRMED.lock().unwrap_or_else(PoisonError::into_inner);
+    matches!(&*confirmed, Some((path, id)) if path == pin_file && *id == identity)
+}
+
+fn set_pin_confirmed(confirmed: Option<(PathBuf, Option<FileIdentity>)>) {
+    *PIN_CONFIRMED.lock().unwrap_or_else(PoisonError::into_inner) = confirmed;
+}
+
+/// Checks `pkcs11.pin_state_dir`: a real directory (not a link to one),
+/// owned by root or this account, that accounts outside its owner and
+/// group can't reach at all. Writing there forges a rejection; holding the
+/// login lock takes less -- `flock` needs only a descriptor, so anyone who
+/// can search the directory and open the lock file to read can stop every
+/// first login (see [`SharedLoginLock`]).
+fn check_pin_state_dir(dir: &Path) -> std::result::Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let fail = |why: String| format!("pkcs11.pin_state_dir {}: {why}", dir.display());
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        fail(format!("{e}. Create it, writable by the accounts that read the PIN file and by nobody else, or remove the setting"))
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(fail("is not a directory".into()));
+    }
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(fail(format!("is owned by uid {}, not by root or this account", meta.uid())));
+    }
+    if meta.mode() & 0o007 != 0 {
+        return Err(fail(format!(
+            "is open to every account (mode {:o}), so any of them could stop PKCS#11 logins. Give it to the group \
+             of the accounts that read the PIN file and nobody else: root:<service-group>, mode 2770",
+            meta.mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+fn shared_latch_text(identity: FileIdentity, reason: &str) -> String {
+    let reason: String = reason.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(400).collect();
+    format!(
+        "{SHARED_LATCH_HEADER}\n{} {} {} {} {}\n{reason}\n",
+        identity.dev, identity.ino, identity.len, identity.mtime.0, identity.mtime.1
+    )
+}
+
+/// The PIN-file version a record names and why its PIN was rejected, or
+/// `None` for anything that isn't a whole record this code wrote. The
+/// reason is shown to an operator, so only printable ASCII survives.
+fn parse_shared_latch(text: &str) -> Option<(FileIdentity, String)> {
+    let mut lines = text.lines();
+    if lines.next()? != SHARED_LATCH_HEADER {
+        return None;
+    }
+    let mut fields = lines.next()?.split(' ');
+    let identity = FileIdentity {
+        dev: fields.next()?.parse().ok()?,
+        ino: fields.next()?.parse().ok()?,
+        len: fields.next()?.parse().ok()?,
+        mtime: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    let reason = lines.next()?.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(400).collect();
+    Some((identity, reason))
+}
+
+/// Why another process's login with this very version of the PIN file was
+/// rejected, if `dir` holds a record saying so. A record for any other
+/// version -- the file has changed since -- says nothing, and neither does
+/// one that can't be read or parsed: this only ever withholds a login.
+fn read_shared_latch(dir: &Path, current: Option<FileIdentity>) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let current = current?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(dir.join(SHARED_LATCH_FILE))
+        .ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_SHARED_LATCH_LEN).read_to_string(&mut text).ok()?;
+    let (rejected, reason) = parse_shared_latch(&text)?;
+    (rejected == current).then_some(reason)
+}
+
+/// Records for every process using `dir` that the token rejected the PIN
+/// in the file version `identity`. Written whole under another name and
+/// renamed into place, so a reader sees the old record or the new one.
+/// Best effort: if it can't be written, this process's own latch still
+/// holds, and the warning says other processes will each try once.
+fn write_shared_latch(dir: &Path, identity: Option<FileIdentity>, reason: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Some(identity) = identity else { return };
+    let temp = dir.join(format!(".{SHARED_LATCH_FILE}.{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp); // a leftover of an earlier process with this pid
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
+        .and_then(|mut file| {
+            // Readable by the other accounts sharing the directory,
+            // whatever this process's umask: it holds nothing secret.
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            file.write_all(shared_latch_text(identity, reason).as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, dir.join(SHARED_LATCH_FILE)));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        log::warn!(
+            "hkdfguard: the rejected PKCS#11 PIN could not be recorded in pkcs11.pin_state_dir {} ({e}); other \
+             processes will each spend one login attempt finding out for themselves",
+            dir.display()
+        );
+    }
+}
+
+/// Held by a process while it logs in with a PIN-file version it hasn't
+/// yet seen accepted, so that processes starting together -- prefork
+/// workers -- learn of a wrong PIN from the first of them, not one attempt
+/// each. An exclusive `flock` on a file in `pkcs11.pin_state_dir`,
+/// released when dropped, or when its holder dies.
+struct SharedLoginLock {
+    _file: std::fs::File,
+}
+
+impl SharedLoginLock {
+    fn acquire(dir: &Path, wait: std::time::Duration) -> std::result::Result<SharedLoginLock, String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let path = dir.join(SHARED_LOGIN_LOCK_FILE);
+        let fail = |why: String| format!("PKCS#11 login lock {}: {why}", path.display());
+        // Read-only is all `flock` needs, so an account that shares the
+        // directory but not this file's owner can still take the lock.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .mode(0o644)
+            .open(&path)
+            .map_err(|e| fail(format!("could not be opened ({e})")))?;
+        let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
+        if !meta.file_type().is_file() {
+            return Err(fail("is not a regular file".into()));
+        }
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o644)); // ours if we just made it; else already set
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            // SAFETY: `file` is an open descriptor for the life of this call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(SharedLoginLock { _file: file });
+            }
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EWOULDBLOCK) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Some(libc::EWOULDBLOCK) => {
+                    return Err(fail(format!(
+                        "still held after {} seconds by another process's first login; no login was attempted",
+                        wait.as_secs()
+                    )))
+                }
+                _ => return Err(fail(format!("could not be locked: {e}"))),
+            }
+        }
+    }
 }
 
 
@@ -359,7 +753,12 @@ fn latch_pin_login(pin_file: &Path, identity: Option<FileIdentity>, reason: Stri
 /// The raw file bytes live in a self-wiping `SecretBuffer` that is wiped
 /// explicitly before this returns -- on every path -- and the PIN itself
 /// comes back as an `AuthPin`, which zeroizes its own storage on drop.
-fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
+///
+/// Also returns the identity of the file the PIN was read from, taken from
+/// the open descriptor, not the path: a latch (see [`PIN_LATCHES`]) must
+/// name exactly the version of the file whose PIN the token rejected, not
+/// whatever an operator's rewrite put at the path a moment later.
+fn read_pin_file(path: &Path) -> std::result::Result<(AuthPin, Option<FileIdentity>), std::io::Error> {
     use crate::secure_file::{check_location, config_owner, open_checked, FileRequirements, SecretBuffer, FORBID_GROUP_OTHER_ACCESS};
     use std::io::{Error as IoError, ErrorKind};
 
@@ -372,6 +771,7 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
     check_location(path, config_owner())?;
     let mut file = open_checked(path, &requirements)?;
     let mut raw = SecretBuffer::read_from(&mut file, MAX_PIN_FILE_LEN)?;
+    let identity = FileIdentity::of_file(&file);
 
     let mut pin = raw.as_slice();
     if let Some(stripped) = pin.strip_suffix(b"\n") {
@@ -395,7 +795,7 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
             })
     };
     raw.wipe();
-    result
+    result.map(|pin| (pin, identity))
 }
 
 // Loads the PIN, loads the module, initializes the library, picks a slot,
@@ -428,8 +828,8 @@ fn open_session() -> Backend<OpenSession> {
     };
 
     let pin_path = settings.pin_file.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_PIN_FILE));
-    let pin = match read_pin_file(&pin_path) {
-        Ok(pin) => pin,
+    let (pin, pin_identity) = match read_pin_file(&pin_path) {
+        Ok(read) => read,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if matches!(crate::security_model::current(), Ok(crate::security_model::SecurityModel::Developer)) {
                 crate::provider::log_once(
@@ -451,8 +851,8 @@ fn open_session() -> Backend<OpenSession> {
     };
     // A PIN this process has already seen the token reject is not tried
     // again until the file changes: see `PIN_LATCHES`. Checked here to fail
-    // fast, and again under `PIN_LOGIN_GATE` just before the login.
-    let pin_identity = FileIdentity::of(&pin_path);
+    // fast, and again under `PIN_LOGIN_GATE` just before the login --
+    // against the identity of the file this PIN came from.
     let login_disabled = |reason: String| {
         Backend::Refused(format!(
             "PKCS#11 login disabled in this process: {reason}; correct the PIN file {} (any change to it re-enables \
@@ -462,6 +862,24 @@ fn open_session() -> Backend<OpenSession> {
     };
     if let Some(reason) = pin_login_blocked(&pin_path, pin_identity) {
         return login_disabled(reason);
+    }
+    // The same, as other processes saw it: see `SHARED_LATCH_FILE`.
+    let state_dir = settings.pin_state_dir.clone();
+    let shared_login_disabled = |dir: &Path, reason: String| {
+        Backend::Refused(format!(
+            "PKCS#11 login disabled: the token rejected the PIN in {} for another process ({reason}). Correct the \
+             PIN file (any change to it re-enables login); if the PIN is right and the token was at fault, delete {}",
+            pin_path.display(),
+            dir.join(SHARED_LATCH_FILE).display()
+        ))
+    };
+    if let Some(dir) = &state_dir {
+        if let Err(reason) = check_pin_state_dir(dir) {
+            return Backend::Refused(reason);
+        }
+        if let Some(reason) = read_shared_latch(dir, pin_identity) {
+            return shared_login_disabled(dir, reason);
+        }
     }
 
     let checked = match validate_module_path(&module) {
@@ -510,6 +928,22 @@ fn open_session() -> Backend<OpenSession> {
     if let Some(reason) = pin_login_blocked(&pin_path, pin_identity) {
         return login_disabled(reason);
     }
+    // And one process at a time, until this process has seen the token
+    // accept this PIN: see `SharedLoginLock`. The record is re-read under
+    // the lock, for the same reason the latch was under the gate.
+    let shared_lock = match &state_dir {
+        Some(dir) if !pin_confirmed(&pin_path, pin_identity) => {
+            let lock = match SharedLoginLock::acquire(dir, SHARED_LOGIN_LOCK_WAIT) {
+                Ok(lock) => lock,
+                Err(reason) => return Backend::Refused(reason),
+            };
+            if let Some(reason) = read_shared_latch(dir, pin_identity) {
+                return shared_login_disabled(dir, reason);
+            }
+            Some(lock)
+        }
+        _ => None,
+    };
 
     // The token reports the user PIN's state. Read it before spending an
     // attempt: a token that is locked, or down to its last try, is refused
@@ -552,13 +986,19 @@ fn open_session() -> Backend<OpenSession> {
     // other call out mid-operation; closing the last session ends the
     // login instead.
     match session.login(UserType::User, Some(&pin)) {
-        Ok(()) | Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
-        // The token rejected the configured PIN, or is now locked. One
-        // attempt was spent finding that out; none more will be, from this
-        // process, until the PIN file changes.
-        Err(CryptokiError::Pkcs11(rv @ (RvError::PinIncorrect | RvError::PinLocked), _)) => {
-            let reason = format!("the token rejected the configured PIN ({rv:?})");
+        Ok(()) => set_pin_confirmed(Some((pin_path.clone(), pin_identity))),
+        // Says nothing about this PIN: another call's login is in effect.
+        Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
+        // The token rejected the configured PIN. One attempt was spent
+        // finding that out; none more will be, from this process, until the
+        // PIN file changes.
+        Err(CryptokiError::Pkcs11(rv, _)) if pin_rejection(rv).is_some() => {
+            let reason = pin_rejection(rv).unwrap_or_default();
             latch_pin_login(&pin_path, pin_identity, reason.clone());
+            set_pin_confirmed(None);
+            if let Some(dir) = &state_dir {
+                write_shared_latch(dir, pin_identity, &reason);
+            }
             return Backend::Refused(format!(
                 "C_Login failed: {reason}; no further login will be attempted by this process until the PIN file {} \
                  changes, so the token's remaining attempts are not spent",
@@ -568,8 +1008,28 @@ fn open_session() -> Backend<OpenSession> {
         Err(e) => return refuse("C_Login failed", &e),
     }
     drop(pin); // AuthPin zeroizes its storage on drop; don't keep the PIN around for the session's lifetime
+    drop(shared_lock); // the verdict is in: other processes' first logins may go ahead
 
-    Backend::Ready(OpenSession { session, pkcs11, slot })
+    // Straight after the login, before any search it is to vouch for. A
+    // token that can't hold one (a module that refuses session objects in
+    // a read-only session, say) still gets the session-state check; only a
+    // logout immediately followed by a new login, both inside one key
+    // search, then goes unseen.
+    let witness = match LoginWitness::create(&session) {
+        Ok(witness) => Some(witness),
+        Err(e) => {
+            crate::provider::log_once(
+                log::Level::Warn,
+                format!(
+                    "hkdfguard: the PKCS#11 token could not create a private session object ({e}); a logout by \
+                     other code in this process, followed at once by a new login, could go unnoticed during a key search"
+                ),
+            );
+            None
+        }
+    };
+
+    Backend::Ready(OpenSession { session, pkcs11, slot, witness })
 }
 
 // Handle type returned from `load_kek`: the service's key, already located
@@ -596,7 +1056,7 @@ impl KekHandle for Pkcs11Handle {
         let open = guard
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?; // session setup failed at construction time
-        inputs.iter().map(|input| token_hmac(&open.session, self.key, input)).collect()
+        crate::provider::collect_outputs(inputs, |input| token_hmac(&open.session, self.key, input))
     }
 }
 
@@ -612,7 +1072,10 @@ fn token_hmac(session: &Session, key: ObjectHandle, input: &[u8]) -> Result<PrfO
     if mac.len() != 32 {
         return Err(Error::Provider(format!("PKCS#11 token returned a {}-byte HMAC-SHA-256", mac.len())));
     }
-    let mut out = PrfOutput::new([0u8; 32]); // zeroizing from the start: no un-wiped intermediate copy on the stack
+    // Self-wiping from here on. Returning it moves it, though, and a move
+    // may leave a copy in the stack frame it came from; and the PKCS#11
+    // module's own buffers are the module's to wipe.
+    let mut out = PrfOutput::new([0u8; 32]);
     out.copy_from_slice(&mac);
     Ok(out)
 }
@@ -630,7 +1093,7 @@ impl KekHandle for SessionKey<'_> {
     }
 
     fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>> {
-        inputs.iter().map(|input| token_hmac(self.session, self.key, input)).collect()
+        crate::provider::collect_outputs(inputs, |input| token_hmac(self.session, self.key, input))
     }
 }
 
@@ -643,12 +1106,23 @@ impl KekProvider for Pkcs11Provider {
         self.refused.is_some() || self.connected()
     }
 
+    // No module configured: not present, unless policy pins a key for this
+    // service -- which says its KEK is on a token.
+    fn claims_while_absent(&self, service: &str) -> Result<()> {
+        match service_pins(service)? {
+            Pins::OneOf(_) => Err(pinned_but_missing()),
+            Pins::Any | Pins::Unpinned => Ok(()),
+        }
+    }
+
     // Side-effect-free: asks the token whether the service's key is there,
     // without creating anything. A refused provider, or a duplicate or
     // foreign object under the label, is an error -- never read as "no
-    // key", see `provider::kek_exists`.
+    // key", see `provider::kek_exists`. So is a pinned service whose key is
+    // gone, or isn't the pinned one (see `Pins`).
     fn kek_exists(&self, service: &str) -> Result<bool> {
         self.check_not_refused()?;
+        let pins = service_pins(service)?;
         let mut guard = self
             .state
             .lock()
@@ -656,7 +1130,17 @@ impl KekProvider for Pkcs11Provider {
         let open = guard
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
-        Ok(find_key(&open.session, service)?.is_some())
+        if matches!(pins, Pins::Unpinned) {
+            return Ok(false); // the allowlist is on and this service isn't on it
+        }
+        match find_key(&open.session, service, open)? {
+            Some(key) => {
+                check_pins(&open.session, key, &pins)?;
+                Ok(true)
+            }
+            None if matches!(pins, Pins::OneOf(_)) => Err(pinned_but_missing()),
+            None => Ok(false),
+        }
     }
 
     // Locates the service's key on the token now -- generating it if
@@ -678,8 +1162,20 @@ impl KekProvider for Pkcs11Provider {
             .as_mut()
             .ok_or(Error::Provider("PKCS#11 session not available".into()))?;
 
-        let key = match find_key(&open.session, service)? {
+        let pins = service_pins(service)?;
+        if matches!(pins, Pins::Unpinned) && !create_if_missing {
+            return Err(Error::KeyNotProvisioned(
+                "pkcs11.require_pinned_keys is on and policy pins no key for this service",
+            ));
+        }
+        let key = match find_key(&open.session, service, open)? {
             Some(key) => key,
+            // A pinned service keeps its KEK here, by the administrator's
+            // own statement, and that key is gone: an error, whether or not
+            // creation was asked for. Declining would send the call on to
+            // the next provider, and a key generated now could never be the
+            // pinned one.
+            None if matches!(pins, Pins::OneOf(_)) => return Err(pinned_but_missing()),
             None if create_if_missing => generate_key(open, service)?, // none exists yet and creation was requested
             None => {
                 return Err(Error::KeyNotProvisioned(
@@ -687,6 +1183,13 @@ impl KekProvider for Pkcs11Provider {
                 ))
             }
         };
+        if matches!(pins, Pins::Unpinned) {
+            // Provisioning under the allowlist ends with a root-owned policy
+            // edit, which this process can't make. The key now exists:
+            // report its fingerprint, ready to pin.
+            return Err(Error::Provider(unpinned_service_instructions(service, &open.session, key)));
+        }
+        check_pins(&open.session, key, &pins)?;
         Ok(Box::new(Pkcs11Handle {
             key_id: format!("hkdfguard:{service}").into_bytes(),
             key,
@@ -714,7 +1217,7 @@ impl KekProvider for Pkcs11Provider {
             .open_rw_session(open.slot)
             .map_err(|e| Error::Provider(format!("PKCS#11 could not open a read/write session to retire a key: {e}")))?;
 
-        let key = find_key(&rw, service)?.ok_or(Error::KekNotFound)?;
+        let key = find_key(&rw, service, open)?.ok_or(Error::KekNotFound)?;
         if crate::crypto::kek_fingerprint(&SessionKey { session: &rw, key })? != *expected_fingerprint {
             return Err(Error::KekFingerprintMismatch);
         }
@@ -730,6 +1233,101 @@ impl KekProvider for Pkcs11Provider {
         }
         Ok(())
     }
+}
+
+/// What policy accepts as `service`'s key on the token.
+///
+/// The token decides who may use and manage keys by one thing, the user
+/// PIN, and every service using the token reads it. A PIN holder can
+/// delete a service's key, or delete it and generate another under the
+/// same label -- one that passes [`check_protections`], being as
+/// token-generated as the first. Pins are how policy, which only root
+/// writes, says which key is the service's.
+enum Pins {
+    /// No pin, and no allowlist: any key that passes the attribute checks.
+    Any,
+    /// A key with one of these fingerprints, and no other. Its absence is
+    /// an error too, never "no key here".
+    OneOf(Vec<[u8; crate::payload::FINGERPRINT_LEN]>),
+    /// No pin, under `pkcs11.require_pinned_keys`: no key at all.
+    Unpinned,
+}
+
+/// Looks up `service`'s pins. A policy file that exists but is broken
+/// fails closed: the pin lookup errors rather than reporting none.
+fn service_pins(service: &str) -> Result<Pins> {
+    if let Some(fingerprints) = crate::policy::pinned_pkcs11_keys(service)? {
+        return Ok(Pins::OneOf(fingerprints));
+    }
+    if crate::policy::require_pkcs11_pinned_keys() {
+        return Ok(Pins::Unpinned);
+    }
+    Ok(Pins::Any)
+}
+
+/// Refuses `key` unless its fingerprint is one `pins` accepts, computed on
+/// the token with the object about to be used. A mismatch is an error, not
+/// "not provisioned": the key under this service's label isn't the one the
+/// administrator recorded, and the chain must not move on as if nothing
+/// were there.
+fn check_pins(session: &Session, key: ObjectHandle, pins: &Pins) -> Result<()> {
+    let Pins::OneOf(accepted) = pins else {
+        return Ok(());
+    };
+    let fingerprint = crate::crypto::kek_fingerprint(&SessionKey { session, key })?;
+    match pin_mismatch(&fingerprint, accepted) {
+        None => Ok(()),
+        Some(message) => Err(Error::Provider(message)),
+    }
+}
+
+/// Why a key with `fingerprint` isn't one of `accepted`; `None` if it is.
+fn pin_mismatch(fingerprint: &[u8; crate::payload::FINGERPRINT_LEN], accepted: &[[u8; crate::payload::FINGERPRINT_LEN]]) -> Option<String> {
+    if accepted.contains(fingerprint) {
+        return None;
+    }
+    let accepted: Vec<String> = accepted.iter().map(|f| hex(f)).collect();
+    Some(format!(
+        "the PKCS#11 key for this service has fingerprint {}, which is not the one pinned in policy \
+         (pkcs11.pinned_keys: {}): the key on the token was replaced since it was pinned. Pin the new fingerprint \
+         only once you know who generated that key; DEKs wrapped under the old one can't be unwrapped with it",
+        hex(fingerprint),
+        accepted.join(", ")
+    ))
+}
+
+/// The error for a service policy pins a key for, when the token holds
+/// none under its label. Never "not provisioned": see `load_kek`.
+fn pinned_but_missing() -> Error {
+    Error::Provider(
+        "policy pins a PKCS#11 key for this service (pkcs11.pinned_keys), but the token holds none: it was deleted, \
+         or this is not the token it was provisioned on. Refusing rather than using a weaker provider, or generating \
+         a key that could not be the pinned one. If the key is gone for good -- retired, say -- remove the service's \
+         pin from the policy, then provision it again"
+            .into(),
+    )
+}
+
+/// The message `provision` gets for an unpinned service under
+/// `pkcs11.require_pinned_keys`: its key's fingerprint, in the form to
+/// paste into policy. The fingerprint and service name are both public.
+fn unpinned_service_instructions(service: &str, session: &Session, key: ObjectHandle) -> String {
+    match crate::crypto::kek_fingerprint(&SessionKey { session, key }) {
+        Ok(fingerprint) => format!(
+            "pkcs11.require_pinned_keys is on and service \"{service}\" has no pinned key. Its key is on the token, \
+             with fingerprint {fingerprint}; to provision it, add this to the policy file and run provision \
+             again:\n  [pkcs11.pinned_keys]\n  \"{service}\" = \"{fingerprint}\"",
+            fingerprint = hex(&fingerprint)
+        ),
+        Err(e) => format!(
+            "pkcs11.require_pinned_keys is on and this service has no pinned key; computing its key's fingerprint \
+             to report it failed: {e}"
+        ),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // The CKA_LABEL used to identify a service's key on the token.
@@ -771,12 +1369,17 @@ fn labelled_template(service: &str) -> [Attribute; 4] {
 // to the next -- or one planted alongside the real one. The match must
 // also carry the CKA_ID `generate_key` gives it. Errors never name the
 // service: the C ABI logs them, and service names stay out of the log.
-fn find_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
+// `session` is the one searched; `open` is this call's, whose login
+// witness says whether an empty result can be trusted.
+fn find_key(session: &Session, service: &str, open: &OpenSession) -> Result<Option<ObjectHandle>> {
     let found = session
         .find_objects(&labelled_template(service)) // C_FindObjects
         .map_err(|e| Error::Provider(format!("PKCS#11 find_objects failed: {e}")))?;
     let handle = match found.as_slice() {
-        [] => return Ok(None),
+        [] => {
+            require_user_session(session, open)?;
+            return Ok(None);
+        }
         [one] => *one,
         many => {
             return Err(Error::Provider(format!(
@@ -801,12 +1404,69 @@ fn find_key(session: &Session, service: &str) -> Result<Option<ObjectHandle>> {
     Ok(Some(handle))
 }
 
+/// Refuses to read an empty search result as "no key" unless the session is
+/// logged in as the user. A service's key is a private object, and a
+/// session that isn't logged in is simply not shown private objects: the
+/// search comes back empty, exactly as if no key had ever been made.
+///
+/// The login is the application's, not the session's -- every session this
+/// process has on the token shares it -- so it can end underneath a call:
+/// the host application (or another library in it) using the same module
+/// calls `C_Logout` or `C_CloseAllSessions`. Read as "no key", that would
+/// send the chain on to the next provider, and every wrap after it to a
+/// weaker KEK, while the real one sits on the token. Checked after the
+/// search rather than before, so a logout at any point up to here is seen:
+/// one still in effect by the session state, and one followed by a new
+/// login -- which the state alone would miss -- by the call's
+/// [`LoginWitness`] having gone.
+fn require_user_session(session: &Session, open: &OpenSession) -> Result<()> {
+    let info = session
+        .get_session_info()
+        .map_err(|e| Error::Provider(format!("PKCS#11 get_session_info failed: {e}")))?;
+    match info.session_state() {
+        SessionState::RoUser | SessionState::RwUser => {}
+        state => {
+            return Err(Error::Provider(format!(
+                "the PKCS#11 session is not logged in as the user (state {state:?}), so the token would not show \
+                 this service's key if it had one: something else in this process logged out of the token. \
+                 Refusing to treat that as \"no key\" rather than using a weaker provider"
+            )))
+        }
+    }
+    match &open.witness {
+        Some(witness) if !witness.intact(&open.session) => Err(Error::Provider(
+            "the PKCS#11 login was interrupted during this call: something else in this process logged out of the \
+             token (and in again), so the search for this service's key may have run while the token hid it. \
+             Refusing to treat that as \"no key\" rather than using a weaker provider"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The attribute values every key `generate_key` makes carries. This is
 /// more than "locked down now": `CKA_ALWAYS_SENSITIVE` and
 /// `CKA_NEVER_EXTRACTABLE` are set by the token, and are true only for a
 /// key that was generated on it and never had its value exposed. A key
 /// imported from outside (`C_CreateObject`, `C_UnwrapKey`) has them false,
 /// whatever else its template says.
+///
+/// Those two say the value was never exposed, not that the token made the
+/// key itself, or that it will stay as it is:
+///
+/// - `CKA_LOCAL` is true only for a key made by `C_GenerateKey` (or a key
+///   pair's). A key made by `C_DeriveKey` from a sensitive base can still
+///   be always-sensitive and never-extractable, but its value is a function
+///   of a base key and data its maker chose.
+/// - `CKA_MODIFIABLE` false keeps every attribute as checked here: on a
+///   modifiable key, anyone with the PIN could later turn on `CKA_DERIVE`
+///   or `CKA_WRAP` -- `C_DeriveKey` with a mechanism that mixes in a key of
+///   theirs is a known way to get material out of a non-extractable key.
+/// - `CKA_COPYABLE` false keeps `C_CopyObject` from making a copy with
+///   different attributes.
+///
+/// `generate_key` sets the last two in its template, so a token that
+/// generated the key accepted them; the check costs no compatibility.
 fn required_protections() -> Vec<Attribute> {
     // CKA_PRIVATE again after the find template: a token that ignores an
     // attribute in a search template must not slip a public object through.
@@ -820,6 +1480,9 @@ fn required_protections() -> Vec<Attribute> {
         Attribute::Extractable(false),
         Attribute::AlwaysSensitive(true),
         Attribute::NeverExtractable(true),
+        Attribute::Local(true),
+        Attribute::Modifiable(false),
+        Attribute::Copyable(false),
     ]
 }
 
@@ -922,7 +1585,7 @@ fn generate_key(open: &OpenSession, service: &str) -> Result<ObjectHandle> {
         } // the read/write session closes here; its object handles are no longer valid
 
         // Through the read-only session, whose handle the caller keeps.
-        if let Some(key) = find_key(&open.session, service)? {
+        if let Some(key) = find_key(&open.session, service, open)? {
             return Ok(key);
         }
         // Nothing left: the other process yielded at the same moment. Generate again.
@@ -961,6 +1624,11 @@ mod tests {
         fn path(&self) -> &Path {
             &self.path
         }
+    }
+
+    // The PIN alone, for the tests that don't look at the file's identity.
+    fn read_pin_file(path: &Path) -> std::io::Result<AuthPin> {
+        super::read_pin_file(path).map(|(pin, _)| pin)
     }
 
     fn pin_file(contents: &[u8], mode: u32) -> PinFile {
@@ -1013,6 +1681,28 @@ mod tests {
     }
 
     #[test]
+    fn the_pin_files_identity_is_the_one_read_not_what_the_path_names_later() {
+        // A latch must name the version of the file whose PIN the token
+        // rejected. Taken by path after the read, an operator's correction
+        // landing in between would be latched against the old PIN's
+        // rejection, and stay blocked until the next change.
+        let f = pin_file(b"1234\n", 0o600);
+        let (_, read_identity) = super::read_pin_file(f.path()).unwrap();
+        assert_eq!(read_identity, FileIdentity::of(f.path()), "unchanged: the same");
+
+        // Replaced at its path (a new inode, as `install` or a Secret
+        // update makes) after the read: the read's identity stays the old one.
+        let replacement = f.path().with_extension("new");
+        std::fs::write(&replacement, b"5678\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(&replacement, f.path()).unwrap();
+        assert_ne!(read_identity, FileIdentity::of(f.path()));
+        let (pin, now) = super::read_pin_file(f.path()).unwrap();
+        assert_eq!(pin.expose_secret(), "5678");
+        assert_eq!(now, FileIdentity::of(f.path()));
+    }
+
+    #[test]
     fn pin_file_readable_by_group_or_others_is_rejected() {
         // SAFETY: geteuid has no preconditions.
         let root = unsafe { libc::geteuid() } == 0;
@@ -1036,6 +1726,20 @@ mod tests {
     }
 
     #[test]
+    fn every_pin_class_login_failure_latches_and_nothing_else_does() {
+        for rv in [RvError::PinIncorrect, RvError::PinInvalid, RvError::PinLenRange, RvError::PinLocked] {
+            let reason = pin_rejection(rv).unwrap_or_else(|| panic!("{rv:?} must latch"));
+            assert!(reason.contains("rejected the configured PIN") && reason.contains(&format!("{rv:?}")), "{reason}");
+        }
+        let expired = pin_rejection(RvError::PinExpired).expect("an expired PIN must latch");
+        assert!(expired.contains("expired") && expired.contains("change it"), "{expired}");
+        // Not about the PIN: a retry may well succeed.
+        for rv in [RvError::DeviceError, RvError::SessionHandleInvalid, RvError::GeneralError, RvError::UserTypeInvalid] {
+            assert_eq!(pin_rejection(rv), None, "{rv:?}");
+        }
+    }
+
+    #[test]
     fn a_rejected_pin_latches_until_the_pin_file_changes() {
         let path = Path::new("/nonexistent/hkdfguard-latch-test-a/pkcs11.pin");
         let first = FileIdentity { dev: 1, ino: 2, len: 5, mtime: (10, 0) };
@@ -1049,6 +1753,132 @@ mod tests {
         let v2 = Some(FileIdentity { mtime: (11, 0), ..first }); // the operator rewrote the file
         assert!(pin_login_blocked(path, v2).is_none(), "a changed file clears the latch, so one login can try it");
         assert!(pin_login_blocked(path, v1).is_none(), "and it stays cleared");
+    }
+
+    #[test]
+    fn a_rejection_recorded_in_the_state_dir_reaches_other_processes_until_the_pin_file_changes() {
+        // What a second process does is exactly these calls, with nothing
+        // in its own `PIN_LATCHES`.
+        let dir = crate::secure_file::private_tempdir();
+        let first = FileIdentity { dev: 7, ino: 42, len: 5, mtime: (-3, 999_999_999) };
+        assert!(read_shared_latch(dir.path(), Some(first)).is_none(), "no record yet");
+
+        write_shared_latch(dir.path(), Some(first), "the token rejected the configured PIN (PinIncorrect)");
+        assert_eq!(
+            read_shared_latch(dir.path(), Some(first)).as_deref(),
+            Some("the token rejected the configured PIN (PinIncorrect)")
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from(SHARED_LATCH_FILE)], "no temporary file is left behind");
+        let mode = std::fs::metadata(dir.path().join(SHARED_LATCH_FILE)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644, "readable by the other accounts sharing the directory, whatever the umask");
+
+        let rewritten = FileIdentity { mtime: (11, 0), ..first }; // the operator corrected the file
+        assert!(read_shared_latch(dir.path(), Some(rewritten)).is_none(), "a changed PIN file is not blocked");
+        assert!(read_shared_latch(dir.path(), None).is_none(), "nor is a file whose version is unknown");
+
+        // A later rejection of the corrected file replaces the record.
+        write_shared_latch(dir.path(), Some(rewritten), "again");
+        assert_eq!(read_shared_latch(dir.path(), Some(rewritten)).as_deref(), Some("again"));
+        assert!(read_shared_latch(dir.path(), Some(first)).is_none());
+    }
+
+    #[test]
+    fn only_a_whole_record_blocks_a_login() {
+        let id = FileIdentity { dev: 1, ino: 2, len: 3, mtime: (4, 5) };
+        let good = shared_latch_text(id, "why");
+        assert_eq!(parse_shared_latch(&good), Some((id, "why".to_string())));
+
+        for bad in [
+            "",
+            "garbage",
+            "hkdfguard-pin-rejected 2\n1 2 3 4 5\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 3 4\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 3 4 5 6\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 x 4 5\nwhy\n",
+            "hkdfguard-pin-rejected 1\n1 2 3 4 5\n", // cut off before the reason: not written whole
+        ] {
+            assert_eq!(parse_shared_latch(bad), None, "{bad:?}");
+        }
+
+        // The reason reaches an operator's log: nothing but printable ASCII, on one line.
+        let (_, reason) = parse_shared_latch("hkdfguard-pin-rejected 1\n1 2 3 4 5\nline\x1b[2Jone\u{e9}\n").unwrap();
+        assert_eq!(reason, "line[2Jone");
+        assert!(!shared_latch_text(id, "two\nlines").trim_end().ends_with("lines\n"));
+        assert_eq!(parse_shared_latch(&shared_latch_text(id, "two\nlines")).unwrap().1, "twolines");
+
+        // Whatever else is at the name -- a link, a directory, junk -- blocks nothing.
+        let dir = crate::secure_file::private_tempdir();
+        let record = dir.path().join(SHARED_LATCH_FILE);
+        std::fs::write(&record, "junk").unwrap();
+        assert!(read_shared_latch(dir.path(), Some(id)).is_none());
+        std::fs::remove_file(&record).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, &good).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+        assert!(read_shared_latch(dir.path(), Some(id)).is_none(), "a link is not followed");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert!(read_shared_latch(dir.path(), Some(id)).is_none());
+    }
+
+    #[test]
+    fn the_pin_state_dir_must_be_a_directory_closed_to_other_accounts() {
+        let base = crate::secure_file::private_tempdir();
+        let dir = base.path().join("state");
+        assert!(check_pin_state_dir(&dir).unwrap_err().contains("Create it"), "a missing one says what to do");
+
+        std::fs::create_dir(&dir).unwrap();
+        for mode in [0o700, 0o770, 0o2770, 0o750] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            check_pin_state_dir(&dir).unwrap_or_else(|e| panic!("mode {mode:o} must pass: {e}"));
+        }
+        // Search or read alone is enough to hold the login lock.
+        for mode in [0o777, 0o1777, 0o702, 0o755, 0o751, 0o774] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = check_pin_state_dir(&dir).unwrap_err();
+            assert!(err.contains("open to every account"), "mode {mode:o}: {err}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(check_pin_state_dir(&link).unwrap_err().contains("not a directory"), "a link to one is refused");
+        let file = base.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(check_pin_state_dir(&file).unwrap_err().contains("not a directory"));
+    }
+
+    #[test]
+    fn first_logins_take_turns_across_processes() {
+        // Two open file descriptions, as two processes have.
+        let dir = crate::secure_file::private_tempdir();
+        let none = std::time::Duration::ZERO;
+        let held = SharedLoginLock::acquire(dir.path(), none).expect("free: taken at once");
+        let err = SharedLoginLock::acquire(dir.path(), none).err().expect("held: the second must not get it");
+        assert!(err.contains("no login was attempted"), "{err}");
+        drop(held);
+        SharedLoginLock::acquire(dir.path(), none).expect("released when its holder is done");
+
+        // A FIFO at the name can't hang the open, and is refused.
+        let fifo_dir = crate::secure_file::private_tempdir();
+        let fifo = std::ffi::CString::new(fifo_dir.path().join(SHARED_LOGIN_LOCK_FILE).to_str().unwrap()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(SharedLoginLock::acquire(fifo_dir.path(), none).err().unwrap().contains("not a regular file"));
+    }
+
+    #[test]
+    fn a_confirmed_pin_is_one_file_version() {
+        let path = Path::new("/nonexistent/hkdfguard-confirmed-test/pkcs11.pin");
+        let v1 = Some(FileIdentity { dev: 1, ino: 2, len: 5, mtime: (10, 0) });
+        let v2 = Some(FileIdentity { dev: 1, ino: 3, len: 5, mtime: (10, 0) });
+        set_pin_confirmed(Some((path.to_path_buf(), v1)));
+        assert!(pin_confirmed(path, v1));
+        assert!(!pin_confirmed(path, v2), "a rewritten file has not been confirmed");
+        assert!(!pin_confirmed(Path::new("/nonexistent/other.pin"), v1));
+        set_pin_confirmed(None);
+        assert!(!pin_confirmed(path, v1));
     }
 
     #[test]
@@ -1166,6 +1996,62 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn a_pinned_service_is_claimed_even_with_no_module_configured() {
+        // Not layered, as above. A pin says the service's KEK is on a
+        // token: with PKCS#11 not even configured, the chain must stop
+        // here, not hand the service to the next provider.
+        let pinned = "com.company.orders";
+        let fingerprint = "ab".repeat(crate::payload::FINGERPRINT_LEN);
+        let _policy = crate::policy::test_support::TestPolicy::exact(format!(
+            "[selection]\nmode = \"prefer\"\n[pkcs11.pinned_keys]\n\"{pinned}\" = \"{fingerprint}\"\n"
+        ));
+        let provider = Pkcs11Provider::new();
+        assert!(!provider.probe());
+        match provider.claims_while_absent(pinned) {
+            Err(Error::Provider(msg)) => assert!(msg.contains("pkcs11.pinned_keys") && msg.contains("Refusing"), "{msg}"),
+            other => panic!("a pinned service must be claimed, got {other:?}"),
+        }
+        assert!(provider.claims_while_absent("com.company.unpinned").is_ok());
+        assert!(matches!(service_pins(pinned).unwrap(), Pins::OneOf(pins) if pins == vec![[0xab; crate::payload::FINGERPRINT_LEN]]));
+        // Production, with nothing said about the allowlist: it is on.
+        assert!(matches!(service_pins("com.company.unpinned").unwrap(), Pins::Unpinned));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pins_follow_policy_and_a_broken_policy_fails_closed() {
+        use crate::policy::test_support::TestPolicy;
+        {
+            let _allowlist = TestPolicy::exact("[selection]\nmode = \"prefer\"\n[pkcs11]\nrequire_pinned_keys = true\n");
+            assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Unpinned));
+        }
+        {
+            // Production, where nothing set means the allowlist is on.
+            let _default = TestPolicy::minimal();
+            assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Unpinned));
+        }
+        {
+            let _off = TestPolicy::exact("[selection]\nmode = \"prefer\"\n[pkcs11]\nrequire_pinned_keys = false\n");
+            assert!(matches!(service_pins("com.company.orders").unwrap(), Pins::Any));
+        }
+        {
+            let _none = TestPolicy::absent();
+            assert!(service_pins("com.company.orders").is_err(), "a missing policy must not report 'nothing pinned'");
+        }
+        let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\n");
+        assert!(service_pins("com.company.orders").is_err(), "a broken policy must not report 'nothing pinned'");
+    }
+
+    #[test]
+    fn a_key_whose_fingerprint_is_not_pinned_is_named_with_the_pins() {
+        let (pinned, other) = ([0x11u8; crate::payload::FINGERPRINT_LEN], [0x22u8; crate::payload::FINGERPRINT_LEN]);
+        assert_eq!(pin_mismatch(&pinned, &[other, pinned]), None, "any one of the pins is accepted");
+        let msg = pin_mismatch(&other, &[pinned]).expect("a different key is refused");
+        assert!(msg.contains(&hex(&other)) && msg.contains(&hex(&pinned)) && msg.contains("replaced"), "{msg}");
+    }
+
+    #[test]
     fn module_path_must_be_absolute() {
         assert!(validate_module_path(Path::new("libsofthsm2.so")).is_err());
         assert!(validate_module_path(Path::new("./libsofthsm2.so")).is_err());
@@ -1179,6 +2065,29 @@ mod tests {
         let f = pin_file(b"not really a module", 0o755);
         let err = validate_module_path(f.path()).unwrap_err();
         assert!(err.contains("refusing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_module_path_through_a_link_someone_else_could_retarget_is_rejected() {
+        if crate::secure_file::skip_as_root() {
+            return; // as root, the directory the link lives in is root-owned too
+        }
+        // The file the path ends at is one validation accepts (see the next
+        // test): what is refused is the route to it, through a directory
+        // this (non-root) user owns and could repoint at any time.
+        let dir = crate::secure_file::private_tempdir();
+        let system = Path::new("/bin/sh");
+        validate_module_path(system).expect("the control: the target itself passes");
+
+        let file_link = dir.path().join("libhsm.so");
+        std::os::unix::fs::symlink(system, &file_link).unwrap();
+        let dir_link = dir.path().join("current");
+        std::os::unix::fs::symlink(system.parent().unwrap(), &dir_link).unwrap();
+        for through in [file_link, dir_link.join("sh")] {
+            assert_eq!(std::fs::canonicalize(&through).unwrap(), std::fs::canonicalize(system).unwrap(), "it does lead there");
+            let err = validate_module_path(&through).unwrap_err();
+            assert!(err.contains("refusing") && err.contains("not an allowed owner"), "{}: {err}", through.display());
+        }
     }
 
     #[test]
@@ -1273,6 +2182,90 @@ mod tests {
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
     #[serial_test::serial]
+    fn a_pin_refuses_a_replaced_or_deleted_key_and_the_allowlist_gates_provisioning() {
+        use crate::policy::test_support::TestPolicy;
+        let service = "com.hkdfguard.test.pinned";
+        let fingerprint_of = |provider: &Pkcs11Provider| hex(&crate::crypto::kek_fingerprint(&*provider.load_kek(service, false).unwrap()).unwrap());
+        let pin = |fingerprint: &str| TestPolicy::write(&format!("[pkcs11.pinned_keys]\n\"{service}\" = \"{fingerprint}\"\n"));
+
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| destroy_all_for(open, service));
+        drop(provider.load_kek(service, true).unwrap());
+        let original = fingerprint_of(&provider);
+
+        // Pinned to the key that is there: used as before.
+        {
+            let _policy = pin(&original);
+            let provider = Pkcs11Provider::new();
+            assert!(provider.kek_exists(service).unwrap());
+            provider.load_kek(service, false).unwrap();
+        }
+
+        // What any PIN holder can do without this library: delete the key
+        // and generate another under the same label. Every attribute check
+        // passes; only the pin tells them apart.
+        with_open(&provider, |open| destroy_all_for(open, service));
+        drop(provider.load_kek(service, true).unwrap());
+        assert_ne!(fingerprint_of(&provider), original);
+        {
+            let _policy = pin(&original);
+            let provider = Pkcs11Provider::new();
+            for refused in [provider.kek_exists(service).err(), provider.load_kek(service, false).err(), provider.load_kek(service, true).err()] {
+                match refused {
+                    Some(Error::Provider(msg)) => assert!(msg.contains("not the one pinned") && msg.contains(&original), "{msg}"),
+                    other => panic!("a replaced key must be refused, got {other:?}"),
+                }
+            }
+        }
+
+        // Deleted outright: an error, never "no key here" -- and nothing is
+        // generated in its place, even when creation is asked for.
+        with_open(&provider, |open| destroy_all_for(open, service));
+        {
+            let _policy = pin(&original);
+            let provider = Pkcs11Provider::new();
+            for refused in [provider.kek_exists(service).err(), provider.load_kek(service, false).err(), provider.load_kek(service, true).err()] {
+                match refused {
+                    Some(Error::Provider(msg)) => assert!(msg.contains("the token holds none"), "{msg}"),
+                    other => panic!("a pinned service's missing key must be an error, got {other:?}"),
+                }
+            }
+            assert_eq!(with_open(&provider, |open| count_labelled(&open.session, service).unwrap()), 0, "nothing was generated");
+        }
+
+        // The allowlist: provisioning an unpinned service creates its key
+        // and is refused with the fingerprint to pin; until then the
+        // service has no KEK here.
+        {
+            let _policy = TestPolicy::write("[pkcs11]\nrequire_pinned_keys = true\n");
+            let provider = Pkcs11Provider::new();
+            assert!(!provider.kek_exists(service).unwrap());
+            assert!(matches!(provider.load_kek(service, false), Err(Error::KeyNotProvisioned(_))));
+            let message = match provider.load_kek(service, true) {
+                Err(Error::Provider(msg)) => msg,
+                other => panic!("expected pinning instructions, got {:?}", other.map(|_| ())),
+            };
+            assert!(!provider.kek_exists(service).unwrap(), "still unpinned: still no KEK here");
+            // Read straight off the token: under the allowlist no handle is given out.
+            let created = with_open(&provider, |open| {
+                let key = find_key(&open.session, service, open).unwrap().expect("provisioning generated the key");
+                hex(&crate::crypto::kek_fingerprint(&SessionKey { session: &open.session, key }).unwrap())
+            });
+            assert!(message.contains(&format!("\"{service}\" = \"{created}\"")), "{message}");
+
+            let _pinned = pin(&created);
+            let provider = Pkcs11Provider::new();
+            assert!(provider.kek_exists(service).unwrap());
+            provider.load_kek(service, true).expect("pinned: provisioned");
+        }
+
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
     fn retire_kek_deletes_the_key_only_with_its_fingerprint() {
         let service = "com.hkdfguard.test.retire";
         let provider = Pkcs11Provider::new();
@@ -1303,6 +2296,147 @@ mod tests {
         assert_ne!(crate::crypto::kek_fingerprint(&*again).unwrap(), fingerprint);
         drop(again);
         with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_logged_out_session_is_an_error_not_a_missing_key() {
+        // The login belongs to the process, not the session: anything else
+        // in the process using the module can end it. The token then hides
+        // every private object, and the search for the service's key comes
+        // back empty -- which must not read as "no key here, try the next
+        // provider".
+        let service = "com.hkdfguard.test.loggedout";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| destroy_all_for(open, service));
+        assert!(!provider.kek_exists(service).unwrap(), "logged in, and no key: a plain no");
+        drop(provider.load_kek(service, true).unwrap());
+
+        with_open(&provider, |open| open.session.logout().unwrap());
+
+        let refused = |result: Result<()>| match result {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("not logged in as the user"), "{msg}");
+                assert!(!msg.contains(service), "errors must not name the service: {msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        };
+        refused(provider.kek_exists(service).map(|_| ()));
+        refused(provider.load_kek(service, false).map(|_| ())); // not KeyNotProvisioned: the chain must stop here
+        refused(provider.load_kek(service, true).map(|_| ())); // and no second key is generated beside the hidden one
+        refused(provider.retire_kek(service, &[0x11; 32]));
+
+        // A fresh provider logs in again, and finds the one key still there.
+        drop(provider);
+        let provider = Pkcs11Provider::new();
+        assert!(provider.kek_exists(service).unwrap());
+        with_open(&provider, |open| {
+            assert_eq!(count_labelled(&open.session, service).unwrap(), 1);
+            destroy_all_for(open, service);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_logout_followed_by_a_new_login_is_still_seen() {
+        // Logged out and straight back in: the session state reads
+        // "logged in" again, so only the login witness -- a private
+        // session object, which C_Logout destroyed -- can tell that the
+        // token was hiding private objects in between.
+        let service = "com.hkdfguard.test.relogin";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        with_open(&provider, |open| {
+            destroy_all_for(open, service);
+            let witness = open.witness.as_ref().expect("SoftHSM2 creates the login witness");
+            assert!(witness.intact(&open.session), "intact while the login lasts");
+        });
+        assert!(!provider.kek_exists(service).unwrap(), "logged in throughout, and no key: a plain no");
+
+        let pin_path = crate::policy::pkcs11_settings().unwrap().pin_file.unwrap_or_else(|| PathBuf::from(DEFAULT_PIN_FILE));
+        let pin = read_pin_file(&pin_path).unwrap();
+        with_open(&provider, |open| {
+            open.session.logout().unwrap();
+            open.session.login(UserType::User, Some(&pin)).unwrap();
+            let state = open.session.get_session_info().unwrap().session_state();
+            assert!(matches!(state, SessionState::RoUser), "logged in again: {state:?}");
+        });
+
+        let refused = |result: Result<()>| match result {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("login was interrupted"), "{msg}");
+                assert!(!msg.contains(service), "errors must not name the service: {msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        };
+        refused(provider.kek_exists(service).map(|_| ()));
+        refused(provider.load_kek(service, false).map(|_| ())); // not KeyNotProvisioned: the chain must stop here
+        refused(provider.load_kek(service, true).map(|_| ())); // nor generate a key beside one it may not have seen
+        refused(provider.retire_kek(service, &[0x11; 32]));
+        with_open(&provider, |open| assert_eq!(count_labelled(&open.session, service).unwrap(), 0, "nothing generated"));
+
+        // A fresh provider has a witness of its own, and answers again.
+        drop(provider);
+        let provider = Pkcs11Provider::new();
+        assert!(!provider.kek_exists(service).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_forked_child_initializes_the_module_for_itself() {
+        // The parent loads and initializes the module; a child created with
+        // fork() must run C_Initialize again before using it, as PKCS#11
+        // asks, and then work like any other process. The child reports
+        // through its exit status, never by panicking: it is a copy of the
+        // test harness. 0 is a pass; anything else names the failed check.
+        let service = "com.hkdfguard.test.forked";
+        let parent = Pkcs11Provider::new();
+        assert!(parent.probe(), "no PKCS#11 session available");
+        with_open(&parent, |open| destroy_all_for(open, service));
+        let expected = prf_of(&*parent.load_kek(service, true).unwrap(), b"input");
+        drop(parent);
+        let parent_pid = this_process();
+        let initialized_by = || {
+            let modules = MODULES.lock().unwrap();
+            modules.iter().map(|m| m.initialized_by).collect::<Vec<_>>()
+        };
+        assert_eq!(initialized_by(), vec![parent_pid]);
+
+        // SAFETY: this test runs alone (serial), so no other thread holds a
+        // lock the child needs; the child only calls this module and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let child = Pkcs11Provider::new();
+            let code = if !child.connected() {
+                1 // refused: the inherited module wasn't usable
+            } else if initialized_by() != vec![this_process()] {
+                2 // the module wasn't initialized again in this process
+            } else {
+                match child.load_kek(service, false).and_then(|h| h.prf(&[b"input"])).map(|out| *out[0]) {
+                    Ok(out) if out == expected => 0,
+                    Ok(_) => 3, // a different key
+                    Err(_) => 4,
+                }
+            };
+            // SAFETY: _exit takes a status and does not return.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: waitpid writes the status of the child just forked.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "the forked child did not exit normally (status {status:#x})");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "forked-child check failed: see the numbered checks above");
+
+        // The parent's own entry is untouched, and it still works.
+        assert_eq!(initialized_by(), vec![parent_pid]);
+        let parent = Pkcs11Provider::new();
+        assert_eq!(prf_of(&*parent.load_kek(service, false).unwrap(), b"input"), expected);
+        with_open(&parent, |open| destroy_all_for(open, service));
     }
 
     #[test]
@@ -1469,6 +2603,121 @@ mod tests {
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
     #[serial_test::serial]
+    fn a_generated_key_that_could_be_altered_or_copied_later_is_refused() {
+        // Generated on the token, never exposed, right label and ID: it
+        // passes every check but these. Left modifiable, a PIN holder could
+        // turn on CKA_DERIVE afterwards; left copyable, copy it with other
+        // attributes. Each is refused on its own, by name.
+        let service = "com.hkdfguard.test.alterable";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        let locked = [Attribute::Sensitive(true), Attribute::Extractable(false), Attribute::Derive(false)];
+        for (loosened, name) in [(Attribute::Modifiable(true), "Modifiable"), (Attribute::Copyable(true), "Copyable")] {
+            with_open(&provider, |open| {
+                destroy_all_for(open, service);
+                let mut extra = locked.to_vec();
+                extra.push(loosened.clone());
+                extra.push(if name == "Modifiable" { Attribute::Copyable(false) } else { Attribute::Modifiable(false) });
+                plant_key_with(open, service, key_id(service), &extra);
+            });
+            let msg = provider.load_kek(service, true).err().expect("a key that can be altered must be refused").to_string();
+            assert!(msg.contains("lacks the protections") && msg.contains(name), "{name}: {msg}");
+            assert!(!msg.contains(service), "errors must not name the service: {msg}");
+            assert!(provider.kek_exists(service).is_err(), "{name}: kek_exists must not answer either way");
+        }
+        with_open(&provider, |open| destroy_all_for(open, service));
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
+    fn a_derived_key_is_refused_though_it_was_never_exposed() {
+        // C_DeriveKey from a sensitive base key: always-sensitive and
+        // never-extractable, so only CKA_LOCAL tells it from a generated
+        // one -- and its value is a function of a base key and data its
+        // maker chose. (CKM_AES_CBC_ENCRYPT_DATA: the derivation SoftHSM2
+        // implements for secret keys.)
+        let service = "com.hkdfguard.test.derivedkey";
+        let provider = Pkcs11Provider::new();
+        assert!(provider.probe(), "no PKCS#11 session available");
+        let derived = with_open(&provider, |open| {
+            destroy_all_for(open, service);
+            let rw = open.pkcs11.open_rw_session(open.slot).unwrap();
+            let base = rw
+                .generate_key(
+                    &Mechanism::AesKeyGen,
+                    &[
+                        Attribute::Class(ObjectClass::SECRET_KEY),
+                        Attribute::KeyType(KeyType::AES),
+                        Attribute::ValueLen((KEK_LEN as u64).into()),
+                        Attribute::Token(false),
+                        Attribute::Sensitive(true),
+                        Attribute::Extractable(false),
+                        Attribute::Derive(true),
+                    ],
+                )
+                .unwrap();
+            let data = [0x5au8; KEK_LEN]; // chosen by the key's maker; a whole number of AES blocks
+            let base_template = [
+                Attribute::Class(ObjectClass::SECRET_KEY),
+                Attribute::KeyType(KeyType::GENERIC_SECRET),
+                Attribute::ValueLen((KEK_LEN as u64).into()),
+                Attribute::Token(true),
+                Attribute::Private(true),
+                Attribute::Sensitive(true),
+                Attribute::Extractable(false),
+                Attribute::Sign(true),
+                Attribute::Label(key_label(service).into_bytes()),
+                Attribute::Id(key_id(service)),
+            ];
+            // hkdfguard's other protections, set where the token lets a
+            // derivation set them: some SoftHSM2 builds (RHEL 9's 2.6.1)
+            // refuse one as read-only (CKR_ATTRIBUTE_READ_ONLY). Each left
+            // out is then expected among the reasons the key is refused.
+            let optional = [Attribute::Modifiable(false), Attribute::Copyable(false), Attribute::Derive(false)];
+            let mut last = None;
+            for mask in 0u8..(1 << optional.len()) {
+                let left_out: Vec<AttributeType> =
+                    optional.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, a)| a.attribute_type()).collect();
+                let mut template = base_template.to_vec();
+                template.extend(optional.iter().filter(|a| !left_out.contains(&a.attribute_type())).cloned());
+                let params = cryptoki::mechanism::ekdf::AesCbcDeriveParams::new([0u8; 16], &data);
+                match rw.derive_key(&Mechanism::AesCbcEncryptData(params), base, &template) {
+                    Ok(key) => {
+                        let attrs = rw.get_attributes(key, &[AttributeType::Local, AttributeType::AlwaysSensitive]).unwrap();
+                        return Ok((attrs, left_out));
+                    }
+                    Err(e @ CryptokiError::Pkcs11(RvError::AttributeReadOnly, _)) => last = Some(e),
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(last.unwrap())
+        });
+        // No skip: the suites run these tests against SoftHSM2, which
+        // implements this derivation, and output is captured -- a skip
+        // would print `ok` like a pass and prove nothing.
+        let (attrs, left_out) = derived.unwrap_or_else(|e| {
+            with_open(&provider, |open| destroy_all_for(open, service));
+            panic!("the token couldn't derive a key with CKM_AES_CBC_ENCRYPT_DATA: {e}")
+        });
+        assert!(attrs.contains(&Attribute::Local(false)), "a derived key is not local: {attrs:?}");
+
+        // Refused, for CKA_LOCAL -- and for nothing else but what the token
+        // wouldn't let the derivation set.
+        let msg = provider.load_kek(service, true).err().expect("a derived key must be refused").to_string();
+        with_open(&provider, |open| destroy_all_for(open, service));
+        assert!(msg.contains("lacks the protections"), "{msg}");
+        let listed = msg.split_once("generates its keys with (").and_then(|(_, rest)| rest.split_once(')')).map(|(l, _)| l);
+        let listed: Vec<&str> = listed.unwrap_or_else(|| panic!("no list of protections: {msg}")).split(", ").collect();
+        let allowed: Vec<String> =
+            std::iter::once("Local".to_string()).chain(left_out.iter().map(|t| format!("{t:?}"))).collect();
+        assert!(listed.contains(&"Local"), "{msg}");
+        assert!(listed.iter().all(|l| allowed.iter().any(|a| a == l)), "refused for {listed:?}; expected only {allowed:?}");
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
+    #[serial_test::serial]
     fn an_imported_key_with_every_attribute_right_is_refused() {
         // A key whose value its importer knows, with hkdfguard's whole
         // template: only CKA_ALWAYS_SENSITIVE / CKA_NEVER_EXTRACTABLE,
@@ -1549,7 +2798,7 @@ mod tests {
             let info = open.session.get_session_info().unwrap();
             assert!(!info.read_write(), "the provider's own session must be read-only");
 
-            let key = find_key(&open.session, service).unwrap().unwrap();
+            let key = find_key(&open.session, service, open).unwrap().unwrap();
             let wanted = [
                 Attribute::Modifiable(false),
                 Attribute::Copyable(false),

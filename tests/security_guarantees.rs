@@ -257,7 +257,7 @@ fn tpm_untrustworthy_key_file_fails_the_call() {
         format!(
             "preferred_order = [\"tpm2\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n\
              [startup_behavior]\nsetup_min_delay_ms = 0\n\
-             [tpm]\nkey_dir = \"{}\"\n{}\
+             [tpm]\nkey_dir = \"{}\"\nallow_unpinned_provisioning = true\n{}\
              [external_secret]\ndir = \"{}\"\n",
             key_dir.path().display(),
             tcti.map(|t| format!("tcti = \"{t}\"\n")).unwrap_or_default(),

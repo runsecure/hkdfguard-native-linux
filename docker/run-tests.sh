@@ -6,8 +6,8 @@
 #
 # It also mounts a read-only volume at /run/hkdfguard-ro-secrets, laid out
 # like a Kubernetes Secret volume (a 1777 root holding KEK files), so the
-# library's one exception to "nothing under a sticky, world-writable
-# directory" -- a read-only mount -- is exercised on a real mount
+# library's one exception to "nothing under a world-writable directory"
+# -- a sticky directory on a read-only mount -- is exercised on a real mount
 # (docker/entrypoint-test.sh fails without it).
 #
 # The container is already ephemeral (`docker run --rm`, and named so an
@@ -46,14 +46,15 @@ trap 'exit 143' TERM
 
 docker build -t "$TAG" -f docker/Dockerfile .
 # The read-only secret volume: a 1777 root, as the kubelet makes a Secret
-# volume, with a KEK for the test service in it and in a 0755
-# subdirectory, each ci's own and 0400. Filled here, then mounted
-# read-only into the test container.
+# volume, with a KEK for the test service in it, in a 0755 subdirectory,
+# and in a 0777 one (a ConfigMap volume's mode: not sticky, so refused even
+# read-only), each ci's own and 0400. Filled here, then mounted read-only
+# into the test container.
 docker volume create "$RO_VOLUME" >/dev/null
 docker run --rm --name "$CONTAINER-ro" --entrypoint sh -v "$RO_VOLUME:/v" "$TAG" -c '
     set -e
-    chmod 1777 /v && install -d -m 0755 /v/hkdfguard
-    for d in /v /v/hkdfguard; do
+    chmod 1777 /v && install -d -m 0755 /v/hkdfguard && install -d -m 0777 /v/unsticky
+    for d in /v /v/hkdfguard /v/unsticky; do
         head -c 32 /dev/urandom > "$d/com.hkdfguard.dockertest.romount"
         chown ci:ci "$d/com.hkdfguard.dockertest.romount" && chmod 0400 "$d/com.hkdfguard.dockertest.romount"
     done'

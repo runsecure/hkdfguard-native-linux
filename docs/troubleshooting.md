@@ -36,24 +36,39 @@ fixing the policy or a file, just try again. Nothing needs restarting.
 
 ## Every call fails: the policy is refused (-9)
 
-`HKDFGUARD_ERR_POLICY_INVALID` means the policy file exists but can't be
-trusted or parsed, and then **every** call fails. The library never falls
-back to defaults in that case.
+`HKDFGUARD_ERR_POLICY_INVALID` means the policy file is missing, or can't
+be trusted or parsed, and then **every** call fails. The library never
+falls back to defaults.
 
 | Message contains | Cause | Fix |
 |---|---|---|
+| `does not exist, and a policy file is required` | There is no `/etc/hkdfguard/policy.toml`: it was never installed, or the volume or ConfigMap that carries it isn't mounted in this container | Install one (`sudo install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example /etc/hkdfguard/policy.toml`), or fix the mount. The shortest valid policy is `[selection]` / `mode = "prefer"` |
+| `it is on a FUSE filesystem served by uid ...` | The file (policy, secret, PIN, key file) is on a FUSE mount that a non-root user's process serves, which can report any owner, mode and contents | Put the file on a filesystem root controls. A FUSE mount made by root (`user_id=0` in `/proc/self/mountinfo`) and virtiofs are accepted |
+| `it is on a FUSE filesystem, and who serves it could not be read` | As above, and `/proc` isn't mounted, so the library can't tell who serves the mount | Mount `/proc`, or move the file off FUSE |
 | `refusing to trust its location (directory ...: writable by group or others (mode 775) ...)` | `/etc/hkdfguard` or a directory above it can be changed by non-root users | `sudo chmod go-w <directory>`; every directory up to `/` must be root-owned and not group- or other-writable |
-| `... (mode 1777; sticky, like /tmp, which is not enough) ...` | The file (policy, secret, PIN, module, key file) is somewhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory, even inside a private directory there | Move it to a directory only root (or, where allowed, the service) can write, all the way up to `/`. Sticky directories are never trusted; only a read-only mount, such as a Kubernetes Secret volume, is exempt |
+| `... (mode 1777; sticky, like /tmp, which is not enough) ...` | The file (policy, secret, PIN, module, key file) is somewhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory, even inside a private directory there | Move it to a directory only root (or, where allowed, the service) can write, all the way up to `/`. Sticky directories are never trusted; only a sticky directory on a read-only mount, such as a Kubernetes Secret volume, is exempt |
+| `... (mode 777) ...` on a read-only Kubernetes volume | A plain `configMap:` volume or a disk-backed `emptyDir` is `0777` and not sticky, so being mounted read-only doesn't exempt it | Mount the ConfigMap through a `projected:` volume (`1777`); for an `emptyDir`, use `medium: Memory` or mount a private subdirectory |
+| `a POSIX ACL entry gives user ... write access` (or `read access`) | An ACL on the file or a directory above it names someone the trust rules don't accept; `ls -l` shows only the ACL's mask | `getfacl <path>`, then remove the entry (`setfacl -x u:<user> <path>`) or the whole ACL (`setfacl -b <path>`); check directories for a default ACL (`setfacl -k`) too |
 | `owned by uid ..., which is not an allowed owner` | The policy, or a directory above it, isn't owned by root | `sudo chown root:root /etc/hkdfguard/policy.toml` |
 | `permissions too broad (mode ...)` | The policy is group- or other-writable | `sudo chmod 0644 /etc/hkdfguard/policy.toml` |
 | `TOML parse error` | Invalid TOML. Most often a top-level key (`preferred_order`) below a `[section]`, or an unquoted service name in `[tpm.pinned_names]` | Move `preferred_order` above the first section; quote service names: `"com.company.orders" = ...` |
+| `has an entry for "...", which is not a service name` | A key in `[tpm.pinned_names]`, `[tpm.auth_groups]` or a `pinned_keys` table has a character no service name can (an underscore, a hyphen, a space), so the entry could never apply | Correct the name: ASCII letters, digits and `.` only, as the application passes it |
 | `unknown field` | A misspelled or misplaced setting | Check it against the [policy reference](configuration.md#policy-reference) |
 | `selection.mode "require" needs a selection.provider` (or similar) | `provider` and `level` don't match the mode | `require` takes `provider`, `require-level` takes `level`, `prefer` takes neither |
 | `unknown variant` ... `session_encryption` | `"auto"` or `"required"`, from before authValues | Use `"on"` (the default) or remove the line |
 | `holds a key with an empty password (emptyAuth)` | A TPM key file from before authValues | Delete it and run `hkdfguard provision` again; re-wrap the DEKs |
 | `pkcs11.module is set, but its PIN file ... does not exist` | PKCS#11 is configured, but the PIN file is missing, misnamed, or was removed during a rotation | Create the PIN file (root-owned, `0400`, or `root:<service-group> 0440`); or remove `pkcs11.module` to stop using PKCS#11 |
 | `this service has a TPM key file (...), but this process could not open the TPM` | The service's KEK is on the TPM, but this process can't open `/dev/tpmrm0`: usually it lost `tss` membership, or the tpm2-tss device TCTI isn't installed | Restore the access (`usermod -aG tss <user>`, then restart the service); new KEKs are not created on a weaker provider meanwhile |
-| `TPM key file has no authValue file` | The `<service>.tpmauth` beside the key file is missing | Restore it from the backup taken with the key file, or retire and re-provision |
+| `this service has a TPM key file (...), but there is no TPM device at /dev/tpmrm0` | The service's KEK is on the TPM, and the TPM device is gone: the kernel driver didn't load, the TPM or vTPM was disabled or detached, or the container was started without the device | Restore the TPM (`ls -l /dev/tpmrm0`; firmware or VM settings; pass the device into the container). If the service has moved off the TPM for good, delete its `.tpmkey` and `.tpmauth` files; DEKs wrapped under that key are then unrecoverable |
+| `policy pins an external secret for this service ..., but none is mounted` | `external_secret.pinned_keys` names the service, so its KEK is an external secret, but no file for it is mounted (not yet, or no longer) | Mount the secret; or remove the service's pin if it no longer uses one |
+| `the PKCS#11 session is not logged in as the user` | Something else in the process using the same PKCS#11 module logged out of the token (`C_Logout`, `C_CloseAllSessions`) during a call; the token then hides the service's key | Retry the call; stop the application logging out of a token this library is using |
+| `the PKCS#11 login was interrupted during this call` | The same, but the other code logged in again before the check: the token may still have hidden the key during the search | As above |
+| `could not create a private session object` (warning) | The PKCS#11 module refuses a private, non-token data object in a read-only session, which the library uses to detect a logout followed at once by a new login | Nothing to fix; on this token only that narrow case goes undetected. The plain logged-out check still applies |
+| `C_Initialize failed: ... (re-initializing the module in a process forked from the one that loaded it)` | A child created with `fork()` must initialize a PKCS#11 module again, and this module refused | Use the module's own guidance for forked processes; or open PKCS#11 only after forking, or `exec` in the child |
+| `TPM key file has no authValue file` | The `<service>.tpmauth` beside the key file is missing | Restore it from the backup taken with the key file. Without one the key can't be used or retired (retire confirms the fingerprint on the TPM, which needs the authValue): delete the `.tpmkey` file by hand and provision again; DEKs wrapped under the old key are lost |
+| `refusing to provision a TPM key: this service has an authValue file (...) but no key file` | A `<service>.tpmauth` with no `<service>.tpmkey`: left by a key file deleted by hand or a retire that couldn't delete it, or the key file is only missing for now (a restore in progress, a directory not mounted). Provisioning never replaces an authValue file, since without it the key file opens nothing | If the key file should be there, put it back and the key works as before. If the key is gone for good, delete the `.tpmauth` file and provision again |
+| `TPM authValue file ... can't be read by this process` | A service's `.tpmauth` file is readable only by root and the service's group from `tpm.auth_groups`; this service runs as an account in neither | Add `"<service>" = "<the service's group>"` under `[tpm.auth_groups]`, and `chgrp <group>` the file (or retire and provision again) |
+| `tpm.auth_groups group "..." ...: an over-broad group can't be a tpm.auth_groups group` (-80) | `tpm.auth_groups` names `users`, `root`, `nogroup` or another group that covers essentially every account | Name a group only the service's accounts are in |
 
 ## No provider is available (-3)
 
@@ -102,8 +117,11 @@ wrong. The library stops rather than quietly using a weaker provider.
 | `TPM2_Load of this service's key file failed` | The key file was made by another TPM, or this TPM was cleared since (a firmware reset can do it). The key is gone for good; see [Fingerprint mismatch](#fingerprint-mismatch--16). |
 | `TSS2_LOG enables debug/trace logging in tpm2-tss ...` | Unset `TSS2_LOG`, or lower it to `info` or below: at debug levels tpm2-tss logs secrets |
 | `tpm.require_pinned_names is set and this service has no pinned TPM Name` | The service isn't in `[tpm.pinned_names]`. Add the line the message prints, then run `provision` again. |
+| `refusing to provision a TPM key: policy pins no storage root key` | `provision` creates no TPM key until `tpm.pinned_session_salt_key_name` is set: the new key's authValue is sent encrypted to that key. Add the line the message prints to the `[tpm]` table, then run `provision` again. On a firmware or virtual TPM, `allow_unpinned_provisioning = true` there provisions without it. |
+| `the TPM key directory's lock ... is still held after 30 seconds` | Another `provision` or `retire` is running, or one is stuck. Nothing was changed. Run it again once that process has finished. |
 | A pinned Name mismatch | The service's key file holds a different key than the pinned one: it was replaced, or the service was retired and provisioned again. Restore the original key file from your backup, or re-learn the pin only once you're sure which key is right: see [Fingerprint mismatch](#fingerprint-mismatch--16). |
 | A failed owner authorization | `owner_auth_file` and the TPM's owner password disagree. Set both in the same change. |
+| `TPM owner authorization file ... holds N bytes; at least 16 are required` | The owner password is short enough to guess offline from recorded bus traffic. Write 32 random bytes to the file and set them as the password: `tpm2_changeauth -c o -p <current> file:<path>`. |
 | `could not open the configured TCTI` | The `tcti` the policy names can't be opened. Check the path, or that `tpm2-abrmd` is running for `tabrmd:`. |
 | `TPM_RC_LOCKOUT` | The TPM is in dictionary-attack lockout, often from another program's failed authorizations. Wait for the lockout interval, or reset it with the lockout password. |
 
@@ -114,20 +132,28 @@ wrong. The library stops rather than quietly using a weaker provider.
 | PIN file refused | Make it `root:<group> 0440` or `root:root 0400`, in directories only root can change up to `/` (never under `/tmp`) |
 | Module refused, or won't load | The module and every directory above it must be root-owned and not group- or other-writable, sticky (`/tmp`) included. Check the path. |
 | No token matches | Check `token_label` and `token_serial` against `pkcs11-tool --list-token-slots` (from OpenSC). Exactly one token must match. |
-| `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. |
+| `the PKCS#11 key for this service has fingerprint ..., which is not the one pinned in policy` | The key under the service's label was deleted and generated again since it was pinned; anyone holding the token's PIN can do that. DEKs wrapped under the old key can't be unwrapped with the new one. Find out who replaced it before pinning the new fingerprint. |
+| `policy pins a PKCS#11 key for this service ..., but the token holds none` | The key was deleted, or this isn't the token it was provisioned on (check `token_label` and `token_serial`). If it was retired on purpose, remove the service's pin from `[pkcs11.pinned_keys]`, then run `provision` and pin the new fingerprint. |
+| `pkcs11.require_pinned_keys is on and service ... has no pinned key` | The service isn't in `[pkcs11.pinned_keys]`, and the allowlist is on: the default under the production security model. Its key is now on the token: add the line the message prints, then run `provision` again. |
+| `the PKCS#11 token reports failed user-PIN attempts` | The PIN file is probably wrong. Fix it **before** the token locks. After a rejected PIN, the process makes no further logins until the PIN file changes. Other processes still try once each unless `pkcs11.pin_state_dir` is set. |
+| `PKCS#11 login disabled: the token rejected the PIN in ... for another process` | Another process recorded a rejected PIN in `pkcs11.pin_state_dir`. Correct the PIN file; any change to it re-enables login. If the PIN was right and the token was at fault, delete `pin-rejected` in that directory. |
+| `pkcs11.pin_state_dir ...: is open to every account`, or `No such file or directory` | Create the directory (`root:<service-group> 2770`) with no access for other accounts, or remove the setting. Under `/run` it must be re-created at boot (`tmpfiles.d`, or the unit's `RuntimeDirectory=` with `RuntimeDirectoryMode=0750`). |
+| `PKCS#11 login lock ... still held after 30 seconds` | Another process has been in its first login for that long, usually a hung module or unreachable HSM. The call can be retried; find the stuck process if it repeats. |
 
 **External secret**
 
 | Symptom | Fix |
 |---|---|
 | `permissions too broad (mode ...)` | The key file must be `0400` or `0600` with no group or other access, or `root:<group> 0440`. On Kubernetes, use `defaultMode: 0400` (never `0444`); a non-root pod also needs `fsGroup`. |
-| `owned by uid ..., which is not an allowed owner` | The key file must be owned by root or by the service's user |
+| `owned by uid ..., which is not an allowed owner` | The key file must be owned by root. One owned by the service's user is accepted under the developer model, or -- as the message says under production -- once `external_secret.pinned_keys` pins the service's key; the mount and every directory above it follow the same rule |
 | `resolves to ..., outside the secret mount` | A symlink points out of the mount. Deliver the file inside it. |
 | `directory ...: writable by group or others (mode ...)` | The mount, or a directory above it or above the resolved file, can be changed by others -- a sticky one (`/tmp`) included. Mount the secrets read-only (as Kubernetes does), or somewhere only root or the service can write, up to `/`. |
 | `external secret is N bytes; it must be exactly 32 raw random bytes ...` | The file must hold exactly 32 raw bytes. Most often it's base64 or hex text (decode it to raw bytes where it is mounted), has a trailing newline (`echo` adds one), or is an old P-256 key in PEM or DER, which is no longer accepted. Generate a new key with `head -c 32 /dev/urandom` or `openssl rand -out <file> 32` and pin its new fingerprint. |
+| `external secret is 32 characters of text, not 32 random bytes` | The file holds a typed passphrase, or the hex or base64 form of a shorter key: far fewer than 256 bits | Provision 32 raw random bytes (`head -c 32 /dev/urandom`) |
+| `readable by group "..." (gid ...), which covers far more than one service's accounts` | The key file is `root:<group> 0440` and the group is `users`, `staff`, `wheel` or similar | `chgrp` it to the service's own group, or make it `0400` |
 | `external secret is all zero bytes` | The file was filled from `/dev/zero` or truncated and extended. Provision 32 random bytes. |
 | `the external secret for this service has fingerprint ..., which is not the one pinned in policy` | The mounted key isn't the one `external_secret.pinned_keys` names. Either something else wrote the mount (check every container that mounts the volume read-write), or the key was rotated without adding its fingerprint first. Pin the new fingerprint only once you've confirmed where the key came from. |
-| `external_secret.require_pinned_keys is set and service ... has no pinned key` | The service isn't in `[external_secret.pinned_keys]`. Compare the printed fingerprint with the one you computed when generating the key, then add the line. |
+| `external_secret.require_pinned_keys is on and service ... has no pinned key` | The service isn't in `[external_secret.pinned_keys]`, and the allowlist is on: the default under the production security model. Compare the printed fingerprint with the one you computed when generating the key, then add the line. |
 | A configured `external_secret.dir` is missing | The mount isn't there yet (a volume not attached, a sidecar not ready). Fix the mount; the library won't use another provider in the meantime. |
 
 ## No KEK for the service (-17)
@@ -156,6 +182,14 @@ KEK** than the one the service resolves to now. Something changed the key:
   different token is now selected.
 - **Any provider:** the payload came from another host. A payload only
   ever opens on the host whose KEK wrapped it.
+- **A service that moved to a stronger provider:** the payload names a
+  provider later in the policy order than one that holds a KEK for the
+  service now (the log line says `refusing a payload wrapped under ...`).
+  Every wrap since the move names the stronger provider, so the library
+  can't tell such a payload from one made by someone holding only the
+  weaker provider's key, and refuses it. If it is left over from before
+  the move, set `allow_unwrap_from_lower_provider = true` under
+  `[selection]`, re-wrap it, and remove the setting.
 
 To recover:
 - **The key file or secret was changed:** restore the original from your

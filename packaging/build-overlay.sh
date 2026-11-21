@@ -4,10 +4,10 @@
 # them first with DISTROS=ubuntu24.04 packaging/build-packages.sh -- then
 # copies each into a clean Ubuntu 24.04 consumer image and runs
 # packaging/overlay/consumer-test.sh there:
-#   overlay      no policy; external-secret KEKs
+#   overlay      no policy shipped; the test writes one, pinning external-secret KEKs
 #   overlay-dev  the dev policy; ephemeral, then SoftHSM2 with a PIN file
 #
-# Leaves hkdfguard-overlay:local and hkdfguard-overlay:local-dev loaded in
+# Leaves hkdfguard-overlay:local and hkdfguard-overlay-dev:local loaded in
 # Docker for that architecture (KEEP=0 removes them too).
 #
 # Usage: [ARCH=amd64|arm64] packaging/build-overlay.sh
@@ -33,7 +33,7 @@ no_bundle=$(mktemp -d)
 cleanup() {
     rm -rf "$no_bundle"
     for tag in "${TEMP_TAGS[@]}"; do docker rmi -f "$tag" >/dev/null 2>&1 || true; done
-    if [ "${KEEP:-1}" = 0 ]; then docker rmi -f hkdfguard-overlay:local hkdfguard-overlay:local-dev >/dev/null 2>&1 || true; fi
+    if [ "${KEEP:-1}" = 0 ]; then docker rmi -f hkdfguard-overlay:local hkdfguard-overlay-dev:local >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 
@@ -44,7 +44,7 @@ expected_dev="$expected_overlay
 -rw-r--r-- 0/0 etc/hkdfguard/policy.toml"
 
 for target in overlay overlay-dev; do
-    tag=hkdfguard-overlay:local${target#overlay}
+    tag=hkdfguard-$target:local   # two images, as released: the dev policy is never a tag of the production one
     echo
     echo "=== Building $target for $platform as $tag ==="
     docker buildx build --platform "$platform" --load -t "$tag" \
@@ -74,7 +74,7 @@ done
 # image installs the same. gcc and libc6-dev build the test programs;
 # softhsm2 is for the dev policy's PKCS#11 half.
 for mode in plain dev; do
-    overlay=hkdfguard-overlay:local; [ "$mode" = dev ] && overlay=hkdfguard-overlay:local-dev
+    overlay=hkdfguard-overlay:local; [ "$mode" = dev ] && overlay=hkdfguard-overlay-dev:local
     echo
     echo "=== Consumer image: $ubuntu + $overlay ==="
     docker buildx build --platform "$platform" --load -t "hkdfguard-overlay-consumer:$mode" \
@@ -95,4 +95,4 @@ DOCKERFILE
 done
 
 echo
-echo "Overlay images for $platform: hkdfguard-overlay:local, hkdfguard-overlay:local-dev"
+echo "Overlay images for $platform: hkdfguard-overlay:local, hkdfguard-overlay-dev:local"

@@ -44,7 +44,7 @@ pub mod status {
     // valid UTF-8 is one more way for it to be invalid, reported as
     // INVALID_SERVICE_NAME below -- see that constant's comment.
     pub const INVALID_SERVICE_NAME: i32 = -8; // `service` is null, empty, not valid UTF-8, over MAX_SERVICE_LEN bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." -- one code for every way the service identifier itself can be wrong
-    pub const POLICY_INVALID: i32 = -9; // the policy file can't be trusted or used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or its directory, or it requires a provider this build lacks
+    pub const POLICY_INVALID: i32 = -9; // the policy file can't be trusted or used: missing (one is required), unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or its directory, or it requires a provider this build lacks
 
     // ---- Wrapped payload ----
     pub const PAYLOAD_MALFORMED: i32 = -10; // wrapped payload is structurally invalid: truncated, trailing bytes, an unknown provider type, or a field length no wrap produces
@@ -66,7 +66,7 @@ pub mod status {
     pub const FILE_IO: i32 = -34; // key file is not a regular file, or reading it failed
     pub const FILE_TOO_SHORT: i32 = -35; // key file is shorter than a wrapped DEK, or than its own header declares
     pub const FILE_TOO_LONG: i32 = -36; // key file is longer than a wrapped DEK, or than its own header declares
-    pub const FILE_PLAINTEXT_KEY: i32 = -37; // key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex) -- a likely key exposure
+    pub const FILE_PLAINTEXT_KEY: i32 = -37; // key file looks like an UNWRAPPED DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), or its base64 or hex) -- a likely key exposure
     pub const FILE_MALFORMED: i32 = -38; // key file is the right length but not a payload a wrap could have produced
     pub const FILE_UNTRUSTED: i32 = -39; // key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust or writable by someone else (or was swapped mid-open): someone else could have replaced it
     // -40..-63 reserved for future common codes.
@@ -144,6 +144,10 @@ pub enum Error {
     /// A deployer group can't be used: it doesn't exist, is over-broad, or
     /// couldn't be looked up. Refines `Policy`.
     GroupInvalid(String), // carries a human-readable description, for logs only
+    /// A caller-supplied argument is out of range: a secret name or
+    /// secret length `crypto::wrap_secret` doesn't accept. The C ABI
+    /// checks these itself first; this is the Rust API's own guard.
+    InvalidArgument(&'static str),
 }
 
 impl Error {
@@ -163,6 +167,7 @@ impl Error {
             Error::KekFingerprintMismatch => status::KEK_FINGERPRINT_MISMATCH,
             Error::AccessDenied(_) => status::KEK_ACCESS_DENIED,
             Error::GroupInvalid(_) => status::LINUX_GROUP_INVALID,
+            Error::InvalidArgument(_) => status::INVALID_ARGUMENT,
         }
     }
 }
@@ -190,6 +195,7 @@ impl fmt::Display for Error {
             ),
             Error::AccessDenied(msg) => write!(f, "access denied: {msg}"),
             Error::GroupInvalid(msg) => write!(f, "policy error: {msg}"),
+            Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
         }
     }
 }

@@ -90,11 +90,16 @@ HARNESS=$(as_ci mktemp -d /work/harness.XXXXXX)
 ( umask 077; mkdir "$HARNESS/tpm-keys" )
 ( umask 077; printf '1234\n' > "$HARNESS/pkcs11.pin" )
 cat > "$HARNESS/policy.toml" <<TOML
+# The developer model, as in scripts/native-tpm-test.sh: under the default
+# (production) one require_pinned_keys is on, and the token tests that read
+# this policy as it stands create and use keys no policy pins.
+security_model = "developer"
 [selection]
 mode = "prefer"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 key_dir = "$HARNESS/tpm-keys"
 
 [pkcs11]
@@ -115,14 +120,58 @@ test_cargo test --features tpm2 -- --ignored --test-threads=1
 section "cargo test --features pkcs11 -- --ignored (against SoftHSM2)"
 test_cargo test --features pkcs11 -- --ignored --test-threads=1
 
+# The PKCS#11 module's own unit tests (PIN file, latch, token selection)
+# need no token, but are compiled only with the feature -- which no pass
+# above runs without --ignored.
+section "cargo test --features pkcs11 --lib provider::pkcs11 (its unit tests)"
+test_cargo test --features pkcs11 --lib provider::pkcs11
+
+# The same provider tests once more, built with AddressSanitizer. These are
+# the paths no other memory check reaches: Miri stops at the first call
+# into C, and the fuzz harnesses (fuzz/) use the ephemeral provider only --
+# so the tss-esapi contexts, the PKCS#11 module, its sessions and the
+# buffers handed across both are otherwise never run under a sanitizer. A
+# use after free, a double free or a read or write past a buffer on the
+# Rust side of either boundary fails the test that reached it. (The C
+# libraries themselves are not instrumented: an error wholly inside
+# tpm2-tss or SoftHSM2 goes unseen.)
+#
+# Library tests only (--lib provider::): the CLI's and the integration
+# tests' memory-locking checks read the kernel's locked-page counts, which
+# the sanitizer's own mappings change. Leak detection is off: it needs
+# ptrace, which a container may not grant, and SoftHSM2 and OpenSSL keep
+# allocations for the life of the process by design.
+# --target: so that only the test binary is instrumented, not build scripts.
+section "AddressSanitizer: the provider tests, TPM2 against swtpm and PKCS#11 against SoftHSM2"
+: "${HKDFGUARD_ASAN_TOOLCHAIN:?docker/Dockerfile sets this to the pinned nightly}"
+ASAN_TARGET=$(rustc -vV | sed -n 's/^host: //p')
+asan_test() {
+    as_ci env RUSTFLAGS="--cfg hkdfguard_test_paths -Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
+        CARGO_TARGET_DIR=target/asan cargo "+$HKDFGUARD_ASAN_TOOLCHAIN" test --target "$ASAN_TARGET" "$@"
+}
+asan_test --features tpm2 --lib provider:: -- --include-ignored --test-threads=1
+asan_test --features pkcs11 --lib provider:: -- --include-ignored --test-threads=1
+echo "TPM2 and PKCS#11 provider tests pass under AddressSanitizer."
+
 unset HKDFGUARD_POLICY_FILE TPM2TOOLS_TCTI
 
 section "C ABI round trip via examples/wrap_unwrap.c (default providers)"
-# With no policy file, Ephemeral is never used, so the example needs a
-# real KEK: provision an external secret for its service, as a
-# deployment platform would, in a standard secret mount.
+# Under a policy that names no provider, Ephemeral is never used, so the
+# example needs a real KEK: provision an external secret for its service,
+# as a deployment platform would, in a standard secret mount.
 # The mount is root's, as a platform's would be; the KEK file belongs to
-# the service user, owner-only, as the provider requires.
+# the service user, owner-only, as the provider requires -- under the
+# developer model, which is what trusts a service user's own file. A
+# policy there must be: without one every call is refused.
+mkdir -p /etc/hkdfguard
+if OUT=$(as_ci target/debug/hkdfguard provision --service-name com.company.orders 2>&1); then
+    echo "FAIL: provision succeeded with no policy file: $OUT" >&2; exit 1
+fi
+grep -q 'a policy file is required' <<<"$OUT" \
+    || { echo "FAIL: with no policy file, provision failed for another reason: $OUT" >&2; exit 1; }
+echo "no policy file: refused, saying one is required."
+printf 'security_model = "developer"\n[selection]\nmode = "prefer"\n' > /etc/hkdfguard/policy.toml
+chmod 0644 /etc/hkdfguard/policy.toml
 SECRET_MOUNT=/run/secrets/hkdfguard
 mkdir -p "$SECRET_MOUNT"
 ci_file "$SECRET_MOUNT/com.company.orders"; head -c 32 /dev/urandom > "$SECRET_MOUNT/com.company.orders"
@@ -228,7 +277,7 @@ rm -rf "$TMP_DEK"
 echo "a --dek-file under /tmp: wrap refuses to read it."
 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
-rm -rf "$SECRET_MOUNT"
+rm -rf "$SECRET_MOUNT" /etc/hkdfguard
 
 section "builds that ship take configuration only from /etc/hkdfguard/policy.toml"
 # Release builds, and plain debug builds -- anything not made with
@@ -260,6 +309,7 @@ provider = "tpm2"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 TOML
 chmod 0644 /etc/hkdfguard/policy.toml
 
@@ -284,6 +334,21 @@ if as_ci "$TEST_BIN"/hkdfguard provision --service-name com.hkdfguard.dockertest
 fi
 echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE and failed, as designed."
 
+# And a release can't be built as a test build at all: build.rs refuses the
+# release profile with --cfg hkdfguard_test_paths, so a RUSTFLAGS leaked
+# into a packaging or release job fails the build instead of shipping. Not
+# for fuzzing (cargo fuzz: release profile, --cfg fuzzing), never shipped.
+# `cargo check` runs build.rs without the release build's codegen.
+guard_check() { as_ci env RUSTFLAGS="$1" CARGO_TARGET_DIR=target/release-guard cargo check --release --lib --features tpm2,pkcs11 2>&1; }
+if OUT=$(guard_check "--cfg hkdfguard_test_paths"); then
+    echo "FAIL: a release-profile build with --cfg hkdfguard_test_paths was allowed" >&2; exit 1
+fi
+grep -q "refusing to build hkdfguard in the release profile with \`--cfg hkdfguard_test_paths\`" <<<"$OUT" \
+    || { echo "FAIL: the release build failed, but not on the test-paths guard: $OUT" >&2; exit 1; }
+OUT=$(guard_check "--cfg hkdfguard_test_paths --cfg fuzzing") \
+    || { echo "FAIL: the guard refused a fuzzing build: $OUT" >&2; exit 1; }
+echo "release profile + --cfg hkdfguard_test_paths: refused by build.rs; a fuzzing build: allowed."
+
 section "a TPM key file that can't be trusted refuses; it never falls back to a weaker provider"
 # The TPM is reachable (swtpm, via tpm.tcti) and a weaker provider is ready
 # to serve: an external-secret KEK in the standard mount. The service's
@@ -307,6 +372,7 @@ mode = "prefer"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 TOML
 for build in release debug; do
     if OUT=$(as_ci target/$build/hkdfguard provision --service-name $UNTRUSTED_SERVICE 2>&1); then
@@ -460,6 +526,7 @@ provider = "tpm2"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 TOML
 OUT=$(as_ci $CLI provision -sn $RETIRE_SERVICE 2>&1) || { echo "FAIL: provision on TPM2: $OUT" >&2; exit 1; }
 FP=$(fingerprint_in "$OUT")
@@ -510,6 +577,7 @@ provider = "tpm2"
 
 [tpm]
 tcti = "$SWTPM_TCTI"
+allow_unpinned_provisioning = true   # swtpm: no bus, and no Name to pin yet
 key_dir = "$TMP_ROOT/tpm-keys"
 TOML
 expect_sticky_refusal "the TPM key directory" as_ci $CLI provision -sn $STICKY_SERVICE
@@ -538,7 +606,10 @@ rm -rf "$TMP_ROOT"
 # service's KEK in it, owner-only.
 TMP_MOUNT=$(as_ci mktemp -d)
 ci_file "$TMP_MOUNT/$STICKY_SERVICE"; head -c 32 /dev/urandom | ci_write "$TMP_MOUNT/$STICKY_SERVICE"
-printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$TMP_MOUNT" \
+# Developer model: under production an unpinned service has no KEK in the
+# mount at all (require_pinned_keys), so the directory is never looked at
+# and ci is told only root provisions -- not the refusal under test.
+printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$TMP_MOUNT" \
     > /etc/hkdfguard/policy.toml
 expect_sticky_refusal "an external-secret mount" as_ci $CLI provision -sn $STICKY_SERVICE
 rm -rf "$TMP_MOUNT"
@@ -554,7 +625,7 @@ expect_sticky_refusal "a missing policy file" as_ci env HKDFGUARD_POLICY_FILE="$
     "$TEST_BIN"/hkdfguard provision -sn $STICKY_SERVICE
 rm -rf "$TMP_POLICY"
 
-# The read-only exception, which Kubernetes Secret and ConfigMap volumes
+# The read-only exception, which Kubernetes Secret and projected volumes
 # depend on: docker/run-tests.sh mounts a volume read-only at $RO_MOUNT,
 # its root 1777 like a Secret volume's, holding a KEK for $RO_SERVICE (ci's,
 # 0400) both in the root itself and in a 0755 subdirectory -- a sticky
@@ -574,7 +645,10 @@ for d in "$RW_MOUNT" "$RW_MOUNT/hkdfguard"; do
     head -c 32 /dev/urandom > "$d/$RO_SERVICE"; chown ci:ci "$d/$RO_SERVICE"; chmod 0400 "$d/$RO_SERVICE"
 done
 for sub in "" /hkdfguard; do
-    printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT$sub" \
+    # The developer model: the KEK is ci's own file, which production
+    # accepts only from root or with its fingerprint pinned. What is under
+    # test here is the directory rule, the same under both models.
+    printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT$sub" \
         > /etc/hkdfguard/policy.toml
     OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1) \
         || { echo "FAIL: the read-only 1777 mount ($RO_MOUNT$sub) was refused: $OUT" >&2; exit 1; }
@@ -585,7 +659,7 @@ for sub in "" /hkdfguard; do
         || { echo "FAIL: a DEK wrapped under the KEK in $RO_MOUNT$sub did not unwrap" >&2; exit 1; }
     echo "external secret in a read-only 1777 mount ($RO_MOUNT$sub): accepted; wrap and unwrap work."
 
-    printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RW_MOUNT$sub" \
+    printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RW_MOUNT$sub" \
         > /etc/hkdfguard/policy.toml
     if OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1); then
         echo "FAIL: the same layout writable ($RW_MOUNT$sub) was accepted: $OUT" >&2; exit 1
@@ -595,6 +669,18 @@ for sub in "" /hkdfguard; do
     echo "the same layout writable ($RW_MOUNT$sub): refused."
 done
 rm -rf "$RW_MOUNT" "$KEYS/ro.dek" "$KEYS/ro.key"
+
+# Only a sticky directory is exempt: a 0777 one on the same read-only mount
+# (a ConfigMap or emptyDir volume's mode) is refused, as whoever writes the
+# volume elsewhere could rename or delete what is in it.
+printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT/unsticky" \
+    > /etc/hkdfguard/policy.toml
+if OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1); then
+    echo "FAIL: a 0777 directory on a read-only mount ($RO_MOUNT/unsticky) was accepted: $OUT" >&2; exit 1
+fi
+grep -q 'writable by group or others (mode 777)' <<<"$OUT" \
+    || { echo "FAIL: $RO_MOUNT/unsticky refused, but not for its mode: $OUT" >&2; exit 1; }
+echo "a 0777 directory on a read-only mount ($RO_MOUNT/unsticky): refused."
 
 rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS" "$KEYS"
 

@@ -36,7 +36,8 @@
 # Environment (read by this script; the library reads none of them):
 #   HKDFGUARD_TCTI                 override the TCTI (default /dev/tpmrm0, else /dev/tpm0)
 #   HKDFGUARD_TPM_OWNER_AUTH_FILE  a private file holding the Owner hierarchy's password,
-#                                  if it has one (tpm.owner_auth_file in every test policy)
+#                                  if it has one (tpm.owner_auth_file in every test policy);
+#                                  at least 16 bytes, or the library refuses it
 #   HKDFGUARD_HARDWARE_TEST_STATE  where `reboot capture` saves its state (default
 #                                  ${XDG_STATE_HOME:-~/.local/state}/hkdfguard-hardware-tests)
 #   HKDFGUARD_TEST_TMPDIR          where the temp dir goes (default $XDG_RUNTIME_DIR, else
@@ -143,9 +144,11 @@ require_private_chain() { # require_private_chain <dir> <what to set instead>
 
 # As scripts/native-tpm-test.sh: a complete policy -- $1 top-level, extra
 # [tpm] keys in $2, further tables in $3 -- and making it the one every
-# test executable reads.
+# test executable reads. allow_unpinned_provisioning: the suite provisions
+# before it can learn the storage root key's Name, which the library
+# otherwise refuses; a deployment pins the Name instead.
 policy() { # policy <selection...> [extra [tpm] keys] [more tables]
-    printf 'security_model = "developer"\n%s\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\n' "$1" "$TCTI" "$KEY_DIR"
+    printf 'security_model = "developer"\n%s\n\n[tpm]\ntcti = "%s"\nkey_dir = "%s"\nallow_unpinned_provisioning = true\n' "$1" "$TCTI" "$KEY_DIR"
     [ -n "${HKDFGUARD_TPM_OWNER_AUTH_FILE:-}" ] && printf 'owner_auth_file = "%s"\n' "$HKDFGUARD_TPM_OWNER_AUTH_FILE"
     printf '%s\n' "${2:-}"
     if [ -n "$SOFTHSM_MODULE" ]; then

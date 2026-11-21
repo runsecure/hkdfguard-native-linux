@@ -1,0 +1,132 @@
+# Nightly fuzzing: every target in fuzz/ for a fixed time, each on its own
+# runner, starting from the corpus the nights before left and the seeds
+# fuzz/make_seeds.py writes. See fuzz/README.md.
+#
+# Where the results go:
+#   - the run's summary page: one table per target (executions, corpus
+#     size, whether there was a finding), written by fuzz/campaign.sh;
+#   - a failed run, when any target has a finding or no longer builds --
+#     which GitHub mails to whoever last edited the schedule below, and
+#     shows on the Actions tab;
+#   - for a finding, a code scanning alert (Security tab, tool
+#     "hkdfguard-fuzz", on the branch that was fuzzed): what failed, the
+#     input that did it, and the end of the fuzzer's log.
+#
+# This repository is public, and so are a run's log, summary and
+# artifacts; a finding's input is a reproducer for whatever it found. So
+# the first two say only *that* a target failed, no artifact is kept, and
+# everything else goes into the alert, which only people with write access
+# can read. The alert is the only copy.
+#
+# A scheduled workflow runs from the default branch's copy of this file,
+# and fuzzes the branch named below.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 7 * * *" # 07:17 UTC, daily
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target
+        default: "900"
+      ref:
+        description: Branch, tag or commit to fuzz
+        default: develop
+
+permissions:
+  contents: read
+  security-events: write # to upload a finding as a code scanning alert
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  # The nightly docker/Dockerfile pins for its AddressSanitizer stage, and
+  # the cargo-fuzz the harnesses were last run with. Bump deliberately.
+  HKDFGUARD_FUZZ_TOOLCHAIN: nightly-2026-11-20
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every [[bin]] in fuzz/Cargo.toml.
+        target:
+          - unwrap_dek
+          - wrap_round_trip
+          - open_file
+          - policy
+          - cli_args
+          - tpm_key_file
+          - path_walk
+          - unwrap_secret
+          - wrap_secret_round_trip
+          - open_secret_file
+          - string_bounds
+          - api_threads
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || 'develop' }}
+          persist-credentials: false
+
+      - name: Install the pinned nightly toolchain
+        run: rustup toolchain install "$HKDFGUARD_FUZZ_TOOLCHAIN" --profile minimal
+
+      - name: Restore cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+
+      # What earlier nights found interesting. Saved under a new key every
+      # run (a cache entry is never overwritten) and restored from the
+      # newest one for this target.
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        id: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '900' }}
+        run: |
+          # The library refuses files under any directory others can write
+          # to; the runner's home is its own, under root's /home.
+          export HKDFGUARD_FUZZ_DIR="$HOME/.cache/hkdfguard-fuzz"
+          mkdir -p "$HKDFGUARD_FUZZ_DIR" && chmod 0700 "$HKDFGUARD_FUZZ_DIR"
+          # The alert is filed against what was fuzzed, not against the
+          # branch this workflow file was read from.
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "ref=$(git symbolic-ref -q HEAD || echo "$GITHUB_REF")"
+          } >> "$GITHUB_OUTPUT"
+          fuzz/campaign.sh "$TARGET" "$SECONDS_PER_TARGET"
+
+      # A finding: its details, to the Security tab and nowhere else. One
+      # category per distinct finding (fuzz/finding_sarif.py), so an alert
+      # is never closed or replaced by a later upload: a person dismisses
+      # it, once the input no longer reproduces.
+      - name: Report the finding to code scanning
+        if: failure() && steps.fuzz.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: ${{ steps.fuzz.outputs.sarif }}
+          category: ${{ steps.fuzz.outputs.category }}
+          ref: ${{ steps.fuzz.outputs.ref }}
+          sha: ${{ steps.fuzz.outputs.sha }}

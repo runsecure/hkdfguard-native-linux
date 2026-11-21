@@ -25,15 +25,35 @@ There are four providers, from strongest to weakest:
 | External secret | `external-secret` | `external` | A root-owned file delivered by your platform (Kubernetes, Vault, systemd credentials, ...) |
 | Ephemeral | `ephemeral` | `ephemeral` | Process memory only; **lost when the process exits** |
 
-With **no policy file**, the library tries `tpm2`, then `pkcs11`, then
-`external-secret`, and uses the first one that is set up on the host. It
-never uses `ephemeral` unless a policy names it.
+Unless the policy says otherwise, the library tries `tpm2`, then `pkcs11`,
+then `external-secret`, and uses the first one that is set up on the host.
+It never uses `ephemeral` unless the policy names it.
 
 The library only moves on to the next provider when one is **absent**: not
 on this host or not set up, or holding no key for the service. A provider
 that is present but **failing** (wrong file permissions, a wrong PIN, a TPM
 that fails its self-test) ends the call with an error instead. Falling
 through would quietly protect new DEKs with a weaker key.
+
+So does a provider that has gone missing while still holding the service's
+key: a TPM key file on a host whose TPM device has disappeared, or a
+service with a key pinned in `external_secret.pinned_keys` and no secret
+mounted. When a later provider does serve a service, audit event 1006
+records it, once per process for each service.
+
+There is one case the library can't tell apart. A process that can open
+neither the TPM nor the TPM key directory (`/var/lib/hkdfguard/tpm`) looks
+the same whether it never used the TPM or is a TPM-backed service that
+lost its `tss` and `hkdfguard` group memberships. The library treats the
+TPM as not that service's and moves on, since failing would break every
+non-TPM service on a host that has a TPM. If the service also has a key in
+a later provider, or the policy allows `ephemeral`, new DEKs are then
+wrapped there, with event 1006 as the only sign.
+
+To rule that out for a TPM-backed service, pin it in `[tpm.pinned_names]`
+(see [Pin each service's key](#tpm-20), step 4). A service pinned to the
+TPM is never served by another provider: if the TPM can't serve it, the
+call fails.
 
 Each wrapped DEK records which provider wrapped it, and is always unwrapped
 by that same provider.
@@ -48,8 +68,25 @@ sudo install -m 0644 -o root -g root /usr/share/hkdfguard/policy.toml.example \
     /etc/hkdfguard/policy.toml
 ```
 
-Copied unedited, it behaves exactly like having no policy: every setting is
+**The file is required.** With no `/etc/hkdfguard/policy.toml`, every call
+fails with `HKDFGUARD_ERR_POLICY_INVALID` (-9). A policy that never arrived
+(a volume that didn't mount, a ConfigMap that wasn't projected, an image
+built without it) looks the same as one that was deleted, and the defaults
+have no pins and name no provider, so the library refuses to fall back to
+them. The shortest valid policy is the defaults, spelled out:
+
+```toml
+[selection]
+mode = "prefer"
+```
+
+Copied unedited, the example is exactly that: every other setting is
 commented out at its default. Uncomment and change only what you need.
+Under the production security model (the default), the PKCS#11 and
+external-secret providers serve only services whose key is pinned in the
+policy, so a service kept in either needs its pin before it works (see
+[PKCS#11](#pkcs11-hsm-or-smart-card) and
+[External secret](#external-secret-file)).
 
 **The file must be trustworthy, or every call fails.**
 
@@ -60,13 +97,36 @@ commented out at its default. Uncomment and change only what you need.
   directories such as `/tmp` are not exempt: nothing the library reads --
   the policy, secrets, the PIN file, the PKCS#11 module, key files -- may
   live anywhere under `/tmp`, `/var/tmp` or `/dev/shm`, however private
-  the directory inside them. The one exception is a read-only mount, such
-  as a Kubernetes Secret or ConfigMap volume (`1777`, but nobody can write
-  to it).
-- Only a *missing* file means "no policy". A file that exists but is wrongly
-  owned, too broadly writable, unreadable or malformed makes every
-  operation fail, rather than falling back to the defaults. Deleting or
-  breaking the policy can never switch it off.
+  the directory inside them. The one exception is a sticky directory on a
+  read-only mount, such as a Kubernetes Secret or projected volume (`1777`:
+  nothing in the container can write to it, and the sticky bit stops
+  whatever writes it elsewhere from renaming or deleting entries it doesn't
+  own). A plain ConfigMap or disk-backed `emptyDir` volume is `0777`, not
+  sticky, and is refused even read-only. Ship the policy from a ConfigMap
+  through a `projected:` volume:
+
+  ```yaml
+  volumes:
+    - name: hkdfguard-policy
+      projected:
+        sources:
+          - configMap: { name: hkdfguard-policy }
+  ```
+- POSIX ACLs count. A named ACL entry that gives someone write access is
+  refused like the mode's write bits, and, on a secret, one that gives
+  anyone but root read access. With an ACL, `ls -l` shows its mask in the
+  group bits, not who it names: check with `getfacl`.
+- It must not be on a FUSE filesystem served by anyone but root. On a FUSE
+  mount the owner, mode and contents of a file are whatever the process
+  serving it reports, and `fusermount` lets any user serve one. The
+  library reads who serves the mount (`user_id=` in
+  `/proc/self/mountinfo`) and requires root; virtiofs, which only root can
+  mount, passes. This applies to every file the library reads. For key
+  files under the developer security model, a mount served by the
+  process's own user passes too.
+- A file that is missing, wrongly owned, too broadly writable, unreadable
+  or malformed makes every operation fail, rather than falling back to the
+  defaults. Deleting or breaking the policy can never switch it off.
 
 **Two TOML rules catch people out.**
 
@@ -114,13 +174,35 @@ packages, create it as root:
 sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 ```
 
-On a `.deb` system, record a different owner or mode with
-`dpkg-statoverride` or an upgrade puts `root:hkdfguard 0750` back.
+The packages set `root:hkdfguard 0750` only when they create the
+directory. An owner or mode you give it afterwards survives upgrades and
+reinstalls, `.deb` and `.rpm` alike.
 
-`hkdfguard provision` then creates both files there, owned by root, with
-the directory's group, mode `0440`. The library refuses either file, or a
-directory above it, that anyone else could write to, so never put the
-directory under `/tmp`. `tpm.key_dir` moves it.
+**3. Each service's own group.** The authValue file is what lets an
+account use one service's key, so it is never given the directory's group,
+which every TPM-using service is in. Name the group of each service that
+doesn't run as root:
+
+```toml
+[tpm.auth_groups]
+"com.company.orders" = "orders"
+```
+
+`hkdfguard provision` then creates both files there, owned by root: the key
+file with the directory's group, mode `0440`, and the authValue file with
+the service's group from `tpm.auth_groups`, mode `0440` -- or, with no
+entry, `root:root 0400`, which only a service running as root can use. A
+group that covers essentially every account (`users`, `nogroup`, `root`,
+`wheel` and the like) is refused. To change a provisioned service's group,
+change its entry in `tpm.auth_groups` and `chgrp` its `.tpmauth` file to
+match: a root-owned `.tpmauth` file a group can read is refused unless
+that group is the one `tpm.auth_groups` names for the service. The library refuses either file, or a directory above it,
+that anyone else could write to, so never put the directory under `/tmp`.
+`tpm.key_dir` moves it.
+
+Provisioning always creates a new authValue. An authValue file left with
+no key file beside it (a retire that couldn't delete it, a key file
+deleted by hand) is replaced, never reused.
 
 #### Back up the key files
 
@@ -137,7 +219,7 @@ changes the TPM's seed, and no key file made before it can be loaded
 again. If DEKs must survive the hardware, keep a copy of each somewhere
 other than this host, protected by a key not tied to it.
 
-**3. Pin each service's key (recommended).** A key file is checked for
+**4. Pin each service's key (recommended).** A key file is checked for
 the attributes every key this library creates has, but a key file someone
 with root put there is otherwise taken as is. With `require_pinned_names`,
 only services listed in the policy have a key, and each one's key must
@@ -166,33 +248,52 @@ sudo hkdfguard provision -sn com.company.orders
 Add the line as printed, then run `provision` again; it reports "already
 provisioned".
 
-**4. The TPM bus traffic is encrypted; pin the storage root key for
+A pin also ties the service to the TPM, with or without
+`require_pinned_names`: no other provider in the policy order serves a
+pinned service, so one that loses its access to the TPM fails instead of
+wrapping under a weaker key (see
+[How the provider is chosen](#how-the-provider-is-chosen)).
+
+**5. The TPM bus traffic is encrypted; pin the storage root key for
 provisioning.** On a *discrete* TPM (a separate chip), the wrapping key
 each wrap and unwrap computes (the output of `TPM2_HMAC`) crosses the
 motherboard bus. It is always encrypted, and its response authenticated,
 under keys derived from the service key's authValue. Nobody without the
 authValue file can read a wrapping key off the bus or replace one. That
 needs no trusted public key, and a quantum computer doesn't help against
-it. `session_encryption = "off"` turns the encryption off, for test
+it. The cipher is AES-256-CFB where the TPM has it and AES-128-CFB where
+it doesn't (a warning is logged once when the TPM refuses AES-256).
+`session_encryption = "off"` turns the encryption off, for test
 harnesses only.
 
 The one moment the authValue itself crosses the bus is `provision`, inside
 a session salted to the TPM's storage root key. Pinning that key's Name
 with `pinned_session_salt_key_name` stops an attacker who can rewrite bus
-traffic at provisioning time from substituting their own. Pin it on any
-host with a discrete TPM, before provisioning. The Name stays the same
-until the TPM is cleared. From a source checkout on the host, as a user
-in the `tss` group:
+traffic at provisioning time from substituting their own, so `provision`
+refuses to create a TPM key until the Name is pinned. The refusal prints
+the Name this TPM reports, as the line to add to the policy:
 
 ```sh
-cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning \
-    -- --ignored --exact --nocapture
-#   SALT_KEY_NAME=000b...
+sudo hkdfguard provision -sn com.company.orders
+#   ... refusing to provision a TPM key: policy pins no storage root key ...
+#     pinned_session_salt_key_name = "000b..."
 ```
 
-`scripts/native-tpm-test.sh` runs this, and a full check of your TPM, for you.
+Add that line to the `[tpm]` table and run `provision` again. The Name
+stays the same until the TPM is cleared, so it is the same for every
+service on the host; if it was recorded when the host was set up, check
+the printed value against that record. Nothing is created by the refused
+run.
 
-**5. Protect the TPM hierarchy (recommended on shared hosts).** Anyone who
+On a TPM with no bus to tamper with (a firmware or virtual TPM),
+`allow_unpinned_provisioning = true` in the `[tpm]` table provisions
+without a pin instead. Each key provisioned that way is recorded as audit
+event 1007. Using a key that already exists never needs the pin.
+
+From a source checkout, `scripts/native-tpm-test.sh` also reports the
+Name, with a full check of your TPM.
+
+**6. Protect the TPM hierarchy (recommended on shared hosts).** Anyone who
 can open the TPM can, with the default empty passwords, *clear* it, which
 makes every key file unloadable. Set a lockout password and disable
 clearing:
@@ -206,11 +307,15 @@ tpm2_clearcontrol -C l -P "$LOCKOUT_PW" s
 Optionally, also set an **owner** password and name a file holding it in
 `tpm.owner_auth_file`. Then the storage root key every key file is loaded
 under can't be re-created without that password either. It changes no
-existing key. But other
+existing key. The file must hold at least 16 random bytes (the README's
+steps write 32): a recorded use of the password lets guesses be tested
+offline, so a passphrase is not enough, and a shorter file is refused. But other
 software on the host that uses the owner hierarchy with an empty password
 (for example `systemd-cryptenroll --tpm2-device`) stops working until it is
-given the password. See the README's "Protect the hierarchy the keys
-live under" for the steps.
+given the password. Every service using TPM keys must be able to read the
+file, so each of them holds the Owner hierarchy's password, not only its
+own key. See the README's "Protect the hierarchy the keys live under" for
+the steps.
 
 **Other TPM settings.**
 
@@ -234,9 +339,10 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
 
 - **The module**, its directory and every directory above it must be owned
   by root and not writable by group or others, sticky or not (so never under
-  `/tmp`). Nothing on that path can then be swapped for another library. A
-  directory on a read-only mount passes whatever its mode, so if the module
-  is bind-mounted read-only from somewhere writable, make sure the original
+  `/tmp`), and no POSIX ACL entry may give anyone else write access. Nothing
+  on that path can then be swapped for another library. A sticky directory
+  on a read-only mount passes whatever its write bits, so if the module is
+  bind-mounted read-only from somewhere writable, make sure the original
   directories are root-owned and unwritable as well: the module is code
   this process runs.
 - **The module's own configuration** is not checked. Most modules find
@@ -247,21 +353,62 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   `EnvironmentFile=`, a pod spec) can point the module at a token they run
   and receive the root-only PIN. Fix the module's configuration in a
   root-owned file, and don't let lower-trust configuration set those
-  variables for the service.
+  variables for the service. Several modules also read a file in the
+  calling user's home directory, with no variable set at all: SoftHSM2
+  reads `~/.config/softhsm2/softhsm2.conf`, OpenSC `~/.config/opensc`, and
+  the p11-kit proxy module loads whatever modules
+  `~/.config/pkcs11/modules/` lists, which is more code in this process.
+  Anything that can write the service account's home directory can
+  redirect the module the same way. Give the service account a home
+  directory it can't write (or none), and prefer a vendor module loaded
+  directly over `p11-kit-proxy.so`.
 - **The PIN file** holds the token's user PIN (one trailing newline is
   ignored). It must be root-owned, mode `0400`, or `0440` with the service's
   group, in directories only root can change, up to `/`. Setting
   `module` is what turns PKCS#11 on, so with it set, a missing PIN file
   fails the call like any other problem: it is never a reason to try the
   next provider. The one exception is the developer security model, where
-  a missing PIN file skips PKCS#11 with a warning (the `-dev` overlay's
+  a missing PIN file skips PKCS#11 with a warning (the dev overlay image's
   "SoftHSM2, else ephemeral").
 - **Choose the token** by `token_label` and/or `token_serial`. Exactly one
   token must match. With neither set, exactly one initialized token must be
   present.
 - **A rejected PIN stops further logins** from that process until the PIN
-  file changes, so a wrong PIN can't run the token's retry counter down to a
-  lockout.
+  file changes, so one process can't run the token's retry counter down to
+  a lockout. That is per process: each worker of a prefork server, and each
+  start of a service in a restart loop, spends one attempt of its own on a
+  stale PIN file, and a token that allows three is locked by three of them.
+  Set `pin_state_dir` to close that:
+
+  ```toml
+  [pkcs11]
+  pin_state_dir = "/run/hkdfguard/pkcs11"
+  ```
+
+  ```sh
+  install -d -m 0755 /run/hkdfguard
+  install -d -m 2770 -o root -g <service-group> /run/hkdfguard/pkcs11   # the group that reads the PIN file
+  ```
+
+  A rejection is then recorded there (`pin-rejected`), and every process
+  using this policy reads it before logging in, so a wrong PIN costs one
+  attempt in total. Processes that haven't yet seen the PIN accepted also
+  log in one at a time (`login.lock`), so workers starting together don't
+  each try it. The record names the PIN file's version, and stops applying
+  when the file changes; deleting it also lets one login retry. The
+  directory must exist, be owned by root or the service's account, and
+  give accounts outside its owner and group no access at all (no read,
+  write or search bit for others); otherwise PKCS#11 is refused. Give
+  access only to the accounts that read the PIN file: whoever can write
+  there, or merely open `login.lock` and hold a lock on it, can stop
+  PKCS#11 logins, though nothing more. `/run` is emptied at boot, so
+  create the directory from a `tmpfiles.d` entry
+  (`d /run/hkdfguard/pkcs11 2770 root <service-group>`) or the unit's
+  `RuntimeDirectory=` with `RuntimeDirectoryMode=0750` (systemd's default,
+  `0755`, is refused). One case is not covered: if the PIN is changed on
+  the token while several processes are already logged in and working,
+  those in the middle of a login at that moment each spend an attempt
+  before the first record is written.
 
 `provision` generates one secret key on the token (`CKO_SECRET_KEY`,
 `CKK_GENERIC_SECRET`, 32 bytes, with `CKM_GENERIC_SECRET_KEY_GEN`),
@@ -272,11 +419,77 @@ encrypt, decrypt, wrap or unwrap), and neither modifiable nor copyable, so
 none of that can be relaxed later. Only private objects are ever looked up,
 so nothing someone creates on the token without the PIN is ever used. A key
 found under a service's label is used only if it still has all of these
-protections, and also `CKA_ALWAYS_SENSITIVE` and `CKA_NEVER_EXTRACTABLE`,
-which a token sets only on a key generated on it: an imported key, whose
-value someone may know, is refused. Only secret keys are looked up, so an
+protections, and also `CKA_ALWAYS_SENSITIVE`, `CKA_NEVER_EXTRACTABLE` and
+`CKA_LOCAL`, which a token sets only on a key it generated itself: an
+imported key, whose value someone may know, or one derived from another
+key, is refused. Only secret keys are looked up, so an
 EC key pair left under the same label by the pre-release ECDH format is
 ignored, not used or refused; delete it from the token by hand.
+
+#### What the PIN decides
+
+A PKCS#11 token has one authority over these keys: its user PIN. Every
+service that uses the token must be able to read the PIN file, so every
+one of them can do, with `pkcs11-tool` or a few lines of code, whatever
+the PIN allows -- whatever this library would have refused:
+
+- delete a service's key, which makes every DEK wrapped under it
+  unrecoverable;
+- delete it and generate another under the same label. The new key
+  passes every check above, being as token-generated as the first;
+- use any other service's key on the same token. Services sharing a token
+  are kept apart by labels only;
+- generate a key under the label of a service that keeps its KEK somewhere
+  else -- an external secret, say, later in the policy order. The token
+  then holds a key for that service, comes first, and takes its wraps,
+  under a key every PIN holder can use; what the real key wrapped is
+  refused. A pin on the service's real key stops this (below).
+
+None of this reveals the value of a key the library generated: it is not
+extractable, and can't be made so. A key a PIN holder generates is another
+matter where the token offers key-extraction or key-combining derive
+mechanisms (`CKM_EXTRACT_KEY_FROM_KEY`, `CKM_XOR_BASE_AND_DATA`, ...): one
+made loose, read out through them, then copied with the library's
+attributes passes every check above, with a value its maker knows. Pinning
+(below) is what refuses it; disable those mechanisms for the user role
+where the HSM allows.
+
+What to do about it:
+
+- **Give each service its own token or HSM partition**, with its own PIN
+  file, wherever one service must not be able to affect another's key.
+- **Pin each service's key.** `provision` prints the key's fingerprint;
+  record it in the policy, which only root writes:
+
+  ```toml
+  [pkcs11.pinned_keys]
+  "com.company.orders" = "<64 hex chars>"    # or a list of them
+  ```
+
+  A key with any other fingerprint is then refused, so a replaced key
+  can't be used. A pinned service whose key is gone fails every call,
+  instead of being treated as having no key -- which would let the next
+  provider in the policy order serve it. A pin also says which provider
+  the service's KEK lives in: a service pinned in one provider
+  (`pkcs11.pinned_keys`, `external_secret.pinned_keys`,
+  `tpm.pinned_names`) is never served by PKCS#11, an external secret or
+  an ephemeral key it has no pin for, whatever key turns up there under
+  its name, and a payload naming such a provider is refused
+  (`KEK_FINGERPRINT_MISMATCH`). A service that really keeps keys in two
+  of them -- during a migration -- needs a pin in each. To provision a pinned service
+  again (after `retire`, say), remove its pin first, then pin the new
+  fingerprint.
+- **`require_pinned_keys`** in `[pkcs11]` makes the pins an allowlist: a
+  service with no pin has no KEK on the token. `provision` then generates
+  the key and fails with the line to add to the policy; run it again once
+  the pin is in place. It is **on unless you turn it off** under the
+  production security model, and off unless you turn it on under the
+  developer one. Without it, an unpinned service is served with whatever
+  key the token holds under its label, and one whose key has gone missing
+  is handed to the next provider in the order.
+
+Pinning detects a deleted or replaced key; it cannot prevent one. Where
+the HSM can make a key undeletable for the user role, do that as well.
 
 **What the HSM must allow.** Each wrap and unwrap is a single-part
 `C_Sign` with `CKM_SHA256_HMAC` on that key, which returns only the HMAC:
@@ -336,18 +549,27 @@ checks the key, so a wrong format is reported when you provision, not
 later.
 
 **File rules.** The file must:
-- be owned by root or by the service's user, with no group or other access
+- be owned by root, with no group or other access
   (`0400` or `0600`), except that a root-owned file may also be readable by
-  its group (`root:<group> 0440`), so a non-root service can read it;
+  its group (`root:<group> 0440`), so a non-root service can read it. A
+  file owned by the service's own user is accepted only under the developer
+  security model, or when `external_secret.pinned_keys` pins the service's
+  key: under the production model only root creates a KEK, and for this
+  provider putting a file in the mount is creating one. The pin is root
+  saying which key it is, whoever wrote the file;
 - be a regular file;
 - resolve to a path inside the mount (symlinks are followed only while they
   stay inside it).
 
-The mount and every directory above it must be owned by root or the
-service's user and not writable by anyone else -- sticky directories such as
+The mount and every directory above it must be owned as the file must be
+(root; or the service's user under the developer model or with a pinned
+key) and not writable by anyone else -- sticky directories such as
 `/tmp` included, so a mount anywhere under `/tmp`, `/var/tmp` or `/dev/shm`
-is refused. A read-only mount is the one exception: a Kubernetes Secret
-volume is `1777`, but read-only, and is fine. Platform settings that meet
+is refused. A sticky directory on a read-only mount is the one exception:
+a Kubernetes Secret volume, or a memory-backed `emptyDir`, is `1777`, and
+mounted read-only is fine. A disk-backed `emptyDir` is `0777`, not sticky,
+and is refused even read-only: use `medium: Memory`, or mount a private
+subdirectory of it. Platform settings that meet
 the mode rule:
 
 | Mechanism | Setting |
@@ -379,9 +601,12 @@ require_pinned_keys = true           # a service with no pin has no KEK here
 ```
 
 A key whose fingerprint isn't pinned for its service is refused, as an
-error, so the library never moves on to another provider. Without
-`require_pinned_keys`, services you haven't pinned work as before. Service
-names must be quoted, as in `[tpm.pinned_names]`.
+error, so the library never moves on to another provider.
+`require_pinned_keys` is on unless you turn it off under the production
+security model, and off unless you turn it on under the developer one.
+With `require_pinned_keys = false`, services you haven't pinned are served
+with whatever key is mounted for them. Service names must be quoted, as in
+`[tpm.pinned_names]`.
 
 The fingerprint is one HMAC-SHA-256 output of the key over a fixed
 input, `HMAC(KEK, [1]_32 || "hkdfguard-kek-fingerprint-v1" || 0x00 || [256]_32)`
@@ -422,9 +647,20 @@ Because the process's memory is the key's only protection, the library
 hardens the process before it creates the first ephemeral key: core dumps
 are disabled and the process is marked non-dumpable, as
 `hkdfguard_harden_process` does, and creating the key fails if that isn't
-possible. Debuggers and crash reporters stop working for that process. The
-keys themselves sit in pages excluded from core dumps and locked into RAM
-where `RLIMIT_MEMLOCK` allows (a warning is logged once if it doesn't).
+possible. Debuggers and crash reporters stop working for that process. It
+is checked again each time a key is used: a process that has become
+dumpable since (the kernel resets the flag when credentials change, and a
+crash reporter may set it) is hardened again first, with a warning, or the
+call fails.
+
+The keys themselves sit in pages excluded from core dumps and wiped in a
+forked child; a kernel that can't do both (before Linux 4.14) can't hold
+an ephemeral key, and creating one fails. The pages are also locked into
+RAM where `RLIMIT_MEMLOCK` allows (a warning is logged once if it
+doesn't). A forked child has none of its parent's keys and creates its
+own. While a call runs, the key is also in that call's ordinary memory,
+which those protections don't cover: a trace of it can reach swap, or a
+child forked at that moment by another thread.
 
 The `hkdfguard` CLI refuses ephemeral keys for `provision` and `wrap`: a
 key it created would be gone when it exits. Wrap DEKs from the application
@@ -434,7 +670,7 @@ itself, for example with `hkdfguard_generate_and_wrap_dek`.
 
 Each example is a complete `policy.toml`. Replace the placeholder Names
 (`000b<64 hex chars>`) with the values your TPM gives you (see
-[step 3](#tpm-20)).
+[step 4](#tpm-20)).
 
 **Strongest: TPM only, everything pinned.** For a host with a TPM, where no
 weaker fallback is acceptable:
@@ -455,6 +691,9 @@ pinned_session_salt_key_name = "000b<64 hex chars>"  # the storage root key prov
 
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"
+
+[tpm.auth_groups]
+"com.company.orders" = "orders"      # only the orders service's group reads its authValue
 ```
 
 **Any hardware, TPM preferred.** For a fleet where some hosts have a TPM and
@@ -468,6 +707,9 @@ level = "hardware"                   # tpm2 or pkcs11, in the default order
 [pkcs11]
 module = "/usr/lib/vendor/libvendor-pkcs11.so"
 token_label = "hkdfguard-prod"
+
+[pkcs11.pinned_keys]                 # on the HSM hosts, only these services have a key
+"com.company.orders" = "<64 hex chars>"
 ```
 
 **Containers: external secrets only.** For pods or containers that receive
@@ -486,10 +728,11 @@ require_pinned_keys = true
 "com.company.orders" = "<64 hex chars>"
 ```
 
-**Development: SoftHSM2, else ephemeral.** The policy in the `-dev` container
+**Development: SoftHSM2, else ephemeral.** The policy in the `hkdfguard-overlay-dev` container
 overlay image. Never use it in production:
 
 ```toml
+security_model = "developer"         # anyone provisions; no pins needed
 preferred_order = ["pkcs11", "ephemeral"]
 
 [selection]
@@ -513,8 +756,8 @@ deployer_groups = ["payments-deployers"] # optional; besides hkdfguard-deployers
 ```
 
 Both keys go above the first `[table]`. Production applies when they are
-absent, and when there is no policy file at all: a host is a production
-install unless an administrator says otherwise. Any other value of
+absent: a host is a production install unless an administrator says
+otherwise. Any other value of
 `security_model` (`"development"` included) makes the policy invalid, and
 every call fails with `HKDFGUARD_ERR_POLICY_INVALID` (-9).
 
@@ -530,9 +773,14 @@ Under **production**:
   returns the existing KEK -- so an application may still call it at
   startup -- or `HKDFGUARD_ERR_KEK_ACCESS_DENIED` (-18) when there is none
   to return. An ephemeral KEK is the exception: it lives only in the
-  process that makes it. Retiring a KEK takes root too. On TPM2 and
-  PKCS#11 this is enforced directly (only root creates a key file, or
-  generates an HMAC secret key on the token); external-secret never creates a KEK
+  process that makes it. Retiring a KEK takes root too. On TPM2 the
+  filesystem enforces it: only root can create or delete a key file.
+  On PKCS#11 it is the library's rule, not the token's: the token's one
+  authority is its user PIN, which every service using it can read, and
+  a PIN holder can delete or regenerate a key with the token's own
+  tools (see [What the PIN decides](#what-the-pin-decides)). Pin each
+  service's key with `pkcs11.pinned_keys` so that is detected.
+  External-secret never creates a KEK
   (the delivered file is the provisioning). With
   `tpm.require_pinned_names = true`, a TPM service also needs its key's
   Name in the root-owned policy: `provision` prints it.
@@ -594,6 +842,21 @@ Things to know:
   NSS, so LDAP and sssd groups count, and a slow directory slows the call.
   Removing a deployer makes every key file they own untrusted at once:
   redeploy those files first.
+- **Removing a deployer from the group does not end what they can do.** A
+  session they already have open keeps the group in its kernel credentials
+  until it ends, and with it write access to every group-writable folder
+  the deployers share. The library stops trusting files they *own*, so
+  anything they write or replace from then on is refused -- but they can
+  still delete or rename the other deployers' key files there. End their
+  sessions when you remove them (`loginctl terminate-user <name>`, or
+  `pkill -KILL -u <name>`), and check the shared folders afterwards.
+- **The packages use a group that already exists.** `hkdfguard` and
+  `hkdfguard-deployers` are looked up through NSS, at install and by the
+  library, so a directory (LDAP, sssd) group of the same name *is* the
+  deployer group, with whatever members it has. Installing warns when
+  either group is already there from a directory or with members; check
+  `getent group hkdfguard-deployers` before relying on the production
+  model on a directory-joined host.
 - Tools can ask the library the same questions: `hkdfguard_security_model`
   (the model, and whether a key file this process writes would be trusted)
   and `hkdfguard_key_file_principal_trusted("uid:<n>"` or `"gid:<n>")`.
@@ -613,10 +876,11 @@ permissions so that only the service's own account can do both.
 | `/etc/hkdfguard/policy.toml` | `root:root 0644` | Readable by services; changeable only by root |
 | `/var/lib/hkdfguard/tpm/` | `root:<key-users> 0750` | Only root may add or replace a key; its group is the group of each key file in it |
 | `/var/lib/hkdfguard/tpm/<service>.tpmkey` | `root:<key-users> 0440` (`provision` sets it) | Readable by the services allowed to use TPM keys |
-| `/var/lib/hkdfguard/tpm/<service>.tpmauth` | `root:<key-users> 0440` (`provision` sets it); better `root:<service-group> 0440` | The key's authValue: only that service should read it |
-| `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | As above |
+| `/var/lib/hkdfguard/tpm/.lock` | `root:root 0600` (`provision` creates it) | Empty; held while a key is provisioned or retired. Only root can open it, so no service can hold up either |
+| `/var/lib/hkdfguard/tpm/<service>.tpmauth` | `root:<service-group> 0440`, the group from `tpm.auth_groups`; `root:root 0400` with none (`provision` sets it) | The key's authValue: only that service may read it |
+| `/etc/hkdfguard/tpm.owner-auth` (if used) | `root:<key-users> 0440` | Every TPM-using service must read it, and so holds the Owner hierarchy's password |
 | `/etc/hkdfguard/pkcs11.pin` | `root:<key-users> 0440` | As above |
-| External secret `<dir>/<service>` | root or the service's user, `0400`; or `root:<group> 0440` | Only that service (or the pod's `fsGroup`) |
+| External secret `<dir>/<service>` | root, `0400`; or `root:<group> 0440`; the service's user only under the developer model or with a pinned key | Only that service (or the pod's `fsGroup`) |
 | Wrapped key files (CLI output) | root or a deployer, `:<service-group> 0640` | Only that service can read its wrapped DEK; under the production model, only root's and deployers' are trusted |
 | Folder holding key files | root or a deployer; `root:hkdfguard-deployers 2775` to share it | Nobody untrusted can replace a key file |
 
@@ -637,16 +901,11 @@ sudo install -d -m 0750 -o root -g hkdfguard /var/lib/hkdfguard/tpm
 # and its wrapped key files are group-owned by that service's own group.
 ```
 
-As provisioned, every member of `hkdfguard` can use every service's TPM
-key: both files take the directory's group. To give each service its own,
-change its authValue file's group to that service's own group after
-`provision` (`sudo chgrp orders /var/lib/hkdfguard/tpm/com.company.orders.tpmauth`);
-the services still need the directory's group to reach it. Without its
-authValue, another service's key file is useless to them. Without that,
-what stops one service from recovering
-another's DEK is that it can't read the other's wrapped key files. Wrapped
-files are meant to be storable openly (in backups, for example), so treat
-this as defence in depth, not a hard boundary.
+Every member of `hkdfguard` can read every service's key file, but only a
+service's own group (from `tpm.auth_groups`) its authValue file, and
+without its authValue another service's key file is useless. List each
+service's group in `tpm.auth_groups` before provisioning it; the services
+still need the directory's group to reach their files.
 
 The same holds for any file above that a group can read: every member of
 that group holds the key it protects, not just read access to a file. An
@@ -673,6 +932,8 @@ preferred_order = ["tpm2", "pkcs11", "external-secret"]
 mode = "prefer"          # prefer | require | require-level
 provider = "tpm2"        # with "require": tpm2 | pkcs11 | external-secret | ephemeral
 level = "hardware"       # with "require-level": ephemeral | software | external | hardware
+allow_unwrap_from_lower_provider = false   # true: unwrap payloads wrapped under a provider later in the order than
+                                           # one holding the service's KEK now. Only while those are re-wrapped.
 
 [key_requirements]
 minimum_protection = "external"   # exclude providers below this level, whatever the mode (default: no minimum)
@@ -689,14 +950,18 @@ key_dir = "/var/lib/hkdfguard/tpm"                    # one <service>.tpmkey per
 owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"     # default: unset (empty owner password)
 require_pinned_names = false
 session_encryption = "on"                             # on | off (off: test harnesses only)
-pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; pin it before provisioning on a discrete TPM
+pinned_session_salt_key_name = "000b<64 hex chars>"   # default: unset; provision refuses until it is set, and prints the Name
+allow_unpinned_provisioning = false                   # true: provision without the pin (firmware or virtual TPMs, test harnesses)
+
+[tpm.auth_groups]                                     # default: none (every .tpmauth file root:root 0400)
+"com.company.orders" = "orders"                       # its .tpmauth file root:orders 0440
 
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"
 
 [external_secret]
 dir = "/run/secrets/hkdfguard"    # default: the first existing conventional mount
-require_pinned_keys = false       # true: only services in pinned_keys have a KEK here
+require_pinned_keys = true        # only services in pinned_keys have a KEK here; default: true under production, false under developer
 
 [external_secret.pinned_keys]
 "com.company.orders" = "<64 hex chars>"           # or a list of them, while rotating
@@ -704,8 +969,13 @@ require_pinned_keys = false       # true: only services in pinned_keys have a KE
 [pkcs11]
 module = "/usr/lib/vendor/libvendor-pkcs11.so"   # default: unset (PKCS#11 not used)
 pin_file = "/etc/hkdfguard/pkcs11.pin"
+pin_state_dir = "/run/hkdfguard/pkcs11"          # default: unset (a rejected PIN is remembered per process only)
 token_label = "hkdfguard-prod"                   # 1 to 32 bytes
 token_serial = "0123456789abcdef"                # 1 to 16 bytes
+require_pinned_keys = true                       # only the services below have a key on the token; default: true under production, false under developer
+
+[pkcs11.pinned_keys]                             # default: none
+"com.company.orders" = "<64 hex chars>"          # the fingerprint provision prints; or a list of them
 ```
 
 Notes:

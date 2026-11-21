@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fails unless Cargo.toml, debian/changelog and the RPM spec (Version and
 # newest %changelog entry) carry the same version -- and, given a release
-# tag such as v0.9.1, unless the tag names it too.
+# tag such as v0.9.2, unless the tag names it too.
 #
 # Releasing a new version means bumping all three together: `version` in
 # Cargo.toml, a new top entry in debian/changelog, and Version plus a new
@@ -27,5 +27,16 @@ check debian/changelog "$deb_v"
 check "packaging/rpm/hkdfguard.spec Version" "$rpm_v"
 check "packaging/rpm/hkdfguard.spec %changelog" "$rpm_log_v"
 [ $# -eq 0 ] || check "tag $1" "${1#v}"
+
+# Each symbol in the Debian symbols file is tagged with the first version
+# that exported it, so no tag may be newer than the version being built:
+# dpkg-gensymbols would then make every dependent package require a
+# libhkdfguard1 that doesn't exist.
+while read -r symbol since; do
+    if [[ "$(printf '%s\n%s\n' "$since" "$cargo_v" | sort -V | tail -n 1)" != "$cargo_v" ]]; then
+        echo "error: debian/libhkdfguard1.symbols tags $symbol with $since, newer than Cargo.toml's $cargo_v" >&2
+        status=1
+    fi
+done < <(sed -n 's/^ \([^ ]*\) \([0-9][^ ]*\)$/\1 \2/p' debian/libhkdfguard1.symbols | tr -d '\r')
 [ $status -eq 0 ] && echo "version $cargo_v is consistent"
 exit $status

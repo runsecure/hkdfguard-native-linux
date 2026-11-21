@@ -25,7 +25,7 @@
 //! TPM2B size prefixes must match their contents. Nothing here talks to a
 //! TPM; `tpm2.rs` unmarshals the two structures and loads them.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64ct::{Base64, Encoding as _};
 
 /// `id-loadablekey` (2.23.133.10.1.3), DER-encoded with its tag and length.
 const LOADABLE_KEY_OID: &[u8] = &[0x06, 0x06, 0x67, 0x81, 0x05, 0x0a, 0x01, 0x03];
@@ -86,7 +86,7 @@ pub(crate) fn encode(blob: &KeyBlob) -> Result<String, String> {
     let mut der = Vec::new();
     der_push(&mut der, TAG_SEQUENCE, &body)?;
 
-    let encoded = STANDARD.encode(&der);
+    let encoded = Base64::encode_string(&der);
     let mut pem = String::with_capacity(encoded.len() + encoded.len() / 64 + PEM_BEGIN.len() + PEM_END.len() + 4);
     pem.push_str(PEM_BEGIN);
     pem.push('\n');
@@ -122,7 +122,7 @@ pub(crate) fn decode(text: &[u8]) -> Result<KeyBlob, String> {
     if lines.any(|l| !l.is_empty()) {
         return Err("has text after the end line".to_string());
     }
-    let der = STANDARD.decode(base64.as_bytes()).map_err(|_| "its PEM body is not valid base64".to_string())?;
+    let der = Base64::decode_vec(&base64).map_err(|_| "its PEM body is not valid base64".to_string())?;
     decode_der(&der)
 }
 
@@ -245,6 +245,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test fixtures only; the code above uses base64ct.
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     fn sample() -> KeyBlob {
         // Sizes like a real key's: an ~88-byte TPMT_PUBLIC and a ~126-byte
