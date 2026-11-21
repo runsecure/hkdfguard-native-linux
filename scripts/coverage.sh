@@ -25,7 +25,7 @@ base=${1:-$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD m
 sysroot=$(rustc --print sysroot)
 host=$(rustc -vV | sed -n 's/^host: //p')
 bin="$sysroot/lib/rustlib/$host/bin"
-[ -x "$bin/llvm-cov" ] || { echo "llvm-cov missing: rustup component add llvm-tools-preview" >&2; exit 2; }
+[[ -x "$bin/llvm-cov" ]] || { echo "llvm-cov missing: rustup component add llvm-tools-preview" >&2; exit 2; }
 
 out=$root/target/coverage
 export CARGO_TARGET_DIR=$out/build
@@ -63,4 +63,4 @@ ignore='(/\.cargo/registry/|/rustc/|/tests/|/fuzz/)'
 
 echo
 echo "Added lines (since ${base:0:12}) that are executable and never ran:"
-git diff -U0 "$base" -- src | python3 "$root/scripts/coverage_diff.py" "$out/lcov.info" "$root" "$root/scripts/coverage-exempt.txt"
+git diff -U0 "$base" -- src | python3 "$root/scripts/coverage_diff.py"

@@ -92,7 +92,7 @@ for t in "${TARGETS[@]}"; do
         scp -q "$t:$REMOTE_DIR/$name" "$logs/$name" && fetched=$((fetched + 1)) \
             || echo "(could not fetch $name from $t)"
     done < <(ssh "$t" "cd $REMOTE_DIR 2>/dev/null && ls -1 hardware-tests-*.log tpm-capabilities-*.txt 2>/dev/null")
-    [ "$fetched" -gt 0 ] || echo "(no logs on $t to fetch)"
+    [[ "$fetched" -gt 0 ]] || echo "(no logs on $t to fetch)"
     [ "$KEEP" = 1 ] || ssh "$t" "rm -rf $REMOTE_DIR" || true
     if [ "$code" -eq 0 ]; then RESULTS+=("$t: passed"); else RESULTS+=("$t: FAILED (exit $code)"); FAILED=1; fi
 done

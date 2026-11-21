@@ -2,3 +2,6 @@ target
 corpus
 artifacts
 coverage
+seeds
+campaign-*.log
+campaign-*.sarif

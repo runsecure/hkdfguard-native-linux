@@ -69,7 +69,7 @@ put_policy() {
 start_job() {
     local fsgroup="" policy_kind=""
     [ "$3" != - ] && fsgroup="fsGroup: $3"
-    [ "$1" = policy-in-configmap-volume ] && policy_kind=configmap
+    [[ "$1" = "policy-in-configmap-volume" ]] && policy_kind=configmap
     kubectl apply -f - >/dev/null <<YAML
 apiVersion: batch/v1
 kind: Job

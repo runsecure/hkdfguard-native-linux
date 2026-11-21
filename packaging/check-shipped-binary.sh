@@ -15,10 +15,10 @@
 # Usage: packaging/check-shipped-binary.sh <file>...
 set -euo pipefail
 
-[ $# -ge 1 ] || { echo "usage: $0 <file>..." >&2; exit 2; }
+[[ $# -ge 1 ]] || { echo "usage: $0 <file>..." >&2; exit 2; }
 marker=hkdfguard_test_paths
 for file in "$@"; do
-    [ -f "$file" ] || { echo "error: $file: no such file" >&2; exit 1; }
+    [[ -f "$file" ]] || { echo "error: $file: no such file" >&2; exit 1; }
     # -a: a binary is searched as text. -F: the marker is not a pattern.
     if grep -a -q -F "$marker" "$file"; then
         echo "error: $file was built with --cfg $marker: a test build, which honors HKDFGUARD_POLICY_FILE." >&2

@@ -932,7 +932,14 @@ fn run_protect_stdin_in(service: &str, name: &str, input: &[u8], extra_args: &[&
     child.wait_with_output().expect("failed to run hkdfguard protect")
 }
 
-fn set_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> std::io::Result<()> {
+// The type of a `RLIMIT_*` constant, which is libc's first argument to
+// setrlimit: glibc's own enum type there, a plain int on musl (Alpine).
+#[cfg(target_env = "gnu")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type RlimitResource = libc::c_int;
+
+fn set_limit(resource: RlimitResource, value: libc::rlim_t) -> std::io::Result<()> {
     let limit = libc::rlimit { rlim_cur: value, rlim_max: value };
     // SAFETY: setrlimit reads a valid rlimit.
     if unsafe { libc::setrlimit(resource, &limit) } != 0 {

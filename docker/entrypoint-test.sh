@@ -126,6 +126,33 @@ test_cargo test --features pkcs11 -- --ignored --test-threads=1
 section "cargo test --features pkcs11 --lib provider::pkcs11 (its unit tests)"
 test_cargo test --features pkcs11 --lib provider::pkcs11
 
+# The same provider tests once more, built with AddressSanitizer. These are
+# the paths no other memory check reaches: Miri stops at the first call
+# into C, and the fuzz harnesses (fuzz/) use the ephemeral provider only --
+# so the tss-esapi contexts, the PKCS#11 module, its sessions and the
+# buffers handed across both are otherwise never run under a sanitizer. A
+# use after free, a double free or a read or write past a buffer on the
+# Rust side of either boundary fails the test that reached it. (The C
+# libraries themselves are not instrumented: an error wholly inside
+# tpm2-tss or SoftHSM2 goes unseen.)
+#
+# Library tests only (--lib provider::): the CLI's and the integration
+# tests' memory-locking checks read the kernel's locked-page counts, which
+# the sanitizer's own mappings change. Leak detection is off: it needs
+# ptrace, which a container may not grant, and SoftHSM2 and OpenSSL keep
+# allocations for the life of the process by design.
+# --target: so that only the test binary is instrumented, not build scripts.
+section "AddressSanitizer: the provider tests, TPM2 against swtpm and PKCS#11 against SoftHSM2"
+: "${HKDFGUARD_ASAN_TOOLCHAIN:?docker/Dockerfile sets this to the pinned nightly}"
+ASAN_TARGET=$(rustc -vV | sed -n 's/^host: //p')
+asan_test() {
+    as_ci env RUSTFLAGS="--cfg hkdfguard_test_paths -Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
+        CARGO_TARGET_DIR=target/asan cargo "+$HKDFGUARD_ASAN_TOOLCHAIN" test --target "$ASAN_TARGET" "$@"
+}
+asan_test --features tpm2 --lib provider:: -- --include-ignored --test-threads=1
+asan_test --features pkcs11 --lib provider:: -- --include-ignored --test-threads=1
+echo "TPM2 and PKCS#11 provider tests pass under AddressSanitizer."
+
 unset HKDFGUARD_POLICY_FILE TPM2TOOLS_TCTI
 
 section "C ABI round trip via examples/wrap_unwrap.c (default providers)"

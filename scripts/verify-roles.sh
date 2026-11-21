@@ -114,7 +114,7 @@ grep -q 'only root retires a KEK' <<<"$OUT" || fail "unexpected refusal of the a
 OUT=$("$CLI" provision -sn "$SERVICE" 2>&1) && fail "root provisioned a service policy pins no key for: $OUT"
 grep -q 'has no pinned key' <<<"$OUT" || fail "unexpected refusal of an unpinned service: $OUT"
 FP=$(grep -o '[0-9a-f]\{64\}' <<<"$OUT" | head -n 1)
-[ ${#FP} -eq 64 ] || fail "the refusal printed no fingerprint to pin: $OUT"
+[[ ${#FP} -eq 64 ]] || fail "the refusal printed no fingerprint to pin: $OUT"
 printf '\n[external_secret.pinned_keys]\n"%s" = "%s"\n' "$SERVICE" "$FP" >> "$POLICY"
 OUT=$("$CLI" provision -sn "$SERVICE" 2>&1) || fail "root's provision failed once the key was pinned: $OUT"
 grep -q "$FP" <<<"$OUT" || fail "provision did not report the pinned fingerprint $FP: $OUT"
