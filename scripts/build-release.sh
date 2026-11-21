@@ -13,7 +13,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build --release
+# --locked: exactly the dependency versions in Cargo.lock, or no build.
+cargo build --release --locked
 
 # The SONAME is a Linux (ELF) name; elsewhere Cargo's output is all there is.
 [ "$(uname -s)" = Linux ] || exit 0

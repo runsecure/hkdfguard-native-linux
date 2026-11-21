@@ -86,13 +86,13 @@ if [ -n "$TCTI" ] && command -v tpm2_getcap >/dev/null 2>&1 && [ "$FAILED" -eq 0
         ok "TPM manufacturer: ${MANUFACTURER:-unknown}${vendor:+ ($vendor)}${fw:+, firmware $fw}"
         case "${MANUFACTURER}" in
             INTC|AMD|QCOM)
-                ok "firmware TPM (inside the SoC): no external bus to probe. Sessions are encrypted anyway; pinning the storage root key is optional here"
+                ok "firmware TPM (inside the SoC): no external bus to probe. Sessions are encrypted anyway; provisioning needs the storage root key pinned, or tpm.allow_unpinned_provisioning = true"
                 ;;
             MSFT|IBM|GOOG|VMW)
-                ok "virtual/software TPM: no external bus. Sessions are encrypted anyway; pinning the storage root key is optional here"
+                ok "virtual/software TPM: no external bus. Sessions are encrypted anyway; provisioning needs the storage root key pinned, or tpm.allow_unpinned_provisioning = true"
                 ;;
             IFX|STM|NTC|ATML|NSM|NSG|SMSC)
-                ok "discrete TPM chip: TPM2_HMAC sessions are encrypted under each key's authValue. Pin the storage root key's Name (tpm.pinned_session_salt_key_name) BEFORE provisioning -- see README"
+                ok "discrete TPM chip: TPM2_HMAC sessions are encrypted under each key's authValue. Pin the storage root key's Name (tpm.pinned_session_salt_key_name): provision refuses without it, and prints the Name -- see README"
                 ;;
             "")
                 warn "could not read the manufacturer; treat it as discrete and pin the storage root key before provisioning"

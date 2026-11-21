@@ -56,12 +56,20 @@ write_policy() {
     } > "$file"
 }
 
-# The ConfigMap volume and mount that put a scenario's policy at
+# The volume and mount that put a scenario's policy, ConfigMap <name>, at
 # /etc/hkdfguard/policy.toml. Read-only, as any secret or config volume
-# should be: the library accepts the volume's world-writable directory only
-# because nothing can write through a read-only mount.
+# should be, and projected: the library accepts a volume's world-writable
+# root only when it is sticky (as a projected or Secret volume's is) and
+# mounted read-only. A plain configMap: volume's root is 0777, not sticky,
+# and is refused; `policy_volume <name> configmap` mounts one that way.
 POLICY_MOUNT='{ name: policy, mountPath: /etc/hkdfguard, readOnly: true }'
-policy_volume() { printf '{ name: policy, configMap: { name: %s } }' "$1"; }
+policy_volume() {
+    if [ "${2:-}" = configmap ]; then
+        printf '{ name: policy, configMap: { name: %s } }' "$1"
+    else
+        printf '{ name: policy, projected: { sources: [{ configMap: { name: %s } }] } }' "$1"
+    fi
+}
 
 # verdict <pod output> <RESULT line> <expected RESULT prefix> <reason or ->:
 # whether the scenario behaved as expected. A reason must also appear in

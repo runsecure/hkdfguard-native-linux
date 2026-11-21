@@ -71,7 +71,9 @@ fn hardening_takes_effect_and_the_library_still_works_afterwards() {
         std::fs::write(
             &policy,
             format!(
-                "[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n[external_secret]\ndir = \"{}\"\n",
+                // The developer model: this user's own secret file, which
+                // production accepts only from root or with a pinned key.
+                "security_model = \"developer\"\n[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n[external_secret]\ndir = \"{}\"\n",
                 mount.path().display()
             ),
         )

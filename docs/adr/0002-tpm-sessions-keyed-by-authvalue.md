@@ -57,10 +57,13 @@ A security review on 2026-10-29 found that mechanism no longer fit:
    and `"required"` are refused. `"off"` uses an unsalted session with no
    encryption attributes; its responses are still authenticated by the
    authValue. It is for test harnesses.
-7. **The authValue file is a second access control.** Written
-   `root:<key-dir group> 0440`, like the key file. An administrator can
-   give it the service's own group, so other services in the key
-   directory's group can't use that key.
+7. **The authValue file is a second access control.** The key file is
+   `root:<key-dir group> 0440`; the authValue file never gets that group,
+   which every service using TPM keys is in. Root writes it
+   `root:<service group> 0440` when `tpm.auth_groups` names a group for
+   the service, and `root:root 0400` when it names none. Anyone else
+   writes it `0400`, their own. So other services in the key directory's
+   group can read a service's key file but can't use its key.
 
 ## Options considered
 

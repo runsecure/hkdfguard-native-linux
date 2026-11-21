@@ -15,13 +15,24 @@
 //!   length must be ones a wrap can produce, and the whole must parse;
 //!   otherwise [`KeyFileError::Malformed`].
 //! - **An unprotected key.** A file holding what looks like an *unwrapped*
-//!   DEK -- 32 raw bytes, or 32 bytes as text: base64 (standard or URL-safe,
-//!   padded or not; the CLI's DEK input is standard base64) or hex, with any
+//!   DEK -- 32 raw bytes, optionally followed by one line ending (LF or
+//!   CRLF), or 32 bytes as text: base64 (standard or URL-safe, padded or
+//!   not; the CLI's DEK input is standard base64) or hex, with any
 //!   surrounding whitespace -- is [`KeyFileError::PlaintextKey`]: most likely the DEK itself saved
 //!   where its wrapped form belongs. A 32-byte file is refused from its size
-//!   alone, normally without its contents being read into this process. Neither
-//!   form can be mistaken for a payload: both are shorter than the smallest
-//!   one.
+//!   alone, normally without its contents being read into this process. No
+//!   such form can be mistaken for a payload: all are shorter than the
+//!   smallest one.
+//! - **A real file.** Only a regular file is opened, and what is read must
+//!   be as long as the file says it is: a file whose filesystem makes its
+//!   contents up when read (procfs, sysfs) has an owner and a mode, but
+//!   nobody they could vouch for wrote its bytes.
+//! - **A filesystem that vouches for it.** Owner, mode and contents are
+//!   what the file's filesystem reports. On a FUSE mount that is whatever
+//!   the process serving it says, and any user can serve one: so whoever
+//!   serves it must be someone the security model trusts as an owner, or
+//!   the file is [`KeyFileError::Untrusted`]
+//!   (see [`secure_file::check_filesystem`]).
 //! - **Integrity.** The file must be owned by someone the security model
 //!   trusts, and must not be writable by anyone else; otherwise
 //!   [`KeyFileError::Untrusted`]. Under the production model (the
@@ -45,18 +56,60 @@
 //!   `/var/tmp`, `/dev/shm` or any other sticky, world-writable directory
 //!   is refused, however private the directories beneath it: a key file
 //!   belongs in a directory only its owner (or root) can write to, all the
-//!   way up. The one exception is a read-only mount -- a Kubernetes Secret
-//!   or ConfigMap volume is `1777` but nobody can write to it. (The OS
+//!   way up. The one exception is a sticky directory on a read-only mount
+//!   -- a Kubernetes Secret or projected volume is `1777` but nobody can
+//!   write to it. (The OS
 //!   itself refusing to open the file -- e.g. `EACCES` -- is the separate
 //!   [`KeyFileError::AccessDenied`].)
 
-use crate::crypto::{DEK_LEN, MAX_KEY_ID_LEN, MAX_WRAPPED_LEN, MIN_WRAPPED_LEN, TAG_LEN};
+use crate::crypto::{
+    DEK_LEN, MAX_KEY_ID_LEN, MAX_SECRET_WRAPPED_LEN, MAX_WRAPPED_LEN, MIN_SECRET_WRAPPED_LEN, MIN_WRAPPED_LEN,
+    SECRET_BLOCK_LEN, TAG_LEN,
+};
 use crate::error::status;
 use crate::payload::{Payload, NONCE_LEN, SALT_LEN, VERSION};
 use crate::provider::ProviderType;
 use crate::secure_file::{self, FileRequirements, PrincipalTrust, SecretBuffer};
 use std::io;
 use std::path::Path;
+
+/// Which kind of payload a key file holds: a wrapped DEK
+/// (`hkdfguard_open_file`) or a wrapped secret (`hkdfguard_open_secret_file`).
+/// Both are read and trusted by exactly the same rules; only the sizes
+/// differ, and only a DEK file is checked for an unwrapped key (a secret
+/// has no fixed form to recognise; one saved unwrapped is shorter than any
+/// secret payload, so it is refused as [`KeyFileError::TooShort`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Dek,
+    Secret,
+}
+
+impl Kind {
+    /// Smallest payload of this kind (an empty `key_id`).
+    pub fn min_len(self) -> usize {
+        match self {
+            Kind::Dek => MIN_WRAPPED_LEN,
+            Kind::Secret => MIN_SECRET_WRAPPED_LEN,
+        }
+    }
+
+    /// Largest payload of this kind.
+    pub fn max_len(self) -> usize {
+        match self {
+            Kind::Dek => MAX_WRAPPED_LEN,
+            Kind::Secret => MAX_SECRET_WRAPPED_LEN,
+        }
+    }
+
+    /// The one ciphertext length (tag included) a wrap of this kind produces.
+    fn ciphertext_len(self) -> usize {
+        match self {
+            Kind::Dek => DEK_LEN + TAG_LEN,
+            Kind::Secret => SECRET_BLOCK_LEN + TAG_LEN,
+        }
+    }
+}
 
 /// Why a key file was refused. Each maps to its own C status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +166,8 @@ impl KeyFileError {
             KeyFileError::TooLong => "the file is longer than a wrapped DEK, or than its header declares",
             KeyFileError::Malformed => "the file is not a well-formed wrapped DEK",
             KeyFileError::PlaintextKey => {
-                "the file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex); treat it as a key exposure"
+                "the file looks like an UNWRAPPED DEK (32 raw bytes, optionally followed by one line ending, or its \
+                 base64 or hex); treat it as a key exposure"
             }
         }
     }
@@ -137,8 +191,9 @@ impl KeyFileError {
 ///    metadata, before a byte is read.
 /// 4. The descriptor is confirmed to be the file resolved and checked in
 ///    steps 1-2 ([`secure_file::verify_opened`]): through `/proc` where it
-///    is mounted, and by device and inode where it isn't -- equally
-///    conclusive, so a sandbox without `/proc` loses nothing.
+///    is mounted, and always by device and inode against the resolved path
+///    walked again without following a link -- conclusive on its own, so a
+///    sandbox without `/proc` loses nothing.
 ///
 /// A file whose size alone says it is too long, or is a raw DEK, is then
 /// normally refused without being read (one rewritten between the size
@@ -147,12 +202,23 @@ impl KeyFileError {
 /// file may have held a plaintext key, and either way the buffer is wiped
 /// when dropped.
 pub fn read(path: &Path, trust: &dyn PrincipalTrust) -> Result<SecretBuffer, KeyFileError> {
-    read_with_proc_root(path, trust, Path::new("/proc"))
+    read_with_proc_root(path, trust, Path::new("/proc"), Kind::Dek)
+}
+
+/// [`read`], for a file holding a wrapped secret: the same trust rules,
+/// with the secret payload's sizes, and no plaintext-key detection.
+pub fn read_secret(path: &Path, trust: &dyn PrincipalTrust) -> Result<SecretBuffer, KeyFileError> {
+    read_with_proc_root(path, trust, Path::new("/proc"), Kind::Secret)
 }
 
 // `read`, with where `/proc` is mounted made a parameter so tests can run
 // it as though `/proc` were missing.
-fn read_with_proc_root(path: &Path, trust: &dyn PrincipalTrust, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
+fn read_with_proc_root(
+    path: &Path,
+    trust: &dyn PrincipalTrust,
+    proc_root: &Path,
+    kind: Kind,
+) -> Result<SecretBuffer, KeyFileError> {
     // Owner and mode are judged below, against `trust`, on the opened
     // descriptor's metadata; `open_checked` only opens it safely.
     let req = FileRequirements {
@@ -175,25 +241,57 @@ fn read_with_proc_root(path: &Path, trust: &dyn PrincipalTrust, proc_root: &Path
         None if e.kind() == io::ErrorKind::PermissionDenied => KeyFileError::Untrusted,
         _ => open_error(e),
     };
+    // Only a regular file is opened at all. Opening is not free of effects
+    // for everything else a caller's path might name -- a watchdog device
+    // is armed by it, a serial line raises DTR, a tape rewinds when closed
+    // -- and `/dev` is as trusted a directory chain as any. Every directory
+    // deciding what this name is has just been judged, so nobody the model
+    // doesn't trust can change it between here and the open; and the open
+    // checks the type again, on the descriptor.
+    match std::fs::symlink_metadata(&target_real) {
+        Ok(named) if named.file_type().is_file() => {}
+        Ok(named) if named.file_type().is_symlink() => return Err(KeyFileError::Untrusted), // became one after it was resolved
+        Ok(_) => return Err(KeyFileError::Io),
+        Err(e) => return Err(open_error(e)),
+    }
     let mut file = secure_file::open_checked(&target_real, &req).map_err(untrusted)?;
     let meta = file.metadata().map_err(|_| KeyFileError::Io)?;
     secure_file::check_metadata_trusting(&meta, trust).map_err(untrusted)?;
+    secure_file::check_acl_trusting(&file, trust).map_err(untrusted)?;
+    secure_file::check_filesystem(&file, trust, proc_root).map_err(untrusted)?;
     secure_file::verify_opened(&file, &target_real, &target_real, proc_root).map_err(|_| KeyFileError::Untrusted)?;
     let size = file.metadata().map_err(|_| KeyFileError::Io)?.len();
-    if size == DEK_LEN as u64 {
+    if kind == Kind::Dek && size == DEK_LEN as u64 {
         return Err(KeyFileError::PlaintextKey);
     }
-    if size > MAX_WRAPPED_LEN as u64 {
+    if size > kind.max_len() as u64 {
         return Err(KeyFileError::TooLong);
+    }
+    if size == 0 {
+        // What an empty file is -- and all that is said of a file whose
+        // filesystem makes its contents up as they are read (procfs: every
+        // such file reports no size), without reading any: a process's
+        // command line there is a root-owned regular file when the process
+        // is root's, with bytes whoever started it chose, and reading some
+        // of the others consumes what they hold.
+        return Err(KeyFileError::TooShort);
     }
     // The size can change between the fstat and the read; `check` judges
     // what was actually read, and a file that grew past the limit fails
     // the read itself.
-    let contents = SecretBuffer::read_from(&mut file, MAX_WRAPPED_LEN).map_err(|e| match e.kind() {
+    let contents = SecretBuffer::read_from(&mut file, kind.max_len()).map_err(|e| match e.kind() {
         io::ErrorKind::InvalidData => KeyFileError::TooLong,
         _ => KeyFileError::Io,
     })?;
-    check(contents.as_slice())?;
+    if contents.as_slice().len() as u64 != size {
+        // Not the bytes its own metadata describes: a file on a filesystem
+        // that generates contents on read (sysfs reports a page, whatever
+        // it holds), where owner and mode say nothing about who chose
+        // them -- or one rewritten in place while it was read, which no
+        // key file is: they are replaced whole, by rename.
+        return Err(KeyFileError::Untrusted);
+    }
+    check_kind(contents.as_slice(), kind)?;
     Ok(contents)
 }
 
@@ -208,15 +306,21 @@ fn open_error(e: io::Error) -> KeyFileError {
 
 /// Checks that `bytes` are a complete wrapped DEK payload: see the module
 /// docs for what each refusal means.
+#[cfg(any(test, hkdfguard_test_paths))]
 pub fn check(bytes: &[u8]) -> Result<(), KeyFileError> {
-    if looks_like_plaintext_dek(bytes) {
+    check_kind(bytes, Kind::Dek)
+}
+
+/// [`check`], for a payload of either kind.
+pub fn check_kind(bytes: &[u8], kind: Kind) -> Result<(), KeyFileError> {
+    if kind == Kind::Dek && looks_like_plaintext_dek(bytes) {
         return Err(KeyFileError::PlaintextKey);
     }
     let len = bytes.len();
-    if len < MIN_WRAPPED_LEN {
+    if len < kind.min_len() {
         return Err(KeyFileError::TooShort);
     }
-    if len > MAX_WRAPPED_LEN {
+    if len > kind.max_len() {
         return Err(KeyFileError::TooLong);
     }
     // From here `len >= MIN_WRAPPED_LEN`, so the fixed header fields read
@@ -228,7 +332,7 @@ pub fn check(bytes: &[u8]) -> Result<(), KeyFileError> {
     if key_id_len > MAX_KEY_ID_LEN {
         return Err(KeyFileError::Malformed); // no wrap records a longer one, so this is not a length the file could be "short" of
     }
-    let declared = MIN_WRAPPED_LEN + key_id_len;
+    let declared = kind.min_len() + key_id_len;
     if len < declared {
         return Err(KeyFileError::TooShort);
     }
@@ -238,7 +342,7 @@ pub fn check(bytes: &[u8]) -> Result<(), KeyFileError> {
     // `len == declared`, so the ciphertext length field is in bounds.
     let ct_len_at = 4 + key_id_len + SALT_LEN + NONCE_LEN;
     let ct_len = u32::from_le_bytes(bytes[ct_len_at..ct_len_at + 4].try_into().unwrap()) as usize;
-    if ct_len != DEK_LEN + TAG_LEN {
+    if ct_len != kind.ciphertext_len() {
         return Err(KeyFileError::Malformed);
     }
     // Every field is now known to be consistent; the real parser has the
@@ -255,15 +359,21 @@ const HEX_DEK_LEN: usize = 2 * DEK_LEN;
 /// length up to this is far below [`MIN_WRAPPED_LEN`], so no payload can
 /// ever be mistaken for a plaintext key, however it is padded.
 const MAX_PLAINTEXT_TEXT_LEN: usize = 96;
+/// Longest raw form recognised: 32 raw bytes and a CRLF.
+const MAX_PLAINTEXT_RAW_LEN: usize = DEK_LEN + 2;
 // Checked at compile time: plaintext detection can never refuse a real payload.
 const _: () = assert!(MAX_PLAINTEXT_TEXT_LEN < MIN_WRAPPED_LEN && DEK_LEN < MIN_WRAPPED_LEN);
+const _: () = assert!(MAX_PLAINTEXT_RAW_LEN <= MAX_PLAINTEXT_TEXT_LEN && MAX_PLAINTEXT_RAW_LEN < MIN_WRAPPED_LEN);
 
-// 32 raw bytes, or 32 bytes written as text: base64 (standard or URL-safe,
-// with or without its `=` padding -- the CLI's own DEK input format is
-// standard, padded) or hex (either case), with any leading or trailing
-// whitespace an editor or `echo` adds. Every one of these is refused as
-// TooShort anyway; recognising them is what turns "wrong file" into "this
-// key is exposed".
+// 32 raw bytes, optionally followed by one line ending (LF or CRLF, as
+// `echo`, `> file` or an editor adds: 33 bytes ending in LF, or 34 ending in
+// CR LF -- decided by length and those trailing bytes alone, never by
+// trimming, since the key's own last bytes may be whitespace values), or 32
+// bytes written as text: base64 (standard or URL-safe, with or without its
+// `=` padding -- the CLI's own DEK input format is standard, padded) or hex
+// (either case), with any leading or trailing whitespace an editor or
+// `echo` adds. Every one of these is refused as TooShort anyway;
+// recognising them is what turns "wrong file" into "this key is exposed".
 //
 // Constant-time in the contents: the only branches are on the length,
 // which the file's size already gives away. Every byte is visited twice
@@ -284,7 +394,8 @@ fn looks_like_plaintext_dek(bytes: &[u8]) -> bool {
     if bytes.len() > MAX_PLAINTEXT_TEXT_LEN {
         return false;
     }
-    ct::looks_like_text_dek(bytes) == 1
+    // Both tests always run and are folded without short-circuiting.
+    (ct::raw_dek_with_line_ending(bytes) | ct::looks_like_text_dek(bytes)) == 1
 }
 
 /// Branch-free byte classification for [`looks_like_plaintext_dek`]. Every
@@ -329,6 +440,20 @@ mod ct {
             | (62 & s62.wrapping_neg())
             | (63 & s63.wrapping_neg());
         (upper | lower | digit | s62 | s63, value)
+    }
+
+    /// 1 if `bytes` is 32 raw bytes followed by exactly one LF (33 bytes)
+    /// or one CR LF (34 bytes), else 0. Branches only on the length; the
+    /// line-ending bytes are compared branch-free, the key bytes not at all.
+    pub(super) fn raw_dek_with_line_ending(bytes: &[u8]) -> u32 {
+        use super::DEK_LEN;
+        if bytes.len() == DEK_LEN + 1 {
+            eq(bytes[DEK_LEN] as u32, 0x0A)
+        } else if bytes.len() == DEK_LEN + 2 {
+            eq(bytes[DEK_LEN] as u32, 0x0D) & eq(bytes[DEK_LEN + 1] as u32, 0x0A)
+        } else {
+            0
+        }
     }
 
     /// 1 if `bytes` (at most `MAX_PLAINTEXT_TEXT_LEN` long) is a DEK as
@@ -399,7 +524,7 @@ mod tests {
     }
 
     fn read_with_proc_root(path: &Path, proc_root: &Path) -> Result<SecretBuffer, KeyFileError> {
-        super::read_with_proc_root(path, &Owner::RootOrCurrentUser, proc_root)
+        super::read_with_proc_root(path, &Owner::RootOrCurrentUser, proc_root, super::Kind::Dek)
     }
 
     fn payload_with_key_id(key_id_len: usize) -> Vec<u8> {
@@ -537,6 +662,59 @@ mod tests {
         assert_eq!(check(&[0xFFu8; DEK_LEN]), Err(KeyFileError::PlaintextKey));
     }
 
+    #[test]
+    fn raw_dek_followed_by_one_line_ending_is_a_plaintext_key() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut random_dek = move || {
+            let mut dek = [0u8; DEK_LEN];
+            for b in dek.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *b = state as u8;
+            }
+            dek
+        };
+        let with = |dek: [u8; DEK_LEN], tail: &[u8]| [&dek[..], tail].concat();
+        for _ in 0..64 {
+            let dek = random_dek();
+            assert_eq!(check(&with(dek, b"\n")), Err(KeyFileError::PlaintextKey), "LF");
+            assert_eq!(check(&with(dek, b"\r\n")), Err(KeyFileError::PlaintextKey), "CRLF");
+        }
+        // The key's own last byte is a whitespace value: no trimming confusion.
+        for last in [0x0Au8, 0x20, 0x0D, 0x09] {
+            let mut dek = random_dek();
+            dek[DEK_LEN - 1] = last;
+            assert_eq!(check(&with(dek, b"\n")), Err(KeyFileError::PlaintextKey), "last byte {last:#04x}, LF");
+            assert_eq!(check(&with(dek, b"\r\n")), Err(KeyFileError::PlaintextKey), "last byte {last:#04x}, CRLF");
+        }
+        // Any key bytes at all, the line ending's own values included.
+        assert_eq!(check(&[0x0Au8; DEK_LEN + 1]), Err(KeyFileError::PlaintextKey));
+        assert_eq!(check(&with([0x0D; DEK_LEN], b"\r\n")), Err(KeyFileError::PlaintextKey));
+    }
+
+    #[test]
+    fn other_line_endings_after_raw_bytes_are_not_a_plaintext_key() {
+        // Non-text key bytes, so the text rule can't claim these either.
+        let dek = [0x80u8; DEK_LEN];
+        let with = |key: &[u8], tail: &[u8]| [key, tail].concat();
+        for (name, bytes) in [
+            ("CR only", with(&dek, b"\r")),
+            ("LF LF", with(&dek, b"\n\n")),
+            ("LF CR", with(&dek, b"\n\r")),
+            ("CR CR", with(&dek, b"\r\r")),
+            ("33 bytes, LF", with(&[0x80u8; DEK_LEN + 1], b"\n")),
+            // 31 bytes in all: a short key and its line ending. (31 key bytes
+            // and an LF make 32, which the exactly-32 rule already refuses.)
+            ("30 bytes, LF", with(&dek[..DEK_LEN - 2], b"\n")),
+            ("29 bytes, CRLF", with(&dek[..DEK_LEN - 3], b"\r\n")),
+            ("32 bytes, CRLF, LF", with(&dek, b"\r\n\n")),
+        ] {
+            assert!(!looks_like_plaintext_dek(&bytes), "{name}");
+            assert_eq!(check(&bytes), Err(KeyFileError::TooShort), "{name}");
+        }
+    }
+
     // Every text form of one DEK whose bytes need '+' and '/' in standard
     // base64 (so '-' and '_' in URL-safe): the encodings really differ.
     fn text_forms_of_a_dek() -> Vec<(&'static str, String)> {
@@ -567,8 +745,8 @@ mod tests {
     }
 
     // The decoder-based definition the constant-time detector replaced:
-    // trim, then hex, or any of the base64 crate's four engines yielding 32
-    // bytes. Kept here as the reference the new code must agree with.
+    // 32 raw bytes plus one LF or CRLF, or trim, then hex, or any of the
+    // base64 crate's four engines yielding 32 bytes. Kept here as the reference the new code must agree with.
     fn reference_looks_like_plaintext_dek(bytes: &[u8]) -> bool {
         use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
         if bytes.len() == DEK_LEN {
@@ -576,6 +754,9 @@ mod tests {
         }
         if bytes.len() > MAX_PLAINTEXT_TEXT_LEN {
             return false;
+        }
+        if (bytes.len() == DEK_LEN + 1 && bytes.ends_with(b"\n")) || (bytes.len() == DEK_LEN + 2 && bytes.ends_with(b"\r\n")) {
+            return true;
         }
         let text = bytes.trim_ascii();
         match text.len() {
@@ -709,13 +890,15 @@ mod tests {
         long.push(0);
         let mut bad_version = valid();
         bad_version[0] = 9;
-        let cases: [(&str, Vec<u8>, KeyFileError); 7] = [
+        let cases: [(&str, Vec<u8>, KeyFileError); 9] = [
             ("empty", vec![], KeyFileError::TooShort),
             ("short", valid()[..100].to_vec(), KeyFileError::TooShort),
             ("long", long, KeyFileError::TooLong),
             ("huge", vec![0u8; 1024 * 1024], KeyFileError::TooLong),
             ("malformed", bad_version, KeyFileError::Malformed),
             ("raw-dek", vec![7u8; DEK_LEN], KeyFileError::PlaintextKey),
+            ("raw-dek-lf", [&[7u8; DEK_LEN][..], b"\n"].concat(), KeyFileError::PlaintextKey),
+            ("raw-dek-crlf", [&[7u8; DEK_LEN][..], b"\r\n"].concat(), KeyFileError::PlaintextKey),
             ("b64-dek", format!("{}\n", base64_dek()).into_bytes(), KeyFileError::PlaintextKey),
         ];
         for (name, contents, expected) in cases {
@@ -980,6 +1163,37 @@ mod tests {
     fn directory_is_refused_as_io() {
         let dir = secure_file::private_tempdir();
         assert_eq!(read(dir.path()).err(), Some(KeyFileError::Io));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "reads /proc and /dev, which Miri can't")]
+    fn a_file_whose_filesystem_makes_up_its_contents_is_never_read() {
+        // Root-owned, regular, in root-owned directories nobody else can
+        // write, and not empty when read: everything the trust checks ask
+        // of a key file, for bytes nobody wrote. Each reports no size, and
+        // is refused from that alone.
+        for generated in ["/proc/version", "/proc/cmdline"] {
+            let path = Path::new(generated);
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            if meta.uid() != 0 || meta.len() != 0 || std::fs::read(path).map(|b| b.is_empty()).unwrap_or(true) {
+                continue; // not this host's procfs as expected: nothing to show
+            }
+            match read(path) {
+                Err(KeyFileError::TooShort) => {}
+                // Something above it isn't trusted on this host (a container's /proc).
+                Err(KeyFileError::Untrusted) => {}
+                other => panic!("{generated}: expected a refusal without a read, got {:?}", other.map(|_| ())),
+            }
+        }
+        // A device is not opened, whoever owns it.
+        assert!(matches!(read(Path::new("/dev/null")), Err(KeyFileError::Io | KeyFileError::Untrusted)));
+    }
+
+    #[test]
+    fn an_empty_key_file_is_too_short() {
+        let dir = secure_file::private_tempdir();
+        let path = write(dir.path(), "wrapped.key", &[]);
+        assert_eq!(read(&path).err(), Some(KeyFileError::TooShort));
     }
 
     #[test]

@@ -1,5 +1,18 @@
-# Keeps the commit-SHA pins in .github/workflows current: each update is a
-# pull request that moves the SHA and its version comment together.
+# Keeps dependencies current, one pull request per group, each checked by
+# CI -- `cargo deny` included, so a bump that brings in an advisory, a
+# yanked version or a second copy of a crate fails there.
+#
+# - github-actions: the commit-SHA pins in .github/workflows; each update
+#   moves the SHA and its version comment together.
+# - cargo: the library's Cargo.lock, and the fuzz harnesses' own (fuzz/ is
+#   a separate workspace). Minor and patch updates come grouped; a new
+#   major version comes on its own, since it may change an API the crypto
+#   or provider code relies on.
+#
+# Not here: the Docker base images, pinned by digest. Their comments ask
+# for a deliberate re-resolve, with docker/Dockerfile.swtpm and the
+# packaging Dockerfiles kept in step, which per-file pull requests would
+# split apart.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -9,3 +22,19 @@ updates:
     groups:
       actions:
         patterns: ['*']
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    groups:
+      fuzz-cargo-minor-and-patch:
+        update-types: [minor, patch]

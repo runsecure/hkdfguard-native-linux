@@ -20,8 +20,9 @@
 # the release passes, makes a missing bundle an error.
 #
 # Two targets:
-#   overlay      no policy: the library uses its defaults (TPM2, PKCS#11 if
-#                configured, external secret; never ephemeral).
+#   overlay      no policy: the image it is copied into must add its own
+#                /etc/hkdfguard/policy.toml, as the library refuses every
+#                call without one.
 #   overlay-dev  adds policy.dev.toml: SoftHSM2 when its PIN file is
 #                present, else EPHEMERAL keys that die with the process.
 #                For development and tests only.

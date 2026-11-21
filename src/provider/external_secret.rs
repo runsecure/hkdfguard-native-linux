@@ -27,7 +27,9 @@
 //! defensive input -- so it is held to the same standard as every other
 //! secret this crate reads from disk:
 //!
-//! - **Owned by root or by this process's user**, with **no group or
+//! - **Owned by root**, or -- under the developer security model, or when
+//!   policy pins the service's key (see "Pinning") -- **by this process's
+//!   user**; with **no group or
 //!   other access** (`0400`/`0600`) -- except that a root-owned file may
 //!   also be group-readable (`root:<group> 0440`), which is what a
 //!   Kubernetes Secret volume becomes when the pod sets `fsGroup`, and how
@@ -37,14 +39,15 @@
 //!   provisioned", so a misconfigured mount can't silently fall through to
 //!   a weaker provider.
 //! - **In a mount nobody else can write to.** The mount directory and
-//!   every directory above it must be owned by root or this process's user
+//!   every directory above it must be owned by the same owners as the file
 //!   and not writable by group or others -- sticky or not, so a mount
 //!   anywhere under `/tmp`, `/var/tmp` or `/dev/shm` is refused, however
 //!   private the directories beneath it (see
 //!   [`crate::secure_file::check_dir_chain`]); so must the directory the
 //!   resolved file sits in and every one above it. The one exception is
-//!   a read-only mount: a Kubernetes Secret volume is `1777` but mounted
-//!   read-only, so nobody can write to it, and it is fine. Otherwise
+//!   a sticky directory on a read-only mount: a Kubernetes Secret volume
+//!   is `1777` but mounted read-only, so nobody can write to it, and it is
+//!   fine. A disk-backed `emptyDir` (`0777`) is refused even read-only. Otherwise
 //!   another user could plant a KEK for a not-yet-provisioned service.
 //! - **A regular file.** Not a directory, device, or FIFO (which would
 //!   block the read forever).
@@ -76,9 +79,13 @@
 //! a service, the key's fingerprint (see [`crate::crypto::kek_fingerprint`])
 //! must be one of the pinned values, or
 //! the key is refused -- an error, never "not provisioned". With
-//! `external_secret.require_pinned_keys`, a service with no pin has no KEK
+//! `external_secret.require_pinned_keys` (on unless policy turns it off
+//! under the production security model), a service with no pin has no KEK
 //! here, whatever is mounted for it; `provision` then reports the mounted
 //! key's fingerprint and the policy line that would accept it.
+//!
+//! Under the production security model a pin is also what lets a file the
+//! service's own user wrote be accepted at all (see [`secret_owner`]).
 
 use crate::crypto::software_kek_fingerprint; // the fingerprint every payload carries, and policy pins
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
@@ -176,6 +183,15 @@ impl KekProvider for ExternalSecretProvider {
         self.dir.is_some() || self.refused.is_some()
     }
 
+    // No mount at all: not present, unless policy pins a key for this
+    // service -- which says its KEK is an external secret.
+    fn claims_while_absent(&self, service: &str) -> Result<()> {
+        match service_pins(service)? {
+            Pins::OneOf(_) => Err(pinned_but_missing()),
+            Pins::Any | Pins::Unpinned => Ok(()),
+        }
+    }
+
     // Loads the key exactly as `load_kek` would -- open, trust checks, read,
     // parse -- so "exists" means "exists *and* is a usable key", and a
     // malformed secret is reported when it is provisioned rather than at
@@ -188,18 +204,20 @@ impl KekProvider for ExternalSecretProvider {
         if !is_safe_file_name(service) {
             return Ok(false); // can never name a provisioned secret file
         }
-        let Some(dir) = self.dir.as_ref() else {
-            return Ok(false); // no mount at all
-        };
         let pins = service_pins(service)?;
+        let Some(dir) = self.dir.as_ref() else {
+            // no mount at all
+            return if matches!(pins, Pins::OneOf(_)) { Err(pinned_but_missing()) } else { Ok(false) };
+        };
         if matches!(pins, Pins::Unpinned) {
             return Ok(false); // the allowlist is on and this service isn't on it
         }
-        match read_key(dir, service)? {
+        match read_key(dir, service, &pins)? {
             Some(key) => {
                 check_pins(&key, &pins)?;
                 Ok(true)
             } // the parsed key drops (and zeroizes) here
+            None if matches!(pins, Pins::OneOf(_)) => Err(pinned_but_missing()),
             None => Ok(false),
         }
     }
@@ -216,20 +234,23 @@ impl KekProvider for ExternalSecretProvider {
                 "this service name cannot be used as an external secret file name".into(), // never the name itself: service names stay out of the log
             ));
         }
-        let dir = self
-            .dir
-            .as_ref()
-            .ok_or(Error::KeyNotProvisioned("no external secret mount found"))?; // no mount at all -> decline immediately
-
         let pins = service_pins(service)?;
+        // A pinned service keeps its KEK here, by the administrator's own
+        // statement. Its secret not being mounted (yet, or any more) is an
+        // outage, not "no key": declining would send the call on to the
+        // next provider.
+        let missing = || match pins {
+            Pins::OneOf(_) => pinned_but_missing(),
+            Pins::Any | Pins::Unpinned => Error::KeyNotProvisioned("no secret file provisioned for this service"),
+        };
+        let dir = self.dir.as_ref().ok_or_else(missing)?; // no mount at all
+
         if matches!(pins, Pins::Unpinned) && !create_if_missing {
             return Err(Error::KeyNotProvisioned(
-                "external_secret.require_pinned_keys is set and policy pins no key for this service",
+                "external_secret.require_pinned_keys is on and policy pins no key for this service",
             ));
         }
-        let key = read_key(dir, service)?.ok_or(Error::KeyNotProvisioned(
-            "no secret file provisioned for this service", // mount exists, but nothing provisioned for this service yet
-        ))?;
+        let key = read_key(dir, service, &pins)?.ok_or_else(missing)?; // mount exists, but nothing there for this service
         if matches!(pins, Pins::Unpinned) {
             // Provisioning here means a root-owned policy edit, which this
             // process can't make itself. Do the part it can: report the
@@ -248,12 +269,28 @@ impl KekProvider for ExternalSecretProvider {
 /// (escapes the mount, wrong owner, too broad a mode, not a regular file),
 /// unreadable, or not exactly [`KEK_LEN`] bytes is an error, never "not
 /// provisioned".
-fn read_key(mount: &Path, service: &str) -> Result<Option<Zeroizing<[u8; KEK_LEN]>>> {
-    let mut file = match open_secret_within_mount(mount, service) {
+fn read_key(mount: &Path, service: &str, pins: &Pins) -> Result<Option<Zeroizing<[u8; KEK_LEN]>>> {
+    let rejected = |e: std::io::Error| format!("external secret for this service rejected: {e}");
+    // First under the rule every mount must meet, whatever the model:
+    // nobody but root and this process's user could have written here.
+    // That is what decides "nothing provisioned" -- a mount the service's
+    // own user owns, with no file for this service, is exactly that.
+    let mut file = match open_secret_within_mount(mount, service, Owner::RootOrCurrentUser) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::Provider(format!("external secret for this service rejected: {e}"))),
+        Err(e) => return Err(Error::Provider(rejected(e))),
     };
+    // Then, for a file that is there, under the rule of who may have
+    // provisioned it (see `secret_owner`).
+    if secret_owner(pins)? == Owner::Root {
+        file = open_secret_within_mount(mount, service, Owner::Root).map_err(|e| {
+            Error::Provider(format!(
+                "{}. Under the production security model an external secret, its mount and every directory above \
+                 them must be owned by root, unless policy pins the service's key (external_secret.pinned_keys)",
+                rejected(e)
+            ))
+        })?;
+    }
 
     // Raw KEK material read straight off disk into a
     // `SecretBuffer`: one fixed allocation, never grown, zeroed on every
@@ -308,6 +345,17 @@ fn check_pins(key: &[u8; KEK_LEN], pins: &Pins) -> Result<()> {
     )))
 }
 
+/// The error for a service policy pins a key for, when no secret is mounted
+/// for it. Never "not provisioned": see `load_kek`.
+fn pinned_but_missing() -> Error {
+    Error::Provider(
+        "policy pins an external secret for this service (external_secret.pinned_keys), but none is mounted. \
+         Refusing rather than using a weaker provider: mount the secret; or, if this service no longer keeps its \
+         KEK in one, remove its pin from the policy"
+            .into(),
+    )
+}
+
 /// The message `provision` gets for an unpinned service under
 /// `external_secret.require_pinned_keys`: the mounted key's fingerprint, in
 /// the form to paste into policy. The fingerprint and service name are both
@@ -315,7 +363,7 @@ fn check_pins(key: &[u8; KEK_LEN], pins: &Pins) -> Result<()> {
 fn unpinned_service_instructions(service: &str, key: &[u8; KEK_LEN]) -> String {
     let fingerprint = hex(&software_kek_fingerprint(key));
     format!(
-        "external_secret.require_pinned_keys is set and service \"{service}\" has no pinned key. The key \
+        "external_secret.require_pinned_keys is on and service \"{service}\" has no pinned key. The key \
          mounted for it has fingerprint {fingerprint}. If that is the key you generated, add this to the \
          policy file and run provision again:\n  [external_secret.pinned_keys]\n  \"{service}\" = \"{fingerprint}\""
     )
@@ -333,16 +381,32 @@ const MAX_SECRET_FILE_LEN: usize = 4096;
 
 /// What a mounted KEK file must satisfy -- identical to the PKCS#11 PIN
 /// and the TPM owner password, because it is at least as sensitive.
-const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
-    owner: Some(Owner::RootOrCurrentUser),
-    forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
-    follow_symlinks: false, // applied to the already-resolved path; see below
-    allow_group_read_if_root_owned: true, // root:<fsGroup> 0440, as the kubelet writes it for a non-root pod
-};
+fn secret_file_requirements(owner: Owner) -> FileRequirements {
+    FileRequirements {
+        owner: Some(owner),
+        forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
+        follow_symlinks: false, // applied to the already-resolved path; see below
+        allow_group_read_if_root_owned: true, // root:<fsGroup> 0440, as the kubelet writes it for a non-root pod
+    }
+}
+
+/// Who may own `service`'s secret file, its mount, and every directory
+/// above either. Under the developer model: root or this process's user.
+/// Under the production model only root creates a KEK, and for this
+/// provider putting a file in the mount *is* creating one -- so root
+/// alone, unless policy pins the service's key: the pin is root saying
+/// which key this is, and whoever wrote the file can't have chosen
+/// another.
+fn secret_owner(pins: &Pins) -> Result<Owner> {
+    Ok(match (crate::security_model::current()?, pins) {
+        (crate::security_model::SecurityModel::Developer, _) | (_, Pins::OneOf(_)) => Owner::RootOrCurrentUser,
+        (crate::security_model::SecurityModel::Production, Pins::Any | Pins::Unpinned) => Owner::Root,
+    })
+}
 
 /// Resolves `<mount>/<service>` to the real file it names, refuses the
 /// result unless it lies inside the mount, and opens it under
-/// [`SECRET_FILE_REQUIREMENTS`].
+/// [`secret_file_requirements`], with `owner` from [`secret_owner`].
 ///
 /// Symlinks are followed during resolution -- that is what makes a
 /// Kubernetes Secret volume (`<key>` → `..data/<key>` → `..<ts>/<key>`)
@@ -365,7 +429,7 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
 /// Only a missing `<mount>/<service>` is `NotFound`, meaning "nothing
 /// provisioned"; every other failure means "something is there and it is
 /// not acceptable", or "this couldn't be checked".
-fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File> {
+fn open_secret_within_mount(mount: &Path, service: &str, owner: Owner) -> std::io::Result<File> {
     use std::io::{Error as IoError, ErrorKind};
 
     // Only a missing `<mount>/<service>` may come back as `NotFound`; that
@@ -376,12 +440,13 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
         .map_err(|e| IoError::new(ErrorKind::PermissionDenied, format!("secret mount {}: {e}", mount.display())))?;
     // A mount others can write to would let them plant a KEK for a service
     // not provisioned yet -- which `create_kek` would then adopt, leaving
-    // them holding the key to everything wrapped under it. The service's
-    // own uid may own it: that uid can read every KEK here anyway.
-    crate::secure_file::check_dir_chain(&mount_real, Owner::RootOrCurrentUser)?;
+    // them holding the key to everything wrapped under it. Where `owner`
+    // lets the service's own uid own it (see `secret_owner`), that uid can
+    // read every KEK here anyway.
+    crate::secure_file::check_dir_chain(&mount_real, owner)?;
     // Resolved with every directory a lookup happens in checked, including
     // any a symlink on the way lives in: NotFound if nothing is provisioned.
-    let target_real = crate::secure_file::resolve_trusted(&mount.join(service), &Owner::RootOrCurrentUser)?
+    let target_real = crate::secure_file::resolve_trusted(&mount.join(service), &owner)?
         .ok_or_else(|| IoError::new(ErrorKind::NotFound, "no secret file provisioned for this service"))?;
 
     if !target_real.starts_with(&mount_real) {
@@ -394,10 +459,10 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
     // And every directory between the mount and the file (Kubernetes'
     // `..<timestamp>/`), so nothing under the mount can be swapped either.
     if let Some(target_dir) = target_real.parent() {
-        crate::secure_file::check_dir_chain(target_dir, Owner::RootOrCurrentUser)?;
+        crate::secure_file::check_dir_chain(target_dir, owner)?;
     }
 
-    let file = open_checked(&target_real, &SECRET_FILE_REQUIREMENTS).map_err(|e| {
+    let file = open_checked(&target_real, &secret_file_requirements(owner)).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
             IoError::new(ErrorKind::PermissionDenied, "changed to a symlink between resolution and open")
         } else {
@@ -406,7 +471,34 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
     })?;
 
     crate::secure_file::verify_opened(&file, &target_real, &mount_real, Path::new("/proc"))?;
+    check_reader_group(&file.metadata()?)?;
     Ok(file)
+}
+
+/// Refuses a secret its group can read when that group is an over-broad
+/// one. Group read is allowed only on a root-owned file (see
+/// [`secret_file_requirements`]), as `root:<service-group> 0440` -- and a
+/// file that came out `root:users 0440` instead is one every account on
+/// the host can read, which the mode alone doesn't show.
+fn check_reader_group(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::io::{Error as IoError, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+    if meta.mode() & 0o040 == 0 {
+        return Ok(());
+    }
+    let denied = |what: String| IoError::new(ErrorKind::PermissionDenied, what);
+    match crate::security_model::over_broad_reader_group(meta.gid()) {
+        Ok(None) => Ok(()),
+        Ok(Some(group)) => Err(denied(format!(
+            "readable by group \"{group}\" (gid {}), which covers far more than one service's accounts; give it to \
+             the service's own group, or make it 0400",
+            meta.gid()
+        ))),
+        Err(e) => Err(denied(format!(
+            "readable by its group (gid {}), and whether that is an over-broad group could not be looked up: {e}",
+            meta.gid()
+        ))),
+    }
 }
 
 // Accepts exactly KEK_LEN raw bytes. Any other length is refused with a
@@ -424,9 +516,38 @@ fn parse_secret_key(bytes: &[u8]) -> Result<Zeroizing<[u8; KEK_LEN]>> {
         // a provisioning mistake, never a key anyone meant.
         return Err(Error::Provider("external secret is all zero bytes; provision 32 random bytes".into()));
     }
+    if bytes.iter().all(|b| matches!(b, 0x20..=0x7e)) && !is_known_answer_kek(bytes) {
+        // Text: a passphrase someone typed, or the hex or base64 of a key
+        // half this size or less -- far fewer than 256 bits, whatever its
+        // length. 32 random bytes are all printable about once in 10^14
+        // keys, so nothing genuine is turned away.
+        return Err(Error::Provider(format!(
+            "external secret is {KEK_LEN} characters of text, not {KEK_LEN} random bytes: a passphrase, or the hex or \
+             base64 form of a shorter key. Provision raw random bytes (head -c {KEK_LEN} /dev/urandom)"
+        )));
+    }
     let mut key = Zeroizing::new([0u8; KEK_LEN]);
     key.copy_from_slice(bytes);
     Ok(key)
+}
+
+/// The KEK of this crate's frozen known-answer payloads
+/// (`crypto::known_answer`): 32 asterisks, chosen before text was refused,
+/// and not replaceable -- one of those payloads was made by a pre-release
+/// build that no longer exists. Unit-test builds alone accept it.
+#[cfg(test)]
+pub(crate) const KNOWN_ANSWER_KEK: [u8; KEK_LEN] = [0x2a; KEK_LEN];
+
+fn is_known_answer_kek(bytes: &[u8]) -> bool {
+    #[cfg(test)]
+    {
+        bytes == KNOWN_ANSWER_KEK
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bytes;
+        false
+    }
 }
 
 // Picks the secret mount directory: `external_secret.dir` from the policy,
@@ -834,6 +955,54 @@ mod tests {
     }
 
     #[test]
+    fn text_is_refused_as_a_key_and_random_bytes_are_not() {
+        let refused = |bytes: &[u8]| match parse_secret_key(bytes) {
+            Err(Error::Provider(msg)) => msg.contains("characters of text"),
+            _ => false,
+        };
+        assert!(refused(b"correct horse battery staple 2026"[..KEK_LEN].as_ref()), "a passphrase");
+        assert!(refused(b"0123456789abcdef0123456789abcdef"), "32 hex digits: a 16-byte key");
+        assert!(refused(b"q83vEjRWeJCrze8BI0VniavN7wEjRWeJ"), "base64 text");
+        assert!(refused(&[b'A'; KEK_LEN]), "one character, repeated");
+        assert!(refused(b"                                "), "spaces");
+
+        // One byte outside printable ASCII is not text: a line ending in a
+        // 32-byte file, or any random key.
+        let mut with_newline = *b"0123456789abcdef0123456789abcde\n";
+        assert!(parse_secret_key(&with_newline).is_ok());
+        with_newline[31] = 0x7f;
+        assert!(parse_secret_key(&with_newline).is_ok());
+        for _ in 0..64 {
+            assert!(parse_secret_key(&random_key()).is_ok());
+        }
+        // The frozen known-answer key, in this build only.
+        assert_eq!(KNOWN_ANSWER_KEK, [b'*'; KEK_LEN]);
+        assert!(parse_secret_key(&KNOWN_ANSWER_KEK).is_ok());
+    }
+
+    #[test]
+    fn a_secret_its_group_can_read_must_not_belong_to_an_over_broad_group() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::secure_file::private_tempdir();
+        let path = provision(dir.path(), "com.company.orders", random_key());
+        // Owner-only: the group is never looked at.
+        check_reader_group(&std::fs::metadata(&path).unwrap()).unwrap();
+
+        // Group-readable: fine unless this account's group is one of the
+        // over-broad ones (`users`, on some hosts), and then refused by name.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o440)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        match crate::security_model::over_broad_reader_group(meta.gid()).unwrap() {
+            None => check_reader_group(&meta).unwrap(),
+            Some(group) => {
+                let err = check_reader_group(&meta).unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(err.to_string().contains(group), "{err}");
+            }
+        }
+    }
+
+    #[test]
     #[serial]
     fn the_policy_dir_is_used_with_no_fallback() {
         use crate::policy::test_support::{secret_mount, TestPolicy};
@@ -859,7 +1028,7 @@ mod tests {
 
         // Only no mount configured, and none of the conventional ones
         // present, means "not here".
-        let _policy = TestPolicy::absent();
+        let _policy = TestPolicy::minimal();
         if !CANDIDATE_MOUNTS.iter().any(|m| Path::new(m).is_dir()) {
             assert_eq!(resolve_dir(), Backend::Absent);
         }
@@ -875,6 +1044,47 @@ mod tests {
         crate::policy::test_support::TestPolicy::write(&format!(
             "[external_secret]\nrequire_pinned_keys = {require}\n[external_secret.pinned_keys]\n{pins}\n"
         ))
+    }
+
+    #[test]
+    #[serial]
+    fn under_the_production_model_only_root_or_a_pin_vouches_for_a_secret() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // as root every file here is root's own
+        }
+        with_dir(|provider, dir| {
+            // A secret this (non-root) user wrote, in a mount it owns: the
+            // developer model's own, and accepted there.
+            let key = random_key();
+            provision(dir, "com.company.orders", key);
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+
+            // Under the production model only root creates a KEK, and a
+            // file put in the mount is one: refused, loudly, saying why.
+            // (The allowlist, on by default there, is switched off: it
+            // would decline the unpinned service before its file was read.)
+            let _production = crate::policy::test_support::TestPolicy::write(
+                "security_model = \"production\"\n[external_secret]\nrequire_pinned_keys = false\n",
+            );
+            for refused in [provider.kek_exists("com.company.orders").map(|_| ()), provider.load_kek("com.company.orders", false).map(|_| ())] {
+                match refused {
+                    Err(Error::Provider(msg)) => {
+                        assert!(msg.contains("production security model") && msg.contains("pinned_keys"), "{msg}");
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+            // A service with nothing mounted is still just "not provisioned".
+            assert!(!provider.kek_exists("com.company.billing").unwrap());
+
+            // Root's policy pinning the key says which key it is, whoever
+            // wrote the file: accepted -- and no other key is.
+            let _pin = pin_policy(false, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&key)));
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+            provision(dir, "com.company.orders", random_key());
+            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Provider(_))));
+        });
     }
 
     #[test]
@@ -909,6 +1119,39 @@ mod tests {
             // Pins are per service: an unpinned one is unaffected without the allowlist.
             provision(dir, "com.company.billing", planted);
             provider.load_kek("com.company.billing", false).unwrap();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn a_pinned_service_with_no_secret_mounted_is_an_error_not_unprovisioned() {
+        // The pin is the administrator saying this service's KEK is an
+        // external secret. One that isn't mounted -- not yet, or not any
+        // more -- is an outage; read as "not provisioned", the chain would
+        // move on and wrap under whatever provider comes next.
+        let refused = |result: Result<()>| match result {
+            Err(Error::Provider(msg)) => assert!(msg.contains("pins an external secret") && msg.contains("none is mounted"), "{msg}"),
+            other => panic!("expected an error, got {other:?}"),
+        };
+        with_dir(|provider, _dir| {
+            let _policy = pin_policy(false, &format!("\"com.company.orders\" = \"{}\"", fingerprint_hex(&random_key())));
+            refused(provider.kek_exists("com.company.orders").map(|_| ()));
+            for create_if_missing in [false, true] {
+                refused(provider.load_kek("com.company.orders", create_if_missing).map(|_| ()));
+            }
+            // An unpinned service with nothing mounted still just declines.
+            assert!(!provider.kek_exists("com.company.billing").unwrap());
+            assert!(matches!(provider.load_kek("com.company.billing", false), Err(Error::KeyNotProvisioned(_))));
+
+            // And with no mount at all, where the provider is otherwise
+            // skipped without being asked about any service.
+            let absent = ExternalSecretProvider { dir: None, refused: None };
+            assert!(!absent.probe());
+            refused(absent.claims_while_absent("com.company.orders"));
+            refused(absent.kek_exists("com.company.orders").map(|_| ()));
+            refused(absent.load_kek("com.company.orders", false).map(|_| ()));
+            absent.claims_while_absent("com.company.billing").unwrap();
+            assert!(!absent.kek_exists("com.company.billing").unwrap());
         });
     }
 
@@ -962,6 +1205,35 @@ mod tests {
 
     #[test]
     #[serial]
+    fn production_serves_only_pinned_services_unless_policy_says_otherwise() {
+        with_dir(|provider, dir| {
+            let key = random_key();
+            provision(dir, "com.company.orders", key);
+
+            // Nothing said about the allowlist: under production it is on,
+            // and a mounted but unpinned key is no KEK.
+            let production = crate::policy::test_support::TestPolicy::write("security_model = \"production\"\n");
+            assert!(!provider.kek_exists("com.company.orders").unwrap());
+            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::KeyNotProvisioned(_))));
+
+            // Pinned, it is the service's KEK.
+            {
+                let _pin = crate::policy::test_support::TestPolicy::write(&format!(
+                    "[external_secret.pinned_keys]\n\"com.company.orders\" = \"{}\"\n",
+                    fingerprint_hex(&key)
+                ));
+                assert!(provider.kek_exists("com.company.orders").unwrap());
+                provider.load_kek("com.company.orders", false).unwrap();
+            }
+            drop(production);
+
+            // The developer model leaves the allowlist off unless asked.
+            assert!(provider.kek_exists("com.company.orders").unwrap());
+        });
+    }
+
+    #[test]
+    #[serial]
     fn the_fingerprint_is_the_documented_hmac() {
         // What the documented OpenSSL command computes from the secret file:
         //   printf '\0\0\0\001hkdfguard-kek-fingerprint-v1\0\0\0\001\0' |
@@ -1001,6 +1273,7 @@ mod tests {
             assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
         });
 
+        let _policy = crate::policy::test_support::TestPolicy::minimal();
         let provider = ExternalSecretProvider::new();
         assert!(!provider.probe());
     }

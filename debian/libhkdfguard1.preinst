@@ -1,0 +1,30 @@
+#!/bin/sh
+set -e
+
+# The security model's groups (packaging/hkdfguard.sysusers) are created by
+# the postinst, which adopts any that already exist -- as it must on an
+# upgrade. On a first install, though, "already exists" may be a directory
+# (LDAP, sssd) group of the same name, since the lookup goes through NSS, or
+# a local one with members, that nobody meant to hand these roles to. Said
+# here, before anything is installed; nothing is changed.
+if [ "$1" = install ] && [ -z "$2" ]; then
+    for group in hkdfguard hkdfguard-deployers; do
+        entry=$(getent group "$group") || continue
+        members=${entry##*:}
+        origin=
+        grep -q "^$group:" /etc/group || origin=" It is not in /etc/group: it comes from a directory service."
+        if [ -n "$origin" ] || [ -n "$members" ]; then
+            echo "hkdfguard: WARNING: group $group already exists and is used as it is.$origin" >&2
+            echo "hkdfguard:   members: ${members:-none listed (primary-group members are not shown)}" >&2
+            case "$group" in
+                hkdfguard-deployers) echo "hkdfguard:   Under the production security model its members deploy key files the library trusts." >&2 ;;
+                *) echo "hkdfguard:   Its members can reach the TPM key directory." >&2 ;;
+            esac
+            echo "hkdfguard:   Check that every member is meant to hold that role (getent group $group)." >&2
+        fi
+    done
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -78,16 +78,29 @@ pub(crate) fn random_kek_for_tests() -> [u8; KEK_LEN] {
 #[cfg(any(feature = "external-secret", feature = "ephemeral", feature = "tpm2", test))]
 pub(crate) fn software_prf(key: &[u8; KEK_LEN], inputs: &[&[u8]]) -> Vec<PrfOutput> {
     use hmac::{Hmac, KeyInit, Mac};
-    inputs
-        .iter()
-        .map(|input| {
-            let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
-            mac.update(input);
-            let mut out = PrfOutput::new([0u8; 32]);
-            out.copy_from_slice(&mac.finalize().into_bytes());
-            out
-        })
-        .collect()
+    collect_outputs(inputs, |input| {
+        let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(input);
+        let mut out = PrfOutput::new([0u8; 32]);
+        out.copy_from_slice(&mac.finalize().into_bytes());
+        Ok(out)
+    })
+    .expect("software HMAC cannot fail")
+}
+
+/// One PRF output per input, from `one`, in a `Vec` allocated once at its
+/// final size -- what [`KekHandle::prf`] promises. Collecting an iterator
+/// of `Result`s gives no such guarantee: it can't know the length up
+/// front, so the `Vec` grows as it goes, and each growth frees a buffer
+/// with outputs still in it. Stops at the first error; the outputs so far
+/// are zeroed as the `Vec` drops.
+#[cfg(any(feature = "external-secret", feature = "ephemeral", feature = "tpm2", feature = "pkcs11", test))]
+pub(crate) fn collect_outputs(inputs: &[&[u8]], mut one: impl FnMut(&[u8]) -> Result<PrfOutput>) -> Result<Vec<PrfOutput>> {
+    let mut outputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        outputs.push(one(input)?);
+    }
+    Ok(outputs)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] // cheap to copy/compare/hash; needed for logging, matching, and use as a map-ish key
@@ -165,6 +178,11 @@ pub trait KekHandle {
     /// TPM each session costs a key load. Each input is one SP 800-108
     /// block, at most [`crate::crypto::MAX_PRF_INPUT_LEN`] bytes. Never
     /// exposes the key itself.
+    ///
+    /// The `Vec` is allocated once, at its final size, and never grown: a
+    /// reallocation would free the old buffer with outputs still in it.
+    /// Callers read the outputs in place and let the `Vec` drop, which
+    /// zeroes each one where it sits (see `crypto::derive_keys`).
     fn prf(&self, inputs: &[&[u8]]) -> Result<Vec<PrfOutput>>;
 }
 
@@ -179,6 +197,19 @@ pub trait KekProvider: Send + Sync {
     /// reports `true` and fails `kek_exists`/`load_kek` with its reason.
     /// Must not create or persist anything.
     fn probe(&self) -> bool;
+
+    /// For a provider that is not present (`probe()` is false): `Err` if
+    /// `service` is nonetheless known to keep its KEK here -- a TPM key
+    /// file on a host whose TPM device has gone, an external secret that
+    /// policy pins but nothing mounts. The chain then stops with that error
+    /// instead of skipping the provider: the key's home disappearing is an
+    /// outage, and treating it as "never there" would hand every new wrap
+    /// to a weaker provider. `Ok` when nothing ties the service to this
+    /// provider. Must not create or persist anything.
+    fn claims_while_absent(&self, service: &str) -> Result<()> {
+        let _ = service;
+        Ok(())
+    }
 
     /// Whether a persistent KEK already exists for `service`, without
     /// creating one. Must be side-effect-free.
@@ -280,8 +311,8 @@ fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider
 /// The provider types this process is currently allowed to use, in
 /// try-order: the compiled-in list ([`compiled_provider_types`]), filtered
 /// down to and reordered by the administrative policy in `crate::policy`
-/// (`/etc/hkdfguard/policy.toml`, or `HKDFGUARD_POLICY_FILE`) if one is
-/// configured. Pure policy evaluation over types -- no provider is
+/// (`/etc/hkdfguard/policy.toml`; a test build also reads
+/// `HKDFGUARD_POLICY_FILE`) if one is configured. Pure policy evaluation over types -- no provider is
 /// constructed here -- so a policy of e.g. `require: external-secret`
 /// never causes a TPM connection or an HSM login just to be told no.
 /// Every selection/creation/existence-check function below goes through
@@ -290,8 +321,7 @@ fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider
 ///
 /// Ephemeral is **excluded** unless a policy explicitly names it (as the
 /// sole provider under `require`, or by name in `preferred_order`) -- see
-/// `crate::policy::Policy::ephemeral_explicitly_listed`. With no policy
-/// file at all, nothing can be named, so it's always excluded then too.
+/// `crate::policy::Policy::ephemeral_explicitly_listed`.
 /// Its keys live only in process memory, so every DEK wrapped under one is
 /// permanently lost on restart; silently falling back to it -- because a
 /// secret mount wasn't there yet at startup, or a TPM failed its
@@ -299,14 +329,9 @@ fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider
 /// data loss.
 fn allowed_types() -> Result<Vec<ProviderType>> {
     let compiled = compiled_provider_types();
-    let Some(policy) = crate::policy::load() else {
-        return Ok(compiled
-            .into_iter()
-            .filter(|t| *t != ProviderType::Ephemeral)
-            .collect()); // no policy configured: default order, minus Ephemeral (named-only)
-    };
-    let policy = policy?; // a configured-but-malformed/self-contradictory policy fails every operation, on purpose (fail closed)
-    policy.allowed_providers(&compiled)
+    // A missing, malformed or self-contradictory policy fails every
+    // operation, on purpose (fail closed).
+    crate::policy::load()?.allowed_providers(&compiled)
 }
 
 /// The policy's first choice of provider (the head of the allowed chain),
@@ -326,9 +351,9 @@ static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new())
 /// Logs `message` at warn level the first time this process sees it, and
 /// never again. For events that are worth an operator's attention but
 /// would repeat on every call -- a fallback, a migration hint -- so the
-/// log shows each distinct one once instead of flooding. Bounded by the
-/// number of distinct messages: provider combinations, and the services a
-/// process uses where a message names one.
+/// log shows each distinct one once instead of flooding. The list of
+/// messages seen is bounded: at `audit::ONCE_LIST_LIMIT` it starts over,
+/// so a message can then be logged once more.
 fn warn_once(message: String) {
     log_once(log::Level::Warn, message);
 }
@@ -342,6 +367,9 @@ pub(crate) fn log_once(level: log::Level, message: String) {
     let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !warned.contains(&message) {
         log::log!(level, "{message}");
+        if warned.len() >= crate::audit::ONCE_LIST_LIMIT {
+            warned.clear(); // bounded: see `ONCE_LIST_LIMIT`
+        }
         warned.push(message);
     }
 }
@@ -353,6 +381,50 @@ fn reset_warn_once() {
     WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
+/// The provider policy pins `service`'s key in, when `provider_type` is not
+/// one of them: `provider_type` then takes no part in any call for the
+/// service. `None` when nothing is pinned for the service, or
+/// `provider_type` itself holds a pin for it.
+///
+/// A pin -- `pkcs11.pinned_keys`, `external_secret.pinned_keys`,
+/// `tpm.pinned_names` -- is the administrator's statement of where a
+/// service's KEK lives. Without this, the chain would still take the first
+/// provider in the order that holds *a* key for the service, and a key can
+/// appear in a provider the service was never given: whoever can read a
+/// shared token's PIN file can generate one there under any service's
+/// label; a writer of the secret mount can add a file. Every wrap for the
+/// service would then go to that key, which its maker can use, and
+/// [`for_unwrap`] would refuse everything wrapped under the real one.
+/// The pin in the service's own provider can't catch that -- the chain
+/// never gets as far -- so it is caught here, before the other provider is
+/// even constructed.
+///
+/// Only pins in providers the policy allows count: one left behind in a
+/// provider since taken out of the order binds nothing. The TPM is never
+/// passed over: only root writes its key directory, so a TPM key for a
+/// service is one an administrator provisioned.
+fn bound_elsewhere(service: &str, provider_type: ProviderType, allowed: &[ProviderType]) -> Result<Option<ProviderType>> {
+    if provider_type == ProviderType::Tpm2 {
+        return Ok(None);
+    }
+    let mut elsewhere = None;
+    for pinned_in in allowed {
+        let pinned = match pinned_in {
+            ProviderType::Tpm2 => crate::policy::pinned_tpm_name(service)?.is_some(),
+            ProviderType::Pkcs11 => crate::policy::pinned_pkcs11_keys(service)?.is_some(),
+            ProviderType::ExternalSecret => crate::policy::pinned_external_keys(service)?.is_some(),
+            ProviderType::Ephemeral => false, // nothing to pin: its keys end with their process
+        };
+        if pinned && *pinned_in == provider_type {
+            return Ok(None);
+        }
+        if pinned && elsewhere.is_none() {
+            elsewhere = Some(*pinned_in);
+        }
+    }
+    Ok(elsewhere)
+}
+
 /// Shared walk behind [`create_kek`] and [`select_existing`]: for each
 /// policy-allowed type in priority order, constructs that one provider
 /// (see [`construct_provider`]), probes it, and calls
@@ -360,15 +432,21 @@ fn reset_warn_once() {
 /// wins and the walk stops -- providers later in the order are never even
 /// constructed.
 ///
-/// The walk moves on past a provider in exactly two cases: it isn't
-/// present at all (`probe()` is false -- see [`Backend::Absent`]), or it is
+/// A provider is left out of the walk altogether when policy pins this
+/// service's key in another one (see [`bound_elsewhere`]). Otherwise the
+/// walk moves on past a provider in exactly two cases: it isn't
+/// present at all (`probe()` is false -- see [`Backend::Absent`]) and
+/// nothing says this service's key lives there
+/// ([`KekProvider::claims_while_absent`]), or it is
 /// present but has no key for this service ([`Error::KeyNotProvisioned`]).
 /// Any other error from a present provider ends the walk and is returned:
 /// a TPM, token, or secret mount that is there but failing must not quietly
 /// hand the call to a weaker provider, because every DEK wrapped meanwhile
 /// would land under that weaker KEK -- or, with Ephemeral, under one that
 /// is gone at the next restart. `not_found_err` is returned if the walk
-/// runs out of providers.
+/// runs out of providers after at least one present provider declined;
+/// [`Error::NoProviderAvailable`] if none was present at all (see
+/// [`nothing_present`]).
 ///
 /// The returned error is logged by the caller (the C ABI layer), not here;
 /// an `Error::Provider` is prefixed with the provider's name so that one
@@ -381,12 +459,26 @@ fn walk_chain(
     // Every provider this call passed over, and why: if a later one serves
     // the call, an operator should know a preferred one didn't.
     let mut passed_over: Vec<String> = Vec::new();
-    for provider_type in allowed_types()? {
+    let mut any_present = false;
+    let allowed = allowed_types()?;
+    for &provider_type in &allowed {
         // priority order, per the configured policy (or the default compiled-in order)
+        if let Some(home) = bound_elsewhere(service, provider_type, &allowed)? {
+            log::debug!(
+                "hkdfguard: policy pins this service's key in {}; not consulting {}",
+                home.as_str(),
+                provider_type.as_str()
+            );
+            continue;
+        }
         let Some(provider) = construct_provider(provider_type) else {
             continue; // not compiled into this build (policy can name a type the build lacks)
         };
-        if !provider.probe() {
+        let present = provider.probe();
+        any_present |= present;
+        if !present {
+            // Gone, but this service's key lives there: stop, don't skip.
+            provider.claims_while_absent(service).map_err(|e| attribute(provider_type, e))?;
             log::debug!("hkdfguard: provider {} not present, trying next", provider_type.as_str());
             passed_over.push(format!("{}: not present", provider_type.as_str()));
             continue;
@@ -396,6 +488,9 @@ fn walk_chain(
             Ok(handle) => {
                 log::debug!("hkdfguard: using provider {} for this call", provider_type.as_str());
                 if !passed_over.is_empty() {
+                    // The audit trail too: the `log` line below goes nowhere
+                    // in a host that installs no logger.
+                    crate::audit::provider_fallback(service, provider_type, &passed_over.join("; "));
                     warn_once(format!(
                         "hkdfguard: {} is serving calls in place of a provider earlier in the policy order ({}); \
                          if that isn't intended, make the earlier provider available, or take it out of \
@@ -426,7 +521,17 @@ fn walk_chain(
         // `provider` drops here: session logged out / module finalized /
         // TCTI closed before the next candidate is even constructed.
     }
-    Err(not_found_err)
+    Err(if any_present { not_found_err } else { nothing_present() })
+}
+
+/// The error for a chain walk that found no policy-allowed provider on
+/// this host at all. Never "no KEK for this service" (`KEK_NOT_FOUND`): that
+/// says provisioning is all that's missing, is deliberately not audited,
+/// and would send a caller to `hkdfguard_create_kek` -- when what is
+/// missing is the provider itself, such as the TPM a `require` policy names.
+/// `PROVIDER_UNAVAILABLE` is audited (event 2005).
+fn nothing_present() -> Error {
+    Error::NoProviderAvailable
 }
 
 // Names the provider in a `Provider` error's message, for the caller's log line.
@@ -463,7 +568,6 @@ pub fn create_kek(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHan
 /// create one either.
 pub fn create_kek_unprivileged(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
     match walk_chain(service, |provider_type| provider_type == ProviderType::Ephemeral, Error::KekNotFound) {
-        Err(Error::KekNotFound) if !any_provider_present()? => Err(Error::NoProviderAvailable),
         Err(Error::KekNotFound) => Err(Error::AccessDenied(
             "no KEK exists for this service, and under the production security model only root creates one \
              (run `hkdfguard provision` as root)",
@@ -472,16 +576,12 @@ pub fn create_kek_unprivileged(service: &str) -> Result<(Arc<dyn KekProvider>, B
     }
 }
 
-// Whether any policy-allowed provider is present on this host.
-fn any_provider_present() -> Result<bool> {
-    Ok(allowed_types()?.into_iter().filter_map(construct_provider).any(|provider| provider.probe()))
-}
-
 /// Walks the policy-allowed priority chain looking for a provider that
 /// already has a persistent KEK for `service`, loading (never creating)
 /// it. Backs `wrap`. Fails with [`Error::KekNotFound`] if the whole chain
 /// is walked without finding one -- the caller must call [`create_kek`]
-/// first.
+/// first -- or [`Error::NoProviderAvailable`] if no allowed provider is
+/// present to walk.
 pub fn select_existing(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
     walk_chain(service, |_| false, Error::KekNotFound)
 }
@@ -490,17 +590,26 @@ pub fn select_existing(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn K
 /// exists for `service`, without creating one anywhere. `Ok(false)` (not an
 /// error) means the chain was fully walked, every present provider answered,
 /// and none has one yet -- call
-/// [`create_kek`] to provision one. Backs `hkdfguard_kek_exists`. Like
+/// [`create_kek`] to provision one. With no allowed provider present at
+/// all, there is nothing to answer, and it fails as [`walk_chain`] does
+/// ([`Error::NoProviderAvailable`]). Backs `hkdfguard_kek_exists`. Like
 /// [`walk_chain`], constructs providers one at a time and stops at the
 /// first that has the key.
 pub fn kek_exists(service: &str) -> Result<bool> {
-    for provider_type in allowed_types()? {
+    let mut any_present = false;
+    let allowed = allowed_types()?;
+    for &provider_type in &allowed {
+        if bound_elsewhere(service, provider_type, &allowed)?.is_some() {
+            continue; // policy pins this service's key in another provider: a key here is not its KEK
+        }
         let Some(provider) = construct_provider(provider_type) else {
             continue;
         };
         if !provider.probe() {
+            provider.claims_while_absent(service).map_err(|e| attribute(provider_type, e))?;
             continue;
         }
+        any_present = true;
         // An error is returned, not read as "no key": the caller would
         // otherwise go on to `create_kek`, and a strong provider that is
         // failing must not be the reason a key gets created somewhere weaker.
@@ -508,7 +617,7 @@ pub fn kek_exists(service: &str) -> Result<bool> {
             return Ok(true);
         }
     }
-    Ok(false)
+    if any_present { Ok(false) } else { Err(nothing_present()) }
 }
 
 /// Looks up a specific provider by the type recorded in a wrapped payload
@@ -550,16 +659,91 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
     construct_provider(provider_type).ok_or(Error::NoProviderAvailable)
 }
 
+/// The provider to unwrap a payload for `service` with: the one the
+/// payload names ([`get_by_type`]) -- unless a provider earlier in the
+/// policy order holds a KEK for the service now.
+///
+/// The provider byte in a payload is authenticated only under the key of
+/// the provider it names. So whoever holds *any* allowed provider's key
+/// for a service -- a sidecar that can write the external-secret mount,
+/// say -- can make a payload naming that provider which opens, although
+/// the service's KEK is on the TPM and every wrap goes there. A wrap
+/// always uses the first provider in the order that holds a key
+/// ([`select_existing`]), so a payload naming a later one is either left
+/// over from before the service moved up, or that forgery; the two can't
+/// be told apart, and it is refused as [`Error::KekFingerprintMismatch`]:
+/// not wrapped under the KEK the service resolves to now. An administrator
+/// re-wrapping what is left over sets
+/// `selection.allow_unwrap_from_lower_provider` for as long as that takes.
+///
+/// A payload naming a provider the service is pinned away from is refused
+/// the same way, whatever the order and that setting, and such a provider
+/// is not asked whether it holds a key: see [`bound_elsewhere`].
+///
+/// The earlier providers are asked only when the payload doesn't name the
+/// first one, so the usual unwrap constructs nothing extra. One that can't
+/// answer -- present but failing, or absent with this service's key known
+/// to live there -- fails the unwrap with its own error, as it would fail
+/// a wrap ([`walk_chain`]).
+pub fn for_unwrap(service: &str, provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> {
+    let provider = get_by_type(provider_type)?;
+    let allowed = allowed_types()?;
+    if let Some(home) = bound_elsewhere(service, provider_type, &allowed)? {
+        log::error!(
+            "hkdfguard: refusing a payload wrapped under {}: policy pins this service's key in {}, so no wrap for it \
+             uses {}. If the service does keep a KEK in {} as well, pin that key too; otherwise the payload was made \
+             by someone who could place a key there",
+            provider_type.as_str(),
+            home.as_str(),
+            provider_type.as_str(),
+            provider_type.as_str()
+        );
+        return Err(Error::KekFingerprintMismatch);
+    }
+    if crate::policy::allow_unwrap_from_lower_provider() {
+        return Ok(provider);
+    }
+    for earlier in allowed.iter().copied().take_while(|t| *t != provider_type) {
+        if bound_elsewhere(service, earlier, &allowed)?.is_some() {
+            continue; // not this service's provider, whatever key it holds under the name (see `bound_elsewhere`)
+        }
+        let Some(stronger) = construct_provider(earlier) else {
+            continue; // not compiled into this build
+        };
+        let holds_key = if stronger.probe() {
+            stronger.kek_exists(service)
+        } else {
+            stronger.claims_while_absent(service).map(|()| false)
+        };
+        if holds_key.map_err(|e| attribute(earlier, e))? {
+            log::error!(
+                "hkdfguard: refusing a payload wrapped under {}: {} is earlier in the policy order and holds a KEK \
+                 for this service, so nothing wrapped for it since then names {}. If the payload is left over from \
+                 before the service moved to {}, set selection.allow_unwrap_from_lower_provider = true while it is \
+                 re-wrapped; otherwise it was made by someone holding only the {} key",
+                provider_type.as_str(),
+                earlier.as_str(),
+                provider_type.as_str(),
+                earlier.as_str(),
+                provider_type.as_str()
+            );
+            return Err(Error::KekFingerprintMismatch);
+        }
+    }
+    Ok(provider)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*; // bring `ProviderType` etc. into scope
     use serial_test::serial;
 
-    // Points HKDFGUARD_POLICY_FILE somewhere guaranteed not to exist, so
-    // tests that don't care about policy behavior aren't accidentally
-    // affected by a real /etc/hkdfguard/policy.toml on the test host.
-    fn clear_policy_env() {
-        let _no_policy = crate::policy::test_support::TestPolicy::absent();
+    // The shortest valid policy, for tests that don't care about policy
+    // behavior: nothing from the harness's policy, and nothing set. In
+    // force while the returned guard lives.
+    #[must_use]
+    fn default_policy() -> crate::policy::test_support::TestPolicy {
+        crate::policy::test_support::TestPolicy::minimal()
     }
 
     // Stand-in for `.unwrap_err()`: the `Ok` type here is
@@ -626,7 +810,7 @@ mod tests {
     #[test]
     #[serial]
     fn get_by_type_finds_compiled_providers() {
-        clear_policy_env();
+        let _policy = default_policy();
         #[cfg(feature = "external-secret")]
         {
             let p = get_by_type(ProviderType::ExternalSecret).unwrap();
@@ -645,6 +829,96 @@ mod tests {
             let p = get_by_type(ProviderType::Ephemeral).unwrap();
             assert_eq!(p.provider_type(), ProviderType::Ephemeral);
         }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+    fn unwrap_refuses_a_payload_from_a_provider_below_the_one_holding_the_services_key() {
+        use crate::policy::test_support::TestPolicy;
+        const ORDER: &str = "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n";
+        let _policy = TestPolicy::write(ORDER);
+        let mount = crate::secure_file::private_tempdir();
+        let _secret_mount = crate::policy::test_support::secret_mount(mount.path());
+        let dek = [7u8; crate::crypto::DEK_LEN];
+
+        // No external secret yet: the wrap lands on Ephemeral, and opens.
+        create_kek("com.company.orders").unwrap();
+        let below = crate::crypto::wrap("com.company.orders", &dek).unwrap();
+        assert_eq!(*crate::crypto::unwrap("com.company.orders", &below).unwrap(), dek);
+
+        // The service's KEK is now an external secret: every wrap goes
+        // there, so a payload naming Ephemeral is left over -- or made by
+        // someone holding only the Ephemeral key. Refused either way.
+        let secret = mount.path().join("com.company.orders");
+        std::fs::write(&secret, random_kek_for_tests()).unwrap();
+        std::fs::set_permissions(&secret, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
+        assert!(matches!(crate::crypto::unwrap("com.company.orders", &below), Err(Error::KekFingerprintMismatch)));
+        assert!(matches!(for_unwrap("com.company.orders", ProviderType::Ephemeral).map(|_| ()), Err(Error::KekFingerprintMismatch)));
+        // What the service wraps now opens as ever, and another service,
+        // with no key higher up, is untouched.
+        let above = crate::crypto::wrap("com.company.orders", &dek).unwrap();
+        assert_eq!(*crate::crypto::unwrap("com.company.orders", &above).unwrap(), dek);
+        assert!(for_unwrap("com.company.billing", ProviderType::Ephemeral).is_ok());
+
+        // While what is left over is re-wrapped, policy can allow it.
+        {
+            let _allowed = TestPolicy::write(&format!("{ORDER}allow_unwrap_from_lower_provider = true\n"));
+            assert_eq!(*crate::crypto::unwrap("com.company.orders", &below).unwrap(), dek);
+        }
+
+        // A provider higher up that can't answer fails the unwrap with its
+        // own error: it is never read as "holds no key".
+        std::fs::set_permissions(&secret, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644)).unwrap();
+        assert!(matches!(crate::crypto::unwrap("com.company.orders", &below), Err(Error::Provider(_))));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+    fn a_pin_binds_a_service_to_its_provider_whatever_comes_earlier_in_the_order() {
+        // Ephemeral is ahead of external-secret, and any process may create
+        // an Ephemeral key: the stand-in for a provider someone other than
+        // the administrator can place a key in (a shared PKCS#11 token).
+        const ORDER: &str = "preferred_order = [\"ephemeral\", \"external-secret\"]\n[selection]\nmode = \"prefer\"\n";
+        let service = "com.company.pinnedhome";
+        let mount = crate::secure_file::private_tempdir();
+        let _secret_mount = crate::policy::test_support::secret_mount(mount.path());
+        let key = random_kek_for_tests();
+        let secret = mount.path().join(service);
+        std::fs::write(&secret, key).unwrap();
+        std::fs::set_permissions(&secret, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
+        let dek = [9u8; crate::crypto::DEK_LEN];
+
+        // Unpinned: the first provider holding a key wins, as ever. A key
+        // planted on Ephemeral takes the service's wraps.
+        let planted = {
+            let _unpinned = write_policy(ORDER);
+            let (provider, _) = create_kek(service).unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+            crate::crypto::wrap(service, &dek).unwrap()
+        };
+
+        // Pinned to its external secret: the planted key is never used, for
+        // a wrap, an existence check, or a creation...
+        let fingerprint: String = crate::crypto::software_kek_fingerprint(&key).iter().map(|b| format!("{b:02x}")).collect();
+        let _pinned = write_policy(&format!("{ORDER}[external_secret.pinned_keys]\n\"{service}\" = \"{fingerprint}\"\n"));
+        for (provider, _) in [select_existing(service).unwrap(), create_kek(service).unwrap()] {
+            assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
+        }
+        assert!(kek_exists(service).unwrap());
+        let genuine = crate::crypto::wrap(service, &dek).unwrap();
+        assert_eq!(crate::payload::Payload::from_bytes(&genuine).unwrap().provider_type, ProviderType::ExternalSecret);
+        // ...what the real key wrapped still opens, though a provider
+        // earlier in the order holds a key under the service's name...
+        assert_eq!(*crate::crypto::unwrap(service, &genuine).unwrap(), dek);
+        // ...and what the planted key wrapped does not.
+        assert!(matches!(crate::crypto::unwrap(service, &planted), Err(Error::KekFingerprintMismatch)));
+        assert!(matches!(for_unwrap(service, ProviderType::Ephemeral).map(|_| ()), Err(Error::KekFingerprintMismatch)));
+
+        // A service with no pin is untouched.
+        let (provider, _) = create_kek("com.company.nopin").unwrap();
+        assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
     }
 
     #[test]
@@ -679,16 +953,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn create_kek_does_not_fall_back_to_ephemeral_without_a_policy() {
+    fn create_kek_does_not_fall_back_to_ephemeral_unless_policy_names_it() {
         #[cfg(feature = "ephemeral")]
         {
-            clear_policy_env(); // no policy file at all
+            let _policy = default_policy(); // a policy that names nothing
 
             // External secret unreachable, so on a host with no hardware
             // provider Ephemeral is the only thing left -- and it must
             // NOT be used: a transient outage must not silently become a
             // key that's lost on restart. The subject here is the
-            // *no-policy default*, so the policy deliberately isn't
+            // *default order*, so the policy deliberately isn't
             // pinned; see `assert_never_ephemeral` for why the outcome is
             // asserted as an invariant rather than one fixed result.
 
@@ -808,7 +1082,7 @@ mod tests {
         #[cfg(feature = "pkcs11")]
         {
             // Nothing from the harness: no PKCS#11 module or PIN file.
-            let _isolated = crate::policy::test_support::TestPolicy::absent();
+            let _isolated = crate::policy::test_support::TestPolicy::minimal();
             // PKCS#11 is compiled in but not reachable here (the policy
             // names no module), and the policy
             // requires exactly it -- so there must be no fallback to
@@ -829,7 +1103,7 @@ mod tests {
         #[cfg(all(feature = "pkcs11", feature = "external-secret"))]
         {
             // Nothing from the harness: no PKCS#11 module or PIN file.
-            let _isolated = crate::policy::test_support::TestPolicy::absent();
+            let _isolated = crate::policy::test_support::TestPolicy::minimal();
             let ext_dir = crate::secure_file::private_tempdir();
             let _secret_mount = crate::policy::test_support::secret_mount(ext_dir.path());
 
@@ -995,6 +1269,18 @@ mod tests {
             assert!(lines[0].contains("EPHEMERAL"), "names the provider that served the call: {}", lines[0]);
             assert!(lines[0].contains("EXTERNAL_SECRET: "), "says what was passed over, and why: {}", lines[0]);
             assert!(!lines[0].contains("fallbackwarn"), "never names the service: {}", lines[0]);
+
+            // And in the audit trail, which reaches syslog whether or not
+            // the host installed a logger: once too, naming the service.
+            let records = crate::audit::captured_containing("\"com.company.fallbackwarn\"");
+            let fallbacks: Vec<&String> = records.iter().filter(|r| r.contains("event=1006 ")).collect();
+            assert_eq!(fallbacks.len(), 1, "{records:#?}");
+            assert!(fallbacks[0].starts_with("<84>"), "a Warning: {}", fallbacks[0]);
+            assert!(
+                fallbacks[0].contains("provider=EPHEMERAL passed_over=\"EXTERNAL_SECRET: "),
+                "says who served it and what was passed over: {}",
+                fallbacks[0]
+            );
         }
     }
 
@@ -1032,6 +1318,83 @@ mod tests {
                 Ok(false)
             ));
 
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_required_provider_that_is_absent_is_unavailable_and_audited_not_kek_not_found() {
+        #[cfg(feature = "external-secret")]
+        {
+            // Policy requires one provider and the host doesn't have it. That
+            // is an outage, not "this service isn't provisioned yet":
+            // KEK_NOT_FOUND would go unaudited and send the caller off to
+            // hkdfguard_create_kek, and kek_exists answering 0 would too.
+            let _isolated = crate::policy::test_support::TestPolicy::minimal();
+            let _policy = write_policy("[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n");
+            if external_secret::ExternalSecretProvider::new().probe() {
+                eprintln!("skipping: this host has a conventional secret mount");
+                return;
+            }
+            let service = "com.company.requiredabsent";
+            assert!(matches!(expect_err(select_existing(service)), Error::NoProviderAvailable));
+            assert!(matches!(kek_exists(service), Err(Error::NoProviderAvailable)));
+
+            let c = std::ffi::CString::new(service).unwrap();
+            let dek = [0x11u8; 32];
+            let mut out = [0u8; 512];
+            let mut out_len: std::os::raw::c_int = 512;
+            assert_eq!(
+                crate::hkdfguard_wrap_dek(c.as_ptr(), dek.as_ptr(), 32, out.as_mut_ptr(), &mut out_len),
+                crate::status::PROVIDER_UNAVAILABLE
+            );
+            let mut exists: std::os::raw::c_int = -1;
+            assert_eq!(crate::hkdfguard_kek_exists(c.as_ptr(), &mut exists), crate::status::PROVIDER_UNAVAILABLE);
+            assert_eq!(exists, -1, "untouched on error");
+
+            let records = crate::audit::captured_containing("\"com.company.requiredabsent\"");
+            for op in ["hkdfguard_wrap_dek", "hkdfguard_kek_exists"] {
+                assert!(
+                    records.iter().any(|r| r.contains(&format!("event=2005 op={op} result=PROVIDER_UNAVAILABLE(-3)"))),
+                    "{op} must be audited: {records:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn an_absent_provider_that_holds_the_services_key_stops_the_chain() {
+        #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+        {
+            // Policy pins an external secret for the service, and no secret
+            // mount exists on this host at all: the provider is absent, and
+            // would be skipped without a word -- leaving Ephemeral, which
+            // policy allows, to take every wrap. The pin says where the key
+            // lives, so the chain stops there instead.
+            let service = "com.company.pinnedbutgone";
+            let _policy = write_policy(&format!(
+                "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n\
+                 [external_secret.pinned_keys]\n\"{service}\" = \"{}\"\n",
+                "ab".repeat(32)
+            ));
+            if external_secret::ExternalSecretProvider::new().probe() {
+                eprintln!("skipping: this host has a conventional secret mount");
+                return;
+            }
+            for result in [create_kek(service).map(|_| ()), select_existing(service).map(|_| ()), kek_exists(service).map(|_| ())] {
+                match result {
+                    Err(Error::Provider(msg)) => {
+                        assert!(msg.starts_with("EXTERNAL_SECRET: ") && msg.contains("none is mounted"), "{msg}")
+                    }
+                    other => panic!("expected external-secret to stop the chain, got {other:?}"),
+                }
+            }
+            assert!(matches!(ephemeral::EphemeralProvider::new().kek_exists(service), Ok(false)), "nothing created on Ephemeral");
+
+            // A service policy doesn't pin still moves on.
+            let (provider, _) = create_kek("com.company.notpinned").unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
         }
     }
 

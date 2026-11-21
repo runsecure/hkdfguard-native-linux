@@ -109,10 +109,16 @@ grep -q 'only root creates or retires a KEK' <<<"$OUT" || fail "unexpected refus
 OUT=$(as_user "$APP" "$CLI" retire -sn "$SERVICE" -fp "$(printf '0%.0s' $(seq 64))" 2>&1) \
     && fail "the application's retire succeeded: $OUT"
 grep -q 'only root retires a KEK' <<<"$OUT" || fail "unexpected refusal of the application's retire: $OUT"
-OUT=$("$CLI" provision -sn "$SERVICE" 2>&1) || fail "root's provision failed: $OUT"
+# Production serves only pinned services unless policy says otherwise: the
+# mounted key is not the service's KEK until root's policy names it.
+OUT=$("$CLI" provision -sn "$SERVICE" 2>&1) && fail "root provisioned a service policy pins no key for: $OUT"
+grep -q 'has no pinned key' <<<"$OUT" || fail "unexpected refusal of an unpinned service: $OUT"
 FP=$(grep -o '[0-9a-f]\{64\}' <<<"$OUT" | head -n 1)
-[ ${#FP} -eq 64 ] || fail "provision printed no fingerprint: $OUT"
-echo "the application's provision and retire refused; root's provision verified KEK $FP."
+[ ${#FP} -eq 64 ] || fail "the refusal printed no fingerprint to pin: $OUT"
+printf '\n[external_secret.pinned_keys]\n"%s" = "%s"\n' "$SERVICE" "$FP" >> "$POLICY"
+OUT=$("$CLI" provision -sn "$SERVICE" 2>&1) || fail "root's provision failed once the key was pinned: $OUT"
+grep -q "$FP" <<<"$OUT" || fail "provision did not report the pinned fingerprint $FP: $OUT"
+echo "the application's provision and retire refused; an unpinned service refused; root's provision verified KEK $FP."
 
 section "deployment admin: the deployer wraps, into the deployers' folder"
 base64 -w0 < "$BASE/dek" | as_user "$DEPLOYER" "$CLI" wrap -kf "$BASE/keys/$SERVICE.key" -sn "$SERVICE" \

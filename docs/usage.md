@@ -68,8 +68,8 @@ What `provision` does depends on the provider:
 | Provider | What `provision` does |
 |---|---|
 | TPM | Has the TPM generate the key and saves it as the service's key file, once; later runs load it into the TPM, check any pinned Name, and report "already provisioned". With `require_pinned_names`, it creates the key file for an unlisted service, then fails and prints the policy line to add. **Back up the key file**: a lost key file is a lost KEK. |
-| PKCS#11 | Generates the HMAC secret key on the token, once; later runs find it there and report "already provisioned". |
-| External secret | Checks the delivered file, that it holds a valid key, and that its fingerprint matches any pin: the file itself is the provisioning. With `require_pinned_keys`, it fails for an unpinned service and prints the policy line for the mounted key. |
+| PKCS#11 | Generates the HMAC secret key on the token, once; later runs find it there and report "already provisioned". With `require_pinned_keys` (on by default under the production security model), it generates the key for an unpinned service, then fails and prints the policy line to add. |
+| External secret | Checks the delivered file, that it holds a valid key, and that its fingerprint matches any pin: the file itself is the provisioning. With `require_pinned_keys` (on by default under the production security model), it fails for an unpinned service and prints the policy line for the mounted key. |
 | Ephemeral | Refused by the CLI, for `provision` and `wrap` alike: an ephemeral key lives only in the process that creates it, so the application must wrap its own DEKs. |
 
 `provision` also prints the KEK's fingerprint. Record it: `retire` asks
@@ -91,7 +91,7 @@ hkdfguard retire --service-name|-sn <name> --fingerprint|-fp <64 hex chars>
 | `--service-name`, `-sn` | The service whose KEK is used |
 | `--key-file-path`, `-kf` | Where `wrap` writes the wrapped DEK (mode `0600`, owned by whoever runs the command). No symbolic link may be in the path above the file, and no folder above it, up to `/`, may be writable by group or others -- sticky folders such as `/tmp` included, since `hkdfguard_open_file` refuses a key file there (`-39`). Checked before the DEK is read. Under the developer model only the folders' modes are checked, not who owns them; under production each folder must be owned by root or a deployer, and may be group-writable only through a deployer group (a `root:hkdfguard-deployers 2775` folder), exactly as the library will check it. |
 | `--dek-stdin` | Read the DEK, base64 of exactly 32 bytes, from standard input |
-| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600`, in a folder that -- with every folder above it, up to `/` -- is owned by root or you and not writable by group or others, sticky folders such as `/tmp` included (a read-only mount is exempt) |
+| `--dek-file <path>` | Read the DEK from a file: a regular file, not a symlink and not reached through one, owned by root or you, mode `0400` or `0600`, in a folder that -- with every folder above it, up to `/` -- is owned by root or you and not writable by group or others, sticky folders such as `/tmp` included (a sticky folder on a read-only mount is exempt), and no POSIX ACL entry giving anyone else access |
 | `--group`, `-g` | Also let this group read the key file (mode `0640`). For a service running as another user. Over-broad groups (`root`, `users`, `nogroup`, `nobody`, `wheel`, `sudo`, `adm`, `staff`) are refused. |
 | `--fingerprint`, `-fp` | The KEK's fingerprint, as `provision` printed it (64 hex characters). For `wrap`: nothing is written unless the DEK was wrapped under that KEK. For `retire`: required; nothing is deleted unless it matches. |
 | `--force`, `-f` | Replace an existing key file. The new payload is written to a temporary file in the same folder first and renamed over the old one, so a failed wrap or write never touches the old file; the replaced file is then overwritten. Refused for a symlink, a non-regular file, or a file with more than one hard link. |
@@ -134,8 +134,11 @@ With `--force`, the existing key file is left as it was.
 
 `retire` permanently deletes the service's KEK, and with it every DEK
 wrapped under it. It deletes nothing unless the KEK's fingerprint is the
-one given. Only PKCS#11 keys can be retired; a TPM key isn't stored
-anywhere, so there's nothing to delete. See "Retiring a KEK" in the README.
+one given. TPM and PKCS#11 keys can be retired. For a TPM key, `retire`
+deletes the service's key file and then its authValue file: the TPM keeps
+no copy, so a backup of both files is the only thing that could still load
+the key. An external secret belongs to the platform that mounted it and is
+removed there. See "Retiring a KEK" in the README.
 
 The CLI hardens itself before touching key material (no core dumps, no
 debugger attachment) and refuses to run if it can't. It also tries to lock
@@ -185,7 +188,7 @@ warning (`memory not locked as a whole`).
 |---|---|---|
 | -1 | `HKDFGUARD_ERR_INVALID_ARGUMENT` | Null pointer, DEK length other than 32, negative capacity |
 | -2 | `HKDFGUARD_ERR_BUFFER_TOO_SMALL` | `*out_len` now holds the size needed |
-| -3 | `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` | No allowed provider is available on this host |
+| -3 | `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` | No allowed provider is available on this host (the TPM a `require` policy names, for example). Wrap and `hkdfguard_kek_exists` return this, not -17 or a 0 answer: there is nothing to provision on |
 | -4 | `HKDFGUARD_ERR_PROVIDER_ERROR` | A provider is present but failing |
 | -5 | `HKDFGUARD_ERR_CRYPTO_ERROR` | A cryptographic step failed for a reason other than authentication, such as the OS random number generator failing |
 | -6 | `HKDFGUARD_ERR_INTERNAL_ERROR` | An internal failure: a bug in the library (a caught panic) |
@@ -203,7 +206,7 @@ warning (`memory not locked as a whole`).
 | -34 | `HKDFGUARD_ERR_FILE_IO` | `hkdfguard_open_file`: not a regular file, or the read failed |
 | -35 | `HKDFGUARD_ERR_FILE_TOO_SHORT` | `hkdfguard_open_file`: the file is shorter than a wrapped DEK, or than its header says (a truncated copy) |
 | -36 | `HKDFGUARD_ERR_FILE_TOO_LONG` | `hkdfguard_open_file`: the file is longer than a wrapped DEK, or than its header says (data appended) |
-| -37 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
+| -37 | `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` | `hkdfguard_open_file`: the file looks like an **unwrapped** DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), or its base64 or hex). Treat it as a key exposure: delete the file and rotate the DEK |
 | -38 | `HKDFGUARD_ERR_FILE_MALFORMED` | `hkdfguard_open_file`: the length is right but the contents aren't a wrapped DEK |
 | -39 | `HKDFGUARD_ERR_FILE_UNTRUSTED` | `hkdfguard_open_file`: the file, or a directory above it (or above a symlink to it), is owned by someone the security model doesn't trust, or writable by someone else, so someone else could have replaced it. Under production (the default) key files and their directories must be owned by root or a deployer, and group-writable only through a deployer group: a key file the service's own account owns is refused. Under developer, owned by the service or by root, with no group write. Either way, all the way up to `/`. Sticky directories are **not** trusted -- for key files or anything else the library reads: a key file anywhere under `/tmp`, `/var/tmp`, `/dev/shm` or another sticky, world-writable directory is refused, however private the directories beneath it (a read-only mount, such as a Kubernetes Secret volume, is fine) |
 

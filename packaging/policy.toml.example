@@ -6,9 +6,17 @@
 #       /etc/hkdfguard/policy.toml
 # then edit /etc/hkdfguard/policy.toml.
 #
-# As shipped -- every setting below commented out -- this file behaves
-# exactly like having no policy file at all: providers are tried in the
-# order tpm2, pkcs11, external-secret, and ephemeral is never used. Each
+# The library needs a policy file: with none at /etc/hkdfguard/policy.toml
+# every call fails (HKDFGUARD_ERR_POLICY_INVALID), so that a file that
+# never arrived -- an unmounted volume, an image built without it -- is an
+# error and not a silent return to defaults.
+#
+# As shipped -- every setting below commented out -- this file is the
+# defaults: the production security model, providers tried in the order
+# tpm2, pkcs11, external-secret, and ephemeral never used. Under the
+# production model the PKCS#11 and external-secret providers serve only
+# the services whose keys are pinned below (`require_pinned_keys`), so a
+# service kept in either needs its pin added before it works. Each
 # commented line shows its default, or a placeholder where there is none;
 # uncomment and change only what you need. See "Policy file reference" in
 # the README (/usr/share/doc/libhkdfguard1/README.md on Debian and Ubuntu)
@@ -18,17 +26,18 @@
 # so must /etc/hkdfguard and every directory above it -- sticky ones such as
 # /tmp included: nothing the library reads (this file, the secrets, PIN and
 # module it names) may live anywhere under /tmp, /var/tmp or /dev/shm. Only
-# a read-only mount (a Kubernetes Secret or ConfigMap volume) is exempt.
-# A file that exists
-# but is wrongly owned, too broadly writable or malformed makes every
-# operation fail closed; only a missing file means "no policy". Unknown
+# a sticky directory on a read-only mount (a Kubernetes Secret or projected
+# volume) is exempt; mount a ConfigMap through a projected volume, as a
+# plain ConfigMap volume (0777, not sticky) is refused.
+# POSIX ACL entries count as the mode bits do.
+# A file that is missing, wrongly owned, too broadly writable or malformed
+# makes every operation fail closed. Unknown
 # keys are rejected, so a typo fails loudly rather than being ignored.
 #
 # The library re-reads this file on every call: changes take effect
 # without restarting the service.
 
-# The security model: "production" (the default, with or without this
-# file) or "developer". Any other value -- "development" included -- makes
+# The security model: "production" (the default) or "developer". Any other value -- "development" included -- makes
 # the policy invalid. Production splits the duties:
 #   security admin    root: `hkdfguard provision` and `retire`. The library
 #                     creates a KEK that doesn't exist yet only for root;
@@ -77,6 +86,12 @@
 mode = "prefer"
 #provider = "tpm2"           # with "require": tpm2 | pkcs11 | external-secret | ephemeral
 #level = "hardware"          # with "require-level": ephemeral | software | external | hardware
+# Unwrap refuses a payload wrapped under a provider later in the order than
+# one that holds a KEK for the service now: every wrap since the service
+# moved up names the earlier provider, so such a payload is either left
+# over from before, or made by someone holding only the later provider's
+# key. Set true only while the leftovers are re-wrapped.
+#allow_unwrap_from_lower_provider = false
 
 [key_requirements]
 # Exclude every provider below this tier, whatever the mode:
@@ -96,18 +111,20 @@ mode = "prefer"
 
 # Directory of TPM key files: a <service>.tpmkey and its authValue,
 # <service>.tpmauth, per service, created by `hkdfguard provision`. Whoever
-# can read both files and open the TPM can use that KEK, so the directory's
-# group is the services that use TPM keys; both files take that group, mode
-# 0440. Give each .tpmauth file its own service's group to keep the others
-# out. The packages create the default directory as root:hkdfguard 0750; a
-# key_dir of your own needs
+# can read both files and open the TPM can use that KEK. The key file takes
+# the directory's group (the services that use TPM keys), mode 0440; the
+# .tpmauth file the service's own group from [tpm.auth_groups] below, or
+# root:root 0400 with none. The packages create the default directory as
+# root:hkdfguard 0750; a key_dir of your own needs
 #   install -d -m 0750 -o root -g <key-users> <dir>
 # Back both files up: losing either loses the KEK. A key file is useless on
 # any other TPM; the .tpmauth file is a secret.
 #key_dir = "/var/lib/hkdfguard/tpm"
 
 # File holding the Owner hierarchy's password, if you set one. Unset: an
-# empty password. Root-owned, mode 0400 (or 0440 with the service's group).
+# empty password. Root-owned, mode 0400 (or 0440 with the services' group).
+# At least 16 random bytes (not a passphrase); a shorter file is refused.
+# Every service using TPM keys must read it, and so holds the password.
 #owner_auth_file = "/etc/hkdfguard/tpm.owner-auth"
 
 # true: only services listed in [tpm.pinned_names] have a KEK on the TPM,
@@ -119,24 +136,48 @@ mode = "prefer"
 # the service key's authValue: "on" (default) | "off" (test harnesses only).
 #session_encryption = "on"
 # The Name of the TPM's storage root key, which every key file is loaded
-# under and provisioning's session is salted to. Pin it before provisioning
-# on a discrete TPM.
+# under and provisioning's session is salted to. `hkdfguard provision`
+# refuses to create a TPM key until it is set, and prints the Name to put
+# here.
 #pinned_session_salt_key_name = "000b<64 hex chars>"
+# Provision without that pin: for a TPM with no bus to tamper with (a
+# firmware or virtual TPM). Each key provisioned this way is audited
+# (event 1007).
+#allow_unpinned_provisioning = false
 
 [tpm.pinned_names]
 # The TPM Name each service's key must have; any other key is refused.
 # Quote the service names: unquoted dots would make nested tables.
 #"com.company.orders" = "000b<64 hex chars>"
 
+[tpm.auth_groups]
+# The group whose members may read each service's .tpmauth file, its key's
+# authValue: root writes it root:<group> 0440. A service with no entry gets
+# root:root 0400, usable only by a service running as root. A group covering
+# essentially every account (users, nogroup, root, wheel, ...) is refused.
+#"com.company.orders" = "orders"
+
 [external_secret]
 # Directory holding one KEK file per service, named after the service. It,
 # and every directory above it, must be owned by root or the service's user
 # and not writable by group or others (so never under /tmp), unless it is a
-# read-only mount such as a Kubernetes Secret volume.
+# sticky directory on a read-only mount, such as a Kubernetes Secret volume.
 # When set, the only place looked. Unset: the first of these that exists:
 #   /var/run/secrets/hkdfguard, /run/secrets/hkdfguard,
 #   /vault/secrets/hkdfguard, /mnt/secrets-store/hkdfguard
 #dir = "/run/secrets/hkdfguard"
+# Serve only the services pinned below; `provision` then prints the line
+# to add for a new one. Unset: true under the production security model,
+# false under the developer one.
+#require_pinned_keys = true
+
+[external_secret.pinned_keys]
+# The fingerprint each service's mounted key must have (`provision` prints
+# it), or a list of them while a key is rotated. The mount's own checks
+# say who could have written a key file, not which key it holds; with a
+# pin, any other key is refused and a missing one is an error, not "no key
+# here". Quote the service names.
+#"com.company.orders" = "<64 hex chars>"
 
 [pkcs11]
 # PKCS#11 is used only when `module` is set: there is no default module.
@@ -145,7 +186,24 @@ mode = "prefer"
 #module = "/usr/lib/vendor/libhsm-pkcs11.so"
 # User PIN file: root-owned, mode 0400 (or 0440 with the service's group).
 #pin_file = "/etc/hkdfguard/pkcs11.pin"
+# A directory where a rejected PIN is recorded for every process, so a
+# stale PIN file costs the token one login attempt in total, not one per
+# worker or restart. Must exist (root:<service-group> 2770, say; /run is
+# emptied at boot) and closed to all other accounts. Unset: per process.
+#pin_state_dir = "/run/hkdfguard/pkcs11"
 # Choose the token by label and/or serial; exactly one token must match.
 # With neither, exactly one initialized token must be present.
 #token_label = "hkdfguard-prod"
 #token_serial = "0123456789abcdef"
+# Serve only the services pinned below; `provision` then prints the line
+# to add for a new one. Unset: true under the production security model,
+# false under the developer one.
+#require_pinned_keys = true
+
+[pkcs11.pinned_keys]
+# The fingerprint each service's key on the token must have (`provision`
+# prints it), or a list of them. Anyone holding the token's PIN can delete
+# a key or generate another under the same label; with a pin, a replaced
+# key is refused and a missing one is an error, not "no key here". Quote
+# the service names.
+#"com.company.orders" = "<64 hex chars>"

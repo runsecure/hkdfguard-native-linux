@@ -10,7 +10,7 @@
 # logs in with the pod's service-account token, renders the key with
 # base64Decode into a shared emptyDir, and keeps it current. The test
 # container mounts that directory at /vault/secrets/hkdfguard, with the
-# policy from a ConfigMap at /etc/hkdfguard -- the documented pinning
+# policy from a ConfigMap, in a projected volume, at /etc/hkdfguard -- the documented pinning
 # example: external_secret.dir set to that mount, require_pinned_keys, and
 # the key's fingerprint pinned -- and runs docker/k8s/pod-test.sh, as for
 # the Secret-volume tests.
@@ -293,14 +293,15 @@ vault_cli write auth/kubernetes/role/hkdfguard \
 #   plant: yes -- an init container plants a key of its own, and the real
 #          key is never written to Vault (its delivery is still pending);
 #          with pin match, the real key is the one pinned
-#   whole-disk works: the library checks ownership, modes and whether the
-#   mount is read-only, not what backs it, so a disk-backed emptyDir passes
-#   as the tmpfs one does. It does leave the key on the node's disk, so
-#   medium: Memory remains the better choice.
+#   whole-disk is refused although the app's mount is read-only: a
+#   disk-backed emptyDir's root is 0777, not sticky like a tmpfs one's
+#   (1777), so the agent -- or anything else writing the volume -- could
+#   rename or delete what is in it. Mount a private subdirectory instead,
+#   or use medium: Memory, which also keeps the key off the node's disk.
 SCENARIOS="
 vault-default-agent-0644|100|10001|0644|whole|-|once|match|-|refused|-
 vault-same-user-whole-0400|10001|10001|0400|whole|-|once|match|-|works|-
-vault-same-user-whole-disk-0400|10001|10001|0400|whole-disk|-|once|match|-|works|-
+vault-same-user-whole-disk-0400|10001|10001|0400|whole-disk|-|once|match|-|refused|(mode 777)
 vault-same-user-subdir-0400|10001|10001|0400|subdir|-|once|match|-|works|-
 vault-same-user-subdir-0444|10001|10001|0444|subdir|-|once|match|-|refused|-
 vault-root-agent-fsgroup-0440|0|10001|0440|subdir|10001|once|match|-|works|-

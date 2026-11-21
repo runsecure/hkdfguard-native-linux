@@ -243,10 +243,10 @@ struct ExternalSecretPolicy {
     #[serde(default)]
     pinned_keys: BTreeMap<String, PinnedKeys>,
     /// Make `pinned_keys` the provider's allowlist: a service with no pin
-    /// is treated as having no KEK, whatever is mounted for it. Default
-    /// `false`, so existing deployments keep working until they pin.
-    #[serde(default)]
-    require_pinned_keys: bool,
+    /// is treated as having no KEK, whatever is mounted for it. Unset: on
+    /// under the production security model, off under the developer one
+    /// (see [`require_pins_default`]).
+    require_pinned_keys: Option<bool>,
 }
 
 /// One `external_secret.pinned_keys` entry: a single fingerprint, or
@@ -268,11 +268,44 @@ struct Pkcs11Policy {
     module: Option<String>,
     /// Absolute path of the user-PIN file (default /etc/hkdfguard/pkcs11.pin).
     pin_file: Option<String>,
+    /// Absolute path of a directory where a rejected PIN is recorded for
+    /// every process using this policy, not only the one that saw the
+    /// rejection (see `pkcs11::PIN_LATCHES`). Default: none, and each
+    /// process then finds out for itself, at one login attempt each.
+    pin_state_dir: Option<String>,
     /// Select the token by its CKA label (`CK_TOKEN_INFO.label`), and/or
     /// its serial number. Slot numbers aren't stable across reboots or
     /// hot-plugging; these are. Exactly one token must match.
     token_label: Option<String>,
     token_serial: Option<String>,
+    /// Expected KEK fingerprint, per service, as hex: the value `provision`
+    /// prints. One string, or a list while a rotation is in progress. When
+    /// a service has an entry here, the key the token holds for it must
+    /// have one of these fingerprints, and its absence is an error rather
+    /// than "no key here" -- see [`pinned_pkcs11_keys`] for what that
+    /// catches.
+    #[serde(default)]
+    pinned_keys: BTreeMap<String, PinnedKeys>,
+    /// Make `pinned_keys` the provider's allowlist: a service with no pin
+    /// is treated as having no KEK on the token, whatever key is there.
+    /// Unset: on under the production security model, off under the
+    /// developer one (see [`require_pins_default`]).
+    require_pinned_keys: Option<bool>,
+}
+
+/// What `require_pinned_keys` means where a policy doesn't set it: on under
+/// the production model, off under the developer one.
+///
+/// A pin is what ties a service to one key in one provider. Without it, a
+/// mounted secret is whichever well-formed key its writers put there, a
+/// token key whichever one a PIN holder last generated under the label,
+/// and a service whose key has gone missing is handed to the next provider
+/// in the order. A production deployment that wants any of that says so,
+/// with `require_pinned_keys = false`. A developer's machine has no
+/// provisioning step to record a fingerprint at, and trusts its own user
+/// with the keys anyway.
+fn require_pins_default(model: SecurityModel) -> bool {
+    model == SecurityModel::Production
 }
 
 /// The PKCS#11 settings policy supplies, validated.
@@ -280,6 +313,7 @@ struct Pkcs11Policy {
 pub struct Pkcs11Settings {
     pub module: Option<PathBuf>,
     pub pin_file: Option<PathBuf>,
+    pub pin_state_dir: Option<PathBuf>,
     pub token_label: Option<String>,
     pub token_serial: Option<String>,
 }
@@ -356,6 +390,15 @@ struct TpmPolicy {
     /// learn it. After provisioning the authValue protects every session
     /// on its own (see `crate::provider::tpm2`).
     pinned_session_salt_key_name: Option<String>,
+    /// Let `provision` create a service key while
+    /// `pinned_session_salt_key_name` is unset. Default `false`: with no
+    /// pin, provisioning is refused, with the storage root key's Name to
+    /// pin in the message. `true` is for a TPM with no bus to tamper with
+    /// (a firmware or virtual TPM) and for test harnesses; a key
+    /// provisioned under it is audited (event 1007). Ignored once a Name
+    /// is pinned.
+    #[serde(default)]
+    allow_unpinned_provisioning: bool,
     /// Which TPM to talk to, as a tpm2-tss TCTI string:
     /// `device:/dev/tpmrm0` (the default when unset), `tabrmd:...`,
     /// `mssim:...` or `swtpm:...`. Set here, by root, because it decides
@@ -379,7 +422,20 @@ struct TpmPolicy {
     /// storage primary key every key file is loaded under -- and so from
     /// using this crate's KEKs at all. Adding it changes no KEK.
     owner_auth_file: Option<String>,
+    /// The group whose members may read a service's authValue file, per
+    /// service: `"com.company.orders" = "orders"`. Root writes the file
+    /// `root:<group> 0440` when it provisions the service. A service with
+    /// no entry gets `root:root 0400`, readable by root alone: the
+    /// authValue is what lets an account use the service's key, so it is
+    /// never shared with the key directory's group, which every service
+    /// using TPM keys belongs to.
+    #[serde(default)]
+    auth_groups: BTreeMap<String, String>,
 }
+
+/// Longest group name `tpm.auth_groups` accepts: generous for directory
+/// (LDAP, AD) names, and bounded so a typo'd value is caught at load time.
+const MAX_GROUP_NAME_LEN: usize = 256;
 
 /// TCTI kinds tss-esapi can open; anything else is rejected at load time.
 const TCTI_KINDS: &[&str] = &["device", "tabrmd", "mssim", "swtpm"];
@@ -448,6 +504,55 @@ fn parse_kek_fingerprint(field: &str, hex: &str) -> Result<[u8; FINGERPRINT_LEN]
     })
 }
 
+// A key of one of the policy's per-service tables (`table` names it in
+// messages), normalized as the C boundary normalizes a caller's service
+// name. One that isn't a service name at all -- an underscore, a hyphen, a
+// stray space -- is refused: no caller could pass it, so the entry would
+// sit in the policy applying to nothing, and the service it was meant for
+// would go unpinned without a word.
+fn service_key(table: &str, service: &str) -> Result<String> {
+    match crate::service_name_problem(service) {
+        None => Ok(crate::normalize_service(service)),
+        Some(problem) => Err(Error::Policy(format!(
+            "hkdfguard policy: {table} has an entry for \"{}\", which is not a service name ({problem}), so it could \
+             never apply to one",
+            service.escape_debug()
+        ))),
+    }
+}
+
+// Decodes one provider's `pinned_keys` table (`table` names it in
+// messages): normalized service name -> every fingerprint accepted for it.
+fn parse_pinned_keys(table: &str, raw: &BTreeMap<String, PinnedKeys>) -> Result<BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>> {
+    let mut pinned = BTreeMap::new();
+    for (service, pins) in raw {
+        let field = format!("{table}[\"{service}\"]");
+        let hexes = match pins {
+            PinnedKeys::One(hex) => std::slice::from_ref(hex),
+            PinnedKeys::Several(hexes) => hexes.as_slice(),
+        };
+        if hexes.is_empty() {
+            return Err(Error::Policy(format!(
+                "hkdfguard policy: {field} is an empty list; remove the entry to unpin the service"
+            )));
+        }
+        let mut fingerprints = Vec::with_capacity(hexes.len());
+        for hex in hexes {
+            let fingerprint = parse_kek_fingerprint(&field, hex)?;
+            if fingerprints.contains(&fingerprint) {
+                return Err(Error::Policy(format!("hkdfguard policy: {field} lists the same fingerprint more than once")));
+            }
+            fingerprints.push(fingerprint);
+        }
+        if pinned.insert(service_key(table, service)?, fingerprints).is_some() {
+            return Err(Error::Policy(format!(
+                "hkdfguard policy: {table} lists \"{service}\" more than once (names are compared case-insensitively)"
+            )));
+        }
+    }
+    Ok(pinned)
+}
+
 // Decodes an even-length hex string. Returns `None` on any non-hex
 // character or odd length.
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
@@ -476,6 +581,14 @@ struct RawSelection {
     mode: SelectionModeTag,
     provider: Option<ProviderType>,
     level: Option<KeyProtectionLevel>,
+    /// Whether unwrap accepts a payload wrapped under a provider later in
+    /// the order than one that holds a KEK for the service now. Off unless
+    /// set: such a payload is either left over from before the service
+    /// moved to the stronger provider, or made by someone holding only the
+    /// weaker provider's key -- and the two look the same. On for the time
+    /// it takes to re-wrap what is left over.
+    #[serde(default)]
+    allow_unwrap_from_lower_provider: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -566,6 +679,7 @@ pub struct Policy {
     security_model: SecurityModel,
     deployer_groups: Vec<String>,
     selection: SelectionMode,
+    allow_unwrap_from_lower_provider: bool,
     minimum_protection: Option<KeyProtectionLevel>,
     preferred_order: Vec<ProviderType>,
     setup_min_delay: Duration,
@@ -574,14 +688,21 @@ pub struct Policy {
     pinned_tpm_names: BTreeMap<String, Vec<u8>>,
     tpm_session_encryption: SessionEncryption,
     pinned_session_salt_key_name: Option<Vec<u8>>,
+    tpm_allow_unpinned_provisioning: bool,
     tpm_tcti: Option<String>,
     tpm_key_dir: Option<PathBuf>,
     tpm_owner_auth_file: Option<PathBuf>,
+    /// Normalized service name -> the group that may read its authValue file.
+    tpm_auth_groups: BTreeMap<String, String>,
     external_secret_dir: Option<PathBuf>,
     require_external_pinned_keys: bool,
     /// Normalized service name -> every KEK fingerprint accepted for it.
     pinned_external_keys: BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>,
     pkcs11: Pkcs11Settings,
+    require_pkcs11_pinned_keys: bool,
+    /// Normalized service name -> every KEK fingerprint accepted for its
+    /// key on the token.
+    pinned_pkcs11_keys: BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>,
     audit_unwrap_success: bool,
 }
 
@@ -699,10 +820,7 @@ impl Policy {
         let mut pinned_tpm_names = BTreeMap::new();
         for (service, hex) in &raw.tpm.pinned_names {
             let bytes = parse_tpm_name(&format!("tpm.pinned_names[\"{service}\"]"), hex)?;
-            if pinned_tpm_names
-                .insert(crate::normalize_service(service), bytes)
-                .is_some()
-            {
+            if pinned_tpm_names.insert(service_key("tpm.pinned_names", service)?, bytes).is_some() {
                 return Err(Error::Policy(format!(
                     "hkdfguard policy: tpm.pinned_names lists \"{service}\" more than once (names are compared case-insensitively)"
                 )));
@@ -726,6 +844,24 @@ impl Policy {
             .as_deref()
             .map(|f| absolute_path("tpm.owner_auth_file", f))
             .transpose()?;
+        // Group names are only checked for shape here; whether each names a
+        // real, narrow group is decided when root provisions the service
+        // (`security_model::service_group_gid`), on the host that has it.
+        let mut tpm_auth_groups = BTreeMap::new();
+        for (service, group) in &raw.tpm.auth_groups {
+            let field = format!("tpm.auth_groups[\"{service}\"]");
+            if group.is_empty() || group.len() > MAX_GROUP_NAME_LEN || group.starts_with('-') || group.contains(['\0', '/', ':', '\n']) {
+                return Err(Error::Policy(format!(
+                    "hkdfguard policy: {field} = \"{}\" is not a group name",
+                    group.escape_debug()
+                )));
+            }
+            if tpm_auth_groups.insert(service_key("tpm.auth_groups", service)?, group.clone()).is_some() {
+                return Err(Error::Policy(format!(
+                    "hkdfguard policy: tpm.auth_groups lists \"{service}\" more than once (names are compared case-insensitively)"
+                )));
+            }
+        }
 
         let external_secret_dir = raw
             .external_secret
@@ -733,40 +869,14 @@ impl Policy {
             .as_deref()
             .map(|d| absolute_path("external_secret.dir", d))
             .transpose()?;
-        // Pinned external-secret fingerprints: decoded and checked up front,
-        // with service keys normalized, as for the TPM pins above.
-        let mut pinned_external_keys = BTreeMap::new();
-        for (service, pins) in &raw.external_secret.pinned_keys {
-            let field = format!("external_secret.pinned_keys[\"{service}\"]");
-            let hexes = match pins {
-                PinnedKeys::One(hex) => std::slice::from_ref(hex),
-                PinnedKeys::Several(hexes) => hexes.as_slice(),
-            };
-            if hexes.is_empty() {
-                return Err(Error::Policy(format!(
-                    "hkdfguard policy: {field} is an empty list; remove the entry to unpin the service"
-                )));
-            }
-            let mut fingerprints = Vec::with_capacity(hexes.len());
-            for hex in hexes {
-                let fingerprint = parse_kek_fingerprint(&field, hex)?;
-                if fingerprints.contains(&fingerprint) {
-                    return Err(Error::Policy(format!("hkdfguard policy: {field} lists the same fingerprint more than once")));
-                }
-                fingerprints.push(fingerprint);
-            }
-            if pinned_external_keys
-                .insert(crate::normalize_service(service), fingerprints)
-                .is_some()
-            {
-                return Err(Error::Policy(format!(
-                    "hkdfguard policy: external_secret.pinned_keys lists \"{service}\" more than once (names are compared case-insensitively)"
-                )));
-            }
-        }
+        // Pinned fingerprints: decoded and checked up front, with service
+        // keys normalized, as for the TPM pins above.
+        let pinned_external_keys = parse_pinned_keys("external_secret.pinned_keys", &raw.external_secret.pinned_keys)?;
+        let pinned_pkcs11_keys = parse_pinned_keys("pkcs11.pinned_keys", &raw.pkcs11.pinned_keys)?;
         let pkcs11 = Pkcs11Settings {
             module: raw.pkcs11.module.as_deref().map(|m| absolute_path("pkcs11.module", m)).transpose()?,
             pin_file: raw.pkcs11.pin_file.as_deref().map(|f| absolute_path("pkcs11.pin_file", f)).transpose()?,
+            pin_state_dir: raw.pkcs11.pin_state_dir.as_deref().map(|d| absolute_path("pkcs11.pin_state_dir", d)).transpose()?,
             token_label: raw.pkcs11.token_label.as_deref().map(|l| token_field("pkcs11.token_label", l, 32)).transpose()?,
             token_serial: raw.pkcs11.token_serial.as_deref().map(|n| token_field("pkcs11.token_serial", n, 16)).transpose()?,
         };
@@ -775,6 +885,7 @@ impl Policy {
             security_model: raw.security_model,
             deployer_groups: raw.deployer_groups,
             selection,
+            allow_unwrap_from_lower_provider: raw.selection.allow_unwrap_from_lower_provider,
             minimum_protection,
             preferred_order: raw.preferred_order,
             setup_min_delay: Duration::from_millis(setup_min_delay_ms),
@@ -782,13 +893,17 @@ impl Policy {
             pinned_tpm_names,
             tpm_session_encryption: raw.tpm.session_encryption,
             pinned_session_salt_key_name,
+            tpm_allow_unpinned_provisioning: raw.tpm.allow_unpinned_provisioning,
             tpm_tcti: raw.tpm.tcti,
             tpm_key_dir,
             tpm_owner_auth_file,
+            tpm_auth_groups,
             external_secret_dir,
-            require_external_pinned_keys: raw.external_secret.require_pinned_keys,
+            require_external_pinned_keys: raw.external_secret.require_pinned_keys.unwrap_or(require_pins_default(raw.security_model)),
             pinned_external_keys,
             pkcs11,
+            require_pkcs11_pinned_keys: raw.pkcs11.require_pinned_keys.unwrap_or(require_pins_default(raw.security_model)),
+            pinned_pkcs11_keys,
             audit_unwrap_success: raw.audit.unwrap_success,
         })
     }
@@ -807,6 +922,12 @@ impl Policy {
     /// The Owner-hierarchy authorization file (`tpm.owner_auth_file`), if policy sets one.
     pub fn tpm_owner_auth_file(&self) -> Option<&std::path::Path> {
         self.tpm_owner_auth_file.as_deref()
+    }
+
+    /// The group that may read `service`'s TPM authValue file
+    /// (`tpm.auth_groups`), if policy names one.
+    pub fn tpm_auth_group(&self, service: &str) -> Option<&str> {
+        self.tpm_auth_groups.get(&crate::normalize_service(service)).map(String::as_str)
     }
 
     /// TPM session parameter-encryption mode (`tpm.session_encryption`).
@@ -838,6 +959,18 @@ impl Policy {
         &self.pkcs11
     }
 
+    /// Whether the PKCS#11 provider treats only pinned services as
+    /// provisioned (`pkcs11.require_pinned_keys`).
+    pub fn require_pkcs11_pinned_keys(&self) -> bool {
+        self.require_pkcs11_pinned_keys
+    }
+
+    /// The KEK fingerprints policy accepts for `service`'s key on the
+    /// token, if it pins any.
+    pub fn pinned_pkcs11_keys(&self, service: &str) -> Option<&[[u8; FINGERPRINT_LEN]]> {
+        self.pinned_pkcs11_keys.get(&crate::normalize_service(service)).map(|v| v.as_slice())
+    }
+
     /// The TCTI the TPM provider must use (`tpm.tcti`), if policy sets one.
     pub fn tpm_tcti(&self) -> Option<&str> {
         self.tpm_tcti.as_deref()
@@ -851,6 +984,19 @@ impl Policy {
     /// The administrator-pinned Name of the session salt key, if any.
     pub fn pinned_session_salt_key_name(&self) -> Option<&[u8]> {
         self.pinned_session_salt_key_name.as_deref()
+    }
+
+    /// Whether unwrap accepts a payload wrapped under a provider later in
+    /// the order than one holding a KEK for the service
+    /// (`selection.allow_unwrap_from_lower_provider`).
+    pub fn allow_unwrap_from_lower_provider(&self) -> bool {
+        self.allow_unwrap_from_lower_provider
+    }
+
+    /// Whether a TPM key may be provisioned with no storage root key Name
+    /// pinned (`tpm.allow_unpinned_provisioning`).
+    pub fn tpm_allow_unpinned_provisioning(&self) -> bool {
+        self.tpm_allow_unpinned_provisioning
     }
 
     /// The floor on how long each setup call (`hkdfguard_create_kek`,
@@ -902,6 +1048,19 @@ impl Policy {
         if self.preferred_order.is_empty() {
             compiled.to_vec()
         } else {
+            // A provider the policy asks for and this build can't supply is
+            // left out, and said so once: a host whose package lacks its
+            // first choice otherwise serves every key from its second with
+            // nothing in the log to show for it.
+            for missing in self.preferred_order.iter().filter(|p| !compiled.contains(p)) {
+                crate::provider::log_once(
+                    log::Level::Warn,
+                    format!(
+                        "hkdfguard policy: preferred_order names \"{}\", which is not compiled into this build; it is skipped",
+                        missing.policy_name()
+                    ),
+                );
+            }
             self.preferred_order
                 .iter()
                 .copied()
@@ -964,41 +1123,46 @@ const POLICY_FILE_REQUIREMENTS: crate::secure_file::FileRequirements = crate::se
     allow_group_read_if_root_owned: false, // already allowed: only write bits are forbidden
 };
 
-/// Reads and parses the configured policy file, if one is present.
+/// Reads and parses the policy file. There is always one: a missing file
+/// is an error like any other.
 ///
-/// Returns:
-/// - `None` **only** if no file exists at the configured path. Every
-///   compiled-in provider except Ephemeral is then allowed, in the default
-///   priority order (see `provider::allowed_chain`).
-/// - `Some(Ok(policy))` if a policy file was found, passed its ownership
-///   and permission checks, and is valid.
-/// - `Some(Err(_))` in every other case -- the file exists but can't be
-///   read (permission denied, it's a directory, an I/O error), is owned by
-///   someone untrusted or writable by group/others, is too large, isn't
-///   UTF-8, or is malformed or self-contradictory; or the directory it
-///   lives in (or would live in), or any directory above it, is one
-///   someone untrusted could change: owned by someone else, or writable by
-///   group or others -- sticky (`/tmp`-style) or not -- unless it is on a
-///   read-only mount (see [`crate::secure_file::check_dir_chain`]).
-///   This **fails closed**: every wrap/unwrap/create/exists call fails
-///   rather than falling back to the unrestricted default. Making the file
-///   unreadable, or deleting it, must never be a way to switch policy off.
+/// `Err` (always an [`Error::Policy`]) when the file does not exist, can't
+/// be read (permission denied, it's a directory, an I/O error), is owned by
+/// someone untrusted or writable by group/others, is too large, isn't
+/// UTF-8, or is malformed or self-contradictory; or when the directory it
+/// lives in (or would live in), or any directory above it, is one someone
+/// untrusted could change: owned by someone else, or writable by group or
+/// others -- sticky (`/tmp`-style) or not -- unless it is a sticky
+/// directory on a read-only mount (see
+/// [`crate::secure_file::check_dir_chain`]): a ConfigMap belongs in a
+/// `projected:` volume, as a plain `configMap:` volume's `0777` root is
+/// refused.
+///
+/// This **fails closed**: every wrap/unwrap/create/exists call fails
+/// rather than falling back to built-in defaults. Making the file
+/// unreadable, or deleting it, must never be a way to switch policy off --
+/// and neither must its never having arrived: a volume that didn't mount,
+/// a ConfigMap that wasn't projected, or an image built without it looks
+/// exactly like a deleted file, and the defaults it would fall back to
+/// have no pins, no chosen provider, and no named TPM. A deployment that
+/// wants the defaults writes the two lines that say so
+/// (`[selection]` / `mode = "prefer"`).
 ///
 /// Re-read from disk on every C ABI call, so an operator can update the
 /// policy without restarting the process -- but only once per call: within
 /// a call, every reader gets the snapshot [`snapshot_for_call`] took (see
 /// there for why).
-pub fn load() -> Option<Result<Policy>> {
+pub fn load() -> Result<Policy> {
     if let Some(snapshot) = SNAPSHOT.with(|s| s.borrow().clone()) {
-        return snapshot.map(|r| r.map_err(Error::Policy));
+        return snapshot.map_err(Error::Policy);
     }
     read_from_disk()
 }
 
-/// The policy as one C ABI call sees it: `None` for no file, else the
-/// parsed policy or the reason it was refused (every refusal is an
-/// `Error::Policy`, so its message is all there is to keep).
-type Snapshot = Option<std::result::Result<Policy, String>>;
+/// The policy as one C ABI call sees it: the parsed policy, or the reason
+/// there is none to use (every refusal is an `Error::Policy`, so its
+/// message is all there is to keep).
+type Snapshot = std::result::Result<Policy, String>;
 
 thread_local! {
     /// The snapshot in force on this thread, while a C ABI call holds a
@@ -1039,29 +1203,33 @@ pub(crate) fn snapshot_for_call() -> SnapshotGuard {
         if s.borrow().is_some() {
             return SnapshotGuard { owns: false };
         }
-        let snapshot: Snapshot = read_from_disk().map(|r| {
-            r.map_err(|e| match e {
-                Error::Policy(msg) => msg,
-                other => other.to_string(),
-            })
+        let snapshot: Snapshot = read_from_disk().map_err(|e| match e {
+            Error::Policy(msg) => msg,
+            other => other.to_string(),
         });
         *s.borrow_mut() = Some(snapshot);
         SnapshotGuard { owns: true }
     })
 }
 
-/// Reads and validates the policy file itself; see [`load`] for what each
-/// outcome means.
-fn read_from_disk() -> Option<Result<Policy>> {
+/// Reads and validates the policy file itself; see [`load`] for what is
+/// refused.
+fn read_from_disk() -> Result<Policy> {
     let path = policy_file_path();
-    let fail = |what: String| Some(Err(Error::Policy(format!("hkdfguard policy file {}: {what}", path.display()))));
+    let fail = |what: String| Err(Error::Policy(format!("hkdfguard policy file {}: {what}", path.display())));
 
     if let Err(e) = crate::secure_file::check_location(&path, crate::secure_file::config_owner()) {
         return fail(format!("refusing to trust its location ({e})"));
     }
     let mut file = match crate::secure_file::open_checked(&path, &POLICY_FILE_REQUIREMENTS) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return fail(
+                "does not exist, and a policy file is required: nothing is wrapped, unwrapped or provisioned without one \
+                 (the built-in defaults are spelled `[selection]` / `mode = \"prefer\"`)"
+                    .to_string(),
+            )
+        }
         Err(e) => return fail(format!("refusing to use it ({e})")),
     };
     let contents = match crate::secure_file::SecretBuffer::read_from(&mut file, MAX_POLICY_FILE_LEN) {
@@ -1073,10 +1241,10 @@ fn read_from_disk() -> Option<Result<Policy>> {
         Err(_) => return fail("is not valid UTF-8".to_string()),
     };
 
-    Some(Policy::from_toml_str(text).map_err(|e| match e {
+    Policy::from_toml_str(text).map_err(|e| match e {
         Error::Policy(msg) => Error::Policy(format!("{} ({})", msg, path.display())),
         other => other,
-    }))
+    })
 }
 
 /// The floor on the wall-clock duration of every `hkdfguard_create_kek` and
@@ -1096,27 +1264,27 @@ fn read_from_disk() -> Option<Result<Policy>> {
 /// hidden from anything that can call the library -- service names are
 /// public identifiers.
 ///
-/// A policy file that exists but is invalid still yields the default here
+/// A policy file that is missing or invalid still yields the default here
 /// -- the call that's being gated is about to fail closed on that same
 /// policy anyway, and there's no reason to let a broken policy also remove
 /// the floor. Read from disk on every call, like everything else in this
 /// module.
 pub(crate) fn setup_min_delay() -> Duration {
     match load() {
-        Some(Ok(policy)) => policy.setup_min_delay(),
-        Some(Err(_)) | None => Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS),
+        Ok(policy) => policy.setup_min_delay(),
+        Err(_) => Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS),
     }
 }
 
 /// Whether a successful unwrap writes audit event 1003
 /// (`audit.unwrap_success`). `true` unless a valid policy explicitly sets
-/// it `false`: no policy file, a policy that doesn't mention it, and one
-/// that is present but invalid all keep it on -- a broken policy must
-/// never be what silently reduces auditing.
+/// it `false`: a policy that doesn't mention it, and one that is missing or
+/// invalid, keep it on -- a broken policy must never be what silently
+/// reduces auditing.
 pub(crate) fn audit_unwrap_success() -> bool {
     match load() {
-        Some(Ok(policy)) => policy.audit_unwrap_success(),
-        Some(Err(_)) | None => true,
+        Ok(policy) => policy.audit_unwrap_success(),
+        Err(_) => true,
     }
 }
 
@@ -1131,27 +1299,25 @@ pub(crate) fn audit_unwrap_success() -> bool {
 /// an administrator recorded out-of-band, in the root-owned policy file,
 /// is what makes substitution detectable.
 ///
-/// `Err` when a policy file exists but can't be trusted -- pinning must
+/// `Err` when a policy file is missing or can't be trusted -- pinning must
 /// fail closed rather than silently degrade to "nothing pinned".
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn pinned_tpm_name(service: &str) -> Result<Option<Vec<u8>>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.pinned_tpm_name(service).map(|n| n.to_vec())),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
+        Ok(policy) => Ok(policy.pinned_tpm_name(service).map(|n| n.to_vec())),
+        Err(e) => Err(e),
     }
 }
 
 /// Whether the TPM provider only serves services whose Name is pinned
-/// (`tpm.require_pinned_names`). No policy file → `false`. A policy file
-/// that exists but is invalid → `true`: a broken policy must never be what
-/// widens the set of services the TPM will serve.
+/// (`tpm.require_pinned_names`). A policy file that is missing or invalid
+/// → `true`: a broken policy must never be what widens the set of services
+/// the TPM will serve.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn require_tpm_pinned_names() -> bool {
     match load() {
-        Some(Ok(policy)) => policy.require_tpm_pinned_names(),
-        Some(Err(_)) => true,
-        None => false,
+        Ok(policy) => policy.require_tpm_pinned_names(),
+        Err(_) => true,
     }
 }
 
@@ -1161,8 +1327,8 @@ pub(crate) fn require_tpm_pinned_names() -> bool {
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn tpm_session_encryption() -> SessionEncryption {
     match load() {
-        Some(Ok(policy)) => policy.tpm_session_encryption(),
-        Some(Err(_)) | None => SessionEncryption::On,
+        Ok(policy) => policy.tpm_session_encryption(),
+        Err(_) => SessionEncryption::On,
     }
 }
 
@@ -1172,46 +1338,54 @@ pub(crate) fn tpm_session_encryption() -> SessionEncryption {
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn tpm_tcti() -> Result<Option<String>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.tpm_tcti().map(str::to_owned)),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
+        Ok(policy) => Ok(policy.tpm_tcti().map(str::to_owned)),
+        Err(e) => Err(e),
     }
 }
 
 /// The TPM key-file directory policy names (`tpm.key_dir`), if any. `Err`
-/// on a policy file that exists but can't be trusted: the TPM provider then
+/// on a policy file that is missing or can't be trusted: the TPM provider then
 /// fails rather than reading or writing keys at the default directory.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn tpm_key_dir() -> Result<Option<PathBuf>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.tpm_key_dir().map(std::path::Path::to_path_buf)),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
+        Ok(policy) => Ok(policy.tpm_key_dir().map(std::path::Path::to_path_buf)),
+        Err(e) => Err(e),
     }
 }
 
 /// The Owner-hierarchy authorization file policy names
-/// (`tpm.owner_auth_file`), if any. `Err` on a policy file that exists but
+/// (`tpm.owner_auth_file`), if any. `Err` on a policy file that is missing or
 /// can't be trusted: the TPM is then refused rather than tried with an
 /// empty owner password the administrator may have replaced.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn tpm_owner_auth_file() -> Result<Option<PathBuf>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.tpm_owner_auth_file().map(std::path::Path::to_path_buf)),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
+        Ok(policy) => Ok(policy.tpm_owner_auth_file().map(std::path::Path::to_path_buf)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The group policy names for `service`'s TPM authValue file
+/// (`tpm.auth_groups`), if any. `Err` on a policy file that is missing or can't
+/// be trusted: provisioning then fails rather than writing the file for a
+/// group the administrator may not have meant.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_auth_group(service: &str) -> Result<Option<String>> {
+    match load() {
+        Ok(policy) => Ok(policy.tpm_auth_group(service).map(str::to_owned)),
+        Err(e) => Err(e),
     }
 }
 
 /// The external-secret directory policy requires (`external_secret.dir`),
-/// if any. `Err` on a policy file that exists but can't be trusted, so the
+/// if any. `Err` on a policy file that is missing or can't be trusted, so the
 /// provider is unavailable rather than searching the default mounts.
 #[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
 pub(crate) fn external_secret_dir() -> Result<Option<PathBuf>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.external_secret_dir().map(std::path::Path::to_path_buf)),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
+        Ok(policy) => Ok(policy.external_secret_dir().map(std::path::Path::to_path_buf)),
+        Err(e) => Err(e),
     }
 }
 
@@ -1226,49 +1400,104 @@ pub(crate) fn external_secret_dir() -> Result<Option<PathBuf>> {
 /// fingerprint recorded when the key was generated, in the root-owned
 /// policy, is what makes that substitution detectable.
 ///
-/// `Err` when a policy file exists but can't be trusted -- pinning must
+/// `Err` when a policy file is missing or can't be trusted -- pinning must
 /// fail closed rather than silently degrade to "nothing pinned".
 #[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
 pub(crate) fn pinned_external_keys(service: &str) -> Result<Option<Vec<[u8; FINGERPRINT_LEN]>>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.pinned_external_keys(service).map(<[_]>::to_vec)),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
+        Ok(policy) => Ok(policy.pinned_external_keys(service).map(<[_]>::to_vec)),
+        Err(e) => Err(e),
     }
 }
 
 /// Whether the external-secret provider only serves services whose key is
-/// pinned (`external_secret.require_pinned_keys`). No policy file →
-/// `false`. A policy file that exists but is invalid → `true`: a broken
-/// policy must never be what widens the set of keys the provider accepts.
+/// pinned (`external_secret.require_pinned_keys`; unset, on under the
+/// production model). A policy file that is missing or invalid → `true`: a
+/// broken policy must never be what widens the set of keys the provider
+/// accepts.
 #[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
 pub(crate) fn require_external_pinned_keys() -> bool {
     match load() {
-        Some(Ok(policy)) => policy.require_external_pinned_keys(),
-        Some(Err(_)) => true,
-        None => false,
+        Ok(policy) => policy.require_external_pinned_keys(),
+        Err(_) => true,
     }
 }
 
-/// The PKCS#11 settings from policy (all unset with no policy file). `Err`
-/// on a policy file that exists but can't be trusted.
+/// The PKCS#11 settings from policy. `Err` on a policy file that is
+/// missing or can't be trusted.
 #[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
 pub(crate) fn pkcs11_settings() -> Result<Pkcs11Settings> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.pkcs11().clone()),
-        Some(Err(e)) => Err(e),
-        None => Ok(Pkcs11Settings::default()),
+        Ok(policy) => Ok(policy.pkcs11().clone()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The KEK fingerprints policy accepts for `service`'s key on the PKCS#11
+/// token (`pkcs11.pinned_keys`), if any.
+///
+/// The token's own access control is its user PIN, which every service
+/// that uses the token must be able to read. Whoever holds it can delete a
+/// service's key, or delete it and generate another under the same label:
+/// the new key carries every attribute this library checks, having been
+/// generated on the token like the first. A fingerprint recorded when the
+/// key was provisioned, in the root-owned policy, is what tells the two
+/// apart -- and what makes a deleted key an error instead of "no key here",
+/// which would hand the service's next wrap to the next provider in the
+/// policy order.
+///
+/// `Err` when a policy file is missing or can't be trusted -- pinning must
+/// fail closed rather than silently degrade to "nothing pinned".
+#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
+pub(crate) fn pinned_pkcs11_keys(service: &str) -> Result<Option<Vec<[u8; FINGERPRINT_LEN]>>> {
+    match load() {
+        Ok(policy) => Ok(policy.pinned_pkcs11_keys(service).map(<[_]>::to_vec)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether the PKCS#11 provider only serves services whose key is pinned
+/// (`pkcs11.require_pinned_keys`; unset, on under the production model). A
+/// policy file that is missing or invalid → `true`: a broken policy must
+/// never be what widens the set of keys the provider accepts.
+#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
+pub(crate) fn require_pkcs11_pinned_keys() -> bool {
+    match load() {
+        Ok(policy) => policy.require_pkcs11_pinned_keys(),
+        Err(_) => true,
     }
 }
 
 /// The pinned storage-root-key Name (`tpm.pinned_session_salt_key_name`), if policy sets one. `Err` on a
-/// policy file that exists but can't be trusted -- pinning fails closed.
+/// policy file that is missing or can't be trusted -- pinning fails closed.
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
     match load() {
-        Some(Ok(policy)) => Ok(policy.pinned_session_salt_key_name().map(|n| n.to_vec())),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
+        Ok(policy) => Ok(policy.pinned_session_salt_key_name().map(|n| n.to_vec())),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a TPM key may be provisioned with no storage root key Name
+/// pinned (`tpm.allow_unpinned_provisioning`). `false` unless a valid policy
+/// sets it: with a policy file that is missing or can't be trusted, provisioning
+/// under an unpinned storage root key is refused.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_allow_unpinned_provisioning() -> bool {
+    match load() {
+        Ok(policy) => policy.tpm_allow_unpinned_provisioning(),
+        Err(_) => false,
+    }
+}
+
+/// Whether unwrap accepts a payload wrapped under a provider later in the
+/// order than one holding a KEK for the service
+/// (`selection.allow_unwrap_from_lower_provider`). `false` unless a valid
+/// policy says otherwise: a broken policy must never be what allows it.
+pub(crate) fn allow_unwrap_from_lower_provider() -> bool {
+    match load() {
+        Ok(policy) => policy.allow_unwrap_from_lower_provider(),
+        Err(_) => false,
     }
 }
 
@@ -1356,9 +1585,8 @@ pub(crate) mod test_support {
         /// `doc` layered over the policy already in force: the tables in
         /// `MERGED_TABLES` merge key by key, `doc` winning; any other
         /// top-level key `doc` sets replaces the old one whole. With no
-        /// `[selection]` anywhere, `mode = "prefer"` is added, which selects
-        /// exactly as having no policy file does; with no `security_model`,
-        /// `"developer"` is.
+        /// `[selection]` anywhere, `mode = "prefer"` is added (the built-in
+        /// provider order); with no `security_model`, `"developer"` is.
         pub(crate) fn write(doc: &str) -> Self {
             let mut merged = base();
             let layer: toml::Table = doc.parse().unwrap_or_else(|e| panic!("TestPolicy::write: invalid TOML ({e}); use TestPolicy::exact for a malformed policy:\n{doc}"));
@@ -1397,7 +1625,15 @@ pub(crate) mod test_support {
             Self::stack(crate::secure_file::private_tempdir(), Layer { path: path.to_path_buf(), table: None })
         }
 
-        /// No policy file at all.
+        /// The shortest valid policy, merged with nothing: the built-in
+        /// provider order, the production model, and every other setting
+        /// at its default. For tests that want nothing from the harness's
+        /// policy and nothing of their own.
+        pub(crate) fn minimal() -> Self {
+            Self::exact("[selection]\nmode = \"prefer\"\n")
+        }
+
+        /// No policy file at all, which every call refuses.
         pub(crate) fn absent() -> Self {
             let dir = crate::secure_file::private_tempdir();
             let path = dir.path().join("no-policy.toml");
@@ -1928,6 +2164,26 @@ mod tests {
     }
 
     #[test]
+    fn tpm_auth_groups_are_read_per_normalized_service_and_shape_checked() {
+        let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        assert_eq!(Policy::from_toml_str(base).unwrap().tpm_auth_group("com.company.orders"), None, "none by default");
+
+        let policy =
+            Policy::from_toml_str(&format!("{base}[tpm.auth_groups]\n\"com.company.Orders\" = \"orders\"\n\"com.company.billing\" = \"billing-svc\"\n"))
+                .unwrap();
+        assert_eq!(policy.tpm_auth_group("com.company.orders"), Some("orders"), "matched case-insensitively");
+        assert_eq!(policy.tpm_auth_group("com.company.billing"), Some("billing-svc"));
+        assert_eq!(policy.tpm_auth_group("com.company.other"), None);
+
+        for bad in ["", "-orders", "a/b", "a:b", "a\\nb", &"g".repeat(MAX_GROUP_NAME_LEN + 1)] {
+            let doc = format!("{base}[tpm.auth_groups]\n\"com.company.orders\" = \"{bad}\"\n");
+            assert!(matches!(Policy::from_toml_str(&doc), Err(Error::Policy(_))), "{bad:?} must be refused");
+        }
+        let dup = format!("{base}[tpm.auth_groups]\n\"com.company.orders\" = \"a\"\n\"com.company.ORDERS\" = \"b\"\n");
+        assert!(matches!(Policy::from_toml_str(&dup), Err(Error::Policy(msg)) if msg.contains("more than once")));
+    }
+
+    #[test]
     fn tpm_owner_auth_file_is_read_and_must_be_absolute() {
         let base = "[selection]\nmode = \"prefer\"\n";
         assert_eq!(Policy::from_toml_str(base).unwrap().tpm_owner_auth_file(), None);
@@ -1969,7 +2225,7 @@ mod tests {
         let _guard = snapshot_for_call();
         for _ in 0..2 {
             match load() {
-                Some(Err(Error::Policy(msg))) => assert!(msg.contains("invalid hkdfguard policy"), "unexpected: {msg}"),
+                Err(Error::Policy(msg)) => assert!(msg.contains("invalid hkdfguard policy"), "unexpected: {msg}"),
                 other => panic!("a malformed policy must stay refused within the call, got {other:?}"),
             }
         }
@@ -1985,6 +2241,7 @@ mod tests {
         let doc = format!(
             "{base}[external_secret]\ndir = \"/srv/secrets/hkdfguard\"\n\
              [pkcs11]\nmodule = \"/usr/lib/vendor/libhsm.so\"\npin_file = \"/etc/hkdfguard/hsm.pin\"\n\
+             pin_state_dir = \"/run/hkdfguard/pkcs11\"\n\
              token_label = \"prod-kek\"\ntoken_serial = \"0123456789abcdef\"\n"
         );
         let policy = Policy::from_toml_str(&doc).unwrap();
@@ -1994,6 +2251,7 @@ mod tests {
             &Pkcs11Settings {
                 module: Some(PathBuf::from("/usr/lib/vendor/libhsm.so")),
                 pin_file: Some(PathBuf::from("/etc/hkdfguard/hsm.pin")),
+                pin_state_dir: Some(PathBuf::from("/run/hkdfguard/pkcs11")),
                 token_label: Some("prod-kek".into()),
                 token_serial: Some("0123456789abcdef".into()),
             }
@@ -2003,6 +2261,7 @@ mod tests {
             "[external_secret]\ndir = \"relative/dir\"\n",
             "[pkcs11]\nmodule = \"libsofthsm2.so\"\n",
             "[pkcs11]\npin_file = \"pkcs11.pin\"\n",
+            "[pkcs11]\npin_state_dir = \"run/pkcs11\"\n",
             "[pkcs11]\ntoken_label = \"\"\n",
             "[pkcs11]\ntoken_label = \"this label is far too long for a pkcs11 token\"\n",
             "[pkcs11]\ntoken_serial = \"0123456789abcdef0\"\n",
@@ -2013,16 +2272,73 @@ mod tests {
         }
     }
 
+    // ---- pkcs11.pinned_keys / pkcs11.require_pinned_keys ----
+
+    #[test]
+    #[serial_test::serial]
+    fn pkcs11_pins_parse_like_external_secret_pins_and_fail_closed() {
+        const PIN: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let base = "[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(base).unwrap();
+        assert!(policy.require_pkcs11_pinned_keys(), "production: the allowlist is on unless policy turns it off");
+        assert_eq!(policy.pinned_pkcs11_keys("com.company.orders"), None);
+        let off = Policy::from_toml_str(&format!("{base}[pkcs11]\nrequire_pinned_keys = false\n")).unwrap();
+        assert!(!off.require_pkcs11_pinned_keys(), "production can opt out, in so many words");
+        let developer = Policy::from_toml_str(&format!("security_model = \"developer\"\n{base}")).unwrap();
+        assert!(!developer.require_pkcs11_pinned_keys(), "developer: off unless policy turns it on");
+        let developer_on = Policy::from_toml_str(&format!("security_model = \"developer\"\n{base}[pkcs11]\nrequire_pinned_keys = true\n")).unwrap();
+        assert!(developer_on.require_pkcs11_pinned_keys());
+
+        let other = "ff".repeat(FINGERPRINT_LEN);
+        let doc = format!(
+            "{base}[pkcs11]\nrequire_pinned_keys = true\n[pkcs11.pinned_keys]\n\"com.company.Orders\" = \"{PIN}\"\n\
+             \"com.company.billing\" = [\"{PIN}\", \"{other}\"]\n"
+        );
+        let policy = Policy::from_toml_str(&doc).unwrap();
+        assert!(policy.require_pkcs11_pinned_keys());
+        assert_eq!(policy.pinned_pkcs11_keys("COM.COMPANY.ORDERS").expect("pinned, whatever the case").len(), 1);
+        assert_eq!(policy.pinned_pkcs11_keys("com.company.billing").expect("pinned").len(), 2);
+        assert_eq!(policy.pinned_external_keys("com.company.orders"), None, "a PKCS#11 pin is not an external-secret pin");
+
+        for bad in ["\"svc\" = \"nothex\"", "\"svc\" = \"0102\"", "\"svc\" = []", "\"svc\" = 7"] {
+            let doc = format!("{base}[pkcs11.pinned_keys]\n{bad}\n");
+            match Policy::from_toml_str(&doc) {
+                Err(Error::Policy(_)) => {}
+                other => panic!("{bad}: expected a policy error, got {other:?}"),
+            }
+        }
+
+        {
+            let _unpinned = TestPolicy::exact(format!("{base}[pkcs11]\nrequire_pinned_keys = false\n"));
+            assert!(!require_pkcs11_pinned_keys());
+            assert_eq!(pinned_pkcs11_keys("com.company.orders").unwrap(), None);
+        }
+        {
+            let _none = TestPolicy::absent();
+            assert!(require_pkcs11_pinned_keys(), "a missing policy must fail closed to the allowlist");
+            assert!(pinned_pkcs11_keys("com.company.orders").is_err(), "a missing policy must not report 'nothing pinned'");
+        }
+        let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\n");
+        assert!(require_pkcs11_pinned_keys(), "a broken policy must fail closed to the allowlist");
+        assert!(pinned_pkcs11_keys("com.company.orders").is_err(), "a broken policy must not report 'nothing pinned'");
+    }
+
     // ---- external_secret.pinned_keys / external_secret.require_pinned_keys ----
 
     const A_FINGERPRINT: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
     const B_FINGERPRINT: &str = "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
 
     #[test]
-    fn external_pins_default_to_none_and_the_allowlist_to_off() {
-        let policy = Policy::from_toml_str("[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"/run/secrets/hkdfguard\"\n").unwrap();
-        assert!(!policy.require_external_pinned_keys(), "the allowlist must be opt-in");
+    fn external_pins_default_to_none_and_the_allowlist_to_the_security_model() {
+        let base = "[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"/run/secrets/hkdfguard\"\n";
+        let policy = Policy::from_toml_str(base).unwrap();
+        assert!(policy.require_external_pinned_keys(), "production: the allowlist is on unless policy turns it off");
         assert_eq!(policy.pinned_external_keys("com.company.orders"), None);
+        let off = Policy::from_toml_str(&format!("{base}require_pinned_keys = false\n")).unwrap();
+        assert!(!off.require_external_pinned_keys(), "production can opt out, in so many words");
+        let developer = Policy::from_toml_str(&format!("security_model = \"developer\"\n{base}")).unwrap();
+        assert!(!developer.require_external_pinned_keys(), "developer: off unless policy turns it on");
+        assert!(developer.require_pkcs11_pinned_keys() == developer.require_external_pinned_keys(), "one default for both providers");
 
         let policy = Policy::from_toml_str("[selection]\nmode = \"prefer\"\n[external_secret]\nrequire_pinned_keys = true\n").unwrap();
         assert!(policy.require_external_pinned_keys(), "on with no pins yet: the first step of rolling it out");
@@ -2070,9 +2386,14 @@ mod tests {
     #[serial_test::serial]
     fn external_pin_helpers_without_a_policy_file_and_with_a_broken_one() {
         {
-            let _no_policy = TestPolicy::absent();
-            assert!(!require_external_pinned_keys(), "no policy must not make the provider refuse every service");
+            let _unpinned = TestPolicy::exact("[selection]\nmode = \"prefer\"\n[external_secret]\nrequire_pinned_keys = false\n");
+            assert!(!require_external_pinned_keys());
             assert_eq!(pinned_external_keys("com.company.orders").unwrap(), None);
+        }
+        {
+            let _no_policy = TestPolicy::absent();
+            assert!(require_external_pinned_keys(), "a missing policy must fail closed to the allowlist");
+            assert!(pinned_external_keys("com.company.orders").is_err(), "a missing policy must not report 'nothing pinned'");
         }
         let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\n"); // missing `provider`
         assert!(require_external_pinned_keys(), "a broken policy must fail closed to the allowlist");
@@ -2087,13 +2408,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn tpm_helpers_without_a_policy_file() {
-        let _no_policy = TestPolicy::absent();
+    fn tpm_helpers_under_a_policy_that_says_nothing_about_the_tpm() {
+        let _minimal = TestPolicy::exact("[selection]\nmode = \"prefer\"\n");
         let key_dir = tpm_key_dir();
         let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
-        assert_eq!(key_dir.unwrap(), None, "no policy: the provider's default directory");
-        assert!(!allowlist, "no policy must not silently make the TPM refuse every service");
+        assert_eq!(key_dir.unwrap(), None, "unset: the provider's default directory");
+        assert!(!allowlist, "unset must not silently make the TPM refuse every service");
         assert_eq!(pinned.unwrap(), None);
     }
 
@@ -2180,6 +2501,23 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn unwrap_from_a_lower_provider_is_refused_unless_policy_allows_it() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        assert!(!Policy::from_toml_str(base).unwrap().allow_unwrap_from_lower_provider(), "unset: refused");
+        let allowed = format!("{base}allow_unwrap_from_lower_provider = true\n");
+        assert!(Policy::from_toml_str(&allowed).unwrap().allow_unwrap_from_lower_provider());
+        assert!(Policy::from_toml_str(&format!("{base}allow_unwrap_from_lower_provider = \"yes\"\n")).is_err(), "a boolean, nothing else");
+
+        let _none = TestPolicy::absent();
+        assert!(!allow_unwrap_from_lower_provider());
+        let _broken = TestPolicy::exact("[selection]\nmode = \"require\"\nallow_unwrap_from_lower_provider = true\n");
+        assert!(!allow_unwrap_from_lower_provider(), "a broken policy must never be what allows it");
+        let _valid = TestPolicy::write(&allowed);
+        assert!(allow_unwrap_from_lower_provider());
+    }
+
+    #[test]
     fn a_pinned_salt_key_needs_no_particular_mode() {
         for mode in ["on", "off"] {
             let doc = format!(
@@ -2202,9 +2540,29 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn unpinned_provisioning_is_off_unless_a_valid_policy_allows_it() {
+        let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        assert!(!Policy::from_toml_str(base).unwrap().tpm_allow_unpinned_provisioning(), "unset: refused");
+        let allowed = format!("{base}[tpm]\nallow_unpinned_provisioning = true\n");
+        assert!(Policy::from_toml_str(&allowed).unwrap().tpm_allow_unpinned_provisioning());
+        assert!(Policy::from_toml_str(&format!("{base}[tpm]\nallow_unpinned_provisioning = \"yes\"\n")).is_err(), "a boolean, nothing else");
+
+        // No policy file, and a policy that can't be used: both refuse.
+        let no_policy = TestPolicy::absent();
+        assert!(!tpm_allow_unpinned_provisioning());
+        drop(no_policy);
+        let broken = TestPolicy::exact("[selection]\nmode = \"require\"\n[tpm]\nallow_unpinned_provisioning = true\n");
+        assert!(!tpm_allow_unpinned_provisioning(), "a broken policy must never be what allows it");
+        drop(broken);
+        let _allowed = TestPolicy::exact(&allowed);
+        assert!(tpm_allow_unpinned_provisioning());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn session_encryption_helpers_fail_closed() {
-        // No policy: on, nothing pinned.
-        let _no_policy = TestPolicy::absent();
+        // A policy that doesn't mention it: on, nothing pinned.
+        let _minimal = TestPolicy::exact("[selection]\nmode = \"prefer\"\n");
         let mode = tpm_session_encryption();
         let pin = pinned_session_salt_key_name();
         assert_eq!(mode, SessionEncryption::On);
@@ -2259,9 +2617,35 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn load_returns_none_when_no_policy_file_is_configured() {
+    fn a_missing_policy_file_is_an_error_that_says_one_is_required() {
         let _no_policy = TestPolicy::absent();
-        assert!(load().is_none());
+        match load() {
+            Err(Error::Policy(msg)) => assert!(msg.contains("does not exist") && msg.contains("required"), "says why: {msg}"),
+            other => panic!("a missing policy must be refused, got {other:?}"),
+        }
+        // And through a call's snapshot, as every C ABI call reads it.
+        let _guard = snapshot_for_call();
+        assert!(matches!(load(), Err(Error::Policy(_))));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_missing_policy_file_widens_nothing() {
+        let _no_policy = TestPolicy::absent();
+        assert!(require_tpm_pinned_names());
+        assert!(require_external_pinned_keys());
+        assert!(require_pkcs11_pinned_keys());
+        assert!(!tpm_allow_unpinned_provisioning());
+        assert!(!allow_unwrap_from_lower_provider());
+        assert!(audit_unwrap_success());
+        assert_eq!(tpm_session_encryption(), SessionEncryption::On);
+        assert!(pinned_tpm_name("com.company.Orders").is_err());
+        assert!(pinned_external_keys("com.company.Orders").is_err());
+        assert!(pinned_pkcs11_keys("com.company.Orders").is_err());
+        assert!(pkcs11_settings().is_err());
+        assert!(tpm_tcti().is_err());
+        assert!(tpm_key_dir().is_err());
+        assert!(external_secret_dir().is_err());
     }
 
     #[test]
@@ -2270,10 +2654,10 @@ mod tests {
         let _policy = TestPolicy::write("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
 
         match load() {
-            Some(Ok(policy)) => {
+            Ok(policy) => {
                 assert_eq!(policy.selection, SelectionMode::Require(ProviderType::Tpm2));
             }
-            other => panic!("expected Some(Ok(_)), got {other:?}"),
+            other => panic!("expected Ok(_), got {other:?}"),
         }
 
     }
@@ -2284,20 +2668,19 @@ mod tests {
         let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n"); // missing required `provider`
 
         match load() {
-            Some(Err(Error::Policy(_))) => {}
-            other => panic!("expected Some(Err(Error::Policy(_))), got {other:?}"),
+            Err(Error::Policy(_)) => {}
+            other => panic!("expected Err(Error::Policy(_)), got {other:?}"),
         }
 
     }
 
-    // Points the policy at `path` and asserts load() fails closed
-    // (Some(Err)) rather than treating the file as absent (None).
+    // Points the policy at `path` and asserts load() fails closed.
     fn assert_load_fails_closed(path: &std::path::Path, why: &str) {
         let _policy = TestPolicy::at(path);
         let result = load();
         match result {
-            Some(Err(Error::Policy(_))) => {}
-            other => panic!("{why}: expected Some(Err(Error::Policy(_))) (fail closed), got {other:?}"),
+            Err(Error::Policy(_)) => {}
+            other => panic!("{why}: expected Err(Error::Policy(_)) (fail closed), got {other:?}"),
         }
     }
 
@@ -2347,14 +2730,13 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert_load_fails_closed(&path, "a policy in a world-writable directory could be swapped out");
 
-        // Absent is "no policy" only where nobody untrusted could have deleted it.
         std::fs::remove_file(&path).unwrap();
         assert_load_fails_closed(&path, "deleting the policy must not be a way to switch it off");
 
+        // Nor where only root could have deleted it: a missing policy is
+        // refused wherever it is missing from.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _policy = TestPolicy::at(&path);
-        let absent = load();
-        assert!(absent.is_none(), "in a trusted directory, a missing policy is just no policy");
+        assert_load_fails_closed(&path, "a missing policy is refused in a trusted directory too");
     }
 
     #[test]
@@ -2372,7 +2754,7 @@ mod tests {
         crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
         {
             let _policy = TestPolicy::at(&path);
-            assert!(matches!(load(), Some(Ok(_))), "a private chain is fine");
+            assert!(load().is_ok(), "a private chain is fine");
         }
 
         std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
@@ -2382,8 +2764,8 @@ mod tests {
             }
             let _policy = TestPolicy::at(&path);
             match load() {
-                Some(Err(Error::Policy(msg))) => assert!(msg.contains("sticky"), "present={present}: says why: {msg}"),
-                other => panic!("present={present}: expected Some(Err(Error::Policy(..sticky..))), got {other:?}"),
+                Err(Error::Policy(msg)) => assert!(msg.contains("sticky"), "present={present}: says why: {msg}"),
+                other => panic!("present={present}: expected Err(Error::Policy(..sticky..)), got {other:?}"),
             }
         }
         std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2398,17 +2780,45 @@ mod tests {
         assert_load_fails_closed(&path, "an oversized policy must be rejected, not truncated");
     }
 
+    #[test]
+    fn a_table_entry_under_a_name_no_service_could_have_is_refused() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        let fingerprint = "ab".repeat(FINGERPRINT_LEN);
+        let name = format!("000b{}", "00".repeat(32));
+        for bad in ["com.company_orders", "com.company-orders", "com.company.orders ", ".hidden", "a..b", ""] {
+            for table in [
+                format!("[pkcs11.pinned_keys]\n\"{bad}\" = \"{fingerprint}\"\n"),
+                format!("[external_secret.pinned_keys]\n\"{bad}\" = \"{fingerprint}\"\n"),
+                format!("[tpm.pinned_names]\n\"{bad}\" = \"{name}\"\n"),
+                format!("[tpm.auth_groups]\n\"{bad}\" = \"orders\"\n"),
+            ] {
+                match Policy::from_toml_str(&format!("{base}{table}")) {
+                    Err(Error::Policy(msg)) => assert!(msg.contains("not a service name"), "{table}: {msg}"),
+                    other => panic!("{table}: expected a policy error, got {other:?}"),
+                }
+            }
+        }
+        // Too long is no name either; the longest one is.
+        let longest = "s".repeat(crate::MAX_SERVICE_LEN);
+        assert!(Policy::from_toml_str(&format!("{base}[pkcs11.pinned_keys]\n\"{longest}\" = \"{fingerprint}\"\n")).is_ok());
+        assert!(Policy::from_toml_str(&format!("{base}[pkcs11.pinned_keys]\n\"{longest}s\" = \"{fingerprint}\"\n")).is_err());
+    }
+
     // ---- packaging/policy.toml.example ----
 
     const EXAMPLE_POLICY: &str = include_str!("../packaging/policy.toml.example");
 
     #[test]
-    fn shipped_example_policy_behaves_like_no_policy() {
+    fn shipped_example_policy_is_the_defaults() {
         // The packages install the example for administrators to copy to
-        // /etc/hkdfguard/policy.toml. Copied unedited, it must change
-        // nothing: the same chain as `provider::allowed_types` with no
-        // policy, and every knob at its default.
+        // /etc/hkdfguard/policy.toml. Copied unedited, it must set
+        // nothing: the built-in chain, and every knob at its default --
+        // the production model's, so only pinned services are served.
         let policy = Policy::from_toml_str(EXAMPLE_POLICY).unwrap();
+        assert_eq!(policy.security_model(), SecurityModel::Production);
+        assert!(policy.require_external_pinned_keys() && policy.require_pkcs11_pinned_keys());
+        assert!(policy.pinned_external_keys("com.company.orders").is_none());
+        assert!(policy.pinned_pkcs11_keys("com.company.orders").is_none());
         let all = [ProviderType::Tpm2, ProviderType::Pkcs11, ProviderType::ExternalSecret, ProviderType::Ephemeral];
         assert_eq!(
             policy.allowed_providers(&all).unwrap(),
@@ -2419,9 +2829,11 @@ mod tests {
         assert!(policy.pinned_tpm_name("com.company.orders").is_none());
         assert_eq!(policy.tpm_session_encryption(), SessionEncryption::On);
         assert!(policy.pinned_session_salt_key_name().is_none());
+        assert!(!policy.tpm_allow_unpinned_provisioning());
         assert!(policy.tpm_tcti().is_none());
         assert!(policy.tpm_key_dir().is_none());
         assert!(policy.tpm_owner_auth_file().is_none());
+        assert!(policy.tpm_auth_group("com.company.orders").is_none());
         assert!(policy.external_secret_dir().is_none());
         assert_eq!(policy.pkcs11(), &Pkcs11Settings::default());
     }

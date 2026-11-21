@@ -1,7 +1,31 @@
-# The Dockerfiles that copy the repository (`COPY . ...`) build from source
-# inside the container, into the container's own target/. Host build output
-# and collected packages are never needed there, and target/ alone can be
-# gigabytes. dist/ reaches the containers that need it as a bind mount.
-/target/
-/dist/
-/build-hardware-tests/
+# An allowlist. The Dockerfiles that copy the repository (`COPY . ...`)
+# build and test from source inside the container, and must get only what
+# is named below -- never .git, an editor's folder, or whatever untracked
+# file (a key, a .env) happens to sit in a working tree.
+#
+# A new top-level file or folder the containers need is added here; until
+# it is, they don't see it.
+#
+# Left out on purpose: target/ (host build output, gigabytes; the
+# containers build into their own), dist/ (reaches the containers that need
+# it as a bind mount or a named build context), build-hardware-tests/,
+# .git/, .github/, and the files only a contributor reads.
+*
+
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!rust-toolchain.toml
+!LICENSE
+!README.md
+
+!src
+!tests
+!include
+!examples
+!docs
+!fuzz
+!scripts
+!docker
+!packaging
+!debian

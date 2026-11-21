@@ -41,6 +41,20 @@ extern "C" {
  * size never needs a retry. */
 #define HKDFGUARD_WRAPPED_MAX_LEN 276
 
+/* Longest secret hkdfguard_wrap_secret takes, in bytes, and the capacity
+ * hkdfguard_unwrap_secret requires of its `out` buffer. */
+#define HKDFGUARD_SECRET_MAX_LEN 256
+
+/* Longest secret name, in bytes (excluding the NUL). */
+#define HKDFGUARD_SECRET_NAME_MAX_LEN 64
+
+/* Largest wrapped payload hkdfguard_wrap_secret can produce, for any
+ * provider, service name and secret. Every secret is padded to
+ * HKDFGUARD_SECRET_MAX_LEN before encryption, so a payload's size never
+ * depends on the secret's length. A buffer of this size never needs a
+ * retry. */
+#define HKDFGUARD_SECRET_WRAPPED_MAX_LEN 502
+
 /*
  * Status codes returned by every hkdfguard_* function.
  *
@@ -78,7 +92,7 @@ extern "C" {
 #define HKDFGUARD_ERR_INVALID_SERVICE_NAME (-8) /* service is null, empty, not valid UTF-8, over 128 bytes, contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains ".." */
 
 /* Policy */
-#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or of any directory above it (writable by group/others, sticky /tmp-style included), or it requires a provider this build lacks */
+#define HKDFGUARD_ERR_POLICY_INVALID (-9)       /* the policy file can't be used: missing (one is required), unparsable, an invalid or contradictory setting, insecure ownership/permissions of it or of any directory above it (writable by group/others, sticky /tmp-style included), or it requires a provider this build lacks */
 
 /* Wrapped payload */
 #define HKDFGUARD_ERR_PAYLOAD_MALFORMED (-10)   /* structurally invalid: truncated, trailing bytes, unknown provider type, or a field length no wrap produces */
@@ -100,9 +114,9 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_IO (-34)             /* key file is not a regular file, or reading it failed */
 #define HKDFGUARD_ERR_FILE_TOO_SHORT (-35)      /* key file is shorter than a wrapped DEK, or than its own header declares */
 #define HKDFGUARD_ERR_FILE_TOO_LONG (-36)       /* key file is longer than a wrapped DEK, or than its own header declares */
-#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex): treat as a key exposure */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), or its base64 or hex): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-38)      /* key file is the right length but not a well-formed wrapped DEK */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust, or writable by someone else (sticky, /tmp-style, included): someone else could have replaced it */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by someone the security model doesn't trust, or writable by someone else (sticky, /tmp-style, included), or the file is on a FUSE filesystem served by someone it doesn't trust: someone else could have replaced it */
 /* -40..-63 reserved for future common codes. */
 
 /* Windows-specific (-64..-79). Not returned on Linux. */
@@ -131,7 +145,15 @@ extern "C" {
  * and after any privilege change (the kernel resets the dumpable flag
  * when credentials change). Root and CAP_SYS_PTRACE are unaffected; that
  * is host configuration. Idempotent. The library applies it itself before
- * creating an ephemeral KEK, whose only protection is process memory.
+ * creating an ephemeral KEK, whose only protection is process memory, and
+ * again before using one if the process has become dumpable since.
+ *
+ * fork(): a child of a process holding ephemeral KEKs has none of them
+ * (their memory is wiped in the child) and creates its own. In a process
+ * with more than one thread, a forked child should exec rather than call
+ * this library: fork copies the library's locks in whatever state another
+ * thread left them, and a call in the child can then wait for ever -- as
+ * with any library that takes locks.
  *
  * Same as hkdfguard_harden_process_with_flags(0).
  *
@@ -196,6 +218,23 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * or HKDFGUARD_ERR_KEK_ACCESS_DENIED if there is none. An ephemeral KEK is
  * the exception: it exists only in this process, so this process makes it.
  *
+ * HKDFGUARD_OK does not say which provider holds the KEK. Where policy
+ * names the ephemeral provider, the KEK created here may be one that ends
+ * with this process, and everything wrapped under it is then unreadable
+ * after a restart; nothing in this API reports that. The second byte of a
+ * wrapped payload names the provider that wrapped it (5 is ephemeral), and
+ * the library logs a warning when it creates an ephemeral KEK. A
+ * deployment that must never use one leaves it out of its policy, which
+ * is the default.
+ *
+ * That is a check this library makes on its own callers, in their process:
+ * it keeps an application from provisioning by accident, and is not what
+ * stops an account that means to. What does is the provider's own access
+ * control -- the TPM key directory only root can write, the token's PIN,
+ * the secret mount -- so an account that can read a PKCS#11 PIN file can
+ * create and delete keys on that token with any PKCS#11 tool, whatever this
+ * function answers (see docs/configuration.md, "What the PIN decides").
+ *
  * Audited: creating a KEK, every wrap and unwrap, and the failures an
  * administrator needs to see are written to syslog (facility authpriv,
  * tag hkdfguard) with the Windows build's event IDs - see README.md,
@@ -219,8 +258,7 @@ int hkdfguard_create_kek(const char* service);
  * Reports whether a persistent KEK already exists for `service`, without
  * creating one. Subject to the same startup latency floor and
  * serialization as hkdfguard_create_kek above; "exists" and "doesn't
- * exist" take the same time. On TPM2, always 1 when the TPM is reachable
- * unless policy sets `tpm.require_pinned_names` (see hkdfguard_create_kek).
+ * exist" take the same time.
  *
  * service:  see hkdfguard_wrap_dek below.
  * exists:   out-parameter; on HKDFGUARD_OK, set to 1 if a KEK exists for
@@ -228,7 +266,11 @@ int hkdfguard_create_kek(const char* service);
  *           nothing has one yet" -- call hkdfguard_create_kek to
  *           provision one). Untouched on any other return code.
  *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code:
+ * HKDFGUARD_ERR_PROVIDER_UNAVAILABLE, not a 0 answer, when no provider the
+ * policy allows is present on this host at all -- there is then nothing
+ * to provision on. hkdfguard_wrap_dek and hkdfguard_kek_fingerprint return
+ * it in the same case, rather than HKDFGUARD_ERR_KEK_NOT_FOUND.
  */
 int hkdfguard_kek_exists(const char* service, int* exists);
 
@@ -325,10 +367,16 @@ int hkdfguard_wrap_dek(
  *                HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED. An invalid service string (see
  *                hkdfguard_wrap_dek) returns HKDFGUARD_ERR_INVALID_SERVICE_NAME.
  * wrapped:       pointer to the wrapped payload bytes.
- * wrapped_len:   length of `wrapped` in bytes.
+ * wrapped_len:   length of `wrapped` in bytes. Above HKDFGUARD_WRAPPED_MAX_LEN,
+ *                refused with HKDFGUARD_ERR_PAYLOAD_MALFORMED before any of
+ *                it is parsed.
  * out:           buffer to receive the recovered 32-byte DEK. May be the
  *                same buffer as `wrapped` (or overlap it): `wrapped` is
- *                read in full before anything is written to `out`.
+ *                read in full before anything is written to `out`. Every
+ *                failure zeroes `out`, so an in-place unwrap that fails --
+ *                for a reason that will pass, too: a provider briefly
+ *                unavailable -- has wiped the payload. Unwrap in place
+ *                only from a copy, or where the payload can be read again.
  * out_len:       in: capacity of `out` in bytes.
  *                out: on HKDFGUARD_OK, always HKDFGUARD_DEK_LEN (32).
  *                     on HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required
@@ -375,6 +423,82 @@ int hkdfguard_generate_and_wrap_dek(
     uint8_t* out,
     int* out_len);
 
+/*
+ * Wraps a secret -- a password, such as a certificate's or a vault's -- of
+ * 1..=256 bytes under the persistent KEK identified by `service`, bound to
+ * the secret name `secret_name`.
+ *
+ * The wrapping key is derived from the KEK under the SP 800-108 label
+ * "hkdfguard-secret-v1/" followed by `secret_name`, instead of the DEK
+ * functions' "hkdfguard-wrap-v1". So the payload opens only through
+ * hkdfguard_unwrap_secret with the same `service` and the same
+ * `secret_name`: never through hkdfguard_unwrap_dek, and never as a secret
+ * of another name. The name is not stored in the payload; supply it again
+ * to unwrap.
+ *
+ * service:      see hkdfguard_wrap_dek.
+ * secret_name:  NUL-terminated, 1..=HKDFGUARD_SECRET_NAME_MAX_LEN bytes of
+ *               lowercase ASCII letters, digits, '.', '_' and '-' -- e.g.
+ *               "vault.password", "ssl.certificate". Not normalized:
+ *               anything else, uppercase included, returns
+ *               HKDFGUARD_ERR_INVALID_ARGUMENT.
+ * secret:       pointer to `secret_len` bytes to wrap. Binary-safe; a
+ *               password needs no NUL terminator.
+ * secret_len:   1..=HKDFGUARD_SECRET_MAX_LEN; anything else returns
+ *               HKDFGUARD_ERR_INVALID_ARGUMENT.
+ * out, out_len: as for hkdfguard_wrap_dek, with
+ *               HKDFGUARD_SECRET_WRAPPED_MAX_LEN as the capacity that
+ *               always fits (and the one a too-small capacity is answered
+ *               with, without reaching a provider).
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_wrap_secret(
+    const char* service,
+    const char* secret_name,
+    const uint8_t* secret,
+    int secret_len,
+    uint8_t* out,
+    int* out_len);
+
+/*
+ * Unwraps a payload produced by hkdfguard_wrap_secret for the same
+ * `service` and `secret_name`, recovering the secret.
+ *
+ * Errors are those of hkdfguard_unwrap_dek. A `secret_name` (or `service`)
+ * other than the one used to wrap returns HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED,
+ * indistinguishable from tampering; a payload from hkdfguard_wrap_dek
+ * returns HKDFGUARD_ERR_PAYLOAD_MALFORMED.
+ *
+ * service, secret_name: as for hkdfguard_wrap_secret.
+ * wrapped:       pointer to the wrapped payload bytes.
+ * wrapped_len:   length of `wrapped` in bytes. Above
+ *                HKDFGUARD_SECRET_WRAPPED_MAX_LEN, refused with
+ *                HKDFGUARD_ERR_PAYLOAD_MALFORMED before any of it is parsed.
+ * out:           buffer to receive the secret. NOT NUL-terminated: use
+ *                *out_len. May be the same buffer as `wrapped`.
+ * out_len:       in: capacity of `out`, which must be at least
+ *                     HKDFGUARD_SECRET_MAX_LEN (256) -- the secret's length
+ *                     isn't known until it is decrypted. A smaller capacity
+ *                     returns HKDFGUARD_ERR_BUFFER_TOO_SMALL with *out_len
+ *                     set to HKDFGUARD_SECRET_MAX_LEN, before any provider
+ *                     is reached.
+ *                out: on HKDFGUARD_OK, the secret's length.
+ *
+ * On ANY non-OK return, every byte of the caller's originally-declared
+ * `out` capacity is zeroed, exactly as for hkdfguard_unwrap_dek. Zero the
+ * secret yourself once you are done with it.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_unwrap_secret(
+    const char* service,
+    const char* secret_name,
+    const uint8_t* wrapped,
+    int wrapped_len,
+    uint8_t* out,
+    int* out_len);
+
 /* Values of hkdfguard_security_model's *out_model: the Windows build's. */
 #define HKDFGUARD_SECURITY_MODEL_PRODUCTION 0
 #define HKDFGUARD_SECURITY_MODEL_DEVELOPER  1
@@ -387,10 +511,13 @@ int hkdfguard_generate_and_wrap_dek(
  *
  *     security_model = "production"   # or "developer"
  *
- * in /etc/hkdfguard/policy.toml. Absent -- or no policy file at all --
- * means HKDFGUARD_SECURITY_MODEL_PRODUCTION: this is a production install
+ * in /etc/hkdfguard/policy.toml. A policy that doesn't set it means
+ * HKDFGUARD_SECURITY_MODEL_PRODUCTION: this is a production install
  * unless an administrator says otherwise. Any other value makes the policy
- * invalid, and every call fails with HKDFGUARD_ERR_POLICY_INVALID. It
+ * invalid, and every call fails with HKDFGUARD_ERR_POLICY_INVALID -- as
+ * every call does when there is no policy file at all: one is required,
+ * so that a file that never arrived (an unmounted volume, an image built
+ * without it) is an error and not a silent return to defaults. It
  * decides:
  *
  *   Who may create or retire a KEK. Production: root (see
@@ -469,11 +596,12 @@ int hkdfguard_key_file_principal_trusted(
  *           -- sticky or not, at any level: a key file anywhere under
  *           /tmp, /var/tmp, /dev/shm or any other sticky, world-writable
  *           directory is refused, however private the directories beneath
- *           it; HKDFGUARD_ERR_FILE_UNTRUSTED otherwise. A directory on a
- *           read-only mount counts as unwritable whatever its mode, so a
- *           Kubernetes Secret or ConfigMap volume (1777, read-only)
- *           passes. The CLI writes key files 0600, and refuses to write
- *           one into a folder this check would refuse -- or at all, under
+ *           it; HKDFGUARD_ERR_FILE_UNTRUSTED otherwise. A sticky directory
+ *           on a read-only mount counts as unwritable, so a Kubernetes
+ *           Secret or projected volume (1777, read-only) passes; a plain
+ *           ConfigMap volume (0777, not sticky) does not. The CLI writes
+ *           key files 0600, and refuses to write one into a folder this
+ *           check would refuse -- or at all, under
  *           the production model, unless it runs as root or a deployer.
  * out:      buffer to receive the wrapped payload. May be NULL only if
  *           *out_len is 0 (to probe the size).
@@ -491,7 +619,9 @@ int hkdfguard_key_file_principal_trusted(
  * The file's length is checked against the payload's own header (the
  * header declares the payload's exact length):
  *   HKDFGUARD_ERR_FILE_PLAINTEXT_KEY - the file is 32 bytes (the size of an
- *       UNWRAPPED DEK), or is 32 bytes written as text -- base64 (standard
+ *       UNWRAPPED DEK), or is 32 raw bytes followed by one line ending (LF
+ *       or CRLF: 33 bytes ending in LF, or 34 ending in CR LF), or is 32
+ *       bytes written as text -- base64 (standard
  *       or URL-safe, padded or not; the CLI's DEK input is standard base64)
  *       or hex -- with any surrounding whitespace. Most likely the plaintext key
  *       saved where its wrapped form belongs: treat it as a key exposure. A
@@ -519,6 +649,28 @@ int hkdfguard_key_file_principal_trusted(
  * capacity, or a NULL `out` with a positive capacity.
  */
 int hkdfguard_open_file(
+    const char* path,
+    uint8_t* out,
+    int* out_len);
+
+/*
+ * hkdfguard_open_file, for a file holding a payload from
+ * hkdfguard_wrap_secret -- as `hkdfguard protect --key-file-path` writes.
+ * Reading it never unwraps it: pass the bytes to hkdfguard_unwrap_secret.
+ *
+ * The same ownership, permission and directory checks as
+ * hkdfguard_open_file, and the same status codes, with these differences:
+ *   - sizes: HKDFGUARD_SECRET_WRAPPED_MAX_LEN is the capacity that always
+ *     fits, and the one a too-small capacity is answered with;
+ *   - no HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: a secret has no fixed form to
+ *     recognise. A secret saved unwrapped is shorter than any secret
+ *     payload, so it is HKDFGUARD_ERR_FILE_TOO_SHORT; if that is what the
+ *     file holds, treat the secret as exposed;
+ *   - a wrapped DEK file is HKDFGUARD_ERR_FILE_TOO_SHORT or
+ *     HKDFGUARD_ERR_FILE_MALFORMED, as a secret file is for
+ *     hkdfguard_open_file.
+ */
+int hkdfguard_open_secret_file(
     const char* path,
     uint8_t* out,
     int* out_len);
