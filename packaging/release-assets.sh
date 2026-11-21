@@ -62,7 +62,7 @@ for dir in "$artifacts"/packages-*/; do
     found=$((found + 1))
 done
 
-python3 packaging/third-party-licenses.py "$stage/THIRD-PARTY-LICENSES.txt"
+python3 packaging/third-party-licenses.py > "$stage/THIRD-PARTY-LICENSES.txt"
 for dir in "$artifacts"/binaries-*/; do
     [ -d "$dir" ] || continue
     arch=$(basename "$dir"); arch=${arch#binaries-}

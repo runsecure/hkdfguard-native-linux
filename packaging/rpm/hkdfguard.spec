@@ -115,7 +115,7 @@ This package contains the static library.
 export CARGO_PROFILE_RELEASE_STRIP=false
 export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 cargo build --locked --offline --release --all-features
-python3 packaging/third-party-licenses.py target/THIRD-PARTY-LICENSES.txt
+python3 packaging/third-party-licenses.py > target/THIRD-PARTY-LICENSES.txt
 
 %install
 # The library goes in under its SONAME (see build.rs), not Cargo's name.

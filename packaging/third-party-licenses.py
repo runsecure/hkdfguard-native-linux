@@ -11,8 +11,8 @@ across them, which Debian's Multi-Arch: same packages require. Build
 scripts' dependencies, dev-dependencies and proc-macro crates run at
 compile time and are left out: none of their code is in the binaries.
 
-Usage: third-party-licenses.py OUTPUT_FILE
-       third-party-licenses.py --licenses   (the distinct license expressions, one per line)
+Usage: third-party-licenses.py > OUTPUT_FILE   (the notices, on standard output)
+       third-party-licenses.py --licenses     (the distinct license expressions, one per line)
 
 Needs only the dependency sources already fetched (`cargo fetch`); runs
 offline.
@@ -68,30 +68,33 @@ def license_texts(pkg):
 
 
 def main():
-    if len(sys.argv) != 2:
+    if sys.argv[1:] not in ([], ["--licenses"]):
         sys.exit(__doc__)
     pkgs = linked_packages()
-    if sys.argv[1] == "--licenses":
+    if sys.argv[1:] == ["--licenses"]:
         for expr in sorted({p["license"] or "(see crate)" for p in pkgs}):
             print(expr)
         return
-    with open(sys.argv[1], "w", encoding="utf-8") as out:
-        out.write("Third-party software compiled into HKDFGuard\n"
-                  "============================================\n\n"
-                  "The HKDFGuard library and the hkdfguard command statically link the\n"
-                  "Rust crates below. Each is distributed under the license(s) shown,\n"
-                  "followed by the license and notice files from that crate's sources.\n")
-        for pkg in pkgs:
-            out.write(f"\n{'=' * 72}\n{pkg['name']} {pkg['version']}\n"
-                      f"License: {pkg['license'] or '(see files below)'}\n")
-            if pkg.get("repository"):
-                out.write(f"Source: {pkg['repository']}\n")
-            texts = license_texts(pkg)
-            if not texts:
-                out.write("(This crate ships no license file; its license is the SPDX expression above.)\n")
-            for name, text in texts:
-                out.write(f"\n--- {name} ---\n\n{text.rstrip()}\n")
-
+    # Standard output, so the caller's redirection names the file. UTF-8
+    # whatever the locale: package builds run under LANG=C, and the license
+    # texts aren't all ASCII.
+    out = sys.stdout
+    out.reconfigure(encoding="utf-8")
+    out.write("Third-party software compiled into HKDFGuard\n"
+              "============================================\n\n"
+              "The HKDFGuard library and the hkdfguard command statically link the\n"
+              "Rust crates below. Each is distributed under the license(s) shown,\n"
+              "followed by the license and notice files from that crate's sources.\n")
+    for pkg in pkgs:
+        out.write(f"\n{'=' * 72}\n{pkg['name']} {pkg['version']}\n"
+                  f"License: {pkg['license'] or '(see files below)'}\n")
+        if pkg.get("repository"):
+            out.write(f"Source: {pkg['repository']}\n")
+        texts = license_texts(pkg)
+        if not texts:
+            out.write("(This crate ships no license file; its license is the SPDX expression above.)\n")
+        for name, text in texts:
+            out.write(f"\n--- {name} ---\n\n{text.rstrip()}\n")
 
 if __name__ == "__main__":
     main()

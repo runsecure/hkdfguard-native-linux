@@ -98,6 +98,10 @@ as_ci softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-p
 HARNESS=$(as_ci mktemp -d /work/harness.XXXXXX)
 ( umask 077; printf '1234\n' > "$HARNESS/pkcs11.pin" )
 cat > "$HARNESS/policy.toml" <<TOML
+# The developer model, as in scripts/native-tpm-test.sh: under the default
+# (production) one require_pinned_keys is on, and the token tests that read
+# this policy as it stands create and use keys no policy pins.
+security_model = "developer"
 [selection]
 mode = "prefer"
 
