@@ -579,7 +579,10 @@ rm -rf "$TMP_ROOT"
 # service's KEK in it, owner-only.
 TMP_MOUNT=$(as_ci mktemp -d)
 ci_file "$TMP_MOUNT/$STICKY_SERVICE"; head -c 32 /dev/urandom | ci_write "$TMP_MOUNT/$STICKY_SERVICE"
-printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$TMP_MOUNT" \
+# Developer model: under production an unpinned service has no KEK in the
+# mount at all (require_pinned_keys), so the directory is never looked at
+# and ci is told only root provisions -- not the refusal under test.
+printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$TMP_MOUNT" \
     > /etc/hkdfguard/policy.toml
 expect_sticky_refusal "an external-secret mount" as_ci $CLI provision -sn $STICKY_SERVICE
 rm -rf "$TMP_MOUNT"
@@ -629,7 +632,7 @@ for sub in "" /hkdfguard; do
         || { echo "FAIL: a DEK wrapped under the KEK in $RO_MOUNT$sub did not unwrap" >&2; exit 1; }
     echo "external secret in a read-only 1777 mount ($RO_MOUNT$sub): accepted; wrap and unwrap work."
 
-    printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RW_MOUNT$sub" \
+    printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RW_MOUNT$sub" \
         > /etc/hkdfguard/policy.toml
     if OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1); then
         echo "FAIL: the same layout writable ($RW_MOUNT$sub) was accepted: $OUT" >&2; exit 1
@@ -643,7 +646,7 @@ rm -rf "$RW_MOUNT" "$KEYS/ro.dek" "$KEYS/ro.key"
 # Only a sticky directory is exempt: a 0777 one on the same read-only mount
 # (a ConfigMap or emptyDir volume's mode) is refused, as whoever writes the
 # volume elsewhere could rename or delete what is in it.
-printf '[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT/unsticky" \
+printf 'security_model = "developer"\n[selection]\nmode = "require"\nprovider = "external-secret"\n\n[external_secret]\ndir = "%s"\n' "$RO_MOUNT/unsticky" \
     > /etc/hkdfguard/policy.toml
 if OUT=$(as_ci $CLI provision -sn $RO_SERVICE 2>&1); then
     echo "FAIL: a 0777 directory on a read-only mount ($RO_MOUNT/unsticky) was accepted: $OUT" >&2; exit 1
