@@ -342,7 +342,11 @@ hkdfguard[4242]: event=1002 op=hkdfguard_wrap_dek result=OK service="com.company
 
 A record about a key file names it in a `path` field, after the caller's
 fields: a long path can't push them past the length a syslog receiver cuts
-a record at.
+a record at. A relative path is followed by `cwd`, the directory it was
+resolved in. A policy the library can't use is recorded (event 2004) for
+every call it fails, the ones that take no service name included:
+`hkdfguard_open_file`, `hkdfguard_open_secret_file`,
+`hkdfguard_security_model` and `hkdfguard_key_file_principal_trusted`.
 
 The fields identify the caller (`uid`, `euid`, `pid`, `exe`) and the service
 by name: service names are public identifiers and are never redacted. Wrap
@@ -1218,7 +1222,10 @@ step is a `rename(2)` over the existing file, so the path holds the old
 key file or the new one at every moment. Whatever fails before then (no
 KEK, provider unavailable, bad input, a full disk, a folder that refuses
 the write) leaves the existing key file exactly as it was, and no
-temporary file behind.
+temporary file behind. So does Ctrl-C, or a `SIGTERM` or `SIGHUP`: the
+temporary file is removed before the signal ends the run. Only `SIGKILL`
+or a power cut can leave one, a hidden `.<name>.hkdfguard-<hex>` file
+holding the wrapped payload, which is ciphertext and safe to delete.
 
 The replaced file is then securely overwritten through a descriptor
 opened before the rename. `--force` only ever replaces a regular file at
@@ -1230,6 +1237,12 @@ name, because something moved it during the wrap, is left alone, with a
 warning. The overwrite is best-effort: on copy-on-write or
 log-structured filesystems (btrfs, ZFS) and on flash storage, old blocks
 can survive it.
+
+A process that opened the old key file just before the rename is still
+reading that file while it is overwritten. Its `hkdfguard_open_file` then
+fails (the bytes are no longer a payload) rather than returning the old
+key file; calling it again opens the new one. Treat one such failure
+during a rotation as a retry, not as tampering.
 
 The key file's folder must be a real folder at the path spelled: a
 `--key-file-path` that goes through a symbolic link anywhere above the file

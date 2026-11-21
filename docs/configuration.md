@@ -333,7 +333,15 @@ token_label = "hkdfguard-prod"                   # and/or token_serial
   `EnvironmentFile=`, a pod spec) can point the module at a token they run
   and receive the root-only PIN. Fix the module's configuration in a
   root-owned file, and don't let lower-trust configuration set those
-  variables for the service.
+  variables for the service. Several modules also read a file in the
+  calling user's home directory, with no variable set at all: SoftHSM2
+  reads `~/.config/softhsm2/softhsm2.conf`, OpenSC `~/.config/opensc`, and
+  the p11-kit proxy module loads whatever modules
+  `~/.config/pkcs11/modules/` lists, which is more code in this process.
+  Anything that can write the service account's home directory can
+  redirect the module the same way. Give the service account a home
+  directory it can't write (or none), and prefer a vendor module loaded
+  directly over `p11-kit-proxy.so`.
 - **The PIN file** holds the token's user PIN (one trailing newline is
   ignored). It must be root-owned, mode `0400`, or `0440` with the service's
   group, in directories only root can change, up to `/`. Setting

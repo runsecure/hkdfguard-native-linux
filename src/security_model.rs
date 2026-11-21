@@ -223,6 +223,46 @@ pub(crate) fn service_group_gid(name: &str) -> Result<libc::gid_t> {
     Ok(vetted_as("tpm.auth_groups group", name, group)?.gid)
 }
 
+/// The over-broad group `gid` is, if it is one: the overflow gid, or the
+/// gid of any name in [`OVER_BROAD_GROUPS`] but `root`. For a secret that
+/// arrives readable by its group, where gid 0 is ordinary -- a root-owned
+/// file's own default group, and the group OpenShift runs every container
+/// user in -- and the others would each open it to accounts well beyond
+/// one service.
+///
+/// The answer for a gid is kept for the life of the process: this is asked
+/// on every wrap and unwrap, and each name is a lookup that may leave the
+/// host. A lookup that fails is an error, and is not kept.
+#[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
+pub(crate) fn over_broad_reader_group(gid: libc::gid_t) -> std::io::Result<Option<&'static str>> {
+    static KNOWN: std::sync::Mutex<Vec<(libc::gid_t, Option<&'static str>)>> = std::sync::Mutex::new(Vec::new());
+    if gid == 0 {
+        return Ok(None);
+    }
+    if gid == 65534 {
+        return Ok(Some("nogroup"));
+    }
+    let known = |gid| {
+        let known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        known.iter().find(|(g, _)| *g == gid).map(|(_, verdict)| *verdict)
+    };
+    if let Some(verdict) = known(gid) {
+        return Ok(verdict);
+    }
+    let mut verdict = None;
+    for broad in OVER_BROAD_GROUPS.iter().copied().filter(|name| *name != "root") {
+        if lookup_group(broad)?.is_some_and(|g| g.gid == gid) {
+            verdict = Some(broad);
+            break;
+        }
+    }
+    let mut all = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if all.len() < 64 && !all.iter().any(|(g, _)| *g == gid) {
+        all.push((gid, verdict));
+    }
+    Ok(verdict)
+}
+
 // `role` names what the group is for, in the refusal.
 fn vetted_as(role: &str, name: &str, group: Group) -> Result<DeployerGroup> {
     let refuse = |why: String| Err(Error::GroupInvalid(format!("{role} \"{name}\" (gid {}): {why}", group.gid)));
@@ -408,6 +448,23 @@ mod tests {
             }
             _ => eprintln!("skipping the positive case: this process's primary group is over-broad or unnamed"),
         }
+    }
+
+    #[test]
+    fn a_reader_group_is_over_broad_by_gid_except_root_s() {
+        assert_eq!(over_broad_reader_group(0).unwrap(), None, "root's own group is ordinary for a root-owned file");
+        assert_eq!(over_broad_reader_group(65534).unwrap(), Some("nogroup"));
+        for broad in OVER_BROAD_GROUPS.iter().copied().filter(|g| *g != "root") {
+            if let Ok(Some(group)) = lookup_group(broad) {
+                if group.gid != 0 && group.gid != 65534 {
+                    // By gid: whichever of the names sharing it is found first.
+                    assert!(over_broad_reader_group(group.gid).unwrap().is_some(), "{broad}");
+                    assert!(over_broad_reader_group(group.gid).unwrap().is_some(), "{broad}, remembered");
+                }
+            }
+        }
+        // A gid no group has, as a Kubernetes fsGroup usually is.
+        assert_eq!(over_broad_reader_group(0x7fff_fff1).unwrap(), None);
     }
 
     #[test]

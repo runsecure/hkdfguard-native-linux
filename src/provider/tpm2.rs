@@ -691,6 +691,48 @@ fn key_file_appeared(key: &Path) -> Error {
     ))
 }
 
+/// Whether `name` is a temporary name [`write_key_dir_file`] gives a file
+/// of `service`'s: `.<service><suffix>.<16 hex digits>`, exactly.
+fn is_temp_name_of(name: &str, service: &str) -> bool {
+    [KEY_FILE_SUFFIX, AUTH_FILE_SUFFIX].iter().any(|suffix| {
+        name.strip_prefix('.')
+            .and_then(|rest| rest.strip_prefix(service))
+            .and_then(|rest| rest.strip_prefix(suffix))
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|nonce| nonce.len() == 16 && nonce.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    })
+}
+
+/// Deletes what interrupted writes left in `dir` for `service`: files under
+/// the temporary names [`write_key_dir_file`] uses, which a crash between
+/// creating one and removing it leaves behind -- either on its own, or as a
+/// second name for the file it became. Each is overwritten first: one of
+/// them may hold an authValue.
+///
+/// For a retire, under [`KeyDirLock`]: no write of this service's files is
+/// in progress, so every such file is a leftover. Best effort: what can't
+/// be deleted is named in the log.
+fn remove_leftover_temp_files(dir: &Path, service: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|name| is_temp_name_of(name, service)) {
+            continue;
+        }
+        let path = entry.path();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            continue; // nothing this library made
+        }
+        let _ = crate::secure_file::zero_regular_file(&path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            log::warn!(
+                "hkdfguard: retired the TPM key, but could not delete {}, left by an interrupted write: {e}. Delete it by hand",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Flushes `dir`'s entries to disk, so a created or deleted key file
 /// survives a crash.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
@@ -2044,9 +2086,14 @@ impl KekProvider for Tpm2Provider {
 
     // Deletes the key file, once its key is confirmed (on the TPM) to have
     // `expected_fingerprint` and the file is confirmed to be the one read,
-    // then its authValue file. The TPM keeps no copy, so every DEK wrapped
-    // under it is then unrecoverable -- unless copies of both files survive
-    // (a backup), which still load on this TPM.
+    // then its authValue file -- overwritten first -- and anything an
+    // interrupted write left for the service. The TPM keeps no copy, so
+    // every DEK wrapped under it is then unrecoverable -- unless copies of
+    // both files survive (a backup), which still load on this TPM.
+    //
+    // Only the authValue is overwritten: it is the secret. The key file's
+    // private half is encrypted to this TPM, which won't use it without
+    // the authValue.
     fn retire_kek(&self, service: &str, expected_fingerprint: &[u8; crate::payload::FINGERPRINT_LEN]) -> Result<()> {
         self.check_not_refused()?;
         if let Some(e) = self.unreachable_for(service)? {
@@ -2088,7 +2135,15 @@ impl KekProvider for Tpm2Provider {
         // the service again is refused until it is deleted (see
         // `refuse_orphaned_auth_file`), so say so.
         let auth_path = auth_file_path(&dir, service);
-        if let Err(e) = std::fs::remove_file(&auth_path) {
+        if let Err(e) = crate::secure_file::zero_regular_file(&auth_path) {
+            log::warn!(
+                "hkdfguard: could not overwrite TPM authValue file {} before deleting it: {e}",
+                auth_path.display()
+            );
+        }
+        let auth_removed = std::fs::remove_file(&auth_path);
+        remove_leftover_temp_files(&dir, service);
+        if let Err(e) = auth_removed {
             log::warn!(
                 "hkdfguard: retired the TPM key, but could not delete its authValue file {}: {e}. Delete it by hand:                  this service can't be provisioned again while it is there",
                 auth_path.display()
@@ -2440,6 +2495,53 @@ mod tests {
             }
             assert_eq!(read_key_file(SERVICE).unwrap().unwrap().public, first);
             assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "no temporary file left behind");
+        });
+    }
+
+    #[test]
+    fn only_this_service_s_temporary_names_are_leftovers() {
+        assert!(is_temp_name_of(".com.company.orders.tpmauth.0123456789abcdef", "com.company.orders"));
+        assert!(is_temp_name_of(".com.company.orders.tpmkey.fedcba9876543210", "com.company.orders"));
+        for other in [
+            "com.company.orders.tpmauth",                      // the real file
+            ".com.company.orders.tpmauth",                     // no nonce
+            ".com.company.orders.tpmauth.0123456789abcde",     // 15 digits
+            ".com.company.orders.tpmauth.0123456789abcdef0",   // 17
+            ".com.company.orders.tpmauth.0123456789ABCDEF",    // not as written
+            ".com.company.orders.lock.0123456789abcdef",       // another suffix
+            ".com.company.orders2.tpmauth.0123456789abcdef",   // another service
+            ".com.company.tpmauth.0123456789abcdef",           // a prefix of this one
+            "com.company.orders.tpmauth.0123456789abcdef",     // not hidden
+        ] {
+            assert!(!is_temp_name_of(other, "com.company.orders"), "{other}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_retire_s_cleanup_removes_what_interrupted_writes_left_and_nothing_else() {
+        with_key_dir(|dir| {
+            // A crash between linking an authValue file and removing its
+            // temporary name: one file, two names.
+            let auth = dir.join(format!("{SERVICE}{AUTH_FILE_SUFFIX}"));
+            std::fs::write(&auth, [0xA5u8; 32]).unwrap();
+            let linked = dir.join(format!(".{SERVICE}{AUTH_FILE_SUFFIX}.0123456789abcdef"));
+            std::fs::hard_link(&auth, &linked).unwrap();
+            // A crash before the link: a temporary file on its own.
+            let alone = dir.join(format!(".{SERVICE}{KEY_FILE_SUFFIX}.fedcba9876543210"));
+            std::fs::write(&alone, b"half a key file").unwrap();
+            // Another service's, and a file that only looks similar.
+            let theirs = dir.join(format!(".{SERVICE}2{AUTH_FILE_SUFFIX}.0123456789abcdef"));
+            std::fs::write(&theirs, b"theirs").unwrap();
+            let similar = dir.join(format!(".{SERVICE}{AUTH_FILE_SUFFIX}.backup"));
+            std::fs::write(&similar, b"an operator's").unwrap();
+
+            remove_leftover_temp_files(dir, SERVICE);
+
+            assert!(!linked.exists() && !alone.exists(), "both leftovers are gone");
+            assert_eq!(std::fs::read(&auth).unwrap(), [0u8; 32], "the file the leftover was a name for is overwritten with it");
+            assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+            assert_eq!(std::fs::read(&similar).unwrap(), b"an operator's");
         });
     }
 

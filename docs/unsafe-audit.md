@@ -149,11 +149,20 @@ The one `unsafe impl` and the only raw-pointer arithmetic.
   is wrapped in `ManuallyDrop`, so it is never closed.
 - **`fchown`, `isatty`, `mlockall`, `getrlimit`** take a descriptor,
   integers, or a valid out-parameter.
+- **The CLI's signal handler** (after 0.9.2, `remove_staged_temp`) removes
+  the staged temporary key file when `SIGINT`, `SIGTERM` or `SIGHUP` ends
+  a `wrap`. It calls only `unlink`, `signal` and `raise`, all
+  async-signal-safe, and reads one atomic pointer: a `CString` leaked by
+  `RemoveOnSignal::arm`, so it is never freed while the handler could be
+  reading it. `sigaction` is given a zeroed struct with an empty mask and
+  a handler of the plain `extern "C" fn(c_int)` form, which is what no
+  `SA_SIGINFO` means. The test forks, and its child calls only `raise`
+  and `_exit`.
 
 ### Calls with no preconditions
 
 `geteuid`, `getuid`, `getegid`, `getpid` and `sysconf` take no pointers
-and can't fail. 35 of the 123 `unsafe` blocks under `src/` (86 at 0.9.1)
+and can't fail. 35 of the 129 `unsafe` blocks under `src/` (86 at 0.9.1)
 are only these. (`getpid` is how the ephemeral store and the PKCS#11 module
 registry notice they are in a forked child.)
 

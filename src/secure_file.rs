@@ -921,6 +921,50 @@ impl FileIdentity {
     }
 }
 
+/// Overwrites the regular file at `path` with zeros, in place and synced,
+/// before it is deleted: for a secret this library wrote and is now
+/// retiring. Every name the file has (a hard link left by an interrupted
+/// write, say) then holds zeros too.
+///
+/// Best effort against what the storage does underneath: a journal, a
+/// snapshot, a copy-on-write filesystem or a flash translation layer may
+/// keep the old blocks, and no call here can reach those. It does mean the
+/// value is no longer in the file's own blocks on a filesystem that writes
+/// in place, nor readable through a link or an open descriptor.
+///
+/// `path` is not followed if it is a symlink, and only a regular file is
+/// written to. The file is made owner-writable first (these files are
+/// created read-only), which its owner and root may do.
+#[cfg_attr(not(any(feature = "tpm2", test)), allow(dead_code))]
+pub(crate) fn zero_regular_file(path: &Path) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let no_follow = if cfg!(miri) { libc::O_NOFOLLOW } else { libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY };
+    let not_regular = || io::Error::new(io::ErrorKind::InvalidData, "not a regular file");
+    // Read-only first: a descriptor to check, and to change the mode
+    // through, so nothing is done to whatever a name is swapped for.
+    let handle = OpenOptions::new().read(true).custom_flags(no_follow).open(path)?;
+    let meta = handle.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(not_regular());
+    }
+    handle.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let mut file = OpenOptions::new().write(true).custom_flags(no_follow).open(path)?;
+    let opened = file.metadata()?;
+    if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file was replaced while it was being overwritten"));
+    }
+    let zeros = [0u8; 4096];
+    let mut left = opened.len();
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    file.sync_all()
+}
+
 /// A byte buffer for secret file contents that is guaranteed to be zeroed
 /// once it's no longer needed: explicitly via [`SecretBuffer::wipe`] as
 /// soon as the caller is done with it, and unconditionally on drop -- so
@@ -1418,6 +1462,39 @@ mod tests {
             return;
         }
         eprintln!("skipping: no readable file on a FUSE mount on this host");
+    }
+
+    #[test]
+    fn zeroing_a_file_overwrites_every_link_to_it_and_nothing_else() {
+        let dir = private_tempdir();
+        let secret = dir.path().join("svc.tpmauth");
+        std::fs::write(&secret, [0xA5u8; 32]).unwrap();
+        chmod(&secret, 0o400); // as these files are created
+        let link = dir.path().join(".svc.tpmauth.0123456789abcdef");
+        std::fs::hard_link(&secret, &link).unwrap();
+
+        zero_regular_file(&secret).unwrap();
+        assert_eq!(std::fs::read(&secret).unwrap(), [0u8; 32], "same length, all zeros");
+        assert_eq!(std::fs::read(&link).unwrap(), [0u8; 32], "a second name for the file holds zeros too");
+
+        // Longer than one buffer, and an empty file.
+        let long = dir.path().join("long");
+        std::fs::write(&long, vec![0x5Au8; 10_000]).unwrap();
+        zero_regular_file(&long).unwrap();
+        assert_eq!(std::fs::read(&long).unwrap(), vec![0u8; 10_000]);
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        zero_regular_file(&empty).unwrap();
+
+        // Never through a symlink, never a directory, and a missing file says so.
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"keep me").unwrap();
+        let symlink = dir.path().join("link");
+        std::os::unix::fs::symlink(&other, &symlink).unwrap();
+        assert!(zero_regular_file(&symlink).is_err());
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+        assert!(zero_regular_file(dir.path()).is_err());
+        assert_eq!(zero_regular_file(&dir.path().join("absent")).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

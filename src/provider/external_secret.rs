@@ -471,7 +471,34 @@ fn open_secret_within_mount(mount: &Path, service: &str, owner: Owner) -> std::i
     })?;
 
     crate::secure_file::verify_opened(&file, &target_real, &mount_real, Path::new("/proc"))?;
+    check_reader_group(&file.metadata()?)?;
     Ok(file)
+}
+
+/// Refuses a secret its group can read when that group is an over-broad
+/// one. Group read is allowed only on a root-owned file (see
+/// [`secret_file_requirements`]), as `root:<service-group> 0440` -- and a
+/// file that came out `root:users 0440` instead is one every account on
+/// the host can read, which the mode alone doesn't show.
+fn check_reader_group(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::io::{Error as IoError, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+    if meta.mode() & 0o040 == 0 {
+        return Ok(());
+    }
+    let denied = |what: String| IoError::new(ErrorKind::PermissionDenied, what);
+    match crate::security_model::over_broad_reader_group(meta.gid()) {
+        Ok(None) => Ok(()),
+        Ok(Some(group)) => Err(denied(format!(
+            "readable by group \"{group}\" (gid {}), which covers far more than one service's accounts; give it to \
+             the service's own group, or make it 0400",
+            meta.gid()
+        ))),
+        Err(e) => Err(denied(format!(
+            "readable by its group (gid {}), and whether that is an over-broad group could not be looked up: {e}",
+            meta.gid()
+        ))),
+    }
 }
 
 // Accepts exactly KEK_LEN raw bytes. Any other length is refused with a
@@ -489,9 +516,38 @@ fn parse_secret_key(bytes: &[u8]) -> Result<Zeroizing<[u8; KEK_LEN]>> {
         // a provisioning mistake, never a key anyone meant.
         return Err(Error::Provider("external secret is all zero bytes; provision 32 random bytes".into()));
     }
+    if bytes.iter().all(|b| matches!(b, 0x20..=0x7e)) && !is_known_answer_kek(bytes) {
+        // Text: a passphrase someone typed, or the hex or base64 of a key
+        // half this size or less -- far fewer than 256 bits, whatever its
+        // length. 32 random bytes are all printable about once in 10^14
+        // keys, so nothing genuine is turned away.
+        return Err(Error::Provider(format!(
+            "external secret is {KEK_LEN} characters of text, not {KEK_LEN} random bytes: a passphrase, or the hex or \
+             base64 form of a shorter key. Provision raw random bytes (head -c {KEK_LEN} /dev/urandom)"
+        )));
+    }
     let mut key = Zeroizing::new([0u8; KEK_LEN]);
     key.copy_from_slice(bytes);
     Ok(key)
+}
+
+/// The KEK of this crate's frozen known-answer payloads
+/// (`crypto::known_answer`): 32 asterisks, chosen before text was refused,
+/// and not replaceable -- one of those payloads was made by a pre-release
+/// build that no longer exists. Unit-test builds alone accept it.
+#[cfg(test)]
+pub(crate) const KNOWN_ANSWER_KEK: [u8; KEK_LEN] = [0x2a; KEK_LEN];
+
+fn is_known_answer_kek(bytes: &[u8]) -> bool {
+    #[cfg(test)]
+    {
+        bytes == KNOWN_ANSWER_KEK
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bytes;
+        false
+    }
 }
 
 // Picks the secret mount directory: `external_secret.dir` from the policy,
@@ -896,6 +952,54 @@ mod tests {
             let err = provider.kek_exists("com.company.orders").unwrap_err();
             assert!(err.to_string().contains("all zero"), "{err}");
         });
+    }
+
+    #[test]
+    fn text_is_refused_as_a_key_and_random_bytes_are_not() {
+        let refused = |bytes: &[u8]| match parse_secret_key(bytes) {
+            Err(Error::Provider(msg)) => msg.contains("characters of text"),
+            _ => false,
+        };
+        assert!(refused(b"correct horse battery staple 2026"[..KEK_LEN].as_ref()), "a passphrase");
+        assert!(refused(b"0123456789abcdef0123456789abcdef"), "32 hex digits: a 16-byte key");
+        assert!(refused(b"q83vEjRWeJCrze8BI0VniavN7wEjRWeJ"), "base64 text");
+        assert!(refused(&[b'A'; KEK_LEN]), "one character, repeated");
+        assert!(refused(b"                                "), "spaces");
+
+        // One byte outside printable ASCII is not text: a line ending in a
+        // 32-byte file, or any random key.
+        let mut with_newline = *b"0123456789abcdef0123456789abcde\n";
+        assert!(parse_secret_key(&with_newline).is_ok());
+        with_newline[31] = 0x7f;
+        assert!(parse_secret_key(&with_newline).is_ok());
+        for _ in 0..64 {
+            assert!(parse_secret_key(&random_key()).is_ok());
+        }
+        // The frozen known-answer key, in this build only.
+        assert_eq!(KNOWN_ANSWER_KEK, [b'*'; KEK_LEN]);
+        assert!(parse_secret_key(&KNOWN_ANSWER_KEK).is_ok());
+    }
+
+    #[test]
+    fn a_secret_its_group_can_read_must_not_belong_to_an_over_broad_group() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::secure_file::private_tempdir();
+        let path = provision(dir.path(), "com.company.orders", random_key());
+        // Owner-only: the group is never looked at.
+        check_reader_group(&std::fs::metadata(&path).unwrap()).unwrap();
+
+        // Group-readable: fine unless this account's group is one of the
+        // over-broad ones (`users`, on some hosts), and then refused by name.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o440)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        match crate::security_model::over_broad_reader_group(meta.gid()).unwrap() {
+            None => check_reader_group(&meta).unwrap(),
+            Some(group) => {
+                let err = check_reader_group(&meta).unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(err.to_string().contains(group), "{err}");
+            }
+        }
     }
 
     #[test]

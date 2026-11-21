@@ -40,7 +40,12 @@
 //!   environment can point the module at a token they run, and `C_Login`
 //!   then hands it the root-only PIN; the token's label and serial are its
 //!   own claims, so they can't tell. Set the module's configuration in a
-//!   root-owned file the service's environment can't override. **A
+//!   root-owned file the service's environment can't override. Some
+//!   modules read the calling user's home directory as well, with nothing
+//!   set (SoftHSM2's `~/.config/softhsm2/softhsm2.conf`; the p11-kit
+//!   proxy's `~/.config/pkcs11/modules/`, which names further modules to
+//!   load): a service account that can write its own home can be
+//!   redirected the same way. **A
 //!   sticky directory on a read-only mount passes whatever its write
 //!   bits**, as everywhere in this crate: a read-only mount's mode bits don't say who
 //!   can write the same directory through another, writable mount of it

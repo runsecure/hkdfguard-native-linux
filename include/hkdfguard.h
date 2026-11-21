@@ -218,6 +218,15 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
  * or HKDFGUARD_ERR_KEK_ACCESS_DENIED if there is none. An ephemeral KEK is
  * the exception: it exists only in this process, so this process makes it.
  *
+ * HKDFGUARD_OK does not say which provider holds the KEK. Where policy
+ * names the ephemeral provider, the KEK created here may be one that ends
+ * with this process, and everything wrapped under it is then unreadable
+ * after a restart; nothing in this API reports that. The second byte of a
+ * wrapped payload names the provider that wrapped it (5 is ephemeral), and
+ * the library logs a warning when it creates an ephemeral KEK. A
+ * deployment that must never use one leaves it out of its policy, which
+ * is the default.
+ *
  * That is a check this library makes on its own callers, in their process:
  * it keeps an application from provisioning by accident, and is not what
  * stops an account that means to. What does is the provider's own access
@@ -363,7 +372,11 @@ int hkdfguard_wrap_dek(
  *                it is parsed.
  * out:           buffer to receive the recovered 32-byte DEK. May be the
  *                same buffer as `wrapped` (or overlap it): `wrapped` is
- *                read in full before anything is written to `out`.
+ *                read in full before anything is written to `out`. Every
+ *                failure zeroes `out`, so an in-place unwrap that fails --
+ *                for a reason that will pass, too: a provider briefly
+ *                unavailable -- has wiped the payload. Unwrap in place
+ *                only from a copy, or where the payload can be read again.
  * out_len:       in: capacity of `out` in bytes.
  *                out: on HKDFGUARD_OK, always HKDFGUARD_DEK_LEN (32).
  *                     on HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required

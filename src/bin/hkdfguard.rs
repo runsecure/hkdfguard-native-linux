@@ -1871,6 +1871,89 @@ fn remove_created_file(path: &Path, file: &File) {
 struct StagedKeyFile {
     file: File,
     temp: PathBuf,
+    // Until the staged file has its real name or is removed.
+    interrupted: RemoveOnSignal,
+}
+
+// The temporary file a terminating signal should take with it, as a C
+// string the handler can pass straight to unlink(2); null when there is
+// none.
+static STAGED_TEMP: std::sync::atomic::AtomicPtr<libc::c_char> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+// Runs on SIGINT, SIGTERM and SIGHUP while a key file is staged: removes
+// the temporary file, then lets the signal end the process as it would
+// have. Only async-signal-safe calls: unlink, signal, raise.
+extern "C" fn remove_staged_temp(signal: libc::c_int) {
+    let temp = STAGED_TEMP.load(std::sync::atomic::Ordering::SeqCst);
+    if !temp.is_null() {
+        // SAFETY: a non-null STAGED_TEMP is a NUL-terminated string that is
+        // never freed (see `RemoveOnSignal::arm`).
+        unsafe { libc::unlink(temp) };
+    }
+    // SAFETY: both take plain integers. The signal is blocked while its
+    // handler runs, so the one raised here is delivered, with the default
+    // action restored, as soon as this returns: the process ends exactly
+    // as it would have with no handler.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+// While this lives, a signal that ends the run removes the staged
+// temporary file first, so Ctrl-C or a `systemctl stop` in the middle of a
+// wrap leaves nothing behind in the key folder. (SIGKILL and a power cut
+// can't be caught: the file they leave is a hidden `.<name>.hkdfguard-<hex>`
+// holding the wrapped payload, which is ciphertext.)
+struct RemoveOnSignal {
+    // The CLI stages one file per run; this binary's tests stage many, on
+    // several threads, and there is one STAGED_TEMP. They take turns.
+    #[cfg(test)]
+    _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RemoveOnSignal {
+    fn arm(temp: &Path) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::Ordering;
+        #[cfg(test)]
+        let one_at_a_time = {
+            static STAGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            STAGING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let name = std::ffi::CString::new(temp.as_os_str().as_bytes()).map_err(|_| "the key file path holds a NUL byte".to_string())?;
+        // Never freed: the handler may be reading it at any moment after
+        // this, and the CLI stages one file per run.
+        STAGED_TEMP.store(name.into_raw(), Ordering::SeqCst);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: an all-zero `sigaction` is valid (an empty mask, no
+            // flags); the handler is an `extern "C" fn(c_int)`, which is
+            // what a handler without SA_SIGINFO is; `action` lives for the
+            // call and no old action is asked for.
+            let installed = unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = remove_staged_temp as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut())
+            };
+            if installed != 0 {
+                let e = std::io::Error::last_os_error();
+                STAGED_TEMP.store(std::ptr::null_mut(), Ordering::SeqCst);
+                return Err(format!("could not arrange for an interrupted run to clean up after itself: {e}"));
+            }
+        }
+        Ok(RemoveOnSignal {
+            #[cfg(test)]
+            _one_at_a_time: one_at_a_time,
+        })
+    }
+}
+
+impl Drop for RemoveOnSignal {
+    fn drop(&mut self) {
+        // The handlers stay: with nothing staged they only end the process.
+        STAGED_TEMP.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 // Writes `wrapped` to a new hidden file in `path`'s folder, named after it
@@ -1898,6 +1981,8 @@ fn stage_key_file(
     let mut suffix = [0u8; 8];
     getrandom::fill(&mut suffix).map_err(|e| format!("the OS random number generator failed: {e}"))?;
     let temp = spelled.with_file_name(format!(".{name}.hkdfguard-{}", hex(&suffix)));
+    // Before the file exists, so there is no moment it could be orphaned in.
+    let interrupted = RemoveOnSignal::arm(&temp)?;
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -1938,7 +2023,7 @@ fn stage_key_file(
         remove_created_file(&temp, &file);
         return Err(e);
     }
-    Ok(StagedKeyFile { file, temp })
+    Ok(StagedKeyFile { file, temp, interrupted })
 }
 
 // Gives the staged key file its real name, `path`, and flushes the folder,
@@ -1958,7 +2043,8 @@ fn stage_key_file(
 // that follow the rename, so none of them failing leaves it intact on the
 // disk.
 fn publish_key_file(staged: StagedKeyFile, path: &Path, shown: &str, force: bool) -> Result<Option<String>, String> {
-    let StagedKeyFile { file, temp } = staged;
+    // `_interrupted` is held to the end: by then the temporary name is gone.
+    let StagedKeyFile { file, temp, interrupted: _interrupted } = staged;
     let fail = |e: String| {
         remove_created_file(&temp, &file);
         Err(e)
@@ -2798,6 +2884,40 @@ mod tests {
         let moved = base.join("moved.key");
         remove_created_file(&moved, &file);
         assert!(!moved.exists(), "the created file itself is removed");
+    }
+
+    #[test]
+    fn a_signal_that_ends_the_run_takes_the_staged_file_with_it() {
+        let dir = private_tempdir();
+        let key = fs::canonicalize(dir.path()).unwrap().join("wrapped.key");
+        let staged = stage_key_file(&key, "wrapped.key", b"payload", None, KEY_FILE_MODE).unwrap();
+        assert!(staged.temp.exists());
+
+        // A child, so the signal ends something other than the test run.
+        // It makes async-signal-safe calls only (other test threads may
+        // hold locks the child would never get): raise, and the handler's
+        // unlink.
+        // SAFETY: fork has no preconditions; the child calls only raise
+        // and _exit.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // SAFETY: plain integers; _exit never returns.
+            unsafe {
+                libc::raise(libc::SIGTERM);
+                libc::_exit(1); // not reached: the handler re-raises with the default action
+            }
+        }
+        let mut status = 0;
+        // SAFETY: `child` is this process's child; `status` is a valid out-parameter.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM, "the signal still ends the process: {status:#x}");
+        assert!(!staged.temp.exists(), "the temporary file went with it");
+        assert_eq!(fs::read_dir(key.parent().unwrap()).unwrap().count(), 0, "nothing left in the key folder");
+
+        // Once the staged file is dealt with, nothing is armed.
+        drop(staged);
+        assert!(STAGED_TEMP.load(std::sync::atomic::Ordering::SeqCst).is_null());
     }
 
     #[test]

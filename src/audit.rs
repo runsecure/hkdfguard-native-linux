@@ -51,6 +51,8 @@ pub(crate) enum Op {
     OpenFile,
     OpenSecretFile,
     KekFingerprint,
+    SecurityModel,
+    KeyFilePrincipalTrusted,
     RetireKek,
 }
 
@@ -67,6 +69,8 @@ impl Op {
             Op::OpenFile => "hkdfguard_open_file",
             Op::OpenSecretFile => "hkdfguard_open_secret_file",
             Op::KekFingerprint => "hkdfguard_kek_fingerprint",
+            Op::SecurityModel => "hkdfguard_security_model",
+            Op::KeyFilePrincipalTrusted => "hkdfguard_key_file_principal_trusted",
             // Not a C function: the CLI's `retire`, through the library's
             // Rust-only `admin::retire_kek`.
             Op::RetireKek => "retire_kek",
@@ -330,6 +334,25 @@ pub(crate) fn operation_failed(op: Op, service: &str, code: i32) {
     );
 }
 
+/// `op` -- one of the calls that take no service name: the two that open a
+/// key file, hkdfguard_security_model, hkdfguard_key_file_principal_trusted
+/// -- failed with `code` because the policy, or a deployer group it names,
+/// can't be used. Event 2002, as [`operation_failed`] writes for the calls
+/// that do take a service; any other code writes nothing. `path` is the
+/// key file the call was for, where it was for one.
+pub(crate) fn policy_refused(op: Op, code: i32, path: Option<&Path>) {
+    if !matches!(code, status::POLICY_INVALID | status::LINUX_GROUP_INVALID) {
+        return;
+    }
+    emit_record(
+        Severity::Error,
+        POLICY_INVALID,
+        &format!("op={} result={}({code})", op.name(), code_name(code)),
+        path,
+        &format!("{} failed: the policy file can't be trusted or used; every call fails closed until it is fixed", op.name()),
+    );
+}
+
 /// hkdfguard_open_file refused `path` as FILE_PLAINTEXT_KEY: it looks like
 /// an unwrapped DEK, so possibly a plaintext key on disk. Names the file;
 /// none of its contents are logged.
@@ -423,7 +446,8 @@ fn emit(severity: Severity, event: u32, fields: &str, message: &str) {
 // every byte of it can take four here (`quote`); a syslog receiver cuts a
 // record at its own limit (8 KiB by default in rsyslog), and a path placed
 // first could push `uid`, `pid` and `exe` -- who made the call -- off the
-// end of the record it sent.
+// end of the record it sent. A relative path is followed by `cwd=`, the
+// directory it was resolved against: without it the record names no file.
 fn emit_for_path(severity: Severity, event: u32, fields: &str, path: &Path, message: &str) {
     emit_record(severity, event, fields, Some(path), message);
 }
@@ -434,7 +458,19 @@ fn emit_record(severity: Severity, event: u32, fields: &str, path: Option<&Path>
     let exe = std::fs::read_link("/proc/self/exe")
         .map(|p| quote(p.as_os_str().as_bytes()))
         .unwrap_or_else(|_| "\"(unknown)\"".to_string());
-    let path = path.map(|p| format!(" path={}", quote(p.as_os_str().as_bytes()))).unwrap_or_default();
+    let path = path
+        .map(|p| {
+            let cwd = if p.is_relative() {
+                match std::env::current_dir() {
+                    Ok(dir) => format!(" cwd={}", quote(dir.as_os_str().as_bytes())),
+                    Err(_) => " cwd=\"(unknown)\"".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            format!(" path={}{cwd}", quote(p.as_os_str().as_bytes()))
+        })
+        .unwrap_or_default();
     let line = format!(
         "event={event} {fields} uid={uid} euid={euid} pid={} exe={exe}{path} msg={}",
         std::process::id(),
@@ -612,6 +648,35 @@ mod tests {
         let records = captured_containing("audit.test.integrity");
         assert_eq!(records.len(), 4);
         assert!(records.iter().all(|r| r.contains("event=2003 ")));
+    }
+
+    #[test]
+    fn a_policy_refusal_is_audited_for_the_calls_that_take_no_service() {
+        let file = Path::new("/srv/audit-test/policy-refused.key");
+        policy_refused(Op::OpenFile, status::POLICY_INVALID, Some(file));
+        policy_refused(Op::OpenSecretFile, status::LINUX_GROUP_INVALID, Some(file));
+        policy_refused(Op::OpenFile, status::FILE_NOT_FOUND, Some(file)); // not a policy refusal: nothing
+        let records = captured_containing("policy-refused.key");
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records[0].contains("event=2004 op=hkdfguard_open_file result=POLICY_INVALID(-9) "), "{}", records[0]);
+        assert!(records[1].contains("op=hkdfguard_open_secret_file result=LINUX_GROUP_INVALID(-80) "), "{}", records[1]);
+
+        policy_refused(Op::SecurityModel, status::POLICY_INVALID, None);
+        policy_refused(Op::KeyFilePrincipalTrusted, status::LINUX_GROUP_INVALID, None);
+        assert!(!captured_containing("event=2004 op=hkdfguard_security_model result=POLICY_INVALID(-9) uid=").is_empty());
+        assert!(!captured_containing("op=hkdfguard_key_file_principal_trusted result=LINUX_GROUP_INVALID(-80) uid=").is_empty());
+    }
+
+    #[test]
+    fn a_relative_path_is_recorded_with_the_directory_it_was_resolved_in() {
+        key_file_refused(Op::OpenFile, Path::new("keys/audit-relative.key"), status::FILE_UNTRUSTED);
+        let records = captured_containing("audit-relative.key");
+        let cwd = quote(std::env::current_dir().unwrap().as_os_str().as_bytes());
+        assert!(records[0].contains(&format!(" path=\"keys/audit-relative.key\" cwd={cwd} msg=")), "{}", records[0]);
+
+        key_file_refused(Op::OpenFile, Path::new("/srv/audit-test/audit-absolute.key"), status::FILE_UNTRUSTED);
+        let records = captured_containing("audit-absolute.key");
+        assert!(!records[0].contains(" cwd="), "an absolute path needs none: {}", records[0]);
     }
 
     #[test]

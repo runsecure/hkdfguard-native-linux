@@ -1264,6 +1264,8 @@ mod known_answer {
     use serial_test::serial;
 
     const SERVICE: &str = "com.hkdfguard.kat";
+    // Text, which the external-secret provider refuses as a key -- except
+    // this one, in unit-test builds (see its `KNOWN_ANSWER_KEK`).
     const KEK: [u8; crate::provider::KEK_LEN] = [0x2a; crate::provider::KEK_LEN];
     const DEK: [u8; DEK_LEN] = [0x5a; DEK_LEN];
 

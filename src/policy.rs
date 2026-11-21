@@ -504,6 +504,23 @@ fn parse_kek_fingerprint(field: &str, hex: &str) -> Result<[u8; FINGERPRINT_LEN]
     })
 }
 
+// A key of one of the policy's per-service tables (`table` names it in
+// messages), normalized as the C boundary normalizes a caller's service
+// name. One that isn't a service name at all -- an underscore, a hyphen, a
+// stray space -- is refused: no caller could pass it, so the entry would
+// sit in the policy applying to nothing, and the service it was meant for
+// would go unpinned without a word.
+fn service_key(table: &str, service: &str) -> Result<String> {
+    match crate::service_name_problem(service) {
+        None => Ok(crate::normalize_service(service)),
+        Some(problem) => Err(Error::Policy(format!(
+            "hkdfguard policy: {table} has an entry for \"{}\", which is not a service name ({problem}), so it could \
+             never apply to one",
+            service.escape_debug()
+        ))),
+    }
+}
+
 // Decodes one provider's `pinned_keys` table (`table` names it in
 // messages): normalized service name -> every fingerprint accepted for it.
 fn parse_pinned_keys(table: &str, raw: &BTreeMap<String, PinnedKeys>) -> Result<BTreeMap<String, Vec<[u8; FINGERPRINT_LEN]>>> {
@@ -527,7 +544,7 @@ fn parse_pinned_keys(table: &str, raw: &BTreeMap<String, PinnedKeys>) -> Result<
             }
             fingerprints.push(fingerprint);
         }
-        if pinned.insert(crate::normalize_service(service), fingerprints).is_some() {
+        if pinned.insert(service_key(table, service)?, fingerprints).is_some() {
             return Err(Error::Policy(format!(
                 "hkdfguard policy: {table} lists \"{service}\" more than once (names are compared case-insensitively)"
             )));
@@ -803,10 +820,7 @@ impl Policy {
         let mut pinned_tpm_names = BTreeMap::new();
         for (service, hex) in &raw.tpm.pinned_names {
             let bytes = parse_tpm_name(&format!("tpm.pinned_names[\"{service}\"]"), hex)?;
-            if pinned_tpm_names
-                .insert(crate::normalize_service(service), bytes)
-                .is_some()
-            {
+            if pinned_tpm_names.insert(service_key("tpm.pinned_names", service)?, bytes).is_some() {
                 return Err(Error::Policy(format!(
                     "hkdfguard policy: tpm.pinned_names lists \"{service}\" more than once (names are compared case-insensitively)"
                 )));
@@ -842,7 +856,7 @@ impl Policy {
                     group.escape_debug()
                 )));
             }
-            if tpm_auth_groups.insert(crate::normalize_service(service), group.clone()).is_some() {
+            if tpm_auth_groups.insert(service_key("tpm.auth_groups", service)?, group.clone()).is_some() {
                 return Err(Error::Policy(format!(
                     "hkdfguard policy: tpm.auth_groups lists \"{service}\" more than once (names are compared case-insensitively)"
                 )));
@@ -1034,6 +1048,19 @@ impl Policy {
         if self.preferred_order.is_empty() {
             compiled.to_vec()
         } else {
+            // A provider the policy asks for and this build can't supply is
+            // left out, and said so once: a host whose package lacks its
+            // first choice otherwise serves every key from its second with
+            // nothing in the log to show for it.
+            for missing in self.preferred_order.iter().filter(|p| !compiled.contains(p)) {
+                crate::provider::log_once(
+                    log::Level::Warn,
+                    format!(
+                        "hkdfguard policy: preferred_order names \"{}\", which is not compiled into this build; it is skipped",
+                        missing.policy_name()
+                    ),
+                );
+            }
             self.preferred_order
                 .iter()
                 .copied()
@@ -2751,6 +2778,30 @@ mod tests {
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, vec![b'#'; MAX_POLICY_FILE_LEN + 1]);
         assert_load_fails_closed(&path, "an oversized policy must be rejected, not truncated");
+    }
+
+    #[test]
+    fn a_table_entry_under_a_name_no_service_could_have_is_refused() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        let fingerprint = "ab".repeat(FINGERPRINT_LEN);
+        let name = format!("000b{}", "00".repeat(32));
+        for bad in ["com.company_orders", "com.company-orders", "com.company.orders ", ".hidden", "a..b", ""] {
+            for table in [
+                format!("[pkcs11.pinned_keys]\n\"{bad}\" = \"{fingerprint}\"\n"),
+                format!("[external_secret.pinned_keys]\n\"{bad}\" = \"{fingerprint}\"\n"),
+                format!("[tpm.pinned_names]\n\"{bad}\" = \"{name}\"\n"),
+                format!("[tpm.auth_groups]\n\"{bad}\" = \"orders\"\n"),
+            ] {
+                match Policy::from_toml_str(&format!("{base}{table}")) {
+                    Err(Error::Policy(msg)) => assert!(msg.contains("not a service name"), "{table}: {msg}"),
+                    other => panic!("{table}: expected a policy error, got {other:?}"),
+                }
+            }
+        }
+        // Too long is no name either; the longest one is.
+        let longest = "s".repeat(crate::MAX_SERVICE_LEN);
+        assert!(Policy::from_toml_str(&format!("{base}[pkcs11.pinned_keys]\n\"{longest}\" = \"{fingerprint}\"\n")).is_ok());
+        assert!(Policy::from_toml_str(&format!("{base}[pkcs11.pinned_keys]\n\"{longest}s\" = \"{fingerprint}\"\n")).is_err());
     }
 
     // ---- packaging/policy.toml.example ----

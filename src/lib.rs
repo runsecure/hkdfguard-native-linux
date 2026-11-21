@@ -856,8 +856,25 @@ fn cstr_to_service(ptr: *const c_char) -> Result<String, c_int> {
     // are readable and non-NUL.
     let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
     let s = std::str::from_utf8(bytes).map_err(|_| status::INVALID_SERVICE_NAME)?; // reject non-UTF-8 byte sequences
+    if service_name_problem(s).is_some() {
+        return Err(status::INVALID_SERVICE_NAME);
+    }
+    Ok(normalize_service(s))
+}
+
+// What is wrong with `s` as a service name, if anything: the one rule, for
+// the names callers pass and the names a policy's tables are keyed by -- a
+// policy entry under a name no caller could pass would never apply to
+// anything.
+pub(crate) fn service_name_problem(s: &str) -> Option<&'static str> {
+    if s.is_empty() {
+        return Some("it is empty");
+    }
+    if s.len() > MAX_SERVICE_LEN {
+        return Some("it is longer than 128 bytes");
+    }
     if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
-        return Err(status::INVALID_SERVICE_NAME); // only ASCII alphanumeric characters and '.' are allowed
+        return Some("it may hold only ASCII letters, digits and '.'");
     }
     if s.starts_with('.') || s.contains("..") {
         // A service name is used directly as a file name by the
@@ -865,9 +882,9 @@ fn cstr_to_service(ptr: *const c_char) -> Result<String, c_int> {
         // never be able to name "." (the mount itself), ".." (its
         // parent), or a hidden dot-file, and never contain an empty
         // label between dots.
-        return Err(status::INVALID_SERVICE_NAME);
+        return Some("it may not start with '.' or contain \"..\"");
     }
-    Ok(normalize_service(s))
+    None
 }
 
 // The canonical form a validated service string is reduced to: lowercase,
@@ -1405,6 +1422,7 @@ fn security_model_impl(out_model: *mut c_int, out_may_write_key_files: *mut c_in
         }
         Err(e) => {
             log::error!("hkdfguard: hkdfguard_security_model: {e}");
+            audit::policy_refused(audit::Op::SecurityModel, e.status_code(), None);
             e.status_code()
         }
     }
@@ -1496,6 +1514,7 @@ fn key_file_principal_trusted_impl(principal: *const c_char, out_trusted: *mut c
         Ok(trust) => trust,
         Err(e) => {
             log::error!("hkdfguard: hkdfguard_key_file_principal_trusted: {e}");
+            audit::policy_refused(audit::Op::KeyFilePrincipalTrusted, e.status_code(), None);
             return e.status_code();
         }
     };
@@ -1652,6 +1671,7 @@ fn open_file_impl(kind: key_file::Kind, path: *const c_char, out: *mut u8, out_l
         Ok(trust) => trust,
         Err(e) => {
             log::error!("hkdfguard: {function} can't decide whose key files to trust: {e}");
+            audit::policy_refused(op, e.status_code(), Some(&path));
             return fail(e.status_code());
         }
     };
@@ -3664,6 +3684,9 @@ mod ffi_tests {
         let _bad = policy::test_support::TestPolicy::exact("security_model = \"lenient\"\n[selection]\nmode = \"prefer\"\n");
         assert_eq!(security_model_now(), (status::POLICY_INVALID, -7, -7));
         assert_eq!(principal_trusted("uid:0"), (status::POLICY_INVALID, -7));
+        // Both are in the audit trail, as a wrap refused the same way is.
+        assert!(!audit::captured_containing("event=2004 op=hkdfguard_security_model result=POLICY_INVALID(-9)").is_empty());
+        assert!(!audit::captured_containing("event=2004 op=hkdfguard_key_file_principal_trusted result=POLICY_INVALID(-9)").is_empty());
         drop(_bad);
         let _missing = policy::test_support::TestPolicy::write("deployer_groups = [\"hkdfguard-no-such-group-xyz\"]\nsecurity_model = \"production\"\n");
         assert_eq!(security_model_now(), (status::LINUX_GROUP_INVALID, -7, -7));
