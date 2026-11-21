@@ -85,7 +85,7 @@ elif command -v dnf >/dev/null; then
 else
     zypper --non-interactive install --force --allow-unsigned-rpm "${rpms[@]}"
 fi
-[ "$(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm)" = "root:hkdfguard-deployers 710" ] \
+[[ "$(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm)" = "root:hkdfguard-deployers 710" ]] \
     || { echo "a reinstall reset /var/lib/hkdfguard/tpm to $(stat -c '%U:%G %a' /var/lib/hkdfguard/tpm 2>&1)" >&2; exit 1; }
 chgrp hkdfguard /var/lib/hkdfguard/tpm
 chmod 0750 /var/lib/hkdfguard/tpm
@@ -132,7 +132,7 @@ for service in com.company.orders com.company.cli; do
     grep -q 'has no pinned key' <<< "$out" \
         || { echo "unexpected refusal of unpinned $service: $out" >&2; exit 1; }
     fingerprint=$(grep -o '[0-9a-f]\{64\}' <<< "$out" | head -n 1)
-    [ ${#fingerprint} -eq 64 ] || { echo "the refusal printed no fingerprint to pin: $out" >&2; exit 1; }
+    [[ ${#fingerprint} -eq 64 ]] || { echo "the refusal printed no fingerprint to pin: $out" >&2; exit 1; }
     sed -i "/^\[external_secret\.pinned_keys\]\$/a \"$service\" = \"$fingerprint\"" /etc/hkdfguard/policy.toml
     echo "pinned $service to $fingerprint"
 done

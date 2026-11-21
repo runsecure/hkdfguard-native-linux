@@ -275,7 +275,9 @@ impl SecretName {
                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
                 b[..end].to_vec()
             }
-            SecretName::Unterminated => return Some(vec![b'a'; 65 + 7]), // read at most 65 bytes in
+            // Exactly the 65 bytes the bounded scan may read, so that under
+            // AddressSanitizer one byte further is a finding.
+            SecretName::Unterminated => return Some(vec![b'a'; 65]),
             SecretName::Null => return None,
         };
         b.push(0);
@@ -310,4 +312,52 @@ pub fn unwrap_secret(service: &Service, name: &SecretName, payload: &[u8], call:
     let name_ptr = name_buf.as_ref().map_or(ptr::null(), |b| b.as_ptr().cast());
     let len: c_int = payload.len().try_into().expect("payload longer than c_int");
     with_buffer(call, |out, out_len| hkdfguard_unwrap_secret(svc_ptr, name_ptr, payload.as_ptr(), len, out, out_len))
+}
+
+// ---- strings at the edge of readable memory ----
+
+/// A byte string placed so that its last byte is the last readable byte
+/// before an inaccessible page: reading one byte past it is a SIGSEGV, in
+/// any build, with or without a sanitizer. What a C caller's string looks
+/// like when it ends at the end of a mapping -- and what an unterminated
+/// one must be treated as.
+pub struct Guarded {
+    base: *mut u8,
+    map_len: usize,
+    start: *mut u8,
+}
+
+impl Guarded {
+    pub fn new(bytes: &[u8]) -> Guarded {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let data_len = bytes.len().div_ceil(page).max(1) * page;
+        let map_len = data_len + page;
+        // SAFETY: a fresh anonymous private mapping; the kernel picks the address.
+        let base = unsafe {
+            libc::mmap(ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(base, libc::MAP_FAILED, "mmap of a guarded string");
+        let base = base.cast::<u8>();
+        // SAFETY: the last page of the mapping just made; the bytes are
+        // copied to the `bytes.len()` bytes that end where it starts.
+        let start = unsafe {
+            assert_eq!(libc::mprotect(base.add(data_len).cast(), page, libc::PROT_NONE), 0, "mprotect of the guard page");
+            let start = base.add(data_len - bytes.len());
+            ptr::copy_nonoverlapping(bytes.as_ptr(), start, bytes.len());
+            start
+        };
+        Guarded { base, map_len, start }
+    }
+
+    pub fn ptr(&self) -> *const std::os::raw::c_char {
+        self.start.cast()
+    }
+}
+
+impl Drop for Guarded {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made, unmapped once.
+        unsafe { libc::munmap(self.base.cast(), self.map_len) };
+    }
 }

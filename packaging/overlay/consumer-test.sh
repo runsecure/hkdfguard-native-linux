@@ -105,7 +105,7 @@ if [ "$mode" = plain ]; then
             exit 1
         fi
         fingerprint=$(grep -o '[0-9a-f]\{64\}' <<< "$out" | head -n 1)
-        [ ${#fingerprint} -eq 64 ] || { echo "the refusal printed no fingerprint to pin: $out" >&2; exit 1; }
+        [[ ${#fingerprint} -eq 64 ]] || { echo "the refusal printed no fingerprint to pin: $out" >&2; exit 1; }
         printf '"%s" = "%s"\n' "$service" "$fingerprint" >> /etc/hkdfguard/policy.toml
     done
     "$work/wrap_unwrap"

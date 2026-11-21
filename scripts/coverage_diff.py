@@ -1,37 +1,36 @@
-"""Reads a unified diff (-U0) on stdin and an lcov file; prints every added
-line that lcov records as executable with a zero count, and a summary.
-Exits 1 if there is any that the exemption file (optional third argument)
-doesn't list. Used by scripts/coverage.sh."""
+"""Reads a unified diff (-U0) on stdin and the lcov file scripts/coverage.sh
+writes; prints every added line that lcov records as executable with a zero
+count, and a summary. Exits 1 if there is any that the exemption file
+doesn't list. Used by scripts/coverage.sh.
+
+Takes no arguments: the repository is the one this script is in, and the
+two files it reads are where coverage.sh puts them. Nothing on the command
+line names a file to open."""
 import os
 import re
 import sys
 
-root = os.path.realpath(sys.argv[2])
+root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+lcov_path = os.path.join(root, "target", "coverage", "lcov.info")
+exempt_path = os.path.join(root, "scripts", "coverage-exempt.txt")
+if len(sys.argv) > 1:
+    sys.exit("usage: git diff -U0 BASE -- src | coverage_diff.py   (run by scripts/coverage.sh)")
 
 
 def inside_root(path):
-    """`path` (relative ones taken from the repository root) with symlinks
-    and `..` resolved, or None if that leaves the repository. Every file
-    this script opens goes through here: the names come from the command
-    line and from the diff on stdin, and none of them has any business
-    outside the checkout."""
+    """`path`, a name from the diff on stdin, taken from the repository
+    root with symlinks and `..` resolved -- or None if that leaves the
+    repository, where no source file this script reports on can be."""
     resolved = os.path.realpath(os.path.join(root, path))
     if os.path.commonpath([root, resolved]) != root:
         return None
     return resolved
 
 
-lcov_path = inside_root(sys.argv[1])
-if lcov_path is None:
-    sys.exit(f"coverage_diff: {sys.argv[1]} is outside {root}")
-
 # Exemptions: `path<TAB>source line, stripped<TAB>why`, '#' comments. Lines
 # a test runs but whose process can't record a profile.
 exempt = {}
-exempt_path = inside_root(sys.argv[3]) if len(sys.argv) > 3 else None
-if len(sys.argv) > 3 and exempt_path is None:
-    sys.exit(f"coverage_diff: {sys.argv[3]} is outside {root}")
-if exempt_path and os.path.exists(exempt_path):
+if os.path.exists(exempt_path):
     with open(exempt_path) as f:
         for raw in f:
             if raw.strip() and not raw.startswith("#"):

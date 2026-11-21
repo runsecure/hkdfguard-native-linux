@@ -67,6 +67,15 @@ RUN set -eu; \
     rm /tmp/rustup-init; \
     rustup component add clippy
 
+# A second, dated nightly toolchain, used by one stage of
+# docker/entrypoint-test.sh only: the TPM2 and PKCS#11 provider tests
+# rebuilt with AddressSanitizer (-Zsanitizer, which no stable compiler
+# takes). Nothing that ships is built with it -- the default toolchain
+# stays the one above -- and it is pinned by date so that a new nightly
+# can't change what the stage does. Bump deliberately.
+ENV HKDFGUARD_ASAN_TOOLCHAIN=nightly-2026-11-20
+RUN rustup toolchain install "$HKDFGUARD_ASAN_TOOLCHAIN" --profile minimal
+
 # The tests run as `ci`, an unprivileged user in the `tss` group (the
 # group that owns /dev/tpmrm0 on a real host), not as root: as root every
 # file a test creates is root-owned and every mode-000 file is readable,

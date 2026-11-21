@@ -33,7 +33,7 @@ check "packaging/rpm/hkdfguard.spec %changelog" "$rpm_log_v"
 # dpkg-gensymbols would then make every dependent package require a
 # libhkdfguard1 that doesn't exist.
 while read -r symbol since; do
-    if [ "$(printf '%s\n%s\n' "$since" "$cargo_v" | sort -V | tail -n 1)" != "$cargo_v" ]; then
+    if [[ "$(printf '%s\n%s\n' "$since" "$cargo_v" | sort -V | tail -n 1)" != "$cargo_v" ]]; then
         echo "error: debian/libhkdfguard1.symbols tags $symbol with $since, newer than Cargo.toml's $cargo_v" >&2
         status=1
     fi
