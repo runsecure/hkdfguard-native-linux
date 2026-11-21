@@ -41,6 +41,20 @@ service with a key pinned in `external_secret.pinned_keys` and no secret
 mounted. When a later provider does serve a service, audit event 1006
 records it, once per process for each service.
 
+There is one case the library can't tell apart. A process that can open
+neither the TPM nor the TPM key directory (`/var/lib/hkdfguard/tpm`) looks
+the same whether it never used the TPM or is a TPM-backed service that
+lost its `tss` and `hkdfguard` group memberships. The library treats the
+TPM as not that service's and moves on, since failing would break every
+non-TPM service on a host that has a TPM. If the service also has a key in
+a later provider, or the policy allows `ephemeral`, new DEKs are then
+wrapped there, with event 1006 as the only sign.
+
+To rule that out for a TPM-backed service, pin it in `[tpm.pinned_names]`
+(see [Pin each service's key](#tpm-20), step 4). A service pinned to the
+TPM is never served by another provider: if the TPM can't serve it, the
+call fails.
+
 Each wrapped DEK records which provider wrapped it, and is always unwrapped
 by that same provider.
 
@@ -233,6 +247,12 @@ sudo hkdfguard provision -sn com.company.orders
 
 Add the line as printed, then run `provision` again; it reports "already
 provisioned".
+
+A pin also ties the service to the TPM, with or without
+`require_pinned_names`: no other provider in the policy order serves a
+pinned service, so one that loses its access to the TPM fails instead of
+wrapping under a weaker key (see
+[How the provider is chosen](#how-the-provider-is-chosen)).
 
 **5. The TPM bus traffic is encrypted; pin the storage root key for
 provisioning.** On a *discrete* TPM (a separate chip), the wrapping key
